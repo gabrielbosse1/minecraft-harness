@@ -401,30 +401,207 @@ function detectStructure (blockNames) {
   return null
 }
 
+// ============================================================================
+// Semantic compression — "block vomit" → ideas.
+//
+// Qwen does not need 400 block ids; it needs the *idea* of the place:
+// "stone tower with a glass slit and three barrels". clusterBlocks rolls the
+// cube up into material shares; detectStructures infers what the place IS.
+// Both are pure (no bot), cheap (single pass) and bounded (top-N output), so
+// they can run on every inference without touching the token budget.
+// ============================================================================
+
+/** Ordered category rules — first match wins. */
+const BLOCK_CATEGORY_RULES = [
+  ['storage', /(chest|barrel|shulker_box|hopper|dispenser|dropper|furnace|smoker|blast_furnace)/],
+  ['light', /(torch|lantern|glowstone|sea_lantern|shroomlight|campfire|candle|beacon|froglight)/],
+  ['glass', /(glass|beacon)/],
+  ['door', /(door|trapdoor|fence_gate)/],
+  ['farming', /(wheat|crop|carrot|potato|beetroot|farmland|pumpkin|melon|hay_block|composter|sugar_cane)/],
+  ['nether', /(netherrack|obsidian|nether_portal|crying_obsidian|soul_|nether_brick|blackstone|basalt|magma|glowstone)/],
+  ['metal', /(iron|gold|copper|diamond|emerald|netherite|anvil|rail|chain)/],
+  ['water', /(water|ice|bubble_column|kelp|seagrass)/],
+  ['terrain', /(dirt|grass_block|short_grass|tall_grass|sand|gravel|podzol|mycelium|snow|clay|mud|moss_block|sculk|rooted_dirt|coarse_dirt)/],
+  ['foliage', /(leaves|vine|fern|flower|mushroom|sapling|azalea|moss_carpet|kelp|seagrass)/],
+  ['wood', /(log|wood|planks|fence|stairs|slab|stem|hyphae|bamboo)/],
+  ['stone', /(stone|cobble|brick|deepslate|granite|diorite|andesite|tuff|sandstone|terracotta|concrete|quartz|prismarine|basalt|calcite|dripstone)/]
+]
+
 /**
- * Build the semantic perception block for a System-2 prompt.
- * @param {import('mineflayer').Bot} bot
- * @param {{radius?:number}} [opts]
- * @returns {{text:string, zones:Array}}
+ * Category id for a block name. Unknown blocks fall into 'other' rather than
+ * inventing a category — conservative semantics beat confident nonsense.
+ * @param {string} name
+ * @returns {string}
  */
-function buildSemanticHints (bot, { radius = 6 } = {}) {
-  const pos = bot.entity?.position
-  const lines = []
+function categorizeBlock (name) {
+  const n = String(name || '').toLowerCase()
+  for (const [cat, re] of BLOCK_CATEGORY_RULES) if (re.test(n)) return cat
+  return 'other'
+}
+
+/**
+ * Roll a visible-block list into material shares (top-N categories).
+ * @param {Array<{name:string}>} blocks
+ * @param {{top?:number}} [opts]
+ * @returns {{total:number, materials:Array<{category:string,count:number,share:number}>, text:string}}
+ */
+function clusterBlocks (blocks, { top = 4 } = {}) {
+  const counts = new Map()
+  let total = 0
+  for (const b of blocks || []) {
+    if (!b || !b.name) continue
+    const n = String(b.name)
+    if (n === 'air' || n === 'cave_air' || n === 'void_air') continue
+    const cat = categorizeBlock(n)
+    counts.set(cat, (counts.get(cat) || 0) + 1)
+    total++
+  }
+  if (!total) return { total: 0, materials: [], text: '' }
+  const materials = [...counts.entries()]
+    .map(([category, count]) => ({ category, count, share: count / total }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, Math.max(1, top))
+  // Sub-2% entries are noise in a prompt ("door 0%"); keep them out of the
+  // text while still reporting them in `materials` for programmatic callers.
+  const salient = materials.filter((m) => m.share >= 0.02)
+  const text = (salient.length ? salient : materials.slice(0, 1))
+    .map((m) => `${m.category} ${Math.round(m.share * 100)}% (${m.count})`)
+    .join(', ')
+  return { total, materials, text }
+}
+
+/** Count helper over visible block names. */
+function countBy (blocks, re) {
+  let n = 0
+  for (const b of blocks || []) if (re.test(String(b?.name || ''))) n++
+  return n
+}
+
+/**
+ * Infer the structures/features in a visible cube from geometry + materials.
+ * Returns at most `max` entries so the prompt stays a summary, never a dump.
+ * @param {Array<{dx?:number,dy?:number,dz?:number,name:string}>} blocks
+ * @param {{max?:number}} [opts]
+ * @returns {Array<{kind:string, confidence:number, evidence:string}>}
+ */
+function detectStructures (blocks, { max = 3 } = {}) {
+  const list = (blocks || []).filter((b) => b && b.name && !/^(air|cave_air|void_air)$/.test(b.name))
+  if (!list.length) return []
+  const found = []
+  const add = (kind, confidence, evidence) => found.push({ kind, confidence, evidence })
+
+  const walls = list.filter((b) => WALL_BLOCKS.has(String(b.name).toLowerCase())).length
+  const roof = countBy(list, ROOF_BLOCKS)
+  const doors = countBy(list, DOOR_BLOCKS)
+  const glass = countBy(list, GLASS_BLOCKS)
+  const chests = countBy(list, CHEST_BLOCKS)
+  const fences = countBy(list, /(fence|fence_gate|wall)$/)
+  const rails = countBy(list, /rail$/)
+  const torches = countBy(list, /(torch|lantern|campfire)/)
+  const logs = countBy(list, /(log|stem|hyphae)$/)
+  const leaves = countBy(list, /leaves$/)
+  const obsidian = countBy(list, /(obsidian|nether_portal)/)
+  const crops = countBy(list, /(wheat|carrots|potatoes|beetroots|pumpkin|melon|sugar_cane)/)
+  const farmland = countBy(list, /farmland/)
+  const water = countBy(list, /(water|ice|kelp|seagrass)/)
+  const path = countBy(list, /(dirt_path|gravel|path$)/)
+  const cracked = countBy(list, /(cracked|mossy)/)
+
+  // Vertical profile over *structural* blocks only — terrain must not inflate
+  // the footprint or the model would see a "house" in a flat field.
+  const isStructural = (b) => {
+    const n = String(b.name || '').toLowerCase()
+    return WALL_BLOCKS.has(n) || ROOF_BLOCKS.test(n) || DOOR_BLOCKS.test(n) ||
+      GLASS_BLOCKS.test(n) || CHEST_BLOCKS.test(n) || /(fence|fence_gate|wall)$/.test(n)
+  }
+  const columns = new Map()
+  let maxDy = 0
+  for (const b of list) {
+    if (!Number.isFinite(b.dx) || !Number.isFinite(b.dz)) continue
+    if (!isStructural(b) && !(Number.isFinite(b.dy) && b.dy >= 1)) continue
+    const key = `${b.dx},${b.dz}`
+    const h = Number.isFinite(b.dy) ? b.dy : 0
+    columns.set(key, Math.max(columns.get(key) ?? -Infinity, h))
+    if (h > maxDy) maxDy = h
+  }
+  const tallColumns = [...columns.values()].filter((h) => h >= 6).length
+
+  // Conservative: a roof, or a door + real window wall, makes a house.
+  if (walls >= 6 && (roof >= 3 || (doors >= 1 && glass >= 2 && columns.size >= 5))) {
+    add('house', 0.9, `walls=${walls} doors=${doors} roof=${roof}`)
+  }
+  if (maxDy >= 6 && tallColumns >= 1 && tallColumns <= 16 && walls >= 6) add('tower', 0.78, `height=${maxDy} footprint=${columns.size}`)
+  if (chests >= 4) add('storage', 0.92, `${chests} chests/barrels`)
+  if (crops >= 6 || (farmland >= 4 && water > 0)) add('farm', 0.8, `crops=${crops} water=${water}`)
+  if (rails >= 4) add('mine_entrance', 0.8, `rails=${rails}`)
+  if (obsidian >= 8) add('portal', 0.85, `obsidian=${obsidian}`)
+  if (fences >= 8) add('enclosure', 0.7, `fences=${fences}`)
+  if (water >= 4 && walls + roof >= 10) add('bridge', 0.6, `stone=${walls + roof} water=${water}`)
+  if (path >= 8 && doors === 0) add('road', 0.55, `path blocks=${path}`)
+  if (logs >= 3 && leaves >= 8) add('grove', 0.7, `logs=${logs} leaves=${leaves}`)
+  if (cracked >= 3) add('ruins', 0.6, `cracked=${cracked}`)
+  if (doors >= 2 && walls >= 10 && columns.size >= 6) add('village_building', 0.65, `doors=${doors} walls=${walls}`)
+
+  // Deduplicate and keep the strongest signals only.
+  const seen = new Set()
+  return found
+    .sort((a, b) => b.confidence - a.confidence)
+    .filter((s) => (seen.has(s.kind) ? false : (seen.add(s.kind), true)))
+    .slice(0, max)
+}
+
+/**
+ * Compose the semantic "idea" of the immediate world: scene + materials +
+ * entity clusters. Bounded output (~5 lines) regardless of block count.
+ * @param {import('mineflayer').Bot} bot
+ * @param {{radius?:number, maxEntities?:number}} [opts]
+ * @returns {{text:string, zones:Array, structures:Array, materials:Array}}
+ */
+function semanticScene (bot, { radius = 8, maxEntities = 16 } = {}) {
+  const pos = bot?.entity?.position
   const zones = []
-  if (!pos) return { text: '', zones }
-  // Blocks: full 360° scan (structure semantics should not depend on facing).
-  const blocks = visibleBlocks(bot, { range: radius, fovDegrees: 360, heightUp: 5, heightDown: 2 })
-  const names = blocks.map((b) => b.name)
-  const structure = detectStructure(names)
-  if (structure) {
-    lines.push(`structures: ${structure.kind} (walls=${structure.walls}, roof=${structure.roof}, doors=${structure.doors}, glass=${structure.glass}${structure.chests ? `, chests=${structure.chests}` : ''})`)
+  if (!pos) return { text: '', zones, structures: [], materials: [] }
+  // Full 360° scan: semantics must not depend on which way the bot faces.
+  const blocks = visibleBlocks(bot, { range: radius, fovDegrees: 360, heightUp: 6, heightDown: 3 })
+  const structures = detectStructures(blocks)
+  const clustered = clusterBlocks(blocks)
+  const lines = []
+  if (structures.length) {
+    lines.push(`scene: ${structures.map((s) => `${s.kind}${s.confidence >= 0.85 ? '' : '?'}`).join(' | ')}`)
   }
-  const chestCount = names.filter((n) => CHEST_BLOCKS.test(n)).length
-  if (chestCount > 10) {
-    lines.push(`clutter: ${chestCount} chests — storage area`)
-    zones.push({ kind: 'storage', x: Math.round(pos.x), y: Math.round(pos.y), z: Math.round(pos.z), count: chestCount, radius })
-  }
-  // Entities: same cube, clustered (not enumerated).
+  if (clustered.text) lines.push(`materials: ${clustered.text}`)
+
+  // Terrain hint — one clause, derived from the same cube (no extra scan).
+  const water = countBy(blocks, /(water|kelp|seagrass)/)
+  const stone = countBy(blocks, /(stone|deepslate|tuff)/)
+  const chests = countBy(blocks, CHEST_BLOCKS)
+  let ceiling = false
+  try {
+    const above = bot.blockAt?.(pos.floored ? pos.floored().offset(0, 4, 0) : pos)
+    ceiling = Boolean(above && above.boundingBox === 'block')
+  } catch { /* unloaded above — assume open */ }
+  const underground = stone > blocks.length * 0.55 && water === 0
+  const terrain = []
+  if (underground) terrain.push('underground')
+  if (water > 0) terrain.push('water nearby')
+  if (!underground && !water) terrain.push('open ground')
+  if (ceiling) terrain.push('ceiling')
+  if (terrain.length) lines.push(`terrain: ${terrain.join(', ')}`)
+
+  // Feature vocabulary: the "idea" of doors/windows/light/storage in one line.
+  const features = []
+  const doorCount = countBy(blocks, DOOR_BLOCKS)
+  const glassCount = countBy(blocks, GLASS_BLOCKS)
+  const lightCount = countBy(blocks, /(torch|lantern|glowstone|sea_lantern|campfire|candle)/)
+  if (doorCount) features.push(`door x${doorCount}`)
+  if (glassCount) features.push(`glass x${glassCount}`)
+  if (lightCount) features.push(`light x${lightCount}`)
+  if (chests && chests < 4) features.push(`barrels x${chests}`)
+  if (features.length) lines.push(`features: ${features.join(', ')}`)
+
+  if (chests >= 4) zones.push({ kind: 'storage', x: Math.round(pos.x), y: Math.round(pos.y), z: Math.round(pos.z), count: chests, radius })
+
+  // Entities: same cube, clustered (never enumerated when dense).
   const rawEnts = []
   for (const e of Object.values(bot.entities || {})) {
     if (!e || !e.position || e === bot.entity) continue
@@ -434,10 +611,40 @@ function buildSemanticHints (bot, { radius = 6 } = {}) {
     rawEnts.push({ name: e.name, username: e.username, dist: Math.round(dist * 10) / 10, position: e.position })
   }
   rawEnts.sort((a, b) => a.dist - b.dist)
-  const cluster = clusterEntities(rawEnts)
+  const cluster = clusterEntities(rawEnts.slice(0, maxEntities))
   lines.push(...cluster.lines)
   zones.push(...cluster.zones)
-  return { text: lines.join('\n'), zones }
+  return { text: lines.slice(0, 12).join('\n'), zones, structures, materials: clustered.materials }
 }
 
-module.exports = { visibleBlocks, visibleEntities, buildVoxelGrid, buildPerceptionText, inHorizontalFov, buildTopDownGrid, buildCrossSection, buildVisionBlock, categoryChar, VISION_LEGEND, classifyEntityName, clusterEntities, detectStructure, buildSemanticHints }
+/**
+ * Build the semantic perception block for a System-2 prompt.
+ * @param {import('mineflayer').Bot} bot
+ * @param {{radius?:number}} [opts]
+ * @returns {{text:string, zones:Array}}
+ */
+function buildSemanticHints (bot, { radius = 6 } = {}) {
+  const scene = semanticScene(bot, { radius })
+  return { text: scene.text, zones: scene.zones }
+}
+
+module.exports = {
+  visibleBlocks,
+  visibleEntities,
+  buildVoxelGrid,
+  buildPerceptionText,
+  inHorizontalFov,
+  buildTopDownGrid,
+  buildCrossSection,
+  buildVisionBlock,
+  categoryChar,
+  VISION_LEGEND,
+  classifyEntityName,
+  clusterEntities,
+  detectStructure,
+  detectStructures,
+  clusterBlocks,
+  categorizeBlock,
+  semanticScene,
+  buildSemanticHints
+}

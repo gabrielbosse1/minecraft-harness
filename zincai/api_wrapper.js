@@ -69,7 +69,7 @@ const ACTION_TOOLS = [
         blueprint: { type: 'string', description: 'Name of a file in zincai/blueprints/ (without .json).' },
         grid: { type: 'array', description: 'Inline 3D layers (bottom-to-top), each layer an array of rows of chars; "." is air.', items: { type: 'array', items: { type: 'string' } } },
         at: { type: 'array', description: 'Absolute [x,y,z] origin; default: bot feet.', items: { type: 'integer' }, minItems: 3, maxItems: 3 },
-        stage: { type: 'string', description: 'Hierarchical stage label: foundation | walls | roof | detailing.' }
+        stage: { type: 'string', description: 'Build phase: foundation | walls_with_windows | roof | interior_details. One phase per call; re-runs are idempotent.' }
       }
     }
   },
@@ -83,7 +83,7 @@ const ACTION_TOOLS = [
         params: { type: 'object', description: 'Shape params: cylinder {r,h}; dome {r}; arch {w,h}; wall {l,h,axis}; box {l,w,h}; floor {l,w}; ring {r}.' },
         block: { type: 'string', description: 'Block id, e.g. "stone_bricks".' },
         at: { type: 'array', description: 'Absolute [x,y,z] origin; default: bot feet.', items: { type: 'integer' }, minItems: 3, maxItems: 3 },
-        stage: { type: 'string', description: 'Hierarchical stage label: foundation | walls | roof | detailing.' }
+        stage: { type: 'string', description: 'Build phase: foundation | walls_with_windows | roof | interior_details. One phase per call; re-runs are idempotent.' }
       },
       required: ['shape', 'block']
     }
@@ -117,7 +117,7 @@ const ACTION_TOOLS = [
   },
   {
     name: 'attack',
-    description: 'Deliberately engage a named hostile/player with the combat AI. Reflex combat (players within 15 m) is handled by System 1 automatically.',
+    description: 'Deliberately engage a named hostile/player. Ordinary mobs that reach you are auto-fought by System 1 (85% cooldown gate, crit timing, mace/elytra evasion) — use this only for a chosen hunt.',
     parameters: {
       type: 'object',
       properties: { name: { type: 'string', description: 'Entity name, e.g. "zombie".' } },

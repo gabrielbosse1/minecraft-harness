@@ -15,6 +15,14 @@
  * directive as the previous Zinc mandate). Any join rejection aborts the
  * process with exit code 1 — no retries, no renames.
  *
+ * VANILLA CONTRACT: 100% vanilla client. No RCON, no server console, no /tp,
+ * no /setworldspawn, no cheats. The action surface is exactly what a player
+ * can do: setControlState, attack, placeBlock/dig, activateItem, equip, and
+ * the A* pathfinder. vanilla_guard.js enforces this at runtime (slash-shaped
+ * chat is dropped; command-shaped actions are refused) and the startup
+ * "Scout & Relocate" routine establishes bot.spawnPoint organically by
+ * walking, never by asking the server to move us.
+ *
  * Usage:
  *   node zincai/index.js             start the bot
  *   node zincai/index.js --dry-run   validate config + prompt, no network
@@ -84,7 +92,11 @@ function loadConfig () {
     memory: raw.memory,
     behavior: raw.behavior,
     build: raw.build,
-    system1: raw.system1
+    system1: raw.system1,
+    combat: raw.combat || {},
+    threat: raw.threat || {},
+    traversal: raw.traversal || {},
+    scout: raw.scout || {}
   }
   return cfg
 }
@@ -101,7 +113,7 @@ function validateConfig (cfg) {
 // ============================================================ boot ====
 function main () {
   if (process.argv.includes('--check')) {
-    require('./api_wrapper'); require('./memory'); require('./perception'); require('./filter'); require('./builder'); require('./custom_mineflayer/pathfinder_wrapper'); require('./system1'); require('./reflex_registry')
+    require('./api_wrapper'); require('./memory'); require('./perception'); require('./filter'); require('./builder'); require('./custom_mineflayer/pathfinder_wrapper'); require('./system1'); require('./reflex_registry'); require('./vanilla_guard')
     require('minecraft-data')('26.3') // postinstall patch must be in place
     logger.info(TAG, '--check OK — all modules load, 26.3 data present')
     return
@@ -136,7 +148,8 @@ function main () {
   const { buildPerceptionText, buildVisionBlock, buildSemanticHints } = require('./perception')
   const filter = require('./filter')
   const { BlueprintParser, BuilderExecutor, generateShape, normalizeStage } = require('./builder')
-  const { PathfinderWrapper } = require('./custom_mineflayer/pathfinder_wrapper')
+  const { PathfinderWrapper, scoutSafeAnchor } = require('./custom_mineflayer/pathfinder_wrapper')
+  const { installVanillaGuard, assertVanillaAction } = require('./vanilla_guard')
   const { System1 } = require('./system1')
   const { ReflexRegistry } = require('./reflex_registry')
   const { runScript } = require('./reflex_registry')
@@ -176,6 +189,8 @@ function main () {
     auth: cfg.server.auth,
     checkTimeoutInterval: 30_000
   })
+  // Runtime vanilla invariant: no slash-command can ever leave this process.
+  installVanillaGuard(bot, { logger })
   bot.loadPlugin(pathfinder)
   if (cfg.behavior.useArmorManager) bot.loadPlugin(armorManager)
   if (cfg.behavior.pvpEnabled) {
@@ -188,11 +203,15 @@ function main () {
     }
   }
 
-  // Upstream-compatible custom pathfinding: doors, jitter, digging guard.
+  // Upstream-compatible custom pathfinding: doors, jitter, digging guard,
+  // predictive threat map, wind-charge traversal.
   const wrapper = new PathfinderWrapper(bot, {
     allowDigging: Boolean(cfg.behavior.allowDigging),
     logger: wrapperLog,
-    fleeRadius: cfg.behavior.fleeRadius ?? 8
+    fleeRadius: cfg.behavior.fleeRadius ?? 8,
+    threat: cfg.threat || {},
+    enableWindCharge: cfg.traversal?.windCharge !== false,
+    windCharge: cfg.traversal || {}
   })
 
   let system1 = null
@@ -208,6 +227,11 @@ function main () {
   let lastEatAt = 0
   let lastSayAt = 0
   let moveGoalTimer = null
+  let anchor = null // organic spawn anchor chosen by Scout & Relocate (local only)
+  let scouting = false
+  let deathPoint = null
+  let systemsReady = false // spawn fires again on respawn — build the stack once
+  let lastScoutAt = 0
 
   function gracefulShutdown (code, reason) {
     if (shuttingDown) return
@@ -236,6 +260,83 @@ function main () {
     gracefulShutdown(1, 'join-failed')
   }
 
+  // ------------------------------------------- Scout & Relocate (vanilla) --
+  /**
+   * No /tp, no /setworldspawn. The bot evaluates its 30x30 surroundings,
+   * scores candidate cells by projected threat + hazards + openness, picks the
+   * best vector-away anchor, walks there with the A* pathfinder, and adopts it
+   * as its local `bot.spawnPoint` (a JS anchor, never a server command).
+   */
+  async function scoutAndRelocate ({ reason = 'startup' } = {}) {
+    if (scouting || shuttingDown) return null
+    // mineflayer emits both 'spawn' and 'respawn' after death; one scout is enough.
+    if (reason !== 'startup' && Date.now() - lastScoutAt < 5000) return null
+    scouting = true
+    lastScoutAt = Date.now()
+    const sc = cfg.scout || {}
+    try {
+      if (!bot.entity?.position) return null
+      // Wait (bounded) for chunks around spawn so blockAt() is real, not void.
+      const waitDeadline = Date.now() + (sc.waitForWorldMs ?? 6000)
+      while (Date.now() < waitDeadline) {
+        try {
+          const below = bot.blockAt(bot.entity.position.floored().offset(0, -1, 0))
+          if (below && below.boundingBox === 'block') break
+        } catch { /* chunk not loaded yet */ }
+        await sleep(250)
+      }
+
+      wrapper.threat.sample(bot, true)
+      const result = scoutSafeAnchor(bot, {
+        radius: sc.radius ?? 15,
+        step: sc.step ?? 3,
+        minRadius: sc.minRadius ?? 5,
+        preferRadius: sc.preferRadius ?? 12,
+        horizonTicks: wrapper.threat.horizonTicks
+      })
+      if (!result) {
+        anchor = bot.entity.position.floored()
+        bot.spawnPoint = anchor.clone ? anchor.clone() : anchor
+        logger.warn(TAG, `scout ${reason}: no candidate — holding current position`)
+        return null
+      }
+      const { Vec3 } = require('vec3')
+      anchor = new Vec3(result.x, result.y, result.z)
+      bot.spawnPoint = anchor // LOCAL anchor only — no server command involved
+      const pos = bot.entity.position
+      const dist = Math.hypot(result.x - pos.x, result.y - pos.y, result.z - pos.z)
+      logger.info(TAG, `scout ${reason}: anchor ${result.x},${result.y},${result.z} score=${result.score} threats=${result.threats} dist=${dist.toFixed(1)} (${result.reasons.join(', ')})`)
+      memory.addEvent({ type: 'scout', msg: `anchor ${result.x},${result.y},${result.z} (${result.reasons.join(', ')})` }, { promote: true })
+
+      if (dist > (sc.relocateAboveBlocks ?? 6)) {
+        try {
+          bot.pathfinder.setGoal(new goals.GoalNear(result.x, result.y, result.z, 2), true)
+          const moveDeadline = Date.now() + (sc.relocateTimeoutMs ?? 25_000)
+          while (!shuttingDown && Date.now() < moveDeadline) {
+            if (!bot.entity?.position) break
+            if (bot.entity.position.distanceTo(anchor) <= 3.5) break
+            await sleep(250)
+          }
+          try { bot.pathfinder.setGoal(null) } catch { /* noop */ }
+        } catch (err) {
+          logger.warn(TAG, `scout walk interrupted: ${err.message || err}`)
+        }
+      }
+      // Arrival re-anchor: standing spot is ground truth (path may stop short).
+      if (bot.entity?.position) {
+        const arrived = bot.entity.position.floored()
+        if (result.reasons.includes('no nearby threats')) {
+          anchor = arrived
+          bot.spawnPoint = arrived
+        }
+      }
+      return result
+    } finally {
+      scouting = false
+      maybeInfer().catch(() => {})
+    }
+  }
+
   // ------------------------------------------------- event wiring --------
   bot.on('login', () => logger.info(TAG, `logged in as ${bot.username}`))
   bot.on('kicked', (reason) => { if (!started) fatalJoinFailure('kicked', reason); else gracefulShutdown(1, 'kicked') })
@@ -252,11 +353,26 @@ function main () {
     movements.canDig = Boolean(cfg.behavior.allowDigging)
     movements.allowSprinting = true
     bot.pathfinder.setMovements(movements)
-    wrapper.apply() // patches this movements instance + prototype hooks
+    wrapper.apply() // idempotent: first call patches + starts timers
+
+    if (systemsReady) {
+      // Respawn: same bot object, same reflex stack. Reset combat state only.
+      logger.info(TAG, 'respawn — reflex stack reused, combat state reset')
+      try { combat?.stop() } catch { /* noop */ }
+      try { combat?.start() } catch { /* noop */ }
+      scoutAndRelocate({ reason: 'respawn' }).catch((err) => logger.warn(TAG, `scout failed: ${err.message || err}`))
+      return
+    }
+    systemsReady = true
 
     combat = new AdvancedCombat(bot, {
-      maxHealth: 20,
-      disengageHealthFraction: 0.3,
+      maxHealth: bot.health ?? 20,
+      disengageHealthFraction: cfg.combat?.disengageHealthFraction ?? 0.3,
+      critThreshold: cfg.combat?.critThreshold ?? 0.85,
+      recoveryMs: cfg.combat?.recoveryMs ?? 220,
+      attackCooldownMs: cfg.combat?.attackCooldownMs ?? 600,
+      engageRadius: cfg.behavior.engageRadius ?? 24,
+      threatMap: wrapper.threat,
       onEvent: (evt) => memory.addEvent({ type: 'combat', msg: evt.msg || 'combat event', ...evt })
     })
     combat.start()
@@ -285,6 +401,10 @@ function main () {
 
     try { bot.armorManager?.equipAll?.() } catch { /* cosmetic */ }
     logger.info(TAG, 'ZincAI ready — System 1 on reflex, System 2 on demand')
+
+    // Vanilla survival bootstrap: find an organic safe anchor and walk there.
+    // Not awaited — reflexes stay live while the scout decides.
+    scoutAndRelocate({ reason: 'startup' }).catch((err) => logger.warn(TAG, `scout failed: ${err.message || err}`))
   })
 
   bot.on('entityHurt', (entity) => {
@@ -304,7 +424,22 @@ function main () {
 
   bot.on('death', () => {
     memory.addEvent({ type: 'death', msg: 'I died' }, { promote: true })
+    deathPoint = bot.entity?.position ? bot.entity.position.clone() : null
+    anchor = null
+    try { wrapper.threat.clear() } catch { /* noop */ }
     setTimeout(() => { try { bot.respawn() } catch { /* not on death screen */ } }, 1500)
+  })
+
+  bot.on('respawn', () => {
+    // New life, new anchor: re-scout away from the death point (no /tp, ever).
+    logger.info(TAG, 'respawned — running Scout & Relocate')
+    if (deathPoint) memory.addEvent({ type: 'death', msg: `died near ${Math.floor(deathPoint.x)},${Math.floor(deathPoint.y)},${Math.floor(deathPoint.z)}` })
+    setTimeout(() => { scoutAndRelocate({ reason: 'respawn' }).catch(() => {}) }, 1200)
+  })
+
+  bot.on('vanilla_command_blocked', (line) => {
+    logger.warn(TAG, `vanilla guard blocked: ${String(line).slice(0, 80)}`)
+    memory.addEvent({ type: 'vanilla_guard', msg: 'blocked a command-shaped chat payload' })
   })
 
   bot.on('messagestr', (raw) => {
@@ -353,8 +488,10 @@ function main () {
     const working = memory.working.last(5).map((e) => `- ${e.type}${e.sender ? ':' + e.sender : ''}: ${e.text || e.msg || ''}`).join('\n') || '- (none)'
     const recalled = memory.recallBlock(query || '', cfg.memory.topK)
     const prefs = memory.preferencesLine()
+    const threatLine = wrapper.threat?.summary?.() || 'threats: none'
     return [
       `vitals ${vitals} ${pos} tod=${tod} mode=${mode}`,
+      `prediction: ${threatLine}`,
       prefs || null,
       recalled || null,
       justNow ? `just now: ${justNow}` : null,
@@ -366,6 +503,7 @@ function main () {
 
   async function maybeInfer () {
     if (shuttingDown || !started || inferBusy) return
+    if (scouting) return // let the scout establish the anchor before spending tokens
     const now = Date.now()
     if (now - lastInfer < cfg.inference.minIntervalMs) return
     const idleWait = idleStreak > 0 ? Math.min(60_000, cfg.inference.idleIntervalMs * idleStreak) : 0
@@ -411,7 +549,9 @@ function main () {
     }
     const plan = parser.plan({ name: label, blocks }, origin, bot.entity.position)
     logger.info(TAG, `${label} — ${plan.steps.length} blocks${stage ? ` (stage ${stage})` : ''}${plan.towerNeeded ? `, tower ${plan.towerHeight} high` : ''}`)
-    const result = await executor.build(plan)
+    // Phase-scoped, idempotent execution: the LLM names a stage, the executor
+    // only visits that stage's cells (foundation → walls → roof → detailing).
+    const result = await executor.build(plan, { stage })
     let scaffoldNote = ''
     if (cfg.build.autoRemoveScaffold !== false) {
       try {
@@ -421,12 +561,19 @@ function main () {
         logger.warn(TAG, `scaffold cleanup failed: ${err.message || err}`)
       }
     }
-    const summary = `build ${label}${stage ? ' (' + stage + ')' : ''}: placed ${result.placed}/${plan.steps.length}${result.skipped.length ? ' skipped ' + result.skipped.length : ''}${scaffoldNote}`
+    const phaseTotal = stage && plan.phaseCounts ? plan.phaseCounts[stage] : plan.steps.length
+    const summary = `build ${label}${stage ? ' (' + stage + ')' : ''}: placed ${result.placed}/${phaseTotal}${result.alreadyPresent ? `, ${result.alreadyPresent} already present` : ''}${result.skipped.length ? ' skipped ' + result.skipped.length : ''}${scaffoldNote}`
     logger.info(TAG, summary)
     memory.addEvent({ type: 'build_complete', msg: summary }, { promote: true })
   }
 
   async function executeAction (action) {
+    const vanilla = assertVanillaAction(action)
+    if (!vanilla.ok) {
+      logger.warn(TAG, `refused non-vanilla action (${vanilla.why})`)
+      memory.addEvent({ type: 'vanilla_guard', msg: `refused action: ${vanilla.why}` })
+      return
+    }
     switch (action.a) {
       case 'idle':
         return
@@ -441,7 +588,8 @@ function main () {
       case 'move': {
         const x = Number(action.x); const y = Number(action.y); const z = Number(action.z)
         if (![x, y, z].every(Number.isFinite)) return logger.warn(TAG, 'move: bad coordinates')
-        bot.pathfinder.setGoal(new goals.GoalNear(x, y, z, 1), true)
+        // Threat-aware: reachable goal, but the route avoids projected kill zones.
+        wrapper.pathTo(x, y, z, { range: 1 })
         clearTimeout(moveGoalTimer)
         moveGoalTimer = setTimeout(() => { try { bot.pathfinder.setGoal(null) } catch { /* noop */ } }, 45_000)
         memory.addEvent({ type: 'move', msg: `moving to ${x},${y},${z}` })

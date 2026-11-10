@@ -17,9 +17,13 @@ system 1 (Node.js, NO LLM)          system 2 (Qwen via AMD API)
   reflex registry, not hardcoded:     planning, chat, remote movement,
   eat < 18 hunger, back-jump from     building, crafting, mode switches —
   hostiles < 2m, water bucket,        only when the pre-filter lets it through
-  flee (hostile within 8 m),          (chat mentions "ZincAI" / question / friend;
+  predictive flee (projected 2 s),    (chat mentions "ZincAI" / question / friend;
   door/trapdoor, fall bucket,         block events > 20 blocks away dropped;
-  anti-stuck watchdog, 200 ms tick    spam costs zero tokens)
+  goldilocks melee + crit timing,     spam costs zero tokens)
+  85 %-cooldown gate, mace panic,
+  elytra dodge, ranged strafe,
+  wind-charge traversal, scout,
+  anti-stuck watchdog, 200 ms tick
         │                                      ▲
         └──────── heuristic pre-filter ────────┘
   reflexes escalate to System 2 only via call_system2 reflexes — System 1
@@ -45,9 +49,13 @@ system 1 (Node.js, NO LLM)          system 2 (Qwen via AMD API)
   rides in the summary), > 10 chests → storage zone, players tagged with
   distance; (3) **structure inference** — walls + roof/door →
   `structures: house (…)` (conservative; walls alone never match).
-  Clutter clusters surface as avoid-zones in the delta. Mineflayer-pathfinder
-  has no region-cost API (patching its A* is off-limits), so mob-dense avoidance
-  is delivered via the flee reflex and tactical prompting, not cost weighting.
+  Clutter clusters surface as avoid-zones in the delta. Since v3 the semantic
+  layer also **rolls block vomit into material shares** (`materials: stone 62%
+  (142), wood 24% (54)`) and **infers multiple structures/features** per scan
+  (house, tower, storage, farm, mine_entrance, portal, enclosure, bridge, road,
+  grove, ruins) — geometry-aware but conservative, capped at three lines.
+  Region avoidance is now real A* cost weighting via the upstream
+  `exclusionAreasStep` hook (see PredictiveThreatMap below), not just prompting.
   A 3D voxel grid can be enabled with `perception3D: true`.
 - **Memory is 3-tier + ephemeral** (`zincai/memory.js`): Working (5 events) →
   10-minute Short-term → Long-term JSON store (`zincai-data/memories.json`,
@@ -67,9 +75,15 @@ system 1 (Node.js, NO LLM)          system 2 (Qwen via AMD API)
   jump-place pillars when a layer exceeds jump reach. Every placement is
   confirmed against the world state (packet acks are unreliable — a block is
   accepted as placed only when `blockAt` shows the target block). Hierarchical
-  decomposition is enforced in the prompt: foundation → walls → roof →
-  detailing, planned before the first block. Voyager/MineDojo-style: code
-  executes, the model decides.
+  decomposition is enforced in code: `decomposePhases()` assigns every block to
+  exactly one of foundation → walls → roof → detailing (doors/glass/torches are
+  detailing wherever they sit), `normalizeStage()` accepts the LLM's natural
+  phase names (`walls_with_windows`, `interior_details`), and
+  `build(plan, {stage})` executes one phase at a time. Placement is
+  **idempotent**: a cell that already holds the right block is reported as
+  `alreadyPresent`, never re-placed, so a re-run after a disconnect resumes
+  exactly where the world left off. Voyager/MineDojo-style: code executes, the
+  model decides.
 - **Custom pathfinding** (`zincai/custom_mineflayer/pathfinder_wrapper.js`):
   never touches `node_modules`. Doors/trapdoors are registered as upstream
   `useOne` steps (open → pass → close), routed with a configurable door cost
@@ -78,6 +92,48 @@ system 1 (Node.js, NO LLM)          system 2 (Qwen via AMD API)
   guard); ±2° yaw/pitch micro-jitter, variable sprint/walk cycles (sprint is
   never the default), forced walk near edges/air/lava, 200–800 ms idle pauses
   on abrupt heading changes. `npm update mineflayer` keeps working.
+  **v3 adds three predictive layers** (details below): `PredictiveThreatMap`
+  (hostile velocity projection → A* node penalties), `WindChargeTraversal`
+  (3–5 block gaps / ≤4 block walls when A* says noPath), and
+  `scoutSafeAnchor()` (organic startup anchor, no commands).
+- **PredictiveThreatMap** (`zincai/custom_mineflayer/pathfinder_wrapper.js`):
+  every 200 ms each hostile's velocity is sampled (measured, or finite-
+  differenced from position deltas) and projected **40 ticks (2 s)** ahead.
+  Two shapes are injected into A* through the upstream `exclusionAreasStep`
+  hook: a **kill sphere** around the projected endpoint and a **corridor**
+  along the enemy→bot line. Penalties are capped at 60 (upstream treats ≥100
+  as impassable, and threat should reroute, not brick, the path).
+  `rankGoals()` scores candidate destinations as
+  `distance + λ · cumulativeRouteThreat`, so a longer open route beats a short
+  murder alley; `escapeVector()` points away from where threats **will be**.
+- **Elite System-1 combat** (`src/combat.js` + `zincai/system1.js`):
+  weapon-aware Goldilocks bands (sword/axe/trident/spear 2.5–3.2 m, mace
+  4–6 m, bow 10–24 m, crossbow 10–20 m, fists 1.8–2.6 m). Inside the band the
+  bot strafes; too close it backpedals; too far the pathfinder closes. Every
+  swing is gated on the **vanilla attack indicator ≥ 85 %**, melee swings are
+  preceded by a micro-jump and land on the falling tick for a **critical hit**,
+  then the bot backpedals. Weapon-specific reflexes: **mace panic** (sprint
+  back + LOS block / water bucket, then re-equip), **elytra + spear/trident
+  lateral evade**, and a **ranged duel** that holds >10 m, strafes
+  perpendicular to the shooter's aim and only looses a **100 %-charged** bow.
+  `system1.tacticalScan()` classifies every hostile within 16 m each tick and
+  fires the matching reflex through the registry — zero inference, zero tokens.
+- **Wind-charge traversal** (`WindChargeTraversal`): when A* reports `noPath`
+  and the blocker is a 3–5 wide gap or a ≤4 high wall, the bot equips
+  `wind_charge`, looks along a computed angle, right-clicks, then jumps
+  (exact order: equip → look → activateItem → jump). Multiple charges chain
+  across ravines; every charge is a real hotbar item. Vanilla physics only.
+- **Scout & Relocate** (`zincai/index.js` + `scoutSafeAnchor`): on spawn and
+  after every respawn the bot evaluates a 30×30 neighbourhood (standable
+  ground, hazards, open sky, distance from the hostile centroid and projected
+  threat), picks the best vector-away anchor, and **walks there** with the
+  pathfinder. That anchor becomes the local `bot.spawnPoint`. No `/tp`, no
+  `/setworldspawn`, no server help of any kind.
+- **Vanilla guard** (`zincai/vanilla_guard.js`): runtime invariant, not a
+  convention. Any chat line starting with `/` is dropped before it hits the
+  wire and logged, and command-shaped action objects are refused. The entire
+  action surface is client packets: controls, attack, place/dig, activateItem,
+  equip, pathfinder.
 - **Scaffold auto-remove** (`zincai/builder.js`): blocks the executor itself
   places via jump-place towers are tracked and dug back out top-down after a
   build (`build.autoRemoveScaffold: true` by default). Pre-existing world is
@@ -85,8 +141,10 @@ system 1 (Node.js, NO LLM)          system 2 (Qwen via AMD API)
 - **Reflex engine** (`zincai/reflex_registry.js` + `zincai/system1.js`):
   System 1 is a registry, not a hardcoded if-chain — `register_reflex({trigger,
   action, script?})` with cooldowns; built-ins cover eat/dodge/water-bucket,
-  hostile flee (1.5–8 m → pathfind away + sprint, skipped in builder mode) and
-  door/trapdoor handling. Scripts live in `zincai/scripts/` (`flee.js`,
+  hostile flee (1.5–8 m → predictive pathfind away + sprint, skipped in builder
+  mode), door/trapdoor handling, plus the v3 tactical ring (`mace_threat`,
+  `elytra_lunge`, `ranged_threat`, `melee_window`). Scripts live in
+  `zincai/scripts/` (`flee.js`,
   `build_tower.js`) and can be invoked from System 2 via
   `{"a":"run_script","name":"build_tower"}`. Complex unhandled events escalate
   to System 2 via `call_system2` reflexes.
@@ -100,9 +158,11 @@ system 1 (Node.js, NO LLM)          system 2 (Qwen via AMD API)
   defaults (sprint allowed), hunter (auto-sprint + jump-while-running for
   gaps), builder (never drops more than 1 block).
 - **LLM contract** (`zincai/system_prompt.txt`): persona + strategy only
-  (~350 words, no JSON grammar). The action contract lives in tool schemas:
-  `say | move | build | build_shape | run_script | set_mode | craft | attack |
-  equip | idle`.
+  (~470 words, no JSON grammar). It states the split explicitly — *the harness
+  equips tools, manages cooldowns and handles mitigation; the model decides
+  WHAT to build, mine or fight* — and enforces phased building. The action
+  contract lives in tool schemas: `say | move | build | build_shape |
+  run_script | set_mode | craft | attack | equip | idle`.
 
 ## Pufferpanel deployment
 
@@ -128,6 +188,7 @@ system 1 (Node.js, NO LLM)          system 2 (Qwen via AMD API)
 node zincai/index.js --check     # modules + 26.3 data present
 node zincai/index.js --dry-run   # config + prompt validation, zero network
 npm run ping                     # server reachable? which version? (shared script)
+npm test                         # 85 tests: 56 legacy + 29 elite-systems
 ```
 
 Loopback e2e (flying-squid + mocked AMD) passes 6/6 — see `.e2e-scratch/` in
@@ -167,8 +228,14 @@ the branch working tree (gitignored, not committed):
   reference actions it just took without claiming deeper knowledge.
 - PvP defaults OFF. On a whitelist with friends, flipping `pvpEnabled` makes
   the bot fight any player on sight — opt in deliberately.
-- Structure inference is conservative (walls + roof/door) and will miss exotic
-  builds; it is a hint for the model, not a game-state oracle.
+- Structure inference is conservative (geometry + material heuristics) and will
+  miss exotic builds; it is a hint for the model, not a game-state oracle.
+- Predictive threat assumes roughly linear motion over 2 s. It is excellent
+  against chargers, arrows and lunges; a target that turns hard mid-projection
+  is handled by the 200 ms resample, not by clairvoyance.
+- Wind-charge traversal is opportunistic: it only triggers on A* noPath with a
+  3–5 gap / ≤4 wall in the goal direction, and it consumes real charges. With
+  an empty inventory the bot simply paths the long way.
 - mob clutter > 15 entities is summarized, never enumerated; the nearest mob
   rides in the summary line.
 - Implicit preferences are a bias, not a lock — the user can always override.

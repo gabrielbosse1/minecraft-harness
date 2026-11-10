@@ -25,6 +25,12 @@
  *   run_script     — execute zincai/scripts/<script> with { bot, ctx }
  *   call_system2   — escalate: ask the LLM what to do about this event
  *   engage_pvp     — hand the fight to System 1's PvP loop (mineflayer-pvp); LLM notified after
+ *
+ * v3 tactical actions (no LLM, no latency — these are the elite-combat reflexes):
+ *   panic_retreat  — mace panic: sprint back + LOS block / water bucket
+ *   evade_lateral  — elytra/spear lunge: lateral sprint strafe + jump
+ *   strafe_ranged  — perpendicular arrow-dodge strafe
+ *   combat_tick    — force one combat mechanics tick (cooldown/crit aware)
  */
 'use strict'
 
@@ -35,10 +41,14 @@ const SCRIPTS_DIR = path.join(__dirname, 'scripts')
 
 const VALID_TRIGGERS = new Set([
   'food_low', 'health_low', 'hostile_near', 'player_near', 'falling', 'in_water',
-  'entity_hurt', 'item_gained', 'player_gave_item', 'chat', 'any'
+  'entity_hurt', 'item_gained', 'player_gave_item', 'chat', 'any',
+  // v3 tactical triggers — emitted by System1's zero-latency threat scan.
+  'mace_threat', 'elytra_lunge', 'ranged_threat', 'melee_window'
 ])
 const VALID_ACTIONS = new Set([
-  'eat', 'drink_water', 'back_jump', 'flee', 'jump', 'say', 'run_script', 'call_system2', 'engage_pvp'
+  'eat', 'drink_water', 'back_jump', 'flee', 'jump', 'say', 'run_script', 'call_system2', 'engage_pvp',
+  // v3 tactical actions — implemented by AdvancedCombat / System1, never an LLM call.
+  'panic_retreat', 'evade_lateral', 'strafe_ranged', 'combat_tick'
 ])
 
 /** Load and execute a user script with the reflex context. Trusted local code. */
@@ -162,6 +172,10 @@ class ReflexRegistry {
       case 'run_script': return runScript(r.script, event, ctx)
       case 'call_system2': return ctx.escalate ? ctx.escalate(event) : 'no_escalation_channel'
       case 'engage_pvp': return ctx.system1?.engageNearestPlayer?.(event) ?? 'pvp_unavailable'
+      case 'panic_retreat': return ctx.system1?.panicRetreat?.(event) ?? 'no_system1'
+      case 'evade_lateral': return ctx.system1?.evadeLateral?.(event) ?? 'no_system1'
+      case 'strafe_ranged': return ctx.system1?.strafeRanged?.(event) ?? 'no_system1'
+      case 'combat_tick': return ctx.system1?.combatTick?.(event) ?? 'no_system1'
       default: return 'unknown_action'
     }
   }

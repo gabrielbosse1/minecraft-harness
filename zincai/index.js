@@ -209,7 +209,11 @@ function main () {
     allowDigging: Boolean(cfg.behavior.allowDigging),
     logger: wrapperLog,
     fleeRadius: cfg.behavior.fleeRadius ?? 8,
-    threat: cfg.threat || {},
+    threat: {
+      ...(cfg.threat || {}),
+      // In PvP-enabled runs, hostile players belong on the threat field too.
+      includePlayers: (cfg.threat?.includePlayers ?? cfg.behavior.pvpEnabled) === true
+    },
     enableWindCharge: cfg.traversal?.windCharge !== false,
     windCharge: cfg.traversal || {}
   })
@@ -292,7 +296,9 @@ function main () {
         step: sc.step ?? 3,
         minRadius: sc.minRadius ?? 5,
         preferRadius: sc.preferRadius ?? 12,
-        horizonTicks: wrapper.threat.horizonTicks
+        horizonTicks: wrapper.threat.horizonTicks,
+        // Never re-anchor where we just died.
+        avoid: deathPoint ? [{ x: deathPoint.x, y: deathPoint.y, z: deathPoint.z, radius: sc.deathAvoidRadius ?? 12 }] : []
       })
       if (!result) {
         anchor = bot.entity.position.floored()

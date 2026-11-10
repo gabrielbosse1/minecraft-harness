@@ -76,7 +76,9 @@
     "sampleMs": 200,
     "maxRadius": 24,
     "penaltyScale": 26,
-    "maxPenalty": 60
+    "maxPenalty": 60,
+    "includePlayers": false,
+    "maxSpeed": 1.0
   },
   "traversal": {
     "_note": "Wind-charge traversal. Used only when A* reports noPath across a 3-5 wide gap or <=4 high wall.",
@@ -94,6 +96,7 @@
     "preferRadius": 12,
     "relocateAboveBlocks": 6,
     "waitForWorldMs": 6000,
-    "relocateTimeoutMs": 25000
+    "relocateTimeoutMs": 25000,
+    "deathAvoidRadius": 12
   }
 }

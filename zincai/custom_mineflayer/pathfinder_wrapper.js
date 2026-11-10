@@ -106,7 +106,8 @@ class PredictiveThreatMap {
    *   horizonTicks?: number, sampleMs?: number, maxRadius?: number,
    *   futureRadius?: number, corridorRadius?: number, penaltyScale?: number,
    *   maxPenalty?: number, engageWeight?: number, logger?: Function,
-   *   now?: () => number, ttlMs?: number
+   *   now?: () => number, ttlMs?: number, includePlayers?: boolean,
+   *   maxSpeed?: number
    * }} [opts]
    */
   constructor (opts = {}) {
@@ -121,6 +122,13 @@ class PredictiveThreatMap {
     this.maxPenalty = Number.isFinite(opts.maxPenalty) ? Math.min(95, opts.maxPenalty) : 60
     this.engageWeight = Number.isFinite(opts.engageWeight) ? opts.engageWeight : 0.35
     this.ttlMs = Number.isFinite(opts.ttlMs) ? opts.ttlMs : this.sampleMs * 3
+    // Hostile players are threats too — opt-in because casual servers have
+    // friends standing next to you. index.js enables this with behavior.pvpEnabled.
+    this.includePlayers = opts.includePlayers === true
+    // Sanity ceiling (blocks/tick). Enderman teleports and knockback arrive as
+    // huge position deltas; without this clamp they project 40-block phantom
+    // kill zones and A* refuses to move at all.
+    this.maxSpeed = Number.isFinite(opts.maxSpeed) ? opts.maxSpeed : 1.0
     this.now = typeof opts.now === 'function' ? opts.now : () => Date.now()
     this.logger = opts.logger || (() => {})
 
@@ -141,21 +149,31 @@ class PredictiveThreatMap {
     for (const id of Object.keys(bot.entities || {})) {
       const e = bot.entities[id]
       if (!e || !e.position || e === bot.entity) continue
-      if (e.type === 'player') continue
-      if (!isHostileName(e.name)) continue
+      const isPlayer = e.type === 'player' || e.name === 'player'
+      if (isPlayer) {
+        if (!this.includePlayers) continue
+      } else if (!isHostileName(e.name)) continue
       const d = dist3(e.position, me)
       if (d > this.maxRadius) continue
-      out.push({ entity: e, distance: d })
+      out.push({ entity: e, distance: d, isPlayer })
     }
     out.sort((a, b) => a.distance - b.distance)
     return out
+  }
+
+  /** Clamp absurd deltas (teleport packets, knockback) to a sane speed. */
+  _saneVelocity (v) {
+    const speed = Math.hypot(v.x, v.y, v.z)
+    if (!(speed > this.maxSpeed)) return v
+    const k = this.maxSpeed / speed
+    return { x: v.x * k, y: v.y * k, z: v.z * k }
   }
 
   /** Measured velocity when the engine exposes it; otherwise finite-difference. */
   velocityOf (entity, nowMs) {
     const v = entity.velocity
     if (v && (Math.abs(v.x) + Math.abs(v.y) + Math.abs(v.z)) > 1e-4) {
-      return { x: Number(v.x) || 0, y: Number(v.y) || 0, z: Number(v.z) || 0 }
+      return this._saneVelocity({ x: Number(v.x) || 0, y: Number(v.y) || 0, z: Number(v.z) || 0 })
     }
     const prev = this._prev.get(entity.id)
     if (prev && nowMs > prev.at) {
@@ -167,7 +185,7 @@ class PredictiveThreatMap {
       }
       // A stationary sample cluster is noise, not a velocity.
       if (Math.hypot(est.x, est.y, est.z) < 0.002) return { x: 0, y: 0, z: 0 }
-      return est
+      return this._saneVelocity(est)
     }
     return { x: 0, y: 0, z: 0 }
   }
@@ -179,6 +197,7 @@ class PredictiveThreatMap {
     const speed = Math.hypot(velocity.x, velocity.z)
     w += clamp(speed / 0.30, 0, 1) * 0.8
     const name = String(entity.name || '').toLowerCase()
+    if (entity.type === 'player' || name === 'player') w *= 1.3 // armed players close fast
     if (/creeper|breeze/.test(name)) w *= 1.5 // explosion / wind burst
     if (/warden|ravager|wither/.test(name)) w *= 1.8
     if (/phantom|vex/.test(name)) w *= 1.2 // 3D approach
@@ -209,6 +228,10 @@ class PredictiveThreatMap {
       const pos = { x: entity.position.x, y: entity.position.y, z: entity.position.z }
       const velocity = this.velocityOf(entity, now)
       const future = projectFuture(pos, velocity, this.horizonTicks)
+      // Gravity makes naive vertical extrapolation dishonest: a jumping mace
+      // user with vy=0.42 would project 16 blocks into the sky. Keep the kill
+      // sphere near the ground plane (±3 blocks), which is where the hit lands.
+      future.y = pos.y + clamp((velocity.y || 0) * this.horizonTicks, -3, 3)
       threats.push({
         id: entity.id,
         name: String(entity.name || 'hostile').toLowerCase(),
@@ -594,6 +617,10 @@ const HAZARD_NAMES = /lava|fire|magma|cactus|sweet_berry|powder_snow|wither_rose
  *   - not welded to the spawn point (prefer 8–20 blocks out).
  * Pure: only `bot.blockAt`, `bot.entity`, `bot.entities` are touched.
  *
+ * @param {{radius?:number, step?:number, maxThreatDistance?:number,
+ *   horizonTicks?:number, minRadius?:number, preferRadius?:number,
+ *   avoid?:Array<{x:number,z:number,radius?:number}>}} [opts]
+ *   `avoid` excludes cells near recent death points / known bad spots.
  * @returns {null | {x:number,y:number,z:number,score:number,reasons:string[],
  *   threats:number, away:{x:number,z:number}, hostiles:Array}}
  */
@@ -603,7 +630,8 @@ function scoutSafeAnchor (bot, {
   maxThreatDistance = 24,
   horizonTicks = 40,
   minRadius = 5,
-  preferRadius = 12
+  preferRadius = 12,
+  avoid = []
 } = {}) {
   const pos = bot?.entity?.position
   if (!pos) return null
@@ -647,6 +675,13 @@ function scoutSafeAnchor (bot, {
       const z = bz + dz
       const distFromBot = Math.hypot(dx, dz)
       if (distFromBot < minRadius) continue // don't "relocate" onto our own feet
+      // Never re-anchor in the kill zone that just killed us.
+      let blacklisted = false
+      for (const a of avoid) {
+        if (!a || !Number.isFinite(a.x) || !Number.isFinite(a.z)) continue
+        if (Math.hypot(x - a.x, z - a.z) < (a.radius ?? 10)) { blacklisted = true; break }
+      }
+      if (blacklisted) continue
       const y = findGroundY(bot, x, z)
       if (y === null) continue
       const candidate = { x, y, z }
@@ -660,22 +695,23 @@ function scoutSafeAnchor (bot, {
       }
       if (threat === 0) reasons.push('no nearby threats')
 
-      // Local hazards.
+      // Local hazards — feet level AND the block we would stand on/step into.
       let hazard = 0
       let sky = 0
       let water = 0
-      for (let ox = -2; ox <= 2; ox++) {
-        for (let oz = -2; oz <= 2; oz++) {
-          const b = (() => {
-            try {
-              const { Vec3 } = require('vec3')
-              return bot.blockAt(new Vec3(x + ox, y, z + oz))
-            } catch { return null }
-          })()
-          if (!b) continue
-          if (HAZARD_NAMES.test(b.name || '')) hazard += 1
-          if (ox === 0 && oz === 0) continue
-          if (/water/.test(b.name || '')) water += 1
+      for (let oy = -1; oy <= 1; oy++) {
+        for (let ox = -2; ox <= 2; ox++) {
+          for (let oz = -2; oz <= 2; oz++) {
+            const b = (() => {
+              try {
+                const { Vec3 } = require('vec3')
+                return bot.blockAt(new Vec3(x + ox, y + oy, z + oz))
+              } catch { return null }
+            })()
+            if (!b) continue
+            if (HAZARD_NAMES.test(b.name || '')) hazard += oy === 0 ? 2 : 1
+            if (oy === 0 && (ox !== 0 || oz !== 0) && /water/.test(b.name || '')) water += 1
+          }
         }
       }
       for (let oy = 1; oy <= 4; oy++) {
@@ -687,7 +723,24 @@ function scoutSafeAnchor (bot, {
         })()
         if (b && b.boundingBox === 'block') sky += 1 // ceiling
       }
+      // Ledge probe: a 2-block walk in each cardinal direction must still have
+      // floor within 3 blocks of our feet, otherwise the "safe" cell is a cliff.
+      let ledges = 0
+      for (const [ldx, ldz] of [[2, 0], [-2, 0], [0, 2], [0, -2]]) {
+        let hasFloor = false
+        for (let drop = 1; drop <= 3; drop++) {
+          const b = (() => {
+            try {
+              const { Vec3 } = require('vec3')
+              return bot.blockAt(new Vec3(x + ldx, y - drop, z + ldz))
+            } catch { return null }
+          })()
+          if (b && b.boundingBox === 'block') { hasFloor = true; break }
+        }
+        if (!hasFloor) ledges += 1
+      }
       if (hazard > 0) reasons.push('hazard nearby')
+      if (ledges > 0) reasons.push('ledge nearby')
       if (sky >= 4) reasons.push('enclosed')
       if (water > 0) reasons.push('water access')
 
@@ -697,7 +750,8 @@ function scoutSafeAnchor (bot, {
 
       const score =
         -threat * 10 -
-        hazard * 12 -
+        hazard * 6 -
+        ledges * 2.5 -
         sky * 1.5 +
         water * 0.8 +
         heading * 4 -

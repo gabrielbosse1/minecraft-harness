@@ -124,6 +124,25 @@ test('threat map samples hostile velocity, projects 40 ticks ahead and throttles
   t += 250
   map.sample(bot)
   assert.equal(map.sampleCount, 2)
+
+  // Teleport/knockback deltas are speed-clamped — no phantom 40-block threats.
+  const warped = threatBot({ 2: hostile(2, 0, 64, 3, { velocity: { x: 0, y: 0, z: 5 } }) })
+  const clamped = new PredictiveThreatMap()
+  clamped.sample(warped, true)
+  assert.ok(clamped.threats[0].speed <= 1.0001, `speed clamp failed: ${clamped.threats[0].speed}`)
+
+  // Vertical projection is gravity-clamped to ±3 blocks.
+  const jumper = threatBot({ 4: hostile(4, 0, 64, 3, { velocity: { x: 0, y: 5, z: 0 } }) })
+  const jmap = new PredictiveThreatMap()
+  jmap.sample(jumper, true)
+  assert.ok(jmap.threats[0].future.y <= 67.0001, `vertical clamp failed: ${jmap.threats[0].future.y}`)
+
+  // Hostile players are opt-in.
+  const pvpBot = threatBot({
+    3: { id: 3, name: 'player', type: 'player', position: pos(0, 64, 4), velocity: { x: 0, y: 0, z: 0 }, heldItem: { name: 'mace' } }
+  })
+  assert.equal(new PredictiveThreatMap().sample(pvpBot, true).length, 0)
+  assert.equal(new PredictiveThreatMap({ includePlayers: true }).sample(pvpBot, true).length, 1)
 })
 
 test('costAt penalizes the projected kill sphere, not empty ground', () => {
@@ -500,6 +519,27 @@ test('scoutSafeAnchor refuses hazard cells and needs a live entity', () => {
   assert.ok(anchor)
   assert.ok(!anchor.reasons.includes('hazard nearby'), `chose a hazard: ${JSON.stringify(anchor)}`)
   assert.ok(anchor.x <= 0, `must stay off the lava half, got x=${anchor.x}`)
+
+  // Cliff half: no floor at z <= -6, mob behind it → anchor must stay inland.
+  const cliffBot = {
+    entity: { position: pos(0, 64, 0) },
+    entities: { 1: hostile(1, 0, 64, -12) },
+    blockAt: (v) => {
+      const y = Math.round(v.y)
+      const z = Math.round(v.z)
+      if (y === 63 && z >= -6) return solid('grass_block')
+      return air()
+    }
+  }
+  const inland = scoutSafeAnchor(cliffBot, { radius: 12, step: 3, minRadius: 4, preferRadius: 8 })
+  assert.ok(inland && inland.z > 0, `cliff half must be rejected, got ${JSON.stringify(inland)}`)
+  assert.ok(!inland.reasons.includes('ledge nearby'))
+
+  // Death-point blacklist: the next-best cell must be >= radius away.
+  const avoided = [{ x: inland.x, y: inland.y, z: inland.z, radius: 6 }]
+  const next = scoutSafeAnchor(cliffBot, { radius: 12, step: 3, minRadius: 4, preferRadius: 8, avoid: avoided })
+  assert.ok(next, 'avoid list must not empty the search')
+  assert.ok(Math.hypot(next.x - inland.x, next.z - inland.z) >= 6, 'must not re-anchor on the death point')
 })
 
 // ================================================== semantic perception ====

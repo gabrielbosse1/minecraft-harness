@@ -106,6 +106,11 @@ system 1 (Node.js, NO LLM)          system 2 (Qwen via AMD API)
   `rankGoals()` scores candidate destinations as
   `distance + λ · cumulativeRouteThreat`, so a longer open route beats a short
   murder alley; `escapeVector()` points away from where threats **will be**.
+  Enderman teleports / knockback deltas are speed-clamped (`maxSpeed`, default
+  1 block/tick) so they cannot project phantom 40-block kill zones; vertical
+  projection is gravity-clamped to ±3 blocks so a jumping mace user does not
+  become a 16-block-tall threat cylinder; and hostile players join the field
+  when `threat.includePlayers` (auto-on with PvP).
 - **Elite System-1 combat** (`src/combat.js` + `zincai/system1.js`):
   weapon-aware Goldilocks bands (sword/axe/trident/spear 2.5–3.2 m, mace
   4–6 m, bow 10–24 m, crossbow 10–20 m, fists 1.8–2.6 m). Inside the band the
@@ -127,8 +132,10 @@ system 1 (Node.js, NO LLM)          system 2 (Qwen via AMD API)
   after every respawn the bot evaluates a 30×30 neighbourhood (standable
   ground, hazards, open sky, distance from the hostile centroid and projected
   threat), picks the best vector-away anchor, and **walks there** with the
-  pathfinder. That anchor becomes the local `bot.spawnPoint`. No `/tp`, no
-  `/setworldspawn`, no server help of any kind.
+  pathfinder. Hazard scanning spans feet ±1, ledge probes check a 2-block walk
+  in all four directions, and after a death the anchor search **excludes the
+  death point** (`scout.deathAvoidRadius`). That anchor becomes the local
+  `bot.spawnPoint`. No `/tp`, no `/setworldspawn`, no server help of any kind.
 - **Vanilla guard** (`zincai/vanilla_guard.js`): runtime invariant, not a
   convention. Any chat line starting with `/` is dropped before it hits the
   wire and logged, and command-shaped action objects are refused. The entire

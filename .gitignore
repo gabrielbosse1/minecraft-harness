@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+# Local secrets and overrides — .env is loaded at runtime but should never be
+# committed. Remove the tracked copy with: git rm --cached .env
+.env
+.env.local
+*.local
+
+# Logs & runtime artifacts
+*.log
+npm-debug.log*
+
+# OS cruft
+.DS_Store
+Thumbs.db

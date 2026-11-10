@@ -1,0 +1,27 @@
+{
+  "name": "mineflayer-zinc-agent",
+  "version": "1.0.0",
+  "description": "Autonomous Minecraft agent (Mineflayer) backed by the AMD Radeon Cloud API — delta-state context, KV-cache-friendly static prompt, full combat/elytra/anti-stuck control.",
+  "private": true,
+  "license": "MIT",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "postinstall": "node scripts/apply-26.3-data.js",
+    "dry-run": "node src/index.js --dry-run",
+    "check": "node --check src/index.js && node --check src/agent.js && node --check src/amdClient.js && node --check src/deltaState.js && node --check src/combat.js && node --check src/elytra.js && node --check src/watchdog.js && node --check src/recipes.js && node --check src/config.js && node --check src/chatGuard.js && node --check src/actionParser.js && node --check src/systemPrompt.js",
+    "test": "node --test test/harness.test.js test/amdClient.test.js",
+    "ping": "node scripts/ping-server.js"
+  },
+  "dependencies": {
+    "dotenv": "^18.0.10",
+    "minecraft-data": "^3.119.0",
+    "mineflayer": "^4.39.0",
+    "mineflayer-armor-manager": "^2.0.1",
+    "mineflayer-pathfinder": "^2.4.5",
+    "prismarine-recipe": "^1.5.0"
+  }
+}

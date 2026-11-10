@@ -113,7 +113,12 @@ writing: `minecraft-data@3.119.0`, latest official version 26.1). This repo ther
 npm test          # node:test suite (26 tests) — no network, loopback mocks only
 npm run dry-run   # config + prompt validation
 npm run check     # syntax-check every src module
+npm run ping      # reachability + version check of the configured server (no join, no LLM call)
 ```
+
+`npm run ping` exits 0 and prints the server's reported version, player count and MOTD
+when the status handshake succeeds — run it before `npm start` if you are unsure whether
+the tunnel is up or which version it speaks.
 
 Agent loop, subsystems (combat AI, elytra controller, anti-stuck watchdog, chat guard,
 action parser) are documented in the module headers under `src/`. The end-to-end harness

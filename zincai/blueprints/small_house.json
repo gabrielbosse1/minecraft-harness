@@ -1,0 +1,36 @@
+{
+  "name": "small_house",
+  "description": "Cozy 5x4x4 oak shell: plank walls, glass windows, oak_log corners, flat slab-free roof. Door gap on the south side (dz=+2). Origin = bot's feet.",
+  "palette": {
+    "#": "oak_planks",
+    "L": "oak_log",
+    "G": "glass",
+    "R": "oak_stairs"
+  },
+  "grid": [
+    [
+      "#####",
+      "#...#",
+      "#...#",
+      "#####"
+    ],
+    [
+      "LL.LL",
+      "L...L",
+      "L...L",
+      "LL.LL"
+    ],
+    [
+      "LLGLL",
+      "L...L",
+      "L.G.L",
+      "LLGLL"
+    ],
+    [
+      "RRRRR",
+      "RRRRR",
+      "RRRRR",
+      "RRRRR"
+    ]
+  ]
+}

@@ -1,0 +1,62 @@
+{
+  "_comment": "ZincAI runtime config. Every value can be overridden by environment variables (env wins): MC_HOST, MC_PORT, MC_USERNAME, MC_VERSION, MC_AUTH, MC_CAN_DIG, AMD_API_BASE_URL, AMD_MODEL, AMD_API_KEY (or API_KEY), ZINC_DATA_DIR, LOG_LEVEL. Credentials: leave amd.apiKey EMPTY and pass AMD_API_KEY/API_KEY via the process environment (Pufferpanel 'secret variables'), or fill amd.apiKey here if the repo stays private. Never commit a real key to a public repo.",
+  "server": {
+    "host": "bidders-scholar.tun.ply.gg",
+    "port": 25565,
+    "username": "ZincAI",
+    "auth": "offline",
+    "version": "",
+    "_note": "version '' = auto-detect (recommended for 26.3). auth 'offline' for whitelist name-join; 'microsoft' needs a real account and interactive device-code login."
+  },
+  "amd": {
+    "apiKey": "",
+    "baseUrl": "https://developer.amd.com.cn/radeon/api/v1",
+    "model": "Qwen3.8-Flash-Next",
+    "_modelNote": "Radeon Cloud Token Factory alias for the Qwen 3.8 27B free standing model. DeepSeek-V4-Flash-0731 also works.",
+    "maxTokens": 96,
+    "temperature": 0.25,
+    "timeoutMs": 20000,
+    "maxRetries": 2
+  },
+  "inference": {
+    "minIntervalMs": 3000,
+    "idleIntervalMs": 15000,
+    "maxSelfChain": 12
+  },
+  "memory": {
+    "file": "zincai-data/memories.json",
+    "workingMax": 5,
+    "shortTermMinutes": 10,
+    "topK": 3,
+    "ephemeralMs": 30000,
+    "preferencesFile": "zincai-data/preferences.json"
+  },
+  "behavior": {
+    "allowDigging": false,
+    "engageRadius": 24,
+    "fovDegrees": 90,
+    "perceptionRange": 10,
+    "friends": [],
+    "chatCooldownMs": 3000,
+    "useArmorManager": true,
+    "mode": "explorer",
+    "fleeRadius": 8,
+    "perception3D": false
+  },
+  "build": {
+    "scaffoldBlocks": [
+      "dirt",
+      "cobblestone",
+      "netherrack"
+    ],
+    "reach": 4.5
+  },
+  "system1": {
+    "eatBelowFood": 18,
+    "drinkWaterItems": [
+      "water_bucket"
+    ],
+    "fallVelocityThreshold": -0.35,
+    "tickMs": 200
+  }
+}

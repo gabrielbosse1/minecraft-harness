@@ -1,0 +1,41 @@
+{
+  "name": "watchtower",
+  "description": "Stone 3x6x3 pillar with a small platform on top — needs scaffold blocks to build above jump reach.",
+  "palette": {
+    "#": "cobblestone",
+    "L": "oak_log",
+    "R": "cobblestone_stairs"
+  },
+  "grid": [
+    [
+      "###",
+      "#.#",
+      "###"
+    ],
+    [
+      "#L#",
+      "###",
+      "#L#"
+    ],
+    [
+      "#L#",
+      "###",
+      "#L#"
+    ],
+    [
+      "#L#",
+      "###",
+      "#L#"
+    ],
+    [
+      "LLL",
+      "L.L",
+      "LLL"
+    ],
+    [
+      "RRR",
+      "R.R",
+      "RRR"
+    ]
+  ]
+}

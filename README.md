@@ -126,6 +126,13 @@ used for local verification runs Mineflayer against a loopback
 [flying-squid](https://github.com/PrismarineJS/flying-squid) server — it lives outside the
 repo (`/tmp/e2e/`) and is not required to run the bot.
 
+## ZincAI (dual-process harness)
+
+A second, self-contained harness lives in [`zincai/`](zincai/README.md):
+a Pufferpanel-ready, Qwen 3.8 27B–tuned bot with System 1/System 2 dual-process
+architecture, FOV-frustum perception, 3-tier memory, and scaffold-aware building.
+It joins as **ZincAI** (the name mandated for it). See `zincai/README.md`.
+
 ## License
 
 MIT

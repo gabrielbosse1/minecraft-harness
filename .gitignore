@@ -14,3 +14,9 @@ npm-debug.log*
 # OS cruft
 .DS_Store
 Thumbs.db
+
+# ZincAI runtime data (memories etc.)
+zincai-data/
+
+# e2e scratch rig (local verification only)
+.e2e-scratch/

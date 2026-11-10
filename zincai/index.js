@@ -39,6 +39,9 @@ const ZINC_DIR = __dirname
 const DATA_DIR = process.env.ZINC_DATA_DIR || path.join(ROOT, 'zincai-data')
 const SYSTEM_PROMPT = fs.readFileSync(path.join(ZINC_DIR, 'system_prompt.txt'), 'utf8').trim()
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+// System-2 action contract — native OpenAI-compatible tool schemas.
+const { AmdToolsClient, createZincTools } = require('./api_wrapper')
+const ZINC_TOOLS = createZincTools()
 
 // ------------------------------------------------------------- logging--
 // logger.js is plain text with ISO timestamps — Pufferpanel-safe by design.
@@ -98,7 +101,7 @@ function validateConfig (cfg) {
 // ============================================================ boot ====
 function main () {
   if (process.argv.includes('--check')) {
-    require('./memory'); require('./perception'); require('./filter'); require('./builder'); require('./custom_mineflayer/pathfinder_wrapper')
+    require('./api_wrapper'); require('./memory'); require('./perception'); require('./filter'); require('./builder'); require('./custom_mineflayer/pathfinder_wrapper'); require('./system1'); require('./reflex_registry')
     require('minecraft-data')('26.3') // postinstall patch must be in place
     logger.info(TAG, '--check OK — all modules load, 26.3 data present')
     return
@@ -130,7 +133,7 @@ function main () {
   const armorManager = require('mineflayer-armor-manager')
 
   const { MemorySystem } = require('./memory')
-  const { buildPerceptionText, buildVisionBlock } = require('./perception')
+  const { buildPerceptionText, buildVisionBlock, buildSemanticHints } = require('./perception')
   const filter = require('./filter')
   const { BlueprintParser, BuilderExecutor, generateShape, normalizeStage } = require('./builder')
   const { PathfinderWrapper } = require('./custom_mineflayer/pathfinder_wrapper')
@@ -139,7 +142,6 @@ function main () {
   const { runScript } = require('./reflex_registry')
   const { AdvancedCombat } = require('../src/combat')
   const { craftItem } = require('../src/recipes')
-  const { AmdClient } = require('../src/amdClient')
 
   const memoryFile = path.join(DATA_DIR, cfg.memory.file.replace(/^zincai-data[/\\]/, ''))
   const preferencesFile = path.join(DATA_DIR, (cfg.memory.preferencesFile || 'zincai-data/preferences.json').replace(/^zincai-data[/\\]/, ''))
@@ -150,7 +152,7 @@ function main () {
     shortTermMinutes: cfg.memory.shortTermMinutes,
     ephemeralMs: cfg.memory.ephemeralMs ?? 30_000
   })
-  const amd = new AmdClient({
+  const amd = new AmdToolsClient({
     apiKey: cfg.amd.apiKey,
     baseUrl: cfg.amd.baseUrl,
     model: cfg.amd.model,
@@ -176,6 +178,15 @@ function main () {
   })
   bot.loadPlugin(pathfinder)
   if (cfg.behavior.useArmorManager) bot.loadPlugin(armorManager)
+  if (cfg.behavior.pvpEnabled) {
+    try {
+      bot.loadPlugin(require('mineflayer-pvp').plugin)
+      logger.info(TAG, 'pvp reflex: mineflayer-pvp loaded')
+    } catch (err) {
+      logger.error(TAG, `mineflayer-pvp failed to load (${err.message || err}) — PvP reflex disabled`)
+      cfg.behavior.pvpEnabled = false
+    }
+  }
 
   // Upstream-compatible custom pathfinding: doors, jitter, digging guard.
   const wrapper = new PathfinderWrapper(bot, {
@@ -209,7 +220,7 @@ function main () {
     memory.save()
     const s = amd.getStats()
     const hit = s.kvCacheHitRate === null ? 'n/a' : `${(s.kvCacheHitRate * 100).toFixed(1)}%`
-    logger.info(TAG, `amd session: ${s.requests} calls, ${s.failures} failures, avg prompt ${s.avgPromptTokensPerCall} tok, cached ${s.cachedTokens} tok, kv-hit-rate ${hit}`)
+    logger.info(TAG, `amd session: ${s.requests} calls, ${s.failures} failures, avg prompt ${s.avgPromptTokensPerCall} tok, cached ${s.cachedTokens} tok, kv-hit-rate ${hit}, tools ${s.toolCalls}${s.jsonFallbacks ? ` (json-fallback ${s.jsonFallbacks})` : ''}`)
     logger.info(TAG, `memory: long-term ${memory.longTerm.entries.length} entries saved to ${memoryFile}`)
     try { bot.quit() } catch { /* already gone */ }
     // Hard-exit safety net: the process must die with `code` even if the
@@ -265,6 +276,9 @@ function main () {
       eatBelowFood: cfg.system1.eatBelowFood ?? 18,
       fallVelocityThreshold: cfg.system1.fallVelocityThreshold ?? -0.35,
       tickMs: cfg.system1.tickMs ?? 200,
+      pvpEnabled: cfg.behavior.pvpEnabled === true,
+      pvpRange: cfg.behavior.pvpRange ?? 15,
+      autoElytra: cfg.behavior.autoElytra !== false,
       escalate: (event) => queueSystem2({ type: 'escalation', text: `${event.type} ${event.item || event.text || ''}`.trim(), msg: `${event.type} escalated by reflex` })
     })
     system1.start()
@@ -333,6 +347,8 @@ function main () {
     if (cfg.behavior.perception3D) {
       perception += `\nvoxel grid:\n${buildPerceptionText(bot, { range: cfg.behavior.perceptionRange, fovDegrees: cfg.behavior.fovDegrees })}`
     }
+    const sem = buildSemanticHints(bot, { radius: 8 })
+    if (sem.zones.length) logger.debug(TAG, `avoid zones: ${sem.zones.map((z) => `${z.kind}@${z.x},${z.y},${z.z} x${z.count}`).join(' | ')}`)
     const justNow = memory.ephemeral.line()
     const working = memory.working.last(5).map((e) => `- ${e.type}${e.sender ? ':' + e.sender : ''}: ${e.text || e.msg || ''}`).join('\n') || '- (none)'
     const recalled = memory.recallBlock(query || '', cfg.memory.topK)
@@ -343,6 +359,7 @@ function main () {
       recalled || null,
       justNow ? `just now: ${justNow}` : null,
       `events:\n${working}`,
+      sem.text ? `semantics:\n${sem.text}` : null,
       `perception:\n${perception}`
     ].filter(Boolean).join('\n')
   }
@@ -364,8 +381,7 @@ function main () {
         { role: 'system', content: SYSTEM_PROMPT },
         { role: 'user', content: delta }
       ]
-      const { content } = await amd.chatCompletion(messages)
-      const action = parseActionLine(content)
+      const { action } = await amd.chatWithTools(messages, ZINC_TOOLS)
       selfChain = action.a === 'idle' ? 0 : selfChain + 1
       idleStreak = action.a === 'idle' ? idleStreak + 1 : 0
       await executeAction(action)
@@ -375,20 +391,6 @@ function main () {
     } finally {
       inferBusy = false
     }
-  }
-
-  /** Strict single-line JSON parse with a markdown-fence recovery. */
-  function parseActionLine (raw) {
-    let s = String(raw || '').trim()
-    const fence = /```(?:json)?\s*([\s\S]*?)```/.exec(s)
-    if (fence) s = fence[1].trim()
-    const line = s.split('\n').find((l) => l.trim().startsWith('{')) || s
-    try {
-      const obj = JSON.parse(line.trim())
-      if (obj && typeof obj === 'object' && typeof obj.a === 'string') return obj
-    } catch { /* fall through */ }
-    logger.warn(TAG, `unparseable action from model: ${s.slice(0, 120)}`)
-    return { a: 'idle' }
   }
 
 
@@ -410,7 +412,16 @@ function main () {
     const plan = parser.plan({ name: label, blocks }, origin, bot.entity.position)
     logger.info(TAG, `${label} — ${plan.steps.length} blocks${stage ? ` (stage ${stage})` : ''}${plan.towerNeeded ? `, tower ${plan.towerHeight} high` : ''}`)
     const result = await executor.build(plan)
-    const summary = `build ${label}${stage ? ' (' + stage + ')' : ''}: placed ${result.placed}/${plan.steps.length}${result.skipped.length ? ' skipped ' + result.skipped.length : ''}`
+    let scaffoldNote = ''
+    if (cfg.build.autoRemoveScaffold !== false) {
+      try {
+        const { removed } = await executor.removeScaffolds()
+        if (removed > 0) scaffoldNote = `, scaffold cleared ${removed}`
+      } catch (err) {
+        logger.warn(TAG, `scaffold cleanup failed: ${err.message || err}`)
+      }
+    }
+    const summary = `build ${label}${stage ? ' (' + stage + ')' : ''}: placed ${result.placed}/${plan.steps.length}${result.skipped.length ? ' skipped ' + result.skipped.length : ''}${scaffoldNote}`
     logger.info(TAG, summary)
     memory.addEvent({ type: 'build_complete', msg: summary }, { promote: true })
   }

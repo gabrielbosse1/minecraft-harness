@@ -27,7 +27,10 @@ class System1 {
    *           combat?: object,
    *           eatBelowFood?: number,
    *           fallVelocityThreshold?: number,
-   *           tickMs?: number }} [opts]
+   *           tickMs?: number,
+   *           pvpEnabled?: boolean,
+   *           pvpRange?: number,
+   *           autoElytra?: boolean }} [opts]
    */
   constructor (bot, opts = {}) {
     this.bot = bot
@@ -40,8 +43,16 @@ class System1 {
     this.eatBelowFood = opts.eatBelowFood ?? 18
     this.fallVelocityThreshold = opts.fallVelocityThreshold ?? -0.35
     this.tickMs = opts.tickMs ?? 200
+    // Instant PvP: DISABLED by default — this harness runs on a private
+    // whitelist with friends. Operators opt in via behavior.pvpEnabled.
+    this.pvpEnabled = opts.pvpEnabled === true
+    this.pvpRange = Number.isFinite(opts.pvpRange) ? opts.pvpRange : 15
+    this.autoElytra = opts.autoElytra !== false
     this._timer = null
     this._lastEat = 0
+    this._lastElytra = 0
+    this._pvp = null // { target, startedAt, targetName, ending? } while a fight is live
+    this._pvpEndedAt = 0
     if (!this.registry) throw new Error('System1 requires a ReflexRegistry')
   }
 
@@ -51,6 +62,11 @@ class System1 {
     R.register({ name: 'eat_when_hungry', trigger: 'food_low', action: 'eat', cooldownMs: 8000 })
     R.register({ name: 'dodge_close_hostile', trigger: 'hostile_near', action: 'back_jump', cooldownMs: 600 })
     R.register({ name: 'water_bucket_when_falling', trigger: 'falling', action: 'drink_water', cooldownMs: 2000 })
+    // Instant PvP — opt-in. The reflex hands the fight to bot.pvp (mineflayer-pvp)
+    // with zero LLM involvement; the LLM is notified when the fight ends or if we are losing.
+    if (this.pvpEnabled) {
+      R.register({ name: 'pvp_players', trigger: 'player_near', action: 'engage_pvp', cooldownMs: 4000, radius: this.pvpRange })
+    }
     // Example of an LLM-escalation reflex — shipped DISABLED; operators opt in:
     // R.register({ name: 'friend_gift', trigger: 'player_gave_item', action: 'call_system2', cooldownMs: 15000 })
   }
@@ -107,6 +123,22 @@ class System1 {
     if (vy < this.fallVelocityThreshold) {
       await this.registry.evaluate({ type: 'falling', distance: 0 }, ctx)
     }
+    // players within PvP range (reflex-gated; engage_pvp only exists if pvpEnabled)
+    for (const e of Object.values(bot.entities || {})) {
+      if (!e?.position || e === bot.entity || e.type !== 'player') continue
+      const d = e.position.distanceTo(bot.entity.position)
+      if (d <= this.pvpRange) {
+        await this.registry.evaluate({ type: 'player_near', distance: d, entity: e, item: e.username || 'player' }, ctx)
+        break
+      }
+    }
+    // losing watchdog — disengage and hand back to System 2 for the decision
+    if (this._pvp && bot.health !== undefined && bot.health < 6) {
+      this._pvp.ending = 'losing'
+      try { bot.pvp?.stop() } catch { /* noop */ }
+    }
+    // auto-elytra on big falls
+    if (this.autoElytra) this._maybeElytra(vy)
   }
 
   // ------------------------------------------------------- built-in actions
@@ -133,6 +165,75 @@ class System1 {
     setTimeout(() => {
       try { bot.setControlState('back', false); bot.setControlState('jump', false) } catch { /* gone */ }
     }, 500)
+  }
+
+  /**
+   * Engage the nearest player within pvpRange with mineflayer-pvp.
+   * Called by the engage_pvp reflex — never by the LLM, never with a decision.
+   * @returns {Promise<string>} outcome tag for reflex logging
+   */
+  async engageNearestPlayer (event) {
+    const bot = this.bot
+    if (!this.pvpEnabled) return 'pvp_disabled'
+    if (!bot?.pvp) return 'pvp_unavailable' // plugin not loaded
+    if (this._pvp) return 'already_fighting'
+    if (Date.now() - this._pvpEndedAt < 10_000) return 'cooldown'
+    const target = event?.entity
+    if (!target?.position) return 'no_target'
+    const d = target.position.distanceTo(bot.entity.position)
+    if (d > this.pvpRange) return 'out_of_range'
+    // Equip the best sword we carry (netherite > diamond > iron > stone > wood > golden).
+    const SWORD_RANK = ['netherite_sword', 'diamond_sword', 'iron_sword', 'stone_sword', 'wooden_sword', 'golden_sword']
+    const swords = bot.inventory.items().filter((i) => /sword$/.test(i.name))
+    swords.sort((a, b) => SWORD_RANK.indexOf(a.name) - SWORD_RANK.indexOf(b.name))
+    if (swords[0]) await bot.equip(swords[0], 'hand').catch(() => {})
+    const targetName = target.username || target.name || 'player'
+    try {
+      bot.pvp.attack(target)
+    } catch (err) {
+      return `pvp_failed:${err.message || err}`
+    }
+    this._pvp = { target, startedAt: Date.now(), targetName, ending: null }
+    this.memory?.addEvent({ type: 'combat', msg: `pvp engaged ${targetName}` })
+    // One notification per fight — System 2 hears about it when it ends.
+    bot.once('stoppedAttacking', () => this._endPvp(this._pvp?.ending || 'disengaged'))
+    bot.once('entityGone', (e) => { if (e === this._pvp?.target) this._endPvp('won') })
+    return 'pvp_engaged'
+  }
+
+  _endPvp (result) {
+    const s = this._pvp
+    if (!s) return
+    this._pvp = null
+    this._pvpEndedAt = Date.now()
+    const secs = Math.max(1, Math.round((Date.now() - s.startedAt) / 1000))
+    this.memory?.addEvent({ type: 'combat', msg: `pvp ${result} vs ${s.targetName} after ${secs}s` }, { promote: result === 'won' })
+    try {
+      this.escalate?.({ type: 'combat_ended', text: `${result} pvp vs ${s.targetName} after ${secs}s`, msg: 'pvp ended' })
+    } catch { /* no escalation channel wired */ }
+  }
+
+  /** Deploy elytra on big falls when one is carried. Fires at most every 5 s. */
+  _maybeElytra (vy) {
+    const bot = this.bot
+    if (!(vy < -1.5)) return
+    if (Date.now() - this._lastElytra < 5000) return
+    const elytra = bot.inventory?.items?.().find((i) => i.name === 'elytra')
+    if (!elytra) return
+    const feet = bot.entity?.position?.floored?.()
+    if (!feet) return
+    let floorDist = Infinity
+    for (let i = 1; i <= 12; i++) {
+      const b = bot.blockAt(feet.offset(0, -i, 0))
+      if (b && b.boundingBox === 'block') { floorDist = i; break }
+    }
+    if (floorDist <= 4) return // survivable fall — do not flap
+    this._lastElytra = Date.now()
+    this.logger?.info?.('reflex', 'auto-elytra: big fall, deploying elytra')
+    bot.equip(elytra, 'torso').then(() => {
+      bot.setControlState('jump', true)
+      setTimeout(() => { try { bot.setControlState('jump', false) } catch { /* gone */ } }, 250)
+    }).catch(() => {})
   }
 
   /** External entry points for bot-event driven reflexes. */

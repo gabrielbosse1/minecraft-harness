@@ -281,5 +281,163 @@ function buildVisionBlock (bot, { mode = 'explorer', range = 6, radius = 6, heig
   if (mode === 'builder') parts.push(buildCrossSection(bot, { radius, heightUp, heightDown }))
   return parts.join('\n')
 }
+// ============================================================================
+// Semantic clustering — answers "what is this place?" in one line instead of
+// making the model count blocks and mobs. Zero LLM tokens are involved; this
+// is pure heuristic structure, cheap enough to run on every inference.
+// ============================================================================
 
-module.exports = { visibleBlocks, visibleEntities, buildVoxelGrid, buildPerceptionText, inHorizontalFov, buildTopDownGrid, buildCrossSection, buildVisionBlock, categoryChar, VISION_LEGEND }
+/** Names treated as hostile for threat tagging (Java edition, 1.21.x). */
+const HOSTILE_MOBS = new Set([
+  'zombie', 'skeleton', 'creeper', 'spider', 'cave_spider', 'enderman', 'witch', 'slime', 'magma_cube',
+  'ghast', 'blaze', 'guardian', 'elder_guardian', 'drowned', 'husk', 'stray', 'phantom', 'pillager',
+  'vindicator', 'evoker', 'ravager', 'vex', 'silverfish', 'endermite', 'shulker', 'hoglin', 'zoglin',
+  'piglin_brute', 'warden', 'breeze', 'bogged', 'creaking'
+])
+
+/**
+ * Classify an entity by its (lower) registry name.
+ * @returns {'player'|'hostile'|'mob'|'item'|'object'}
+ */
+function classifyEntityName (name) {
+  const n = String(name || '').toLowerCase()
+  if (n === 'player') return 'player'
+  if (HOSTILE_MOBS.has(n)) return 'hostile'
+  if (n === 'item' || n === 'experience_orb' || n === 'arrow' || n === 'snowball' || n === 'fireball' || n === 'splash_potion' || n === 'egg' || n === 'trident') return 'item'
+  if (n.includes('bot')) return 'object'
+  return 'mob'
+}
+
+/**
+ * Cluster raw entity sightings for a System-2 prompt.
+ * Pure function — pass pre-filtered entities for testability.
+ * @param {Array<{name?:string, username?:string, dist:number, position?:{x,y,z}}>} ents
+ * @returns {{lines:string[], zones:Array<{kind:string,x:number,y:number,z:number,count:number,radius:number}>}}
+ */
+function clusterEntities (ents) {
+  const lines = []
+  const zones = []
+  if (!Array.isArray(ents) || ents.length === 0) return { lines, zones }
+  const players = []
+  const hostile = []
+  const mobs = new Map()   // name -> { count, sx, sy, sz }
+  const items = new Map()  // name -> count
+  for (const e of ents) {
+    const name = String(e.username ? 'player' : (e.name || 'unknown')).toLowerCase()
+    const cls = classifyEntityName(name)
+    if (cls === 'player') { players.push(e); continue }
+    if (cls === 'item') { items.set(name, (items.get(name) || 0) + 1); continue }
+    const agg = mobs.get(name) || { count: 0, sx: 0, sy: 0, sz: 0 }
+    agg.count += 1
+    if (e.position) { agg.sx += e.position.x; agg.sy += e.position.y; agg.sz += e.position.z }
+    mobs.set(name, agg)
+    if (cls === 'hostile') hostile.push({ ...e, name })
+  }
+  for (const p of players.slice(0, 6)) {
+    lines.push(`player ${p.username || 'unknown'} ${p.dist}m`)
+  }
+  // Clutter culling — over the threshold, mobs are NEVER enumerated;
+  // the nearest threat rides in the summary instead.
+  const mobTotal = [...mobs.values()].reduce((s, m) => s + m.count, 0)
+  if (mobTotal > 15) {
+    let nearest = Infinity
+    for (const e of ents) {
+      const cls = classifyEntityName(String(e.username ? 'player' : (e.name || 'unknown')).toLowerCase())
+      if (cls === 'mob' || cls === 'hostile') nearest = Math.min(nearest, e.dist ?? Infinity)
+    }
+    const parts = [...mobs.entries()].sort((a, b) => b[1].count - a[1].count).slice(0, 4).map(([n, m]) => `${n} x${m.count}`).join(', ')
+    const near = Number.isFinite(nearest) ? `, nearest ${Math.round(nearest * 10) / 10}m` : ''
+    lines.push(`clutter: ${mobTotal} mobs (${parts}${near}) — avoid this area`)
+    const positioned = [...mobs.values()].filter((m) => m.sx !== 0 || m.sy !== 0 || m.sz !== 0)
+    if (positioned.length) {
+      const wsum = positioned.reduce((s, m) => s + m.count, 0)
+      const cx = positioned.reduce((s, m) => s + (m.sx / m.count) * m.count, 0) / wsum
+      const cy = positioned.reduce((s, m) => s + (m.sy / m.count) * m.count, 0) / wsum
+      const cz = positioned.reduce((s, m) => s + (m.sz / m.count) * m.count, 0) / wsum
+      zones.push({ kind: 'mob_cluster', x: Math.round(cx), y: Math.round(cy), z: Math.round(cz), count: mobTotal, radius: 8 })
+    }
+  } else {
+    for (const h of hostile.slice(0, 6)) {
+      lines.push(`hostile ${h.name} ${h.dist}m`)
+    }
+    if (mobs.size) {
+      lines.push(`mobs: ${[...mobs.entries()].map(([n, m]) => `${n} x${m.count}`).join(', ')}`)
+    }
+  }
+  // Item clutter — same treatment.
+  const itemTotal = [...items.values()].reduce((s, c) => s + c, 0)
+  if (itemTotal > 10) {
+    const parts = [...items.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4).map(([n, c]) => `${n} x${c}`).join(', ')
+    lines.push(`items: ${itemTotal} (${parts})`)
+  }
+  return { lines: lines.slice(0, 12), zones }
+}
+
+// Block categories for structure inference.
+const WALL_BLOCKS = new Set(['cobblestone', 'stone', 'stone_bricks', 'mossy_cobblestone', 'mossy_stone_bricks', 'bricks', 'cracked_stone_bricks', 'deepslate_bricks', 'deepslate_tiles', 'oak_planks', 'spruce_planks', 'birch_planks', 'jungle_planks', 'acacia_planks', 'dark_oak_planks', 'mangrove_planks', 'cherry_planks', 'crimson_planks', 'warped_planks', 'oak_log', 'spruce_log', 'birch_log', 'deepslate_brick_wall', 'cobblestone_wall', 'stone_brick_wall'])
+const ROOF_BLOCKS = /(stairs|slab|terracotta|deepslate_tile|smooth_stone)$/
+const DOOR_BLOCKS = /(door|trapdoor|fence_gate)$/
+const GLASS_BLOCKS = /glass/
+const CHEST_BLOCKS = /(chest|barrel)$/
+
+/**
+ * Infer structure semantics from a block-name list. Conservative by design —
+ * only house-like structures are tagged, never guessed wildly.
+ * @param {string[]} blockNames names of the blocks in the visible cube
+ * @returns {null | {kind:string, walls:number, roof:number, doors:number, glass:number}}
+ */
+function detectStructure (blockNames) {
+  let walls = 0; let roof = 0; let doors = 0; let glass = 0; let chests = 0
+  for (const raw of blockNames || []) {
+    const n = String(raw || '').toLowerCase()
+    if (WALL_BLOCKS.has(n)) walls++
+    else if (ROOF_BLOCKS.test(n)) roof++
+    else if (DOOR_BLOCKS.test(n)) doors++
+    else if (GLASS_BLOCKS.test(n)) glass++
+    else if (CHEST_BLOCKS.test(n)) chests++
+  }
+  if (walls >= 6 && (doors >= 1 || roof >= 3)) return { kind: 'house', walls, roof, doors, glass, chests }
+  if (walls >= 12 && doors === 0 && roof === 0) return { kind: 'incomplete_structure', walls, roof, doors, glass, chests }
+  return null
+}
+
+/**
+ * Build the semantic perception block for a System-2 prompt.
+ * @param {import('mineflayer').Bot} bot
+ * @param {{radius?:number}} [opts]
+ * @returns {{text:string, zones:Array}}
+ */
+function buildSemanticHints (bot, { radius = 6 } = {}) {
+  const pos = bot.entity?.position
+  const lines = []
+  const zones = []
+  if (!pos) return { text: '', zones }
+  // Blocks: full 360° scan (structure semantics should not depend on facing).
+  const blocks = visibleBlocks(bot, { range: radius, fovDegrees: 360, heightUp: 5, heightDown: 2 })
+  const names = blocks.map((b) => b.name)
+  const structure = detectStructure(names)
+  if (structure) {
+    lines.push(`structures: ${structure.kind} (walls=${structure.walls}, roof=${structure.roof}, doors=${structure.doors}, glass=${structure.glass}${structure.chests ? `, chests=${structure.chests}` : ''})`)
+  }
+  const chestCount = names.filter((n) => CHEST_BLOCKS.test(n)).length
+  if (chestCount > 10) {
+    lines.push(`clutter: ${chestCount} chests — storage area`)
+    zones.push({ kind: 'storage', x: Math.round(pos.x), y: Math.round(pos.y), z: Math.round(pos.z), count: chestCount, radius })
+  }
+  // Entities: same cube, clustered (not enumerated).
+  const rawEnts = []
+  for (const e of Object.values(bot.entities || {})) {
+    if (!e || !e.position || e === bot.entity) continue
+    const dx = e.position.x - pos.x; const dy = e.position.y - pos.y; const dz = e.position.z - pos.z
+    const dist = Math.hypot(dx, dy, dz)
+    if (dist > Math.max(16, radius * 2)) continue
+    rawEnts.push({ name: e.name, username: e.username, dist: Math.round(dist * 10) / 10, position: e.position })
+  }
+  rawEnts.sort((a, b) => a.dist - b.dist)
+  const cluster = clusterEntities(rawEnts)
+  lines.push(...cluster.lines)
+  zones.push(...cluster.zones)
+  return { text: lines.join('\n'), zones }
+}
+
+module.exports = { visibleBlocks, visibleEntities, buildVoxelGrid, buildPerceptionText, inHorizontalFov, buildTopDownGrid, buildCrossSection, buildVisionBlock, categoryChar, VISION_LEGEND, classifyEntityName, clusterEntities, detectStructure, buildSemanticHints }

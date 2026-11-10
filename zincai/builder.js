@@ -170,6 +170,8 @@ class BuilderExecutor {
     this.log = typeof opts.logger === 'function' ? opts.logger : () => {}
     this.stepDelayMs = opts.buildStepDelayMs ?? 60
     this.cancelRequested = false
+    this.placedScaffolds = [] // { pos, name } — only blocks WE placed via pillar towers
+    this._trackedKeys = new Set() // dedupe re-placements of the same cell
   }
 
   cancel () { this.cancelRequested = true }
@@ -310,7 +312,14 @@ class BuilderExecutor {
             ])
             if (outcome !== 'pending') break
           }
-          if (bot.blockAt(dest)?.name !== scaffold.name) this.log('debug', `tower place at ${dest} not confirmed`)
+          if (bot.blockAt(dest)?.name === scaffold.name) {
+            const key = `${dest.x},${dest.y},${dest.z}`
+            if (!this._trackedKeys.has(key)) {
+              this._trackedKeys.add(key)
+              this.placedScaffolds.push({ pos: dest.clone(), name: scaffold.name })
+            }
+          }
+          else this.log('debug', `tower place at ${dest} not confirmed`)
         }
       } catch (err) {
         this.log('debug', `tower place failed: ${err.message || err}`)
@@ -325,6 +334,40 @@ class BuilderExecutor {
       await new Promise((r) => setTimeout(r, 80))
     }
     return Math.floor(bot.entity.position.y) >= targetY
+  }
+
+  /**
+   * Dig back down the pillar we just climbed. Only touches blocks placed by
+   * pillarUpTo during THIS process — never pre-existing world. Digs top-down;
+   * the bot falls one block per dig onto the remaining scaffold.
+   * @returns {Promise<{removed:number}>}
+   */
+  async removeScaffolds () {
+    const mine = [...this.placedScaffolds]
+    this.placedScaffolds = []
+    if (mine.length === 0) return { removed: 0 }
+    const bot = this.bot
+    let removed = 0
+    mine.sort((a, b) => b.pos.y - a.pos.y)
+    for (const { pos, name } of mine) {
+      const now = bot.blockAt(pos)
+      if (!now || now.name !== name) continue // replaced or already gone — leave it
+      const feet = bot.entity.position
+      const d = Math.hypot(feet.x - pos.x, feet.y - pos.y, feet.z - pos.z)
+      if (d > 6) await this._approach(pos, 2) // slow but may path across the site
+      try {
+        const target = bot.blockAt(pos)
+        if (!target || target.name !== name) continue
+        await bot.dig(target)
+        removed++
+        await new Promise((r) => setTimeout(r, 120))
+      } catch (err) {
+        this.log('debug', `scaffold dig failed at ${pos}: ${err.message || err}`)
+      }
+    }
+    this._trackedKeys.clear()
+    this.log('info', `scaffold cleanup: removed ${removed} block${removed === 1 ? '' : 's'}`)
+    return { removed }
   }
 
   /**

@@ -13,7 +13,7 @@
     "baseUrl": "https://developer.amd.com.cn/radeon/api/v1",
     "model": "Qwen3.8-Flash-Next",
     "_modelNote": "Radeon Cloud Token Factory alias for the Qwen 3.8 27B free standing model. DeepSeek-V4-Flash-0731 also works.",
-    "maxTokens": 96,
+    "maxTokens": 256,
     "temperature": 0.25,
     "timeoutMs": 20000,
     "maxRetries": 2
@@ -41,7 +41,10 @@
     "useArmorManager": true,
     "mode": "explorer",
     "fleeRadius": 8,
-    "perception3D": false
+    "perception3D": false,
+    "pvpEnabled": false,
+    "pvpRange": 15,
+    "autoElytra": true
   },
   "build": {
     "scaffoldBlocks": [
@@ -49,7 +52,8 @@
       "cobblestone",
       "netherrack"
     ],
-    "reach": 4.5
+    "reach": 4.5,
+    "autoRemoveScaffold": true
   },
   "system1": {
     "eatBelowFood": 18,

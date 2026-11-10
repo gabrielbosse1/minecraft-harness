@@ -24,6 +24,7 @@
  *   say            — bot.chat(event.text or reflex.text)
  *   run_script     — execute zincai/scripts/<script> with { bot, ctx }
  *   call_system2   — escalate: ask the LLM what to do about this event
+ *   engage_pvp     — hand the fight to System 1's PvP loop (mineflayer-pvp); LLM notified after
  */
 'use strict'
 
@@ -37,7 +38,7 @@ const VALID_TRIGGERS = new Set([
   'entity_hurt', 'item_gained', 'player_gave_item', 'chat', 'any'
 ])
 const VALID_ACTIONS = new Set([
-  'eat', 'drink_water', 'back_jump', 'flee', 'jump', 'say', 'run_script', 'call_system2'
+  'eat', 'drink_water', 'back_jump', 'flee', 'jump', 'say', 'run_script', 'call_system2', 'engage_pvp'
 ])
 
 /** Load and execute a user script with the reflex context. Trusted local code. */
@@ -160,6 +161,7 @@ class ReflexRegistry {
       }
       case 'run_script': return runScript(r.script, event, ctx)
       case 'call_system2': return ctx.escalate ? ctx.escalate(event) : 'no_escalation_channel'
+      case 'engage_pvp': return ctx.system1?.engageNearestPlayer?.(event) ?? 'pvp_unavailable'
       default: return 'unknown_action'
     }
   }

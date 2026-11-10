@@ -214,3 +214,145 @@ test('reflex registry validates specs loudly', () => {
   assert.throws(() => registry.register({ name: 'bad2', trigger: 'chat', action: 'explode' }))
   assert.throws(() => registry.register({ name: 'bad3', trigger: 'chat', action: 'run_script' }))
 })
+
+// ------------------------------------------------------------- api_wrapper ---
+const { createZincTools, coerceAction, buildToolsPayload } = require('../zincai/api_wrapper')
+
+test('createZincTools emits OpenAI-format schemas with the full action set', () => {
+  const tools = createZincTools()
+  const names = tools.map((t) => t.function?.name)
+  for (const required of ['say', 'move', 'build', 'build_shape', 'run_script', 'set_mode', 'craft', 'attack', 'equip', 'idle']) {
+    assert.ok(names.includes(required), `missing tool ${required}`)
+  }
+  for (const t of tools) {
+    assert.equal(t.type, 'function')
+    assert.ok(t.function.description.length > 10, `${t.function.name} needs a description`)
+    assert.equal(t.function.parameters.type, 'object')
+    assert.ok(!Array.isArray(t.function.parameters.required) || t.function.parameters.required.length <= 3)
+  }
+  const shape = tools.find((t) => t.function.name === 'build_shape')
+  assert.deepEqual(shape.function.parameters.properties.shape.enum, ['cylinder', 'dome', 'arch', 'wall', 'box', 'floor', 'ring'])
+})
+
+test('buildToolsPayload enforces single-call, auto tool_choice', () => {
+  const tools = createZincTools()
+  const payload = buildToolsPayload({ model: 'Qwen3.8-Flash-Next', messages: [{ role: 'user', content: 'hi' }], temperature: 0.25, maxTokens: 256, tools })
+  assert.equal(payload.tool_choice, 'auto')
+  assert.equal(payload.parallel_tool_calls, false)
+  assert.equal(payload.stream, false)
+  assert.equal(payload.tools.length, tools.length)
+})
+
+test('coerceAction maps tool_calls onto the internal action shape', () => {
+  const say = coerceAction({ tool_calls: [{ id: '1', type: 'function', function: { name: 'say', arguments: '{"text":"hello there"}' } }] })
+  assert.deepEqual(say, { a: 'say', t: 'hello there', _via: 'tool' })
+  const shape = coerceAction({ tool_calls: [{ id: '2', type: 'function', function: { name: 'build_shape', arguments: '{"shape":"wall","block":"stone","params":{"l":4,"h":2}}' } }] })
+  assert.equal(shape.a, 'build_shape')
+  assert.equal(shape.shape, 'wall')
+  assert.deepEqual(shape.params, { l: 4, h: 2 })
+  const craft = coerceAction({ tool_calls: [{ id: '3', type: 'function', function: { name: 'craft', arguments: '{"item":"crafting_table"}' } }] })
+  assert.deepEqual(craft, { a: 'craft', i: 'crafting_table', _via: 'tool' })
+})
+
+test('coerceAction falls back to legacy JSON content when tools are ignored', () => {
+  const legacy = coerceAction({ content: '{"a":"say","t":"old school"}' })
+  assert.equal(legacy.a, 'say')
+  assert.equal(legacy.t, 'old school')
+  assert.equal(legacy._via, 'json-fallback')
+  const fenced = coerceAction({ content: 'sure!\n```json\n{"a":"idle"}\n```' })
+  assert.equal(fenced.a, 'idle')
+  const garbage = coerceAction({ content: 'definitely not an action' })
+  assert.equal(garbage.a, 'idle')
+  const badCall = coerceAction({ tool_calls: [{ id: '4', type: 'function', function: { name: 'teleport', arguments: '{}' } }] })
+  assert.equal(badCall.a, 'idle')
+  const badArgs = coerceAction({ tool_calls: [{ id: '5', type: 'function', function: { name: 'say', arguments: 'not-json' } }] })
+  assert.equal(badArgs.a, 'idle')
+})
+
+// ------------------------------------------------------------- perception semantics ---
+const { classifyEntityName, clusterEntities, detectStructure } = require('../zincai/perception')
+
+test('classifyEntityName tags players, hostiles, mobs and items', () => {
+  assert.equal(classifyEntityName('player'), 'player')
+  assert.equal(classifyEntityName('Zombie'), 'hostile')
+  assert.equal(classifyEntityName('warden'), 'hostile')
+  assert.equal(classifyEntityName('cow'), 'mob')
+  assert.equal(classifyEntityName('item'), 'item')
+})
+
+test('clusterEntities summarizes mob clutter instead of enumerating', () => {
+  const ents = []
+  for (let i = 0; i < 12; i++) ents.push({ name: 'zombie', dist: 5 + i, position: { x: i, y: 64, z: 0 } })
+  for (let i = 0; i < 5; i++) ents.push({ name: 'skeleton', dist: 6 + i, position: { x: i, y: 64, z: 2 } })
+  ents.push({ name: 'player', username: 'Steve', dist: 3 })
+  const { lines, zones } = clusterEntities(ents)
+  assert.ok(lines.some((l) => l.includes('player Steve')))
+  assert.ok(lines.some((l) => /clutter: 17 mobs/.test(l)), lines.join('\n'))
+  assert.ok(!lines.some((l) => /hostile zombie/.test(l)), 'mobs must be summarized, not enumerated')
+  assert.equal(zones.length, 1)
+  assert.equal(zones[0].kind, 'mob_cluster')
+  assert.equal(zones[0].count, 17)
+})
+
+test('clusterEntities stays enumerated when sparse and groups items', () => {
+  const sparse = clusterEntities([{ name: 'zombie', dist: 3 }, { name: 'cow', dist: 4 }])
+  assert.ok(sparse.lines.join(' ').includes('mobs:'))
+  assert.ok(!sparse.lines.join(' ').includes('clutter'))
+  const items = clusterEntities(Array.from({ length: 12 }, () => ({ name: 'item', dist: 2 })))
+  assert.ok(items.lines.join(' ').includes('items:'))
+})
+
+test('detectStructure tags house only with walls + roof/door', () => {
+  const walls = Array(8).fill('stone_bricks')
+  const house = detectStructure([...walls, 'oak_door', 'oak_stairs'])
+  assert.equal(house.kind, 'house')
+  const roofOnly = detectStructure([...walls, ...Array(3).fill('cobblestone_stairs')])
+  assert.equal(roofOnly.kind, 'house')
+  const bare = detectStructure(walls)
+  assert.equal(bare, null)
+  const ruin = detectStructure(Array(14).fill('deepslate_bricks'))
+  assert.equal(ruin.kind, 'incomplete_structure')
+})
+
+// ------------------------------------------------------------- builder scaffolds ---
+test('removeScaffolds digs only self-placed blocks, top-down', async () => {
+  const { BuilderExecutor } = require('../zincai/builder')
+  const { Vec3 } = require('vec3')
+  const dug = []
+  const tower = [new Vec3(5, 62, 5), new Vec3(5, 63, 5), new Vec3(5, 64, 5)]
+  const bot = {
+    entity: { position: new Vec3(5, 65, 5) },
+    inventory: { items: () => [{ name: 'dirt', count: 10 }] },
+    blockAt: (p) => tower.some((t) => t.equals(p)) ? { name: 'dirt', position: p } : { name: 'air', position: p },
+    dig: async (b) => { dug.push(b.position.y) },
+    pathfinder: { setGoal () {} }
+  }
+  const executor = new BuilderExecutor(bot, { scaffoldBlocks: ['dirt'], logger: () => {} })
+  executor.placedScaffolds = tower.map((pos) => ({ pos, name: 'dirt' }))
+  executor._trackedKeys = new Set(tower.map((t) => `${t.x},${t.y},${t.z}`))
+  const { removed } = await executor.removeScaffolds()
+  assert.equal(removed, 3)
+  assert.deepEqual(dug, [64, 63, 62], 'must dig top-down')
+  assert.equal(executor.placedScaffolds.length, 0)
+  assert.equal(executor._trackedKeys.size, 0)
+})
+
+test('removeScaffolds leaves non-scaffold replacements alone', async () => {
+  const { BuilderExecutor } = require('../zincai/builder')
+  const { Vec3 } = require('vec3')
+  const dug = []
+  const pos = new Vec3(5, 62, 5)
+  const bot = {
+    entity: { position: new Vec3(5, 63, 5) },
+    inventory: { items: () => [{ name: 'dirt', count: 10 }] },
+    blockAt: () => ({ name: 'stone', position: pos }), // something replaced our dirt
+    dig: async (b) => { dug.push(b.name) },
+    pathfinder: { setGoal () {} }
+  }
+  const executor = new BuilderExecutor(bot, { scaffoldBlocks: ['dirt'], logger: () => {} })
+  executor.placedScaffolds = [{ pos, name: 'dirt' }]
+  executor._trackedKeys = new Set(['5,62,5'])
+  const { removed } = await executor.removeScaffolds()
+  assert.equal(removed, 0)
+  assert.equal(dug.length, 0)
+})

@@ -110,7 +110,7 @@ writing: `minecraft-data@3.119.0`, latest official version 26.1). This repo ther
 ## Development
 
 ```bash
-npm test          # node:test suite (46 tests) — no network, loopback mocks only
+npm test          # node:test suite (56 tests) — no network, loopback mocks only
 npm run dry-run   # config + prompt validation
 npm run check     # syntax-check every src module
 npm run ping      # reachability + version check of the configured server (no join, no LLM call)
@@ -130,9 +130,11 @@ repo (`/tmp/e2e/`) and is not required to run the bot.
 
 A second, self-contained harness lives in [`zincai/`](zincai/README.md):
 a Pufferpanel-ready, Qwen 3.8 27B–tuned bot with System 1/System 2 dual-process
-architecture, FOV-frustum perception plus 2D ASCII "vision", 3-tier memory with
+architecture, native OpenAI-compatible tool calling, FOV-frustum perception
+plus 2D ASCII "vision" and semantic clustering, 3-tier memory with
 ephemeral action buffer and grep-first recall, mathematical shape primitives
-(`build_shape`), and scaffold-aware hierarchical building.
+(`build_shape`), scaffold-aware hierarchical building with automatic scaffold
+removal, and an opt-in instant-PvP reflex.
 It joins as **ZincAI** (the name mandated for it). See `zincai/README.md`.
 
 ## License

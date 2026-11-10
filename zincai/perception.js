@@ -336,14 +336,18 @@ function clusterEntities (ents) {
   for (const p of players.slice(0, 6)) {
     lines.push(`player ${p.username || 'unknown'} ${p.dist}m`)
   }
-  for (const h of hostile.slice(0, 6)) {
-    lines.push(`hostile ${h.name} ${h.dist}m`)
-  }
-  // Clutter culling — do NOT enumerate a mob-heavy area; summarize it.
+  // Clutter culling — over the threshold, mobs are NEVER enumerated;
+  // the nearest threat rides in the summary instead.
   const mobTotal = [...mobs.values()].reduce((s, m) => s + m.count, 0)
   if (mobTotal > 15) {
+    let nearest = Infinity
+    for (const e of ents) {
+      const cls = classifyEntityName(String(e.username ? 'player' : (e.name || 'unknown')).toLowerCase())
+      if (cls === 'mob' || cls === 'hostile') nearest = Math.min(nearest, e.dist ?? Infinity)
+    }
     const parts = [...mobs.entries()].sort((a, b) => b[1].count - a[1].count).slice(0, 4).map(([n, m]) => `${n} x${m.count}`).join(', ')
-    lines.push(`clutter: ${mobTotal} mobs (${parts}) — avoid this area`)
+    const near = Number.isFinite(nearest) ? `, nearest ${Math.round(nearest * 10) / 10}m` : ''
+    lines.push(`clutter: ${mobTotal} mobs (${parts}${near}) — avoid this area`)
     const positioned = [...mobs.values()].filter((m) => m.sx !== 0 || m.sy !== 0 || m.sz !== 0)
     if (positioned.length) {
       const wsum = positioned.reduce((s, m) => s + m.count, 0)
@@ -352,8 +356,13 @@ function clusterEntities (ents) {
       const cz = positioned.reduce((s, m) => s + (m.sz / m.count) * m.count, 0) / wsum
       zones.push({ kind: 'mob_cluster', x: Math.round(cx), y: Math.round(cy), z: Math.round(cz), count: mobTotal, radius: 8 })
     }
-  } else if (mobs.size) {
-    lines.push(`mobs: ${[...mobs.entries()].map(([n, m]) => `${n} x${m.count}`).join(', ')}`)
+  } else {
+    for (const h of hostile.slice(0, 6)) {
+      lines.push(`hostile ${h.name} ${h.dist}m`)
+    }
+    if (mobs.size) {
+      lines.push(`mobs: ${[...mobs.entries()].map(([n, m]) => `${n} x${m.count}`).join(', ')}`)
+    }
   }
   // Item clutter — same treatment.
   const itemTotal = [...items.values()].reduce((s, c) => s + c, 0)

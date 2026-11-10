@@ -24,14 +24,31 @@ system 1 (Node.js, NO LLM)          system 2 (Qwen via AMD API)
         └──────── heuristic pre-filter ────────┘
   reflexes escalate to System 2 only via call_system2 reflexes — System 1
   itself never calls the LLM
+
+  (opt-in: instant PvP reflex, auto-elytra on big falls)
 ```
 
-- **Perception is dual** (`zincai/perception.js`): frustum-culled voxel
-  palette + run-length grid for spatial awareness (~100–300 tokens), **plus a
-  2D ASCII "vision" block** — a top-down grid (`#` stone, `.` air, `@` bot)
-  always injected into System-2 prompts, and a cross-sectional grid in builder
-  mode so Qwen can "see" the layout, symmetry and unfinished layers while it
-  builds. A 3D voxel grid can be enabled with `perception3D: true`.
+- **Native tool calling** (`zincai/api_wrapper.js`): the System-2 action
+  contract is an OpenAI-compatible `tools` array — `say, move, build,
+  build_shape, run_script, set_mode, craft, attack, equip, idle` with full
+  JSON schemas — sent with `tool_choice: "auto"` and
+  `parallel_tool_calls: false`. Qwen answers with `tool_calls`, not
+  syntax-error-prone raw JSON. If the endpoint ever ignores `tools`, a
+  tolerant fallback parses the legacy single-line JSON shape and counts it
+  (`jsonFallbacks` in the session stats) — the bot degrades, it does not die.
+
+- **Perception is three-layer** (`zincai/perception.js`): (1) frustum-culled
+  voxel palette + run-length grid, **plus a 2D ASCII "vision" block** —
+  top-down grid always, cross-section in builder mode; (2) **semantic
+  clustering** — hostile mobs > 15 → `clutter: N mobs (zombie x12, …)`
+  summary + avoid zone (never enumerated individually; the nearest threat
+  rides in the summary), > 10 chests → storage zone, players tagged with
+  distance; (3) **structure inference** — walls + roof/door →
+  `structures: house (…)` (conservative; walls alone never match).
+  Clutter clusters surface as avoid-zones in the delta. Mineflayer-pathfinder
+  has no region-cost API (patching its A* is off-limits), so mob-dense avoidance
+  is delivered via the flee reflex and tactical prompting, not cost weighting.
+  A 3D voxel grid can be enabled with `perception3D: true`.
 - **Memory is 3-tier + ephemeral** (`zincai/memory.js`): Working (5 events) →
   10-minute Short-term → Long-term JSON store (`zincai-data/memories.json`,
   gitignored) retrieved by cosine × importance (top 3 injected). On top of
@@ -61,6 +78,10 @@ system 1 (Node.js, NO LLM)          system 2 (Qwen via AMD API)
   guard); ±2° yaw/pitch micro-jitter, variable sprint/walk cycles (sprint is
   never the default), forced walk near edges/air/lava, 200–800 ms idle pauses
   on abrupt heading changes. `npm update mineflayer` keeps working.
+- **Scaffold auto-remove** (`zincai/builder.js`): blocks the executor itself
+  places via jump-place towers are tracked and dug back out top-down after a
+  build (`build.autoRemoveScaffold: true` by default). Pre-existing world is
+  never touched; blocks replaced mid-cleanup are left alone.
 - **Reflex engine** (`zincai/reflex_registry.js` + `zincai/system1.js`):
   System 1 is a registry, not a hardcoded if-chain — `register_reflex({trigger,
   action, script?})` with cooldowns; built-ins cover eat/dodge/water-bucket,
@@ -69,12 +90,19 @@ system 1 (Node.js, NO LLM)          system 2 (Qwen via AMD API)
   `build_tower.js`) and can be invoked from System 2 via
   `{"a":"run_script","name":"build_tower"}`. Complex unhandled events escalate
   to System 2 via `call_system2` reflexes.
+- **Instant PvP (opt-in)**: `behavior.pvpEnabled: true` (default **false** —
+  this harness runs on a private whitelist) + `mineflayer-pvp` — a `player_near`
+  reflex hands the fight to System 1 with zero LLM tokens: best-sword equip,
+  jump-crit/strafe loop, auto-disengage below 6 HP, System 2 notified on fight
+  end (won / disengaged / losing). `behavior.autoElytra: true` deploys a carried
+  elytra on falls > 4 blocks.
 - **Modes** (`{"a":"set_mode","mode":"builder|hunter|explorer"}`): explorer
   defaults (sprint allowed), hunter (auto-sprint + jump-while-running for
   gaps), builder (never drops more than 1 block).
-- **LLM contract** (`zincai/system_prompt.txt`): single-line JSON only, no
-  markdown, Qwen-3.8-27B-tuned. Schema: `say | move | build | build_shape |
-  run_script | set_mode | craft | attack | equip | idle`.
+- **LLM contract** (`zincai/system_prompt.txt`): persona + strategy only
+  (~350 words, no JSON grammar). The action contract lives in tool schemas:
+  `say | move | build | build_shape | run_script | set_mode | craft | attack |
+  equip | idle`.
 
 ## Pufferpanel deployment
 
@@ -111,10 +139,12 @@ the branch working tree (gitignored, not committed):
 - `build-e2e.js` — builder pipeline against loopback 1.16.5 (the 1.21.4
   flying-squid↔mineflayer packet stream is lossy, which corrupts client-side
   physics; the harness placement logic itself is version-agnostic). Checks
-  wall placement (2×2 on solid ground) and a one-block pillar tower. ZincAI's
-  full staircase jump-place is covered by the same code path and must be
-  verified live (`npm run start:zincai` on the production host) — the loopback
-  cannot deterministically validate the second pillar step.
+  wall placement (2×2 on solid ground), a one-block pillar tower (dirt consumed,
+  in-world block verified), and tracked scaffold cleanup (dug back out, zero
+  blocks left in world). ZincAI's full staircase jump-place is covered by the
+  same code path and must be verified live (`npm run start:zincai` on the
+  production host) — the loopback cannot deterministically validate the second
+  pillar step.
 
 ## Extending
 
@@ -135,6 +165,12 @@ the branch working tree (gitignored, not committed):
   says so in its debug log.
 - The 30 s ephemeral buffer is working memory, not truth — expect the model to
   reference actions it just took without claiming deeper knowledge.
+- PvP defaults OFF. On a whitelist with friends, flipping `pvpEnabled` makes
+  the bot fight any player on sight — opt in deliberately.
+- Structure inference is conservative (walls + roof/door) and will miss exotic
+  builds; it is a hint for the model, not a game-state oracle.
+- mob clutter > 15 entities is summarized, never enumerated; the nearest mob
+  rides in the summary line.
 - Implicit preferences are a bias, not a lock — the user can always override.
 - FOV perception is a cone approximation, not true line-of-sight raycasts.
   Dense forests will look "full" to the model; that's the intended trade-off.

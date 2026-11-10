@@ -171,6 +171,7 @@ class BuilderExecutor {
     this.stepDelayMs = opts.buildStepDelayMs ?? 60
     this.cancelRequested = false
     this.placedScaffolds = [] // { pos, name } — only blocks WE placed via pillar towers
+    this._trackedKeys = new Set() // dedupe re-placements of the same cell
   }
 
   cancel () { this.cancelRequested = true }
@@ -311,7 +312,13 @@ class BuilderExecutor {
             ])
             if (outcome !== 'pending') break
           }
-          if (bot.blockAt(dest)?.name === scaffold.name) this.placedScaffolds.push({ pos: dest.clone(), name: scaffold.name })
+          if (bot.blockAt(dest)?.name === scaffold.name) {
+            const key = `${dest.x},${dest.y},${dest.z}`
+            if (!this._trackedKeys.has(key)) {
+              this._trackedKeys.add(key)
+              this.placedScaffolds.push({ pos: dest.clone(), name: scaffold.name })
+            }
+          }
           else this.log('debug', `tower place at ${dest} not confirmed`)
         }
       } catch (err) {
@@ -358,6 +365,7 @@ class BuilderExecutor {
         this.log('debug', `scaffold dig failed at ${pos}: ${err.message || err}`)
       }
     }
+    this._trackedKeys.clear()
     this.log('info', `scaffold cleanup: removed ${removed} block${removed === 1 ? '' : 's'}`)
     return { removed }
   }

@@ -11,10 +11,31 @@
  * System 1 can escalate to System 2 only through reflexes whose action is
  * `call_system2` — the LLM decides, the event text rides along, zero chat
  * spam, zero ambiguity about why tokens were spent.
+ *
+ * v3 adds the elite-combat reflex ring. Every 200 ms tick it classifies each
+ * nearby hostile by equipment/pose (mace airborne, elytra + spear/trident
+ * lunge, bow/crossbow, plain melee) using `src/combat.js#classifyThreat`, and
+ * fires the matching reflex directly — no inference, no tokens, no latency:
+ *
+ *   mace_threat   → panic_retreat   (sprint back / LOS block / water bucket)
+ *   elytra_lunge  → evade_lateral   (lateral sprint strafe breaks the line)
+ *   ranged_threat → strafe_ranged   (perpendicular to the shooter's aim)
+ *   melee_window  → combat_tick     (cooldown-gated crit swing)
+ *
+ * The same rings still drive eating, near-field dodging, fall mitigation and
+ * opt-in PvP; ordering is by lethality, so a mace always beats a bow.
  */
 'use strict'
 
 const FOOD_RE = /(bread|apple|potato|carrot|beef|porkchop|chicken|mutton|salmon|cod|berries|cookie|melon_slice|cooked_|golden_carrot|steak|stew|mushroom_stew|beetroot)/
+
+// Loaded lazily so a partial mock bot can still instantiate System1 in tests.
+const threatSense = () => require('../src/combat')
+
+/** Parse `event.entity` or a bare entity into the tactical event shape. */
+function asThreatEvent (type, entity, distance) {
+  return { type, entity, distance: Number.isFinite(distance) ? distance : undefined, item: entity?.name }
+}
 
 class System1 {
   /**
@@ -67,6 +88,14 @@ class System1 {
     if (this.pvpEnabled) {
       R.register({ name: 'pvp_players', trigger: 'player_near', action: 'engage_pvp', cooldownMs: 4000, radius: this.pvpRange })
     }
+    // --- v3 elite combat ring ---------------------------------------------
+    // Ordering here is explanatory only; the tick below fires triggers by
+    // lethality. Cooldowns are tuned so a panic is one fluid motion, not a
+    // seizure of key-toggling.
+    R.register({ name: 'mace_panic_retreat', trigger: 'mace_threat', action: 'panic_retreat', cooldownMs: 1200 })
+    R.register({ name: 'elytra_lunge_dodge', trigger: 'elytra_lunge', action: 'evade_lateral', cooldownMs: 900 })
+    R.register({ name: 'ranged_aim_strafe', trigger: 'ranged_threat', action: 'strafe_ranged', cooldownMs: 400 })
+    R.register({ name: 'melee_cooldown_pressure', trigger: 'melee_window', action: 'combat_tick', cooldownMs: 150 })
     // Example of an LLM-escalation reflex — shipped DISABLED; operators opt in:
     // R.register({ name: 'friend_gift', trigger: 'player_gave_item', action: 'call_system2', cooldownMs: 15000 })
   }
@@ -111,13 +140,15 @@ class System1 {
     // hostiles within 2m (near-field dodge — far-field flee is the wrapper's job)
     for (const e of Object.values(bot.entities || {})) {
       if (!e?.position || e === bot.entity) continue
-      if (!/zombie|skeleton|creeper|spider|drowned|husk|witch|blaze|phantom/i.test(e.name || '')) continue
+      if (!/zombie|skeleton|creeper|spider|drowned|husk|witch|blaze|phantom|piglin|vindicator|pillager|breeze|bogged/i.test(e.name || '')) continue
       const d = e.position.distanceTo(bot.entity.position)
       if (d < 2.0) {
         await this.registry.evaluate({ type: 'hostile_near', distance: d, entity: e, item: e.name }, ctx)
         break
       }
     }
+    // --- v3 tactical threat scan (zero LLM, ~20 lines of math) ------------
+    await this.tacticalScan(ctx)
     // falling fast
     const vy = bot.entity?.velocity?.y ?? 0
     if (vy < this.fallVelocityThreshold) {
@@ -139,6 +170,150 @@ class System1 {
     }
     // auto-elytra on big falls
     if (this.autoElytra) this._maybeElytra(vy)
+  }
+
+  // ------------------------------------------------- v3 tactical reflexes
+  /**
+   * Classify nearby hostiles and fire the matching elite reflex. This runs
+   * BEFORE target-facing decisions and costs microseconds; it is the layer
+   * that reacts to a mace at 12 Hz rather than at LLM latency.
+   * @returns {Promise<Array>} registry results (empty when nothing applies)
+   */
+  async tacticalScan (ctx = this._ctx()) {
+    const bot = this.bot
+    const botPos = bot?.entity?.position
+    if (!botPos) return []
+    const { classifyThreat, HOSTILE_NAMES } = threatSense()
+    const candidates = []
+    for (const e of Object.values(bot.entities || {})) {
+      if (!e?.position || e === bot.entity) continue
+      if (!e.name) continue
+      const d = e.position.distanceTo(botPos)
+      if (d > 16) continue
+      candidates.push({ entity: e, distance: d, threat: classifyThreat(e, { botPos, distance: d }) })
+    }
+    if (!candidates.length) return []
+    candidates.sort((a, b) => a.distance - b.distance)
+    this.lastThreats = candidates.slice(0, 6)
+    const results = []
+    // Lethality order: mace smash > elytra spear/trident > bow > melee window.
+    const mace = candidates.find((c) => c.threat.tags.includes('mace_airborne') && c.distance <= 5.5)
+    if (mace) {
+      results.push(...await this.registry.evaluate(asThreatEvent('mace_threat', mace.entity, mace.distance), ctx))
+    }
+    const lunge = candidates.find((c) => c.threat.tags.includes('elytra_charge') && c.distance <= 8)
+    const elytraClose = candidates.find((c) => c.threat.elytra && c.threat.airborne && c.distance <= 8)
+    const elytra = lunge || elytraClose
+    if (elytra) {
+      results.push(...await this.registry.evaluate(asThreatEvent('elytra_lunge', elytra.entity, elytra.distance), ctx))
+    }
+    const ranged = candidates.find((c) => c.threat.tags.includes('ranged') && c.distance <= 16)
+    if (ranged) {
+      results.push(...await this.registry.evaluate(asThreatEvent('ranged_threat', ranged.entity, ranged.distance), ctx))
+    }
+    // Only hostiles/players deserve melee pressure — never auto-attack a cow.
+    const nearest = candidates.find((c) => {
+      const name = String(c.entity.name || '').toLowerCase()
+      return c.entity.type !== 'player' && HOSTILE_NAMES.has(name)
+    })
+    if (nearest && nearest.distance <= 4.5) {
+      results.push(...await this.registry.evaluate(asThreatEvent('melee_window', nearest.entity, nearest.distance), ctx))
+    }
+    return results
+  }
+
+  /** Reflex action: mace panic. Delegates to combat when it owns the state. */
+  panicRetreat (event) {
+    const reason = event?.entity ? `${event.entity.name || 'mace'}` : 'mace'
+    if (this.combat?.panicRetreat) {
+      this.combat.panicRetreat(reason)
+      this.logger?.warn?.('reflex', `mace panic vs ${reason} — combat controller`)
+      return 'panic_combat'
+    }
+    // Standalone fallback: sprint backwards, jump, water bucket if carried.
+    const bot = this.bot
+    try {
+      bot.pathfinder?.setGoal?.(null)
+      bot.setControlState('back', true)
+      bot.setControlState('sprint', true)
+      bot.setControlState('jump', true)
+      setTimeout(() => {
+        try {
+          bot.setControlState('back', false)
+          bot.setControlState('jump', false)
+        } catch { /* gone */ }
+      }, 700)
+      this.useWaterBucket()
+      this.logger?.warn?.('reflex', `mace panic vs ${reason} — standalone retreat`)
+      return 'panic_standalone'
+    } catch { return 'panic_failed' }
+  }
+
+  /** Reflex action: elytra / spear lunge → break the linear trajectory. */
+  evadeLateral (event) {
+    const reason = event?.entity ? `${event.entity.name || 'elytra'}` : 'elytra'
+    if (this.combat?.evadeLateral) {
+      this.combat.evadeLateral(reason)
+      return 'lateral_combat'
+    }
+    const bot = this.bot
+    try {
+      const side = Math.random() < 0.5 ? 'left' : 'right'
+      bot.pathfinder?.setGoal?.(null)
+      bot.setControlState(side, true)
+      bot.setControlState('sprint', true)
+      bot.setControlState('jump', true)
+      setTimeout(() => {
+        try {
+          bot.setControlState(side, false)
+          bot.setControlState('jump', false)
+        } catch { /* gone */ }
+      }, 450)
+      return `lateral_${side}`
+    } catch { return 'lateral_failed' }
+  }
+
+  /** Reflex action: strafe perpendicular to a shooter's aim vector. */
+  strafeRanged (event) {
+    if (this.combat?.strafeRanged) return this.combat.strafeRanged()
+    const bot = this.bot
+    const target = event?.entity?.position
+    const me = bot?.entity?.position
+    if (!target || !me) return 'no_target'
+    const dx = target.x - me.x
+    const dz = target.z - me.z
+    // Perpendicular in XZ; pick a side, hold it briefly, keep sprinting.
+    const side = (dx * -1 + dz * 1) >= 0 ? 'right' : 'left'
+    try {
+      bot.setControlState(side, true)
+      bot.setControlState('sprint', true)
+      setTimeout(() => { try { bot.setControlState(side, false) } catch { /* gone */ } }, 420)
+      return `strafe_${side}`
+    } catch { return 'strafe_failed' }
+  }
+
+  /**
+   * Reflex action: cooldown/crit-aware melee pressure.
+   *
+   * If the combat controller already owns the fight, its 20 Hz physics tick is
+   * already running — do nothing (never double-pulse jump keys).
+   * If it is idle and a *safely meleeable* mob is inside 4.5 m, the reflex
+   * engages it directly: survival fighting is System-1 work, and the LLM is
+   * told afterwards through the combat event sink. Explosive/instakill mobs
+   * (creeper, warden, ravager) are never auto-engaged — those get distance.
+   */
+  combatTick (event) {
+    if (!this.combat) return 'no_combat'
+    if (this.combat.isEngaged) return 'combat_engaged' // physicsTick already drives it
+    const name = String(event?.entity?.name || '').toLowerCase()
+    const SAFE_MELEE = /^(zombie|husk|drowned|zombie_villager|skeleton|stray|bogged|spider|cave_spider|silverfish|slime|magma_cube|pillager|vindicator|witch)$/
+    const health = this.bot.health ?? 20
+    if (name && SAFE_MELEE.test(name) && health > this.combat.disengageAt + 2) {
+      this.combat.engage(name).catch((err) => this.logger?.debug?.('reflex', `auto-engage failed: ${err.message || err}`))
+      return 'combat_engage'
+    }
+    this.combat.forceTick()
+    return 'combat_tick'
   }
 
   // ------------------------------------------------------- built-in actions

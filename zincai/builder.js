@@ -45,6 +45,69 @@ function parseLayer (layer) {
   return rows
 }
 
+// ============================================================================
+// Phased decomposition — the LLM plans in phases, the executor places them.
+//
+//   foundation  →  walls (with windows)  →  roof  →  detailing/interior
+//
+// The phase of a block is derived from geometry (vertical position) and
+// material role (doors/glass/torches are detailing even at ground level), so
+// the model never has to emit coordinates. Every block belongs to exactly ONE
+// phase, which makes per-phase builds idempotent: re-running a phase only
+// fills what is missing.
+// ============================================================================
+
+const PHASE_ORDER = ['foundation', 'walls', 'roof', 'detailing']
+const PHASE_ALIASES = {
+  foundation: 'foundation',
+  base: 'foundation',
+  walls: 'walls',
+  wall: 'walls',
+  walls_with_windows: 'walls',
+  wall_with_windows: 'walls',
+  roof: 'roof',
+  roofing: 'roof',
+  detailing: 'detailing',
+  details: 'detailing',
+  interior: 'detailing',
+  interior_details: 'detailing'
+}
+
+/** Decorative / fixture blocks: detailing wherever they sit vertically. */
+const DETAILING_BLOCK_RE = /(door|trapdoor|fence_gate|glass|pane|torch|lantern|candle|campfire|chest|barrel|shulker|bed|sign|banner|painting|item_frame|flower_pot|carpet|bookshelf|crafting_table|furnace|smoker|anvil|cauldron|brewing_stand|enchanting_table|ladder|rail|button|lever|pressure_plate|skull|head|bell|composter|lectern|loom|cartography_table|smithing_table|stonecutter|grindstone|beehive|note_block|jukebox|respawn_anchor)/
+
+const isDetailingBlock = (name) => DETAILING_BLOCK_RE.test(String(name || '').toLowerCase())
+
+/**
+ * Split a block list into the four canonical phases. Deterministic, pure and
+ * lossless: concatenating the phases yields every input block exactly once.
+ * @param {Array<{dy:number,name:string}>} blocks
+ * @returns {{foundation:Array, walls:Array, roof:Array, detailing:Array}}
+ */
+function decomposePhases (blocks) {
+  const out = { foundation: [], walls: [], roof: [], detailing: [] }
+  const list = (blocks || []).filter(Boolean)
+  if (!list.length) return out
+  let minY = Infinity
+  let maxY = -Infinity
+  for (const b of list) {
+    const y = Number.isFinite(b.dy) ? b.dy : 0
+    if (y < minY) minY = y
+    if (y > maxY) maxY = y
+  }
+  const span = maxY - minY
+  // Top quarter becomes roof; flat structures (span < 3) have no roof band.
+  const roofStart = span >= 3 ? maxY - Math.max(1, Math.round(span * 0.25)) : maxY + 1
+  for (const b of list) {
+    const y = Number.isFinite(b.dy) ? b.dy : 0
+    if (isDetailingBlock(b.name)) out.detailing.push(b)
+    else if (y <= minY) out.foundation.push(b)
+    else if (y > roofStart) out.roof.push(b)
+    else out.walls.push(b)
+  }
+  return out
+}
+
 /**
  * BlueprintParser — pure parsing/planning, no bot needed (unit-testable).
  */
@@ -128,6 +191,16 @@ class BlueprintParser {
   }
 
   /**
+   * Expose the phase split for callers that want to pre-flight per stage.
+   * @param {Array<{dy:number,name:string}>} blocks
+   */
+  decompose (blocks) {
+    const phases = decomposePhases(blocks)
+    const counts = Object.fromEntries(PHASE_ORDER.map((p) => [p, phases[p].length]))
+    return { phases, counts, order: PHASE_ORDER }
+  }
+
+  /**
    * Build the execution plan.
    *
    * @param {{blocks:Array}} parsed
@@ -141,17 +214,22 @@ class BlueprintParser {
     // Absolute `at` origin wins; otherwise blueprint y=0 sits on the bot's floor.
     const originY = Number.isFinite(Number(origin?.y)) ? Math.floor(origin.y) : Math.floor(botPos.y)
     const standBase = Math.floor(botPos.y)
+    const phaseBuckets = decomposePhases(parsed.blocks)
+    const phaseOf = new Map()
+    for (const phase of PHASE_ORDER) {
+      for (const b of phaseBuckets[phase]) phaseOf.set(b, phase) // identity-keyed
+    }
     const steps = []
     for (const b of parsed.blocks) {
       const worldY = originY + b.dy
       const topReach = standBase + this.reach
       const needsTower = worldY > topReach + 0.0
-      steps.push({ x: origin.x + b.dx, y: worldY, z: origin.z + b.dz, name: b.name, needsTower, localDy: b.dy })
+      steps.push({ x: origin.x + b.dx, y: worldY, z: origin.z + b.dz, name: b.name, needsTower, localDy: b.dy, phase: phaseOf.get(b) || 'walls' })
     }
     const maxY = originY + maxLocalY
     const towerNeeded = maxY > standBase + this.reach
     const towerHeight = towerNeeded ? Math.ceil(maxY - (standBase + this.reach)) : 0
-    return { steps, towerNeeded, maxY, towerHeight, originY }
+    return { steps, towerNeeded, maxY, towerHeight, originY, phaseCounts: Object.fromEntries(Object.entries(phaseBuckets).map(([k, v]) => [k, v.length])) }
   }
 }
 
@@ -371,17 +449,38 @@ class BuilderExecutor {
   }
 
   /**
-   * Execute a full plan. Returns compact stats for the LLM.
+   * Execute a plan (optionally one phase at a time).
+   *
+   * Placement is IDEMPOTENT: a cell that already holds the right block is
+   * counted as `alreadyPresent` and never re-placed. Steps are always ordered
+   * foundation → walls → roof → detailing, then bottom-to-top inside a phase,
+   * so a re-run after a disconnect resumes exactly where the world left off.
+   *
+   * @param {{steps:Array}} plan
+   * @param {{stage?:string}} [opts] restrict to one hierarchical phase
+   * @returns {Promise<{ok:boolean, placed:number, alreadyPresent:number,
+   *   skipped:string[], missing:Array, towerUsed:number, stage:string|null}>}
    */
-  async build (plan) {
+  async build (plan, { stage = null } = {}) {
     this.cancelRequested = false
     const bot = this.bot
+    const wanted = normalizeStage(stage)
     let placed = 0
+    let alreadyPresent = 0
     const skipped = []
     let towerUsed = 0
-    for (const step of plan.steps) {
-      if (this.cancelRequested) return { ok: false, reason: 'cancelled', placed, skipped, missing: [], towerUsed }
+    const steps = [...plan.steps]
+      .map((s, i) => ({ ...s, _i: i, phase: s.phase || 'walls' }))
+      .filter((s) => (wanted ? s.phase === wanted : true))
+      .sort((a, b) => (PHASE_ORDER.indexOf(a.phase) - PHASE_ORDER.indexOf(b.phase)) || (a.y - b.y) || (a._i - b._i))
+    for (const step of steps) {
+      if (this.cancelRequested) return { ok: false, reason: 'cancelled', placed, alreadyPresent, skipped, missing: [], towerUsed, stage: wanted }
       const target = new (require('vec3').Vec3)(step.x, step.y, step.z)
+      // Idempotency: the world may already match (previous run, another builder).
+      try {
+        const existing = bot.blockAt?.(target)
+        if (existing && existing.name === step.name) { alreadyPresent++; placed++; continue }
+      } catch { /* unloaded cell — fall through to place */ }
       const needed = step.y - Math.floor(bot.entity.position.y)
       if (needed > 4) {
         const before = this._count(this.scaffoldBlocks[0])
@@ -394,7 +493,7 @@ class BuilderExecutor {
       else skipped.push(`${step.name}@${step.x},${step.y},${step.z}`)
     }
     // Tower blocks are consumed from scaffold inventory — caller reports usage.
-    return { ok: skipped.length === 0, placed, skipped, missing: [], towerUsed }
+    return { ok: skipped.length === 0, placed, alreadyPresent, skipped, missing: [], towerUsed, stage: wanted }
   }
 }
 
@@ -543,10 +642,15 @@ function generateShape (shape, p = {}, block = 'stone') {
   return B
 }
 
-/** Hierarchical stage label used in events/prompt (foundation → walls → roof → detailing). */
+/**
+ * Hierarchical stage label used in events/prompt.
+ * Accepts the LLM's natural phase names as well as the canonical four:
+ *   foundation | walls | walls_with_windows | roof | interior_details | detailing
+ * Unknown labels return null (the caller then builds the whole plan).
+ */
 function normalizeStage (s) {
-  const v = String(s || '').toLowerCase().trim()
-  return ['foundation', 'walls', 'roof', 'detailing'].includes(v) ? v : null
+  const v = String(s || '').toLowerCase().trim().replace(/[\s-]+/g, '_')
+  return PHASE_ALIASES[v] || null
 }
 
-module.exports = { BlueprintParser, BuilderExecutor, BLUEPRINT_DIR, generateShape, normalizeStage }
+module.exports = { BlueprintParser, BuilderExecutor, BLUEPRINT_DIR, generateShape, normalizeStage, decomposePhases, PHASE_ORDER, PHASE_ALIASES, isDetailingBlock }

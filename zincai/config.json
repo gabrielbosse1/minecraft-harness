@@ -62,5 +62,41 @@
     ],
     "fallVelocityThreshold": -0.35,
     "tickMs": 200
+  },
+  "combat": {
+    "_note": "Elite System-1 combat. critThreshold gates every swing on the vanilla attack indicator (0.85 = >=85% charged, max-damage window).",
+    "critThreshold": 0.85,
+    "recoveryMs": 220,
+    "attackCooldownMs": 600,
+    "disengageHealthFraction": 0.3
+  },
+  "threat": {
+    "_note": "PredictiveThreatMap: project hostile velocity 40 ticks (~2s) ahead and inject node penalties into A*.",
+    "horizonTicks": 40,
+    "sampleMs": 200,
+    "maxRadius": 24,
+    "penaltyScale": 26,
+    "maxPenalty": 60,
+    "includePlayers": false,
+    "maxSpeed": 1.0
+  },
+  "traversal": {
+    "_note": "Wind-charge traversal. Used only when A* reports noPath across a 3-5 wide gap or <=4 high wall.",
+    "windCharge": true,
+    "maxChain": 3,
+    "minGap": 3,
+    "maxGap": 5,
+    "maxWall": 4
+  },
+  "scout": {
+    "_note": "Startup/respawn Scout & Relocate. Evaluates a 30x30 area and WALKS to the safest anchor; never /tp or /setworldspawn.",
+    "radius": 15,
+    "step": 3,
+    "minRadius": 5,
+    "preferRadius": 12,
+    "relocateAboveBlocks": 6,
+    "waitForWorldMs": 6000,
+    "relocateTimeoutMs": 25000,
+    "deathAvoidRadius": 12
   }
 }

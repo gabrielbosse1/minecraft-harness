@@ -24,18 +24,765 @@
  *   4. Human movement mimicry: ±2° yaw/pitch micro-jitter, variable
  *      sprint/walk cycles (never 100% sprint), forced walk near hazards,
  *      and 200–800ms idle pauses when the heading changes abruptly.
+ *   5. PredictiveThreatMap: every 200 ms each hostile's velocity is sampled
+ *      and projected 30–40 ticks (1.5–2 s) forward. The projected endpoint
+ *      (a "kill sphere") and the enemy→bot line (a "corridor") are injected
+ *      into A* as node cost via the upstream `exclusionAreasStep` hook. Goal
+ *      candidates are ranked by distance AND cumulative route threat.
+ *   6. WindChargeTraversal: when A* reports noPath and the obstruction is a
+ *      3–5 block gap or a ≤4 block wall, the bot equips `wind_charge`, aims
+ *      along a computed ballistic angle, right-clicks, then jumps. Chaining
+ *      is allowed while more charges remain.
+ *   7. scoutSafeAnchor(): pure 30×30 safe-anchor search used by the startup
+ *      "Scout & Relocate" routine. Client-side only — no commands, no /tp.
  */
 'use strict'
 
 const PATCH_MARK = Symbol.for('zincai.pathfinder.patched')
 const DEG = Math.PI / 180
+const TICK_MS = 50
 
 const isDoorOrTrapdoorName = (name) => (/_door$/i.test(name) || /_trapdoor$/i.test(name)) && !/iron/i.test(name)
 
+/**
+ * Hostiles relevant to movement/combat threat. Kept as a regex (not a Set) so
+ * variants like zombie_villager / bogged match without maintenance.
+ */
+const HOSTILE_RE = /zombie|husk|drowned|skeleton|stray|wither_skeleton|creeper|spider|cave_spider|enderman|witch|pillager|vindicator|evoker|ravager|vex|phantom|blaze|ghast|slime|magma_cube|hoglin|zoglin|piglin_brute|guardian|elder_guardian|warden|breeze|bogged|silverfish|shulker/i
+
+const isHostileName = (name) => HOSTILE_RE.test(String(name || ''))
+
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v))
+const dist3 = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z)
+const dist2 = (a, b) => Math.hypot(a.x - b.x, a.z - b.z)
+
+/** Positional projection helper (pure; used by tests and the live map). */
+function projectFuture (position, velocity, ticks = 40) {
+  if (!position) return null
+  const v = velocity || { x: 0, y: 0, z: 0 }
+  return {
+    x: position.x + (Number(v.x) || 0) * ticks,
+    y: position.y + (Number(v.y) || 0) * ticks,
+    z: position.z + (Number(v.z) || 0) * ticks
+  }
+}
+
+/** Squared distance from point p to segment ab (all plain {x,y,z}). */
+function pointSegmentDistance (p, a, b) {
+  const abx = b.x - a.x
+  const aby = b.y - a.y
+  const abz = b.z - a.z
+  const apx = p.x - a.x
+  const apy = p.y - a.y
+  const apz = p.z - a.z
+  const denom = abx * abx + aby * aby + abz * abz
+  const t = denom < 1e-9 ? 0 : clamp((apx * abx + apy * aby + apz * abz) / denom, 0, 1)
+  return Math.hypot(apx - abx * t, apy - aby * t, apz - abz * t)
+}
+
+// ===========================================================================
+// PredictiveThreatMap
+// ===========================================================================
+/**
+ * Real-time threat field over the local world.
+ *
+ * For every hostile within `radius` we keep:
+ *   - current position + velocity (measured, or estimated from position delta),
+ *   - `future` = position + velocity * horizonTicks   (30–40 ticks ≈ 1.5–2 s),
+ *   - a scalar weight derived from distance, speed, mob type and whether the
+ *     enemy is actually closing on the bot.
+ *
+ * `costAt(node)` returns an A* node penalty (0..maxPenalty). Two shapes feed it:
+ *   · KILL SPHERE  — a ball around the projected point (radius `futureRadius`);
+ *   · CORRIDOR     — the capsule between the enemy and the bot's *sampled*
+ *                    position, i.e. the path a projectile/charge would take.
+ *
+ * Sampling is throttled to `sampleMs` (200 ms default) so 20 Hz physics ticks
+ * never pay for it, and entries expire so a despawned mob stops scaring A*.
+ */
+class PredictiveThreatMap {
+  /**
+   * @param {{
+   *   horizonTicks?: number, sampleMs?: number, maxRadius?: number,
+   *   futureRadius?: number, corridorRadius?: number, penaltyScale?: number,
+   *   maxPenalty?: number, engageWeight?: number, logger?: Function,
+   *   now?: () => number, ttlMs?: number, includePlayers?: boolean,
+   *   maxSpeed?: number
+   * }} [opts]
+   */
+  constructor (opts = {}) {
+    this.horizonTicks = Number.isFinite(opts.horizonTicks) ? opts.horizonTicks : 40 // 2 s
+    this.sampleMs = Number.isFinite(opts.sampleMs) ? opts.sampleMs : 200
+    this.maxRadius = Number.isFinite(opts.maxRadius) ? opts.maxRadius : 24
+    this.futureRadius = Number.isFinite(opts.futureRadius) ? opts.futureRadius : Math.max(1.5, this.horizonTicks / 20)
+    this.corridorRadius = Number.isFinite(opts.corridorRadius) ? opts.corridorRadius : 1.6
+    this.penaltyScale = Number.isFinite(opts.penaltyScale) ? opts.penaltyScale : 26
+    // Upstream treats >=100 as "impossible" in some safeOrBreak paths — never
+    // cross that line, threat should reroute A*, not brick it.
+    this.maxPenalty = Number.isFinite(opts.maxPenalty) ? Math.min(95, opts.maxPenalty) : 60
+    this.engageWeight = Number.isFinite(opts.engageWeight) ? opts.engageWeight : 0.35
+    this.ttlMs = Number.isFinite(opts.ttlMs) ? opts.ttlMs : this.sampleMs * 3
+    // Hostile players are threats too — opt-in because casual servers have
+    // friends standing next to you. index.js enables this with behavior.pvpEnabled.
+    this.includePlayers = opts.includePlayers === true
+    // Sanity ceiling (blocks/tick). Enderman teleports and knockback arrive as
+    // huge position deltas; without this clamp they project 40-block phantom
+    // kill zones and A* refuses to move at all.
+    this.maxSpeed = Number.isFinite(opts.maxSpeed) ? opts.maxSpeed : 1.0
+    this.now = typeof opts.now === 'function' ? opts.now : () => Date.now()
+    this.logger = opts.logger || (() => {})
+
+    /** @type {Array<object>} live threats (projected + weighted) */
+    this.threats = []
+    this.anchor = null // bot position at last sample (corridor target)
+    this._prev = new Map() // id -> { position, at }
+    this._lastSample = 0
+    this._lastSummary = ''
+    this._samples = 0
+  }
+
+  /** Hostiles within `radius` of the bot, nearest first. */
+  scan (bot) {
+    const out = []
+    if (!bot?.entity?.position) return out
+    const me = bot.entity.position
+    for (const id of Object.keys(bot.entities || {})) {
+      const e = bot.entities[id]
+      if (!e || !e.position || e === bot.entity) continue
+      const isPlayer = e.type === 'player' || e.name === 'player'
+      if (isPlayer) {
+        if (!this.includePlayers) continue
+      } else if (!isHostileName(e.name)) continue
+      const d = dist3(e.position, me)
+      if (d > this.maxRadius) continue
+      out.push({ entity: e, distance: d, isPlayer })
+    }
+    out.sort((a, b) => a.distance - b.distance)
+    return out
+  }
+
+  /** Clamp absurd deltas (teleport packets, knockback) to a sane speed. */
+  _saneVelocity (v) {
+    const speed = Math.hypot(v.x, v.y, v.z)
+    if (!(speed > this.maxSpeed)) return v
+    const k = this.maxSpeed / speed
+    return { x: v.x * k, y: v.y * k, z: v.z * k }
+  }
+
+  /** Measured velocity when the engine exposes it; otherwise finite-difference. */
+  velocityOf (entity, nowMs) {
+    const v = entity.velocity
+    if (v && (Math.abs(v.x) + Math.abs(v.y) + Math.abs(v.z)) > 1e-4) {
+      return this._saneVelocity({ x: Number(v.x) || 0, y: Number(v.y) || 0, z: Number(v.z) || 0 })
+    }
+    const prev = this._prev.get(entity.id)
+    if (prev && nowMs > prev.at) {
+      const ticks = Math.max(1, (nowMs - prev.at) / TICK_MS)
+      const est = {
+        x: (entity.position.x - prev.position.x) / ticks,
+        y: (entity.position.y - prev.position.y) / ticks,
+        z: (entity.position.z - prev.position.z) / ticks
+      }
+      // A stationary sample cluster is noise, not a velocity.
+      if (Math.hypot(est.x, est.y, est.z) < 0.002) return { x: 0, y: 0, z: 0 }
+      return this._saneVelocity(est)
+    }
+    return { x: 0, y: 0, z: 0 }
+  }
+
+  /** Threat weight ∈ [0.4, ~4.5]: proximity, speed, type, closing rate. */
+  _weight (entity, pos, velocity, botPos) {
+    const d = clamp(dist3(pos, botPos) / this.maxRadius, 0, 1)
+    let w = 0.4 + (1 - d) * 1.6
+    const speed = Math.hypot(velocity.x, velocity.z)
+    w += clamp(speed / 0.30, 0, 1) * 0.8
+    const name = String(entity.name || '').toLowerCase()
+    if (entity.type === 'player' || name === 'player') w *= 1.3 // armed players close fast
+    if (/creeper|breeze/.test(name)) w *= 1.5 // explosion / wind burst
+    if (/warden|ravager|wither/.test(name)) w *= 1.8
+    if (/phantom|vex/.test(name)) w *= 1.2 // 3D approach
+    // Closing rate: velocity projected onto the enemy→bot axis.
+    const ax = botPos.x - pos.x
+    const az = botPos.z - pos.z
+    const alen = Math.hypot(ax, az) || 1
+    const closing = (velocity.x * ax + velocity.z * az) / alen
+    if (closing > 0.02) w *= 1 + clamp(closing / 0.3, 0, 1) * 0.35
+    return w
+  }
+
+  /**
+   * Refresh the threat field. Throttled to `sampleMs` unless `force`.
+   * @returns {Array<object>} current threats
+   */
+  sample (bot, force = false) {
+    const now = this.now()
+    if (!force && now - this._lastSample < this.sampleMs) return this.threats
+    this._lastSample = now
+    this._samples++
+    if (!bot?.entity?.position) { this.threats = []; this.anchor = null; return this.threats }
+
+    const botPos = { x: bot.entity.position.x, y: bot.entity.position.y, z: bot.entity.position.z }
+    this.anchor = botPos
+    const threats = []
+    for (const { entity, distance } of this.scan(bot)) {
+      const pos = { x: entity.position.x, y: entity.position.y, z: entity.position.z }
+      const velocity = this.velocityOf(entity, now)
+      const future = projectFuture(pos, velocity, this.horizonTicks)
+      // Gravity makes naive vertical extrapolation dishonest: a jumping mace
+      // user with vy=0.42 would project 16 blocks into the sky. Keep the kill
+      // sphere near the ground plane (±3 blocks), which is where the hit lands.
+      future.y = pos.y + clamp((velocity.y || 0) * this.horizonTicks, -3, 3)
+      threats.push({
+        id: entity.id,
+        name: String(entity.name || 'hostile').toLowerCase(),
+        position: pos,
+        velocity,
+        future,
+        distance,
+        speed: Math.hypot(velocity.x, velocity.z),
+        weight: this._weight(entity, pos, velocity, botPos),
+        radius: this.futureRadius,
+        corridorRadius: this.corridorRadius,
+        sampledAt: now,
+        expiresAt: now + this.ttlMs
+      })
+      this._prev.set(entity.id, { position: pos, at: now })
+    }
+    // Drop stale trackers (despawns) and expired threats.
+    const liveIds = new Set(threats.map((t) => t.id))
+    for (const id of this._prev.keys()) if (!liveIds.has(id)) this._prev.delete(id)
+    this.threats = threats.filter((t) => t.expiresAt > now).slice(0, 12)
+    this._lastSummary = this._buildSummary()
+    return this.threats
+  }
+
+  /** Keep the field warm even when no navigation is active. */
+  tick (bot) { return this.sample(bot) }
+
+  /**
+   * Cumulative threat score at a world point. 0 = safe, ~1 = standing in a
+   * projected kill sphere. Not clamped: overlapping mobs stack.
+   */
+  threatScoreAt (point, { yWeight = 0.45 } = {}) {
+    if (!point) return 0
+    let score = 0
+    for (const t of this.threats) {
+      if (!t || t.expiresAt <= this.now()) continue
+      const df = Math.hypot(point.x - t.future.x, (point.y - t.future.y) * yWeight, point.z - t.future.z)
+      if (df < t.radius) score += (1 - df / t.radius) * t.weight
+      if (this.anchor) {
+        const dLine = pointSegmentDistance(point, t.position, this.anchor)
+        if (dLine < t.corridorRadius) score += (1 - dLine / t.corridorRadius) * t.weight * 0.75
+      }
+    }
+    return score
+  }
+
+  /** Integer A* node penalty, bounded below upstream's hard "impossible" line. */
+  costAt (point) {
+    if (!point || this.threats.length === 0) return 0
+    return Math.round(clamp(this.threatScoreAt(point) * this.penaltyScale, 0, this.maxPenalty))
+  }
+
+  /** Cumulative threat along a straight route, sampled every ~2 blocks. */
+  pathThreat (from, to, samples = 12) {
+    if (!from || !to) return 0
+    let sum = 0
+    const n = Math.max(2, Math.min(32, samples))
+    for (let i = 1; i <= n; i++) {
+      const t = i / n
+      sum += this.threatScoreAt({ x: from.x + (to.x - from.x) * t, y: from.y + (to.y - from.y) * t, z: from.z + (to.z - from.z) * t })
+    }
+    return sum / n
+  }
+
+  /**
+   * Priority routing: rank candidate destinations by
+   *   score = distance + threatLambda * routeThreat * (1 + distance / 8)
+   * so a route twice as long but through open ground beats a short murder alley.
+   * @param {Array<{x:number,y:number,z:number}>} candidates
+   * @param {{x,y,z}} from
+   * @param {{lambda?:number, samples?:number}} [opts]
+   */
+  rankGoals (candidates, from, { lambda = 14, samples = 12 } = {}) {
+    if (!Array.isArray(candidates) || !from) return []
+    return candidates
+      .filter((c) => c && Number.isFinite(c.x) && Number.isFinite(c.z))
+      .map((c) => {
+        const distance = dist2(from, c)
+        const threat = this.pathThreat(from, c, samples)
+        return { ...c, distance, threat, score: distance + lambda * threat * (1 + distance / 8) }
+      })
+      .sort((a, b) => a.score - b.score)
+  }
+
+  /** Weighted unit vector (XZ) pointing away from where the threats WILL be. */
+  escapeVector (from) {
+    if (!from) return { x: 1, z: 0 }
+    let sx = 0
+    let sz = 0
+    for (const t of this.threats) {
+      if (!t || t.expiresAt <= this.now()) continue
+      const p = t.future || t.position
+      const dx = from.x - p.x
+      const dz = from.z - p.z
+      const len = Math.hypot(dx, dz)
+      if (len < 0.01) { sx += 1; continue }
+      // Closer projected threats dominate the escape direction.
+      const w = t.weight * (1 + clamp(1 - len / this.maxRadius, 0, 1))
+      sx += (dx / len) * w
+      sz += (dz / len) * w
+    }
+    const len = Math.hypot(sx, sz)
+    if (len < 0.01) return { x: 1, z: 0 }
+    return { x: sx / len, z: sz / len }
+  }
+
+  /** One compact line for logs/prompts — never a block dump. */
+  _buildSummary () {
+    if (!this.threats.length) return 'threats: none'
+    const parts = this.threats.slice(0, 3).map((t) => `${t.name} ${t.distance.toFixed(1)}m→${Math.round(t.speed * 20)}m/s`)
+    const maxScore = Math.max(...this.threats.map((t) => t.weight))
+    const near = this.threats[0]
+    const closing = near.speed > 0.05 ? ', closing' : ''
+    return `threats: ${parts.join(', ')}${closing}${maxScore > 3 ? ' — HIGH' : ''}`
+  }
+
+  summary () {
+    if (!this.threats.length) return this._lastSummary || 'threats: none'
+    return this._lastSummary || this._buildSummary()
+  }
+
+  /**
+   * Inject the live field into A* through the upstream-sanctioned hook.
+   * `exclusionAreasStep` functions receive a block and return extra cost.
+   * @returns {boolean} true when attached
+   */
+  attachToMovements (movements) {
+    if (!movements || !Array.isArray(movements.exclusionAreasStep)) return false
+    if (movements.exclusionAreasStep.some((fn) => fn && fn._zincaiThreatCost)) return true
+    const fn = (block) => this.costAt(block?.position)
+    fn._zincaiThreatCost = true
+    movements.exclusionAreasStep.push(fn)
+    return true
+  }
+
+  /** Test/teardown helper. */
+  clear () {
+    this.threats = []
+    this.anchor = null
+    this._prev.clear()
+    this._lastSummary = ''
+  }
+
+  get sampleCount () { return this._samples }
+}
+
+// ===========================================================================
+// WindChargeTraversal
+// ===========================================================================
+const WIND_CHARGE_ITEM = 'wind_charge'
+
+/**
+ * Vanilla wind-charge traversal. A wind charge pushes entities away from the
+ * burst point; a player who jumps and detonates it at the ground below/behind
+ * gets a large vertical + horizontal impulse. This class computes whether the
+ * obstruction in front is a 3–5 wide gap or a ≤4 high wall, then performs:
+ *
+ *   equip wind_charge → look along computed angle → activateItem() → jump
+ *
+ * Chaining is supported and capped (`maxChain`) so a ravine too wide for one
+ * burst can be crossed with two or three — each is a real item from the hotbar.
+ */
+class WindChargeTraversal {
+  /**
+   * @param {import('mineflayer').Bot} bot
+   * @param {{ maxChain?:number, minGap?:number, maxGap?:number, maxWall?:number,
+   *           logger?:Function, now?:() => number, enabled?:boolean }} [opts]
+   */
+  constructor (bot, opts = {}) {
+    this.bot = bot
+    this.maxChain = Number.isFinite(opts.maxChain) ? opts.maxChain : 3
+    this.minGap = Number.isFinite(opts.minGap) ? opts.minGap : 3
+    this.maxGap = Number.isFinite(opts.maxGap) ? opts.maxGap : 5
+    this.maxWall = Number.isFinite(opts.maxWall) ? opts.maxWall : 4
+    this.enabled = opts.enabled !== false
+    this.logger = opts.logger || (() => {})
+    this.now = typeof opts.now === 'function' ? opts.now : () => Date.now()
+    this._busy = false
+    this.lastActionAt = 0
+  }
+
+  /** All wind charges carried (any slot). */
+  charges () {
+    try {
+      return (this.bot.inventory?.items?.() || []).filter((i) => i && i.name === WIND_CHARGE_ITEM)
+    } catch { return [] }
+  }
+
+  count () { return this.charges().reduce((s, i) => s + (i.count || 1), 0) }
+
+  hasCharges () { return this.count() > 0 }
+
+  _blockAt (x, y, z) {
+    try {
+      const { Vec3 } = require('vec3')
+      return this.bot.blockAt(new Vec3(Math.round(x), Math.round(y), Math.round(z)))
+    } catch { return null }
+  }
+
+  _solidAt (x, y, z) {
+    const b = this._blockAt(x, y, z)
+    if (!b) return true // unloaded chunk: assume solid, never gamble
+    return b.boundingBox === 'block'
+  }
+
+  _airAt (x, y, z) {
+    const b = this._blockAt(x, y, z)
+    return Boolean(b && (b.name === 'air' || b.name === 'cave_air' || b.name === 'void_air'))
+  }
+
+  /**
+   * Inspect the corridor in `direction` for a wind-charge-able obstruction.
+   * @param {{x:number,z:number}} direction unit XZ vector
+   * @param {{reach?:number}} [opts]
+   * @returns {null | {kind:'gap'|'wall', width?:number, height?:number,
+   *   distance:number, landing?:{x,y,z}, pitchDeg:number, direction:{x,z}}}
+   */
+  analyze (direction, { reach = 8 } = {}) {
+    const pos = this.bot.entity?.position
+    if (!pos) return null
+    const len = Math.hypot(direction?.x || 0, direction?.z || 0)
+    if (len < 1e-6) return null
+    const dx = direction.x / len
+    const dz = direction.z / len
+    const fx = Math.floor(pos.x)
+    const fy = Math.floor(pos.y)
+    const fz = Math.floor(pos.z)
+
+    // --- gap: floor disappears, then reappears within 3..5 blocks ----------
+    let gapStart = null
+    for (let d = 1; d <= reach; d++) {
+      const x = fx + Math.round(dx * d)
+      const z = fz + Math.round(dz * d)
+      const floorSolid = this._solidAt(x, fy - 1, z)
+      const bodyClear = !this._solidAt(x, fy, z) && !this._solidAt(x, fy + 1, z)
+      if (gapStart === null) {
+        if (!floorSolid && bodyClear) gapStart = d
+      } else if (floorSolid) {
+        const width = d - gapStart
+        if (width >= this.minGap && width <= this.maxGap) {
+          return {
+            kind: 'gap',
+            width,
+            distance: gapStart,
+            landing: { x: fx + Math.round(dx * (d + 1)), y: fy, z: fz + Math.round(dz * (d + 1)) },
+            // Aim down-forward: the burst under/behind the player converts
+            // sprint momentum into height + carry.
+            pitchDeg: -45,
+            direction: { x: dx, z: dz }
+          }
+        }
+        gapStart = null
+      }
+    }
+
+    // --- wall: 3..4 solid blocks in front with clear air above --------------
+    for (let d = 1; d <= 2; d++) {
+      const x = fx + Math.round(dx * d)
+      const z = fz + Math.round(dz * d)
+      let height = 0
+      for (let h = 0; h <= this.maxWall + 2; h++) {
+        if (this._solidAt(x, fy + h, z)) height++
+        else break
+      }
+      const topClear = this._airAt(x, fy + height, z) && this._airAt(x, fy + height + 1, z)
+      if (height >= this.minGap && height <= this.maxWall && topClear) {
+        return {
+          kind: 'wall',
+          height,
+          distance: d,
+          landing: { x: fx + Math.round(dx * (d + 1)), y: fy + height, z: fz + Math.round(dz * (d + 1)) },
+          // Nearly straight down: maximum vertical impulse to clear the lip.
+          pitchDeg: -68,
+          direction: { x: dx, z: dz }
+        }
+      }
+    }
+    return null
+  }
+
+  _yawFor (direction) {
+    // mineflayer look vector is (-sin yaw, cos yaw); 0 rad = +z (south).
+    return Math.atan2(-direction.x, direction.z)
+  }
+
+  /**
+   * Execute ONE wind charge. Exact order is part of the contract:
+   * equip → look → activateItem → jump.
+   * @returns {Promise<{ok:boolean, why?:string}>}
+   */
+  async use ({ pitchDeg = -45, direction = { x: 0, z: 1 } } = {}) {
+    if (!this.enabled) return { ok: false, why: 'disabled' }
+    const item = this.charges()[0]
+    if (!item) return { ok: false, why: 'no_charge' }
+    const bot = this.bot
+    try {
+      await bot.equip(item, 'hand')
+      await bot.look(this._yawFor(direction), pitchDeg * DEG, true)
+      bot.activateItem()
+      bot.setControlState('jump', true)
+      setTimeout(() => { try { bot.setControlState('jump', false) } catch { /* gone */ } }, 200)
+      this.lastActionAt = this.now()
+      this.logger('debug', `wind charge: ${pitchDeg}° toward ${direction.x.toFixed(2)},${direction.z.toFixed(2)} (${this.count()} left)`)
+      return { ok: true }
+    } catch (err) {
+      this.logger('warn', `wind charge failed: ${err.message || err}`)
+      return { ok: false, why: `equip_failed:${err.message || err}` }
+    }
+  }
+
+  /**
+   * Cross/scale the obstruction in `direction`, chaining charges when the first
+   * burst lands short. Stops as soon as the obstruction is no longer detected.
+   * @returns {Promise<{ok:boolean, used:number, why?:string, kind?:string}>}
+   */
+  async traverse (direction, { maxChain = this.maxChain } = {}) {
+    if (!this.enabled) return { ok: false, used: 0, why: 'disabled' }
+    if (!this.hasCharges()) return { ok: false, used: 0, why: 'no_charge' }
+    if (this._busy) return { ok: false, used: 0, why: 'busy' }
+    if (this.now() - this.lastActionAt < 300) return { ok: false, used: 0, why: 'cooldown' }
+    this._busy = true
+    let used = 0
+    let kind = null
+    try {
+      for (let i = 0; i < Math.max(1, maxChain); i++) {
+        if (!this.hasCharges()) break
+        const plan = this.analyze(direction)
+        if (i === 0 && !plan) return { ok: false, used, why: 'no_obstruction' }
+        if (i > 0 && !plan) break // cleared — momentum carries the rest
+        kind = plan.kind
+        const r = await this.use({ pitchDeg: plan.pitchDeg, direction: plan.direction })
+        if (!r.ok) return { ok: false, used, why: r.why, kind }
+        used++
+        await new Promise((res) => setTimeout(res, 420))
+      }
+      return { ok: used > 0, used, kind }
+    } finally {
+      this._busy = false
+    }
+  }
+
+  /** Aim at an arbitrary world point and traverse toward it. */
+  async traverseTo (goal) {
+    const pos = this.bot.entity?.position
+    if (!pos || !goal) return { ok: false, used: 0, why: 'no_position' }
+    const direction = { x: goal.x - pos.x, z: goal.z - pos.z }
+    if (Math.hypot(direction.x, direction.z) < 2) return { ok: false, used: 0, why: 'too_close' }
+    return this.traverse(direction)
+  }
+}
+
+// ===========================================================================
+// Scout & Relocate — pure safe-anchor search
+// ===========================================================================
+/** First standable ground Y at (x,z), scanning a small vertical window. */
+function findGroundY (bot, x, z, { up = 3, down = 6 } = {}) {
+  const pos = bot?.entity?.position
+  if (!pos) return null
+  const base = Math.floor(pos.y)
+  for (let y = base + up; y >= base - down; y--) {
+    try {
+      const { Vec3 } = require('vec3')
+      const ground = bot.blockAt(new Vec3(x, y - 1, z))
+      const feet = bot.blockAt(new Vec3(x, y, z))
+      const head = bot.blockAt(new Vec3(x, y + 1, z))
+      if (!ground || !feet || !head) continue
+      if (ground.boundingBox !== 'block') continue
+      const feetClear = feet.boundingBox !== 'block'
+      const headClear = head.boundingBox !== 'block'
+      if (feetClear && headClear) return y
+    } catch { return null }
+  }
+  return null
+}
+
+const HAZARD_NAMES = /lava|fire|magma|cactus|sweet_berry|powder_snow|wither_rose|campfire/
+
+/**
+ * Evaluate a 30×30 (radius 15) neighbourhood and pick the best organic anchor:
+ *   - as far as possible from hostile *projected* positions (vector away),
+ *   - no lava/fire/cactus/cliff within 2 blocks,
+ *   - open sky + standable ground preferred,
+ *   - not welded to the spawn point (prefer 8–20 blocks out).
+ * Pure: only `bot.blockAt`, `bot.entity`, `bot.entities` are touched.
+ *
+ * @param {{radius?:number, step?:number, maxThreatDistance?:number,
+ *   horizonTicks?:number, minRadius?:number, preferRadius?:number,
+ *   avoid?:Array<{x:number,z:number,radius?:number}>}} [opts]
+ *   `avoid` excludes cells near recent death points / known bad spots.
+ * @returns {null | {x:number,y:number,z:number,score:number,reasons:string[],
+ *   threats:number, away:{x:number,z:number}, hostiles:Array}}
+ */
+function scoutSafeAnchor (bot, {
+  radius = 15,
+  step = 3,
+  maxThreatDistance = 24,
+  horizonTicks = 40,
+  minRadius = 5,
+  preferRadius = 12,
+  avoid = []
+} = {}) {
+  const pos = bot?.entity?.position
+  if (!pos) return null
+
+  // --- hostile field: current + projected positions -----------------------
+  const hostiles = []
+  for (const id of Object.keys(bot.entities || {})) {
+    const e = bot.entities[id]
+    if (!e || !e.position || e === bot.entity) continue
+    if (e.type === 'player' || !isHostileName(e.name)) continue
+    const velocity = e.velocity || { x: 0, y: 0, z: 0 }
+    const future = projectFuture(e.position, velocity, horizonTicks)
+    hostiles.push({
+      name: String(e.name || 'hostile').toLowerCase(),
+      position: { x: e.position.x, y: e.position.y, z: e.position.z },
+      future,
+      speed: Math.hypot(velocity.x || 0, velocity.z || 0)
+    })
+  }
+
+  // Vector away from the mob centroid (mandate: "a vector away from the mobs").
+  let away = { x: 1, z: 0 }
+  if (hostiles.length) {
+    let cx = 0
+    let cz = 0
+    for (const h of hostiles) { cx += h.future.x; cz += h.future.z }
+    cx /= hostiles.length
+    cz /= hostiles.length
+    const ax = pos.x - cx
+    const az = pos.z - cz
+    const len = Math.hypot(ax, az)
+    away = len > 0.01 ? { x: ax / len, z: az / len } : { x: 1, z: 0 }
+  }
+
+  let best = null
+  const bx = Math.floor(pos.x)
+  const bz = Math.floor(pos.z)
+  for (let dx = -radius; dx <= radius; dx += step) {
+    for (let dz = -radius; dz <= radius; dz += step) {
+      const x = bx + dx
+      const z = bz + dz
+      const distFromBot = Math.hypot(dx, dz)
+      if (distFromBot < minRadius) continue // don't "relocate" onto our own feet
+      // Never re-anchor in the kill zone that just killed us.
+      let blacklisted = false
+      for (const a of avoid) {
+        if (!a || !Number.isFinite(a.x) || !Number.isFinite(a.z)) continue
+        if (Math.hypot(x - a.x, z - a.z) < (a.radius ?? 10)) { blacklisted = true; break }
+      }
+      if (blacklisted) continue
+      const y = findGroundY(bot, x, z)
+      if (y === null) continue
+      const candidate = { x, y, z }
+      const reasons = []
+
+      // Threat integral over projected hostile positions.
+      let threat = 0
+      for (const h of hostiles) {
+        const d = Math.hypot(x - h.future.x, z - h.future.z)
+        if (d < maxThreatDistance) threat += (1 - d / maxThreatDistance) * (1 + h.speed * 2)
+      }
+      if (threat === 0) reasons.push('no nearby threats')
+
+      // Local hazards — feet level AND the block we would stand on/step into.
+      let hazard = 0
+      let sky = 0
+      let water = 0
+      for (let oy = -1; oy <= 1; oy++) {
+        for (let ox = -2; ox <= 2; ox++) {
+          for (let oz = -2; oz <= 2; oz++) {
+            const b = (() => {
+              try {
+                const { Vec3 } = require('vec3')
+                return bot.blockAt(new Vec3(x + ox, y + oy, z + oz))
+              } catch { return null }
+            })()
+            if (!b) continue
+            if (HAZARD_NAMES.test(b.name || '')) hazard += oy === 0 ? 2 : 1
+            if (oy === 0 && (ox !== 0 || oz !== 0) && /water/.test(b.name || '')) water += 1
+          }
+        }
+      }
+      for (let oy = 1; oy <= 4; oy++) {
+        const b = (() => {
+          try {
+            const { Vec3 } = require('vec3')
+            return bot.blockAt(new Vec3(x, y + oy, z))
+          } catch { return null }
+        })()
+        if (b && b.boundingBox === 'block') sky += 1 // ceiling
+      }
+      // Ledge probe: a 2-block walk in each cardinal direction must still have
+      // floor within 3 blocks of our feet, otherwise the "safe" cell is a cliff.
+      let ledges = 0
+      for (const [ldx, ldz] of [[2, 0], [-2, 0], [0, 2], [0, -2]]) {
+        let hasFloor = false
+        for (let drop = 1; drop <= 3; drop++) {
+          const b = (() => {
+            try {
+              const { Vec3 } = require('vec3')
+              return bot.blockAt(new Vec3(x + ldx, y - drop, z + ldz))
+            } catch { return null }
+          })()
+          if (b && b.boundingBox === 'block') { hasFloor = true; break }
+        }
+        if (!hasFloor) ledges += 1
+      }
+      if (hazard > 0) reasons.push('hazard nearby')
+      if (ledges > 0) reasons.push('ledge nearby')
+      if (sky >= 4) reasons.push('enclosed')
+      if (water > 0) reasons.push('water access')
+
+      // Heads-away alignment with the hostile centroid.
+      const heading = distFromBot > 0.01 ? (dx * away.x + dz * away.z) / distFromBot : 0
+      if (heading > 0.5) reasons.push('away from mobs')
+
+      const score =
+        -threat * 10 -
+        hazard * 6 -
+        ledges * 2.5 -
+        sky * 1.5 +
+        water * 0.8 +
+        heading * 4 -
+        Math.abs(distFromBot - preferRadius) * 0.25
+
+      if (!best || score > best.score) {
+        best = {
+          x,
+          y,
+          z,
+          score: Math.round(score * 100) / 100,
+          reasons: reasons.length ? reasons : ['open ground'],
+          threats: hostiles.length,
+          away,
+          hostiles: hostiles.slice(0, 6)
+        }
+      }
+    }
+  }
+  return best
+}
+
+// ===========================================================================
+// PathfinderWrapper
+// ===========================================================================
 class PathfinderWrapper {
   /**
    * @param {import('mineflayer').Bot} bot
-   * @param {{ allowDigging?: boolean, doorCost?: number, jitterDegrees?: number, logger?: (level:string,msg:string)=>void }} [opts]
+   * @param {{ allowDigging?: boolean, doorCost?: number, jitterDegrees?: number,
+   *           logger?: (level:string,msg:string)=>void, fleeRadius?: number,
+   *           threat?: object, windCharge?: object, enableWindCharge?: boolean }} [opts]
    */
   constructor (bot, opts = {}) {
     this.bot = bot
@@ -60,6 +807,20 @@ class PathfinderWrapper {
     this._fleeUntil = 0
     this._lastFleeCheck = 0
     this._jumpSprintTimer = null
+
+    // --- v3: predictive threat + wind charge ------------------------------
+    this.threat = opts.threat instanceof PredictiveThreatMap
+      ? opts.threat
+      : new PredictiveThreatMap({ ...(opts.threat || {}), logger: this.log })
+    this.windCharge = opts.windCharge instanceof WindChargeTraversal
+      ? opts.windCharge
+      : new WindChargeTraversal(bot, { enabled: opts.enableWindCharge !== false, logger: this.log, ...(opts.windCharge || {}) })
+    this.enableWindCharge = opts.enableWindCharge !== false
+    this._threatTimer = null
+    this._windBusy = false
+    this._windAttempts = 0
+    this._onPathUpdate = null
+    this._appliedOnce = false
   }
 
   /** Modes: 'builder' | 'hunter' | 'explorer' */
@@ -70,6 +831,7 @@ class PathfinderWrapper {
       if (this.mode === 'builder') { m.allowSprinting = false; m.maxDropDown = 1 }
       else if (this.mode === 'hunter') { m.allowSprinting = true; m.maxDropDown = 4 }
       else { m.allowSprinting = true; m.maxDropDown = 4 }
+      this.threat.attachToMovements(m)
     }
     // Hunter: rhythmic jump pulses while sprinting — parkour over 1-block gaps.
     clearInterval(this._jumpSprintTimer)
@@ -109,22 +871,102 @@ class PathfinderWrapper {
 
   /**
    * Apply all patches against THIS bot's loaded pathfinder package.
-   * Call AFTER bot.loadPlugin(pathfinder).
+   * Call AFTER bot.loadPlugin(pathfinder) and setMovements().
    */
   apply () {
+    // Mineflayer re-emits `spawn` on respawn; never double-register timers or
+    // physicsTick listeners. New Movements objects still get threat costs.
+    if (this._appliedOnce) {
+      const movements = this._movements()
+      if (movements) this.threat.attachToMovements(movements)
+      return this._applied
+    }
+    this._appliedOnce = true
     this._patchDigging()
     this._patchDoors()
     this._startHumanizer()
+    this._startThreatMap()
     this._onTick(this._fleeTick.bind(this))
     return this._applied
   }
 
+  /** 200 ms threat sampling + dynamic A* cost injection + wind recovery. */
+  _startThreatMap () {
+    const movements = this._movements()
+    if (movements) this.threat.attachToMovements(movements)
+    clearInterval(this._threatTimer)
+    this._threatTimer = setInterval(() => {
+      try { this.threat.sample(this.bot) } catch (err) { this.log('debug', `threat sample failed: ${err.message || err}`) }
+    }, this.threat.sampleMs)
+    // Sample immediately so the first path is already threat-aware.
+    try { this.threat.sample(this.bot, true) } catch { /* no entity yet */ }
+
+    if (this.enableWindCharge && !this._onPathUpdate) {
+      this._onPathUpdate = (result) => {
+        // A* admitted defeat: is the blocker a gap/wall a wind charge can beat?
+        if (!result || result.status !== 'noPath') return
+        this._windChargeRecovery().catch((err) => this.log('debug', `wind recovery failed: ${err.message || err}`))
+      }
+      this.bot.on('path_update', this._onPathUpdate)
+    }
+    this.log('info', `predictive threat map on (horizon ${this.threat.horizonTicks}t, sample ${this.threat.sampleMs}ms, maxPenalty ${this.threat.maxPenalty})`)
+  }
+
+  /** Attempt wind-charge traversal toward the active goal after A* noPath. */
+  async _windChargeRecovery () {
+    if (this._windBusy || !this.windCharge.hasCharges()) return { ok: false, why: 'unavailable' }
+    const target = this._goalPosition()
+    if (!target) return { ok: false, why: 'no_goal' }
+    const pos = this.bot.entity?.position
+    if (!pos) return { ok: false, why: 'no_position' }
+    const direction = { x: target.x - pos.x, z: target.z - pos.z }
+    if (Math.hypot(direction.x, direction.z) < 2) return { ok: false, why: 'too_close' }
+    this._windBusy = true
+    try {
+      const plan = this.windCharge.analyze(direction)
+      if (!plan) return { ok: false, why: 'not_traversable' }
+      const result = await this.windCharge.traverse(direction, { maxChain: this.windCharge.charges().length > 1 ? 3 : 1 })
+      if (result.used > 0) {
+        this._windAttempts++
+        this.log('info', `wind charge: ${plan.kind} ${plan.kind === 'gap' ? `${plan.width}w` : `${plan.height}h`} — ${result.used} charge(s)`)
+      }
+      return result
+    } finally {
+      this._windBusy = false
+    }
+  }
+
+  /** Best-effort world position of the active pathfinder goal (Vec3-like). */
+  _goalPosition () {
+    const goal = this.bot.pathfinder?.goal
+    if (!goal) return null
+    if (Number.isFinite(goal.x) && Number.isFinite(goal.z)) return { x: goal.x, y: goal.y, z: goal.z }
+    const e = goal.entity?.position
+    if (e) return { x: e.x, y: e.y, z: e.z }
+    return null
+  }
+
+  /** Threat-aware path to a coordinate; returns the ranked winner. */
+  pathTo (x, y, z, { range = 1, lambda = 14 } = {}) {
+    const pos = this.bot.entity?.position
+    if (!pos) return null
+    const { goals } = require('mineflayer-pathfinder')
+    this.threat.sample(this.bot, true)
+    const ranked = this.threat.rankGoals([{ x, y, z }], pos, { lambda })
+    const best = ranked[0] || { x, y, z, score: 0 }
+    try { this.bot.pathfinder.setGoal(new goals.GoalNear(best.x, best.y, best.z, range), true) } catch (err) {
+      this.log('debug', `pathTo failed: ${err.message || err}`)
+      return null
+    }
+    return best
+  }
+
   // ------------------------------------------------ enemy-flee inversion--
   /**
-   * Emergency reflex: nearest hostile closer than fleeRadius => invert the goal
-   * and run AWAY at speed, with jumping. <1.5m is treated as melee and left to
-   * the combat controller. Never fights the combat system at point-blank;
-   * never overrides an active builder task.
+   * Emergency reflex: nearest hostile closer than fleeRadius => run AWAY from
+   * where it WILL be (predictive escape vector), picking the lowest-threat
+   * route among three fan-out candidates. <1.5m is melee range and left to the
+   * combat controller. Never overrides an active builder task.
    */
   _fleeTick () {
     const bot = this.bot
@@ -137,27 +979,36 @@ class PathfinderWrapper {
     let nearestDist = Infinity
     for (const e of Object.values(bot.entities || {})) {
       if (!e?.position || e === bot.entity) continue
-      if (!/zombie|skeleton|creeper|spider|drowned|husk|witch|blaze|phantom|enderman/i.test(e.name || '')) continue
+      if (!isHostileName(e.name)) continue
       const d = e.position.distanceTo(bot.entity.position)
       if (d < nearestDist) { nearestDist = d; nearest = e }
     }
-    if (nearest && nearestDist < this.fleeRadius && nearestDist > 1.5) {
-      if (now < this._fleeUntil) return
-      const away = bot.entity.position.minus(nearest.position)
-      away.y = 0
-      if (away.norm() < 0.01) away.set(1, 0, 0)
-      const target = bot.entity.position.plus(away.normalize().scale(12))
-      try {
-        const { goals } = require('mineflayer-pathfinder')
-        bot.pathfinder.setGoal(new goals.GoalNear(Math.floor(target.x), Math.floor(target.y), Math.floor(target.z), 2), true)
-        this._fleeUntil = now + 2500
-        const m = this._movements()
-        if (m) m.allowSprinting = true
-        bot.setControlState('sprint', true)
-        this.log('info', `fleeing ${nearest.name} (${nearestDist.toFixed(1)}m)`)
-      } catch (err) {
-        this.log('debug', `flee failed: ${err.message || err}`)
-      }
+    if (!nearest || nearestDist >= this.fleeRadius || nearestDist <= 1.5) return
+    if (now < this._fleeUntil) return
+
+    // Predictive: escape away from the projected position, not the stale one.
+    this.threat.sample(bot, true)
+    const base = this.threat.escapeVector(bot.entity.position)
+    const perp = { x: -base.z, z: base.x }
+    const pos = bot.entity.position
+    const candidates = [0, 0.55, -0.55].map((bend) => {
+      const dx = base.x + perp.x * bend
+      const dz = base.z + perp.z * bend
+      const len = Math.hypot(dx, dz) || 1
+      return { x: pos.x + (dx / len) * 12, y: Math.floor(pos.y), z: pos.z + (dz / len) * 12 }
+    })
+    const best = this.threat.rankGoals(candidates, pos)[0]
+    if (!best) return
+    try {
+      const { goals } = require('mineflayer-pathfinder')
+      bot.pathfinder.setGoal(new goals.GoalNear(Math.floor(best.x), Math.floor(best.y), Math.floor(best.z), 2), true)
+      this._fleeUntil = now + 2500
+      const m = this._movements()
+      if (m) m.allowSprinting = true
+      bot.setControlState('sprint', true)
+      this.log('info', `fleeing ${nearest.name} (${nearestDist.toFixed(1)}m) → threat ${best.threat.toFixed(2)} route`)
+    } catch (err) {
+      this.log('debug', `flee failed: ${err.message || err}`)
     }
   }
 
@@ -214,7 +1065,7 @@ class PathfinderWrapper {
       if (isDoorOrTrapdoorName(block.name)) doorIds.add(block.id)
     }
     const doorCost = this.doorCost
-    if (Array.isArray(movements.exclusionAreasStep) && !movements.exclusionAreasStep._zincaiDoorCost) {
+    if (Array.isArray(movements.exclusionAreasStep) && !movements.exclusionAreasStep.some((f) => f && f._zincaiDoorCost)) {
       const fn = (block) => (block && doorIds.has(block.type) ? doorCost : 0)
       fn._zincaiDoorCost = true
       movements.exclusionAreasStep.push(fn)
@@ -380,12 +1231,31 @@ class PathfinderWrapper {
     clearTimeout(this._jitterTimer)
     clearTimeout(this._sprintTimer)
     clearInterval(this._jumpSprintTimer)
+    clearInterval(this._threatTimer)
+    this._threatTimer = null
     this._jumpSprintTimer = null
+    if (this._onPathUpdate) {
+      try { this.bot.removeListener('path_update', this._onPathUpdate) } catch { /* bot gone */ }
+      this._onPathUpdate = null
+    }
     for (const fn of this._tickHandlers) {
       try { this.bot.removeListener('physicsTick', fn) } catch { /* bot gone */ }
     }
     this._tickHandlers = []
+    this.threat.clear()
   }
 }
 
-module.exports = { PathfinderWrapper, isDoorOrTrapdoorName }
+module.exports = {
+  PathfinderWrapper,
+  PredictiveThreatMap,
+  WindChargeTraversal,
+  scoutSafeAnchor,
+  findGroundY,
+  projectFuture,
+  pointSegmentDistance,
+  isHostileName,
+  isDoorOrTrapdoorName,
+  HOSTILE_RE,
+  WIND_CHARGE_ITEM
+}

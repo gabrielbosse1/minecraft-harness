@@ -51,6 +51,40 @@ class PathfinderWrapper {
     this._pauseUntil = 0
     this._applied = []
     this._tickHandlers = [] // physicsTick listeners we own — removed in stop()
+
+    // --- v2: movement modes -----------------------------------------------
+    // 'explorer' (default, balanced) | 'builder' (steady, no sprint, cautious
+    // drops) | 'hunter' (always sprint-jump parkour). Flee-reflex is always on.
+    this.mode = 'explorer'
+    this.fleeRadius = Number.isFinite(opts.fleeRadius) ? opts.fleeRadius : 8
+    this._fleeUntil = 0
+    this._lastFleeCheck = 0
+    this._jumpSprintTimer = null
+  }
+
+  /** Modes: 'builder' | 'hunter' | 'explorer' */
+  setMode (mode) {
+    this.mode = ['builder', 'hunter', 'explorer'].includes(mode) ? mode : 'explorer'
+    const m = this._movements()
+    if (m) {
+      if (this.mode === 'builder') { m.allowSprinting = false; m.maxDropDown = 1 }
+      else if (this.mode === 'hunter') { m.allowSprinting = true; m.maxDropDown = 4 }
+      else { m.allowSprinting = true; m.maxDropDown = 4 }
+    }
+    // Hunter: rhythmic jump pulses while sprinting — parkour over 1-block gaps.
+    clearInterval(this._jumpSprintTimer)
+    this._jumpSprintTimer = null
+    if (this.mode === 'hunter') {
+      this._jumpSprintTimer = setInterval(() => {
+        const bot = this.bot
+        if (!bot.entity?.onGround) return
+        if (bot.pathfinder?.isMoving?.()) {
+          bot.setControlState('jump', true)
+          setTimeout(() => { try { bot.setControlState('jump', false) } catch { /* noop */ } }, 180)
+        }
+      }, 550)
+    }
+    return this.mode
   }
 
   /** Register one of OUR physicsTick handlers (named so stop() can remove it). */
@@ -81,7 +115,50 @@ class PathfinderWrapper {
     this._patchDigging()
     this._patchDoors()
     this._startHumanizer()
+    this._onTick(this._fleeTick.bind(this))
     return this._applied
+  }
+
+  // ------------------------------------------------ enemy-flee inversion--
+  /**
+   * Emergency reflex: nearest hostile closer than fleeRadius => invert the goal
+   * and run AWAY at speed, with jumping. <1.5m is treated as melee and left to
+   * the combat controller. Never fights the combat system at point-blank;
+   * never overrides an active builder task.
+   */
+  _fleeTick () {
+    const bot = this.bot
+    const now = Date.now()
+    if (!bot.entity || now - this._lastFleeCheck < 400) return
+    this._lastFleeCheck = now
+    if (this.mode === 'builder') return // builders finish the course first
+
+    let nearest = null
+    let nearestDist = Infinity
+    for (const e of Object.values(bot.entities || {})) {
+      if (!e?.position || e === bot.entity) continue
+      if (!/zombie|skeleton|creeper|spider|drowned|husk|witch|blaze|phantom|enderman/i.test(e.name || '')) continue
+      const d = e.position.distanceTo(bot.entity.position)
+      if (d < nearestDist) { nearestDist = d; nearest = e }
+    }
+    if (nearest && nearestDist < this.fleeRadius && nearestDist > 1.5) {
+      if (now < this._fleeUntil) return
+      const away = bot.entity.position.minus(nearest.position)
+      away.y = 0
+      if (away.norm() < 0.01) away.set(1, 0, 0)
+      const target = bot.entity.position.plus(away.normalize().scale(12))
+      try {
+        const { goals } = require('mineflayer-pathfinder')
+        bot.pathfinder.setGoal(new goals.GoalNear(Math.floor(target.x), Math.floor(target.y), Math.floor(target.z), 2), true)
+        this._fleeUntil = now + 2500
+        const m = this._movements()
+        if (m) m.allowSprinting = true
+        bot.setControlState('sprint', true)
+        this.log('info', `fleeing ${nearest.name} (${nearestDist.toFixed(1)}m)`)
+      } catch (err) {
+        this.log('debug', `flee failed: ${err.message || err}`)
+      }
+    }
   }
 
   // ------------------------------------------------------------- digging--
@@ -194,6 +271,36 @@ class PathfinderWrapper {
     return null
   }
 
+  /**
+   * Jump-place pillar to at least targetY (integer feet height).
+   * Consumes scaffold blocks from inventory. Returns true on success.
+   * @param {number} targetY
+   * @param {string[]} scaffoldBlocks
+   */
+  async pillarToHeight (targetY, scaffoldBlocks = ['dirt', 'cobblestone', 'netherrack']) {
+    const bot = this.bot
+    const { Vec3 } = require('vec3')
+    let guard = 0
+    while (guard++ < 40) {
+      const feetY = Math.floor(bot.entity?.position?.y ?? 0)
+      if (feetY >= targetY) return true
+      const scaffold = bot.inventory.items().find((i) => scaffoldBlocks.includes(i.name))
+      if (!scaffold) { this.log('warn', 'pillar: out of scaffold blocks'); return false }
+      await bot.equip(scaffold, 'hand').catch(() => {})
+      bot.setControlState('jump', true)
+      await new Promise((r) => setTimeout(r, 120))
+      try {
+        const refBlock = bot.blockAt(bot.entity.position.floored().offset(0, -1, 0))
+        if (refBlock) await bot.placeBlock(refBlock, new Vec3(0, 1, 0))
+      } catch (err) {
+        this.log('debug', `pillar place failed: ${err.message || err}`)
+      }
+      bot.setControlState('jump', false)
+      await new Promise((r) => setTimeout(r, 180))
+    }
+    return false
+  }
+
   _movements () {
     return this.bot.pathfinder?.movements || null
   }
@@ -272,6 +379,8 @@ class PathfinderWrapper {
   stop () {
     clearTimeout(this._jitterTimer)
     clearTimeout(this._sprintTimer)
+    clearInterval(this._jumpSprintTimer)
+    this._jumpSprintTimer = null
     for (const fn of this._tickHandlers) {
       try { this.bot.removeListener('physicsTick', fn) } catch { /* bot gone */ }
     }

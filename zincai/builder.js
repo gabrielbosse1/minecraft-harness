@@ -138,9 +138,9 @@ class BlueprintParser {
    */
   plan (parsed, origin, botPos) {
     const maxLocalY = parsed.blocks.reduce((m, b) => Math.max(m, b.dy), 0)
-    const baseY = Math.floor(botPos.y)
-    const originY = baseY // blueprint y=0 sits on the bot's current floor
-    const standBase = baseY
+    // Absolute `at` origin wins; otherwise blueprint y=0 sits on the bot's floor.
+    const originY = Number.isFinite(Number(origin?.y)) ? Math.floor(origin.y) : Math.floor(botPos.y)
+    const standBase = Math.floor(botPos.y)
     const steps = []
     for (const b of parsed.blocks) {
       const worldY = originY + b.dy
@@ -223,19 +223,38 @@ class BuilderExecutor {
       { ref: target.offset(0, 0, -1), face: { x: 0, y: 0, z: 1 } }
     ]
     const { Vec3 } = require('vec3')
+    let tried = 0
     for (const { ref, face } of refOffsets) {
       const refBlock = bot.blockAt(ref)
       if (!refBlock || refBlock.name === 'air' || refBlock.name === 'cave_air') continue
+      tried++
       try {
         await bot.lookAt(target.offset(0.5, 0.5, 0.5), true)
-        await bot.placeBlock(refBlock, new Vec3(face.x, face.y, face.z))
-        await new Promise((r) => setTimeout(r, this.stepDelayMs))
-        const placed = bot.blockAt(target)
-        if (placed && placed.name === itemName) return true
-      } catch {
-        // try the next reference face
+        // placeBlock resolves on the dest blockUpdate; poll the world in
+        // parallel as ground truth so an unmatched ack never hangs placement.
+        const placePromise = bot.placeBlock(refBlock, new Vec3(face.x, face.y, face.z))
+        // Avoid an unhandled rejection if the poll wins the race below.
+        placePromise.catch(() => {})
+        const deadline = Date.now() + 6000
+        while (Date.now() < deadline) {
+          const placed = bot.blockAt(target)
+          if (placed && placed.name === itemName) return true
+          const outcome = await Promise.race([placePromise.then(() => 'ok', (err) => err), new Promise((r) => setTimeout(() => r('pending'), 200))])
+          if (outcome !== 'pending') {
+            const after = bot.blockAt(target)
+            if (!(after && after.name === itemName) && !(outcome && outcome.message)) {
+              this.log('debug', `face ${face.x},${face.y},${face.z} placed but target reads ${after?.name ?? 'unknown'}`)
+            }
+            if (outcome && outcome.message) this.log('debug', `face ${face.x},${face.y},${face.z} rejected: ${outcome.message}`)
+            if (after && after.name === itemName) return true
+            break
+          }
+        }
+      } catch (err) {
+        this.log('debug', `face ${face.x},${face.y},${face.z} rejected: ${err.message || err}`)
       }
     }
+    if (tried === 0) this.log('debug', `no solid neighbour to place against for ${itemName}@${target.x},${target.y},${target.z}`)
     return false
   }
 
@@ -247,26 +266,65 @@ class BuilderExecutor {
     const bot = this.bot
     const Vec3 = require('vec3').Vec3
     let guard = 0
+    let stall = 0
+    let lastFeetY = Math.floor(bot.entity.position.y)
     while (guard++ < 40) {
       const feetY = Math.floor(bot.entity.position.y)
       if (feetY >= targetY) return true
+      if (feetY > lastFeetY) { stall = 0; lastFeetY = feetY } else if (++stall >= 6) {
+        this.log('debug', `tower stalled at y=${feetY}; aborting pillar attempt`)
+        return false
+      }
       const scaffold = this._pickScaffold()
       if (!scaffold) { this.log('warn', 'out of scaffold blocks mid-tower'); return false }
       await bot.equip(scaffold, 'hand')
-      const below = bot.blockAt(bot.entity.position.floored().offset(0, -1, 0))
+      const baseY = Math.floor(bot.entity.position.y)
+      const basePos = bot.entity.position.floored()
+      const below = bot.blockAt(basePos.offset(0, -1, 0))
       if (!below) return false
+      // Jump first, place AFTER rising past +1 block: the server refuses to
+      // place a block into the player's own floored cell, so placing while
+      // grounded always fails. Near the apex the feet cell is one above the
+      // target — placing at the threshold can race ahead of the move packets,
+      // so target ~1.12 and treat the block write as confirmed by a world poll
+      // rather than the packet ack alone.
       bot.setControlState('jump', true)
-      await new Promise((r) => setTimeout(r, 120))
+      const airborneDeadline = Date.now() + 1500
+      while (Date.now() < airborneDeadline) {
+        if (bot.entity.position.y - baseY >= 1.12) break
+        await new Promise((r) => setTimeout(r, 40))
+      }
+      const dest = basePos
       try {
-        const refBlock = bot.blockAt(bot.entity.position.floored().offset(0, -1, 0))
-        if (refBlock) await bot.placeBlock(refBlock, new Vec3(0, 1, 0))
+        const refBlock = bot.blockAt(basePos.offset(0, -1, 0))
+        if (refBlock && refBlock.name !== 'air') {
+          const placePromise = bot.placeBlock(refBlock, new Vec3(0, 1, 0))
+          placePromise.catch(() => {}) // avoid unhandled rejection when the world poll wins
+          const deadline = Date.now() + 3000
+          while (Date.now() < deadline) {
+            const now = bot.blockAt(dest)
+            if (now && now.name === scaffold.name) break
+            const outcome = await Promise.race([
+              placePromise.then(() => 'settled', () => 'settled'),
+              new Promise((r) => setTimeout(() => r('pending'), 150))
+            ])
+            if (outcome !== 'pending') break
+          }
+          if (bot.blockAt(dest)?.name !== scaffold.name) this.log('debug', `tower place at ${dest} not confirmed`)
+        }
       } catch (err) {
         this.log('debug', `tower place failed: ${err.message || err}`)
       }
       bot.setControlState('jump', false)
-      await new Promise((r) => setTimeout(r, 180))
+      // Wait for touchdown (on the placed block on success, back on the ground otherwise)
+      const landDeadline = Date.now() + 2500
+      while (Date.now() < landDeadline) {
+        if (bot.entity.onGround) break
+        await new Promise((r) => setTimeout(r, 60))
+      }
+      await new Promise((r) => setTimeout(r, 80))
     }
-    return false
+    return Math.floor(bot.entity.position.y) >= targetY
   }
 
   /**
@@ -297,4 +355,155 @@ class BuilderExecutor {
   }
 }
 
-module.exports = { BlueprintParser, BuilderExecutor, BLUEPRINT_DIR }
+
+// ============================================================================
+// Shape primitives — mathematical block-coordinate generators.
+// The LLM NEVER places blocks one by one for large structures; it names a
+// shape, we compute every coordinate locally. Voyager-style: code executes.
+// ============================================================================
+
+/**
+ * Generate blocks of a geometric primitive.
+ * @param {string} shape cylinder|dome|arch|wall|box|floor|ring
+ * @param {object} p    shape params (see each branch)
+ * @param {string} block block id (e.g. "stone") — all placed blocks share it
+ * @returns {Array<{dx:number, dy:number, dz:number, name:string}>}
+ */
+function generateShape (shape, p = {}, block = 'stone') {
+  if (!block || !/^[a-z0-9_]+$/.test(block)) throw new Error(`build_shape: bad block id "${block}"`)
+  const B = []
+  const push = (x, y, z) => B.push({ dx: x, dy: y, dz: z, name: block })
+  const axis = (p.axis === 'z') ? 'z' : 'x'
+
+  switch (String(shape)) {
+    case 'cylinder': {
+      const r = Math.max(1, Math.trunc(Number(p.r) || 3))
+      const h = Math.max(1, Math.trunc(Number(p.h) || 6))
+      const filled = Boolean(p.filled)
+      const th = Math.max(1, Math.trunc(Number(p.th) || 1)) // shell thickness
+      for (let y = 0; y < h; y++) {
+        for (let dx = -r; dx <= r; dx++) {
+          for (let dz = -r; dz <= r; dz++) {
+            const d2 = dx * dx + dz * dz
+            if (d2 > r * r) continue
+            if (!filled) {
+              const inner = (r - th) > 0 ? (r - th) : 0
+              if (inner > 0 && d2 < inner * inner) continue
+            }
+            push(dx, y, dz)
+          }
+        }
+      }
+      break
+    }
+    case 'dome': {
+      const r = Math.max(2, Math.trunc(Number(p.r) || 5))
+      const th = Math.max(1, Math.trunc(Number(p.th) || 1))
+      for (let dx = -r; dx <= r; dx++) {
+        for (let dz = -r; dz <= r; dz++) {
+          const d = Math.hypot(dx, dz)
+          if (d > r) continue
+          const y = Math.round(Math.sqrt(Math.max(0, r * r - d * d)))
+          push(dx, y, dz)
+          for (let t = 1; t < th; t++) push(dx, Math.max(0, y - t), dz)
+        }
+      }
+      break
+    }
+    case 'arch': {
+      const w = Math.max(3, Math.trunc(Number(p.w) || 10))
+      const h = Math.max(3, Math.trunc(Number(p.h) || 8))
+      const th = Math.max(1, Math.trunc(Number(p.th) || 1))
+      // Semicircle arc springing from y=S with apex exactly at h:
+      //   r = w/2, cx = (w-1)/2, endOffset = sqrt(r^2 - cx^2), S = h - r + endOffset
+      //   y(x) = S + sqrt(r^2 - (x-cx)^2) - endOffset   ->  y(0)=S, y(cx)=h
+      // Columns fill [0..round(S)]; the arc closes the curve onto the columns.
+      const r = w / 2
+      const cx = (w - 1) / 2
+      const endOffset = Math.sqrt(Math.max(0, r * r - cx * cx))
+      const S = Math.max(0.5, h - r + endOffset)
+      const colTop = Math.round(S)
+      const seen = new Set()
+      for (let t = 0; t < th; t++) {
+        for (let dz = 0; dz < th; dz++) {
+          for (let x = 0; x < w; x++) {
+            const cells = []
+            if (x < th && x === t) for (let y = 0; y <= colTop; y++) cells.push([x, y])
+            if (x >= w - th && (x - (w - th)) === t) for (let y = 0; y <= colTop; y++) cells.push([x, y])
+            const dy2 = r * r - (x - cx) * (x - cx)
+            if (dy2 >= 0) cells.push([x, Math.round(S + Math.sqrt(dy2) - endOffset)])
+            for (const [bx, by] of cells) {
+              const key = `${bx},${by},${dz}`
+              if (seen.has(key)) continue
+              seen.add(key)
+              push(bx, by, dz)
+            }
+          }
+        }
+      }
+      break
+    }
+    case 'wall': {
+      const l = Math.max(1, Math.trunc(Number(p.l) || 20))
+      const h = Math.max(1, Math.trunc(Number(p.h) || 5))
+      const th = Math.max(1, Math.trunc(Number(p.th) || 1))
+      for (let t = 0; t < th; t++) {
+        for (let i = 0; i < l; i++) {
+          for (let y = 0; y < h; y++) {
+            if (axis === 'x') push(i, y, t)
+            else push(t, y, i)
+          }
+        }
+      }
+      break
+    }
+    case 'box': {
+      const w = Math.max(1, Math.trunc(Number(p.w) || 6))
+      const h = Math.max(1, Math.trunc(Number(p.h) || 4))
+      const d = Math.max(1, Math.trunc(Number(p.d) || 6))
+      const filled = Boolean(p.filled)
+      const th = Math.max(1, Math.trunc(Number(p.th) || 1))
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          for (let z = 0; z < d; z++) {
+            const onShell = x < th || x >= w - th || y < th || y >= h - th || z < th || z >= d - th
+            if (!filled && !onShell) continue
+            push(x, y, z)
+          }
+        }
+      }
+      break
+    }
+    case 'floor': {
+      const w = Math.max(1, Math.trunc(Number(p.w) || 10))
+      const d = Math.max(1, Math.trunc(Number(p.d) || 10))
+      for (let x = 0; x < w; x++) for (let z = 0; z < d; z++) push(x, 0, z)
+      break
+    }
+    case 'ring': {
+      const r = Math.max(2, Math.trunc(Number(p.r) || 6))
+      const th = Math.max(1, Math.trunc(Number(p.th) || 1))
+      for (let dx = -r; dx <= r; dx++) {
+        for (let dz = -r; dz <= r; dz++) {
+          const d2 = dx * dx + dz * dz
+          const inner = Math.max(0, r - th)
+          if (d2 <= r * r && d2 >= inner * inner) push(dx, 0, dz)
+        }
+      }
+      break
+    }
+    default:
+      throw new Error(`build_shape: unknown shape "${shape}" (cylinder|dome|arch|wall|box|floor|ring)`)
+  }
+  // bottom-to-top order (gravity-safe placement)
+  B.sort((a, b) => a.dy - b.dy)
+  return B
+}
+
+/** Hierarchical stage label used in events/prompt (foundation → walls → roof → detailing). */
+function normalizeStage (s) {
+  const v = String(s || '').toLowerCase().trim()
+  return ['foundation', 'walls', 'roof', 'detailing'].includes(v) ? v : null
+}
+
+module.exports = { BlueprintParser, BuilderExecutor, BLUEPRINT_DIR, generateShape, normalizeStage }

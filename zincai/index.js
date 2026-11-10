@@ -130,19 +130,25 @@ function main () {
   const armorManager = require('mineflayer-armor-manager')
 
   const { MemorySystem } = require('./memory')
-  const { buildPerceptionText } = require('./perception')
+  const { buildPerceptionText, buildVisionBlock } = require('./perception')
   const filter = require('./filter')
-  const { BlueprintParser, BuilderExecutor } = require('./builder')
+  const { BlueprintParser, BuilderExecutor, generateShape, normalizeStage } = require('./builder')
   const { PathfinderWrapper } = require('./custom_mineflayer/pathfinder_wrapper')
+  const { System1 } = require('./system1')
+  const { ReflexRegistry } = require('./reflex_registry')
+  const { runScript } = require('./reflex_registry')
   const { AdvancedCombat } = require('../src/combat')
   const { craftItem } = require('../src/recipes')
   const { AmdClient } = require('../src/amdClient')
 
   const memoryFile = path.join(DATA_DIR, cfg.memory.file.replace(/^zincai-data[/\\]/, ''))
+  const preferencesFile = path.join(DATA_DIR, (cfg.memory.preferencesFile || 'zincai-data/preferences.json').replace(/^zincai-data[/\\]/, ''))
   const memory = new MemorySystem({
     file: memoryFile,
+    preferencesFile,
     workingMax: cfg.memory.workingMax,
-    shortTermMinutes: cfg.memory.shortTermMinutes
+    shortTermMinutes: cfg.memory.shortTermMinutes,
+    ephemeralMs: cfg.memory.ephemeralMs ?? 30_000
   })
   const amd = new AmdClient({
     apiKey: cfg.amd.apiKey,
@@ -174,11 +180,14 @@ function main () {
   // Upstream-compatible custom pathfinding: doors, jitter, digging guard.
   const wrapper = new PathfinderWrapper(bot, {
     allowDigging: Boolean(cfg.behavior.allowDigging),
-    logger: wrapperLog
+    logger: wrapperLog,
+    fleeRadius: cfg.behavior.fleeRadius ?? 8
   })
 
-  let system1Timer = null // assigned below; shutdown may run before that (join failure)
+  let system1 = null
+  const reflexRegistry = new ReflexRegistry()
   let started = false
+  let lastQueryText = ''
   let shuttingDown = false
   let inferBusy = false
   let lastInfer = 0
@@ -193,7 +202,7 @@ function main () {
     if (shuttingDown) return
     shuttingDown = true
     logger.info(TAG, `shutting down (${reason})`)
-    clearInterval(system1Timer)
+    try { system1?.stop() } catch { /* noop */ }
     clearTimeout(moveGoalTimer)
     try { wrapper.stop() } catch { /* noop */ }
     try { combat?.stop() } catch { /* noop */ }
@@ -242,8 +251,41 @@ function main () {
     combat.start()
     executor = new BuilderExecutor(bot, { scaffoldBlocks: cfg.build.scaffoldBlocks, logger: wrapperLog })
 
+    // Mode state machine (builder|hunter|explorer) — affects sprint/jitter/drop-guard
+    const mode = wrapper.setMode(cfg.behavior.mode || 'explorer')
+    logger.info(TAG, `movement mode: ${mode}`)
+
+    // System 1 — reflex registry-driven survival layer
+    system1 = new System1(bot, {
+      registry: reflexRegistry,
+      logger,
+      pathfinder: wrapper,
+      memory,
+      combat,
+      eatBelowFood: cfg.system1.eatBelowFood ?? 18,
+      fallVelocityThreshold: cfg.system1.fallVelocityThreshold ?? -0.35,
+      tickMs: cfg.system1.tickMs ?? 200,
+      escalate: (event) => queueSystem2({ type: 'escalation', text: `${event.type} ${event.item || event.text || ''}`.trim(), msg: `${event.type} escalated by reflex` })
+    })
+    system1.start()
+
     try { bot.armorManager?.equipAll?.() } catch { /* cosmetic */ }
     logger.info(TAG, 'ZincAI ready — System 1 on reflex, System 2 on demand')
+  })
+
+  bot.on('entityHurt', (entity) => {
+    if (entity === bot.entity) {
+      memory.addEvent({ type: 'hurt', msg: 'I was hit' })
+      queueSystem2({ type: 'hurt', msg: 'I was just attacked' })
+    }
+    system1?.onEntityHurt(entity)
+  })
+
+  bot.on('playerCollect', (collector, item) => {
+    if (!started || collector !== bot.entity) return
+    const name = item?.name || 'item'
+    memory.addEvent({ type: 'item_gained', msg: `collected ${name}` })
+    system1?.onItemGained(name, null)
   })
 
   bot.on('death', () => {
@@ -255,18 +297,14 @@ function main () {
     const parsed = filter.parseChatLine(raw)
     if (!parsed) return // server line, not attributed chat
     if (parsed.sender === bot.username) return // never react to ourselves
+    // Implicit preference tracking — silent, no tokens.
+    const pref = memory.observeChat(parsed.sender, parsed.text)
+    if (pref) logger.debug(TAG, `preference learned (${pref.polarity}): ${pref.text}`)
+    system1?.onChatLine(parsed.sender, parsed.text)
     const friends = cfg.behavior.friends || []
     const trigger = filter.chatTriggersSystem2(parsed.text, parsed.sender, friends)
     logger.debug(TAG, `chat from ${parsed.sender}: ${parsed.text} (${trigger ? 'System 2' : 'ignored'})`)
     if (trigger) queueSystem2({ type: 'chat', sender: parsed.sender, text: parsed.text })
-  })
-
-  bot.on('entityHurt', (entity) => {
-    // Bot itself hurt => high priority; a nearby fight worth a look.
-    if (entity === bot.entity) {
-      memory.addEvent({ type: 'hurt', msg: 'I was hit' })
-      queueSystem2({ type: 'hurt', msg: 'I was just attacked' })
-    }
   })
 
   bot.on('blockUpdate', (oldBlock, newBlock) => {
@@ -276,49 +314,10 @@ function main () {
     }
   })
 
-  // ---------------------------------------------------- System 1 --------
-  const FOOD_RE = /(bread|apple|potato|carrot|beef|porkchop|chicken|mutton|salmon|cod|berries|cookie|melon_slice|cooked_|golden_carrot|steak|stew|mushroom_stew|beetroot)/
-  // hoist: shutdown clears this timer; assignment happens right here at boot
-  system1Timer = setInterval(() => {
-    if (!started || shuttingDown) return
-    try {
-      // 1) hunger — eat the best food on hand
-      if (bot.food < cfg.system1.eatBelowFood && Date.now() - lastEatAt > 8_000) {
-        const food = bot.inventory.items().find((i) => FOOD_RE.test(i.name))
-        if (food) {
-          lastEatAt = Date.now()
-          bot.equip(food, 'hand').then(() => bot.consume()).catch(() => {})
-        }
-      }
-      // 2) immediate danger dodge — hostile inside 2 blocks: jump + back away
-      for (const e of Object.values(bot.entities || {})) {
-        if (!e?.position || e === bot.entity) continue
-        const hostile = /zombie|skeleton|creeper|spider|drowned|husk|witch|blaze|phantom/i.test(e.name || '')
-        if (!hostile) continue
-        const d = e.position.distanceTo(bot.entity.position)
-        if (d < 2.0) {
-          bot.setControlState('back', true)
-          bot.setControlState('jump', true)
-          setTimeout(() => { try { bot.setControlState('back', false); bot.setControlState('jump', false) } catch { /* gone */ } }, 500)
-          break
-        }
-      }
-      // 3) fall mitigation — water bucket if we're dropping fast
-      const vy = bot.entity?.velocity?.y ?? 0
-      if (vy < cfg.system1.fallVelocityThreshold) {
-        const bucket = bot.inventory.items().find((i) => i.name === 'water_bucket')
-        if (bucket) {
-          bot.equip(bucket, 'hand').then(() => bot.activateItem()).catch(() => {})
-        }
-      }
-    } catch (err) {
-      logger.debug(TAG, `system1 tick: ${err.message || err}`)
-    }
-  }, 200)
-
   // ---------------------------------------------------- System 2 --------
   function queueSystem2 (evt) {
     memory.addEvent(evt)
+    if (evt && (evt.text || evt.msg)) lastQueryText = String(evt.text || evt.msg)
     // The actual inference runs on the shared gate; events just accumulate in
     // the working memory delta — one call sees everything new.
     maybeInfer().catch(() => {})
@@ -329,12 +328,20 @@ function main () {
     const p = bot.entity?.position
     const pos = p ? `pos=${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}` : 'pos=?'
     const tod = bot.time ? (bot.time.timeOfDay < 12000 ? 'day' : 'night') : '?'
-    const perception = buildPerceptionText(bot, { range: cfg.behavior.perceptionRange, fovDegrees: cfg.behavior.fovDegrees })
+    const mode = wrapper.mode || 'explorer'
+    let perception = `vision (mode=${mode}):\n${buildVisionBlock(bot, { mode, range: 6, radius: 6, heightUp: 5, heightDown: 2 })}`
+    if (cfg.behavior.perception3D) {
+      perception += `\nvoxel grid:\n${buildPerceptionText(bot, { range: cfg.behavior.perceptionRange, fovDegrees: cfg.behavior.fovDegrees })}`
+    }
+    const justNow = memory.ephemeral.line()
     const working = memory.working.last(5).map((e) => `- ${e.type}${e.sender ? ':' + e.sender : ''}: ${e.text || e.msg || ''}`).join('\n') || '- (none)'
-    const recalled = memory.promptBlock(query || '', cfg.memory.topK)
+    const recalled = memory.recallBlock(query || '', cfg.memory.topK)
+    const prefs = memory.preferencesLine()
     return [
-      `vitals ${vitals} ${pos} tod=${tod}`,
-      recalled ? `memories:\n${recalled}` : null,
+      `vitals ${vitals} ${pos} tod=${tod} mode=${mode}`,
+      prefs || null,
+      recalled || null,
+      justNow ? `just now: ${justNow}` : null,
       `events:\n${working}`,
       `perception:\n${perception}`
     ].filter(Boolean).join('\n')
@@ -351,7 +358,7 @@ function main () {
     inferBusy = true
     lastInfer = now
     try {
-      const query = memory.working.last(1)[0]?.text || memory.working.last(1)[0]?.msg || ''
+      const query = lastQueryText || memory.working.last(1)[0]?.text || memory.working.last(1)[0]?.msg || ''
       const delta = await buildDeltaText(query)
       const messages = [
         { role: 'system', content: SYSTEM_PROMPT },
@@ -384,6 +391,30 @@ function main () {
     return { a: 'idle' }
   }
 
+
+  /** Shared executor path for blueprint, inline grid and shape builds. */
+  async function buildBlocks (blocks, label, stage, at) {
+    let origin
+    if (Array.isArray(at) && at.length >= 3 && at.every((v) => Number.isFinite(Number(v)))) {
+      origin = new Vec3(Math.trunc(Number(at[0])), Math.trunc(Number(at[1])), Math.trunc(Number(at[2])))
+    } else {
+      origin = bot.entity.position.floored()
+    }
+    const preflight = parser.checkInventory(blocks, bot.inventory.items())
+    if (!preflight.ok) {
+      const missing = preflight.missing.map((m) => `${m.name} x${m.need - m.have}`).join(', ')
+      logger.warn(TAG, `${label}: missing materials — ${missing}`)
+      memory.addEvent({ type: 'build_failed', msg: `cannot build ${label}${stage ? ' (' + stage + ')' : ''}: missing ${missing}` })
+      return
+    }
+    const plan = parser.plan({ name: label, blocks }, origin, bot.entity.position)
+    logger.info(TAG, `${label} — ${plan.steps.length} blocks${stage ? ` (stage ${stage})` : ''}${plan.towerNeeded ? `, tower ${plan.towerHeight} high` : ''}`)
+    const result = await executor.build(plan)
+    const summary = `build ${label}${stage ? ' (' + stage + ')' : ''}: placed ${result.placed}/${plan.steps.length}${result.skipped.length ? ' skipped ' + result.skipped.length : ''}`
+    logger.info(TAG, summary)
+    memory.addEvent({ type: 'build_complete', msg: summary }, { promote: true })
+  }
+
   async function executeAction (action) {
     switch (action.a) {
       case 'idle':
@@ -407,6 +438,7 @@ function main () {
       }
       case 'build': {
         if (!executor) return logger.warn(TAG, 'build: not ready yet')
+        const stage = normalizeStage(action.stage)
         try {
           let planned
           if (action.blueprint) {
@@ -416,24 +448,57 @@ function main () {
           } else {
             return logger.warn(TAG, 'build: need blueprint name or inline grid')
           }
-          const origin = bot.entity.position.floored()
-          const preflight = parser.checkInventory(planned.blocks, bot.inventory.items())
-          if (!preflight.ok) {
-            const missing = preflight.missing.map((m) => `${m.name} x${m.need - m.have}`).join(', ')
-            logger.warn(TAG, `build: missing materials — ${missing}`)
-            memory.addEvent({ type: 'build_failed', msg: `cannot build ${planned.name}: missing ${missing}` })
-            return
-          }
-          const plan = parser.plan(planned, origin, bot.entity.position)
-          logger.info(TAG, `building ${planned.name} — ${plan.steps.length} blocks (tower ${plan.towerNeeded ? plan.towerHeight + ' high' : 'not needed'})`)
-          const result = await executor.build(plan)
-          const summary = `build ${planned.name}: placed ${result.placed}/${plan.steps.length}${result.skipped.length ? ' skipped ' + result.skipped.length : ''}`
-          logger.info(TAG, summary)
-          memory.addEvent({ type: 'build_complete', msg: summary }, { promote: true })
+          await buildBlocks(planned.blocks, String(action.blueprint || 'inline'), stage, action.at)
         } catch (err) {
           logger.error(TAG, `build failed: ${err.message || err}`)
           memory.addEvent({ type: 'build_failed', msg: `build error: ${err.message || err}` })
         }
+        return
+      }
+      case 'build_shape': {
+        if (!executor) return logger.warn(TAG, 'build_shape: not ready yet')
+        const shape = String(action.shape || '')
+        const block = String(action.block || '')
+        const params = (action.params && typeof action.params === 'object') ? action.params : {}
+        if (!shape || !block) return logger.warn(TAG, 'build_shape: need shape and block')
+        const stage = normalizeStage(action.stage)
+        try {
+          const blocks = generateShape(shape, params, block)
+          logger.info(TAG, `shape ${shape} -> ${blocks.length} blocks of ${block}`)
+          await buildBlocks(blocks, `shape:${shape}`, stage, action.at)
+        } catch (err) {
+          logger.error(TAG, `build_shape failed: ${err.message || err}`)
+          memory.addEvent({ type: 'build_failed', msg: `shape error: ${err.message || err}` })
+        }
+        return
+      }
+      case 'run_script': {
+        const name = String(action.name || '')
+        if (!name) return logger.warn(TAG, 'run_script: need a script name')
+        try {
+          const { goals } = require('mineflayer-pathfinder')
+          const ctx = {
+            bot, goals, memory, combat,
+            pathfinder: wrapper,
+            executor,
+            escalate: (event) => queueSystem2({ type: 'escalation', text: `${event.type} ${event.item || event.text || ''}`.trim(), msg: `${event.type} escalated by script` }),
+            system1,
+            logger
+          }
+          const result = await runScript(name, {}, ctx)
+          logger.info(TAG, `run_script ${name}: ${typeof result === 'string' ? result : JSON.stringify(result)}`)
+          memory.addEvent({ type: 'script', msg: `script ${name}: ${typeof result === 'string' ? result : 'done'}` })
+        } catch (err) {
+          logger.error(TAG, `run_script failed: ${err.message || err}`)
+        }
+        return
+      }
+      case 'set_mode': {
+        const mode = String(action.mode || '')
+        const applied = wrapper.setMode(mode)
+        cfg.behavior.mode = applied
+        logger.info(TAG, `movement mode -> ${applied}`)
+        memory.addEvent({ type: 'mode', msg: `mode ${applied}` })
         return
       }
       case 'craft': {

@@ -174,6 +174,31 @@ class LongTermMemory {
     return entry
   }
 
+  /**
+   * Grep-able search: literal case-insensitive substring match first; if the
+   * store has no literal hits, fall back to token overlap. "Remember when we
+   * built the castle?" -> grep finds the castle memory without the user
+   * repeating a single detail.
+   */
+  grep (text, limit = 3) {
+    const q = String(text || '').trim().toLowerCase()
+    if (!q || !this.entries.length) return []
+    const terms = tokenize(q)
+    const literal = this.entries.filter((e) => e.text.toLowerCase().includes(q))
+    const scored = []
+    if (literal.length) {
+      for (const e of literal) scored.push({ text: e.text, score: 1 + (e.importance || 0) * 0.1 })
+    } else {
+      for (const e of this.entries) {
+        const low = e.text.toLowerCase()
+        const hits = terms.filter((t) => low.includes(t)).length
+        if (hits > 0) scored.push({ text: e.text, score: hits / terms.length + (e.importance || 0) * 0.05 })
+      }
+    }
+    scored.sort((a, b) => b.score - a.score)
+    return scored.slice(0, limit)
+  }
+
   /** Top-K relevant memories for a query string. */
   query (text, k = 3) {
     if (!this.entries.length) return []
@@ -193,10 +218,12 @@ class LongTermMemory {
 
 /** Facade: one object the rest of the app talks to. */
 class MemorySystem {
-  constructor ({ file, workingMax = 5, shortTermMinutes = 10 } = {}) {
+  constructor ({ file, workingMax = 5, shortTermMinutes = 10, preferencesFile, ephemeralMs = 30_000 } = {}) {
     this.working = new WorkingMemory(workingMax)
     this.shortTerm = new ShortTermMemory(shortTermMinutes)
     this.longTerm = new LongTermMemory(file || path.join(__dirname, '..', 'zincai-data', 'memories.json'))
+    this.ephemeral = new EphemeralMemory(ephemeralMs)
+    this.preferences = new PreferenceTracker(preferencesFile || path.join(path.dirname(file || path.join(__dirname, '..', 'zincai-data', 'memories.json')), 'preferences.json'))
   }
 
   /**
@@ -206,6 +233,7 @@ class MemorySystem {
   addEvent (evt, { promote = null } = {}) {
     this.working.push(evt)
     this.shortTerm.push(evt)
+    this.ephemeral.push(evt)
     const importance = scoreImportance(evt)
     const shouldPromote = promote === null ? importance >= 2 : Boolean(promote)
     if (shouldPromote) {
@@ -220,7 +248,167 @@ class MemorySystem {
     return hits.map((h) => `- (${h.importance}*) ${h.text}`).join('\n')
   }
 
-  save () { this.longTerm.save() }
+  /** True when the query smells like a recall request ("remember when..."). */
+  static isRecallQuery (text) {
+    return /remember|recall|last time|when we|you (built|made|gave)|where.*(is|are|was)|what did we/i.test(String(text || ''))
+  }
+
+  /**
+   * Full memory context: ephemeral "just now" window + recalled hits.
+   * If the query looks like a recall request, grep the store LITERALLY first
+   * (exact place names like "castle"), then fall back to vector retrieval.
+   */
+  recallBlock (queryText, topK = 3) {
+    const q = String(queryText || '').trim()
+    if (!q) return ''
+    const parts = []
+    if (MemorySystem.isRecallQuery(q)) {
+      const literal = this.longTerm.grep(q, topK)
+      if (literal.length) {
+        parts.push('recalled:\n' + literal.map((h) => `- ${h.text}`).join('\n'))
+      } else {
+        // no literal hit — try per-significant-token grep, merge unique hits
+        const tokens = tokenize(q).slice(0, 4)
+        const seen = new Set()
+        for (const tok of tokens) {
+          for (const h of this.longTerm.grep(tok, 2)) seen.add(h.text)
+          if (seen.size >= topK) break
+        }
+        if (seen.size) parts.push('recalled:\n' + [...seen].slice(0, topK).map((t) => `- ${t}`).join('\n'))
+      }
+    } else {
+      const hits = this.longTerm.query(q, topK)
+      if (hits.length) parts.push('memories:\n' + hits.map((h) => `- (${h.importance}*) ${h.text}`).join('\n'))
+    }
+    return parts.join('\n')
+  }
+
+  /** Observe an inbound chat line (drives implicit preference tracking). */
+  observeChat (sender, text) {
+    if (!sender || !text) return null
+    return this.preferences.observe(text)
+  }
+
+  /** One-line preferences fragment for the prompt, or '' */
+  preferencesLine () { return this.preferences.line() }
+
+  save () { this.longTerm.save(); this.preferences.save() }
 }
 
-module.exports = { MemorySystem, WorkingMemory, ShortTermMemory, LongTermMemory, embed, cosine, tokenize, scoreImportance }
+
+// ============================================================================
+// v2 upgrades — ephemeral buffer, grep-able long-term, implicit preferences
+// ============================================================================
+
+/**
+ * EphemeralMemory — a rolling 30-second action/observation window.
+ * Injected into prompts as "just now"; discarded fast; never persisted.
+ */
+class EphemeralMemory {
+  constructor (maxAgeMs = 30_000, max = 12) {
+    this.maxAgeMs = maxAgeMs
+    this.max = max
+    this.items = []
+  }
+
+  push (evt) {
+    this.items.push({ ts: Date.now(), ...evt })
+    this.prune()
+  }
+
+  prune () {
+    const cutoff = Date.now() - this.maxAgeMs
+    while (this.items.length && this.items[0].ts < cutoff) this.items.shift()
+    while (this.items.length > this.max) this.items.shift()
+  }
+
+  snapshot () { this.prune(); return this.items.slice() }
+
+  /** Compact single-line rendering, e.g. "placed 3 dirt, said hi, moved north" */
+  line () {
+    this.prune()
+    if (!this.items.length) return ''
+    return this.items
+      .map((e) => e.text || e.msg || e.type)
+      .slice(-8)
+      .join('; ')
+  }
+}
+
+/**
+ * PreferenceTracker — implicit user-preference learning from chat lines.
+ * No explicit commands: we watch for "I prefer/like/love X", "don't use X",
+ * "favourite X is Y" and keep a weighted tally on disk.
+ */
+class PreferenceTracker {
+  constructor (file) {
+    this.file = file
+    this.prefs = [] // { text, polarity: 'like'|'dislike', count, ts }
+    this._load()
+  }
+
+  _load () {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(this.file, 'utf8'))
+      if (Array.isArray(parsed)) this.prefs = parsed
+    } catch { this.prefs = [] }
+  }
+
+  save () {
+    try {
+      fs.mkdirSync(path.dirname(this.file), { recursive: true })
+      const tmp = this.file + '.tmp'
+      fs.writeFileSync(tmp, JSON.stringify(this.prefs.slice(0, 100)), 'utf8')
+      fs.renameSync(tmp, this.file)
+    } catch { /* non-fatal */ }
+  }
+
+  /** Observe one chat line from a non-bot player. Returns detected pref or null. */
+  observe (text) {
+    const t = String(text || '').trim()
+    if (!t) return null
+    const rules = [
+      { re: /\b(?:i|we)\s+(?:prefer|like|love|enjoy)\s+([a-z0-9][a-z0-9 \-_']{1,48})/i, polarity: 'like' },
+      { re: /\b(?:my\s+)?favou?rite\s+(?:block|style|build|material|thing)s?\s*(?:is|are)?\s*([a-z0-9][a-z0-9 \-_']{1,48})/i, polarity: 'like' },
+      { re: /\b(?:don't|do not|never|stop)\s+(?:use|using|place|placing|build(?:ing)?\s+with)\s+([a-z0-9][a-z0-9 \-_']{1,48})/i, polarity: 'dislike' },
+      { re: /\b(?:i|we)\s+hate\s+([a-z0-9][a-z0-9 \-_']{1,48})/i, polarity: 'dislike' }
+    ]
+    for (const { re, polarity } of rules) {
+      const m = re.exec(t)
+      if (!m) continue
+      const phrase = m[1].replace(/\s+/g, ' ').trim().replace(/[.!,]+$/, '')
+      if (phrase.length < 2) continue
+      this._upsert(phrase, polarity)
+      this.save()
+      return { text: phrase, polarity }
+    }
+    return null
+  }
+
+  _upsert (text, polarity) {
+    const key = text.toLowerCase()
+    const hit = this.prefs.find((p) => p.text.toLowerCase() === key && p.polarity === polarity)
+    if (hit) {
+      hit.count += 1
+      hit.ts = Date.now()
+    } else {
+      this.prefs.push({ text, polarity, count: 1, ts: Date.now() })
+      this.prefs.sort((a, b) => b.count - a.count || b.ts - a.ts)
+      this.prefs = this.prefs.slice(0, 50)
+    }
+  }
+
+  /** Compact one-line prompt fragment: "likes: gothic style, stone bricks; dislikes: dirt towers" */
+  line (limit = 5) {
+    if (!this.prefs.length) return ''
+    const likes = this.prefs.filter((p) => p.polarity === 'like').slice(0, limit).map((p) => p.text)
+    const dislikes = this.prefs.filter((p) => p.polarity === 'dislike').slice(0, limit).map((p) => p.text)
+    const bits = []
+    if (likes.length) bits.push(`likes: ${likes.join(', ')}`)
+    if (dislikes.length) bits.push(`dislikes: ${dislikes.join(', ')}`)
+    return bits.length ? `user preferences: ${bits.join('; ')}` : ''
+  }
+}
+
+
+module.exports = { MemorySystem, WorkingMemory, ShortTermMemory, LongTermMemory, EphemeralMemory, PreferenceTracker, embed, cosine, tokenize, scoreImportance }

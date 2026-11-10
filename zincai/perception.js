@@ -179,4 +179,107 @@ function buildPerceptionText (bot, opts = {}) {
   return `${entLine}\nvoxel view (origin=you, FOV-culled):\n${grid.text}`
 }
 
-module.exports = { visibleBlocks, visibleEntities, buildVoxelGrid, buildPerceptionText, inHorizontalFov }
+
+// ============================================================================
+// "LATENT SPATIAL REPRESENTATION" — 2D ASCII vision for the text-only LLM.
+// A flat, aligned character grid is to Qwen what a canvas is to a vision
+// model: it can judge symmetry, openings, and drift at a glance.
+//
+// Top-down map (build alignment, footprint, door gaps, symmetry):
+//   rows = z-3..z+N, cols = x-N..x+N, '@' = bot.
+// Cross-section (facade/arch/wall alignment):
+//   rows = y descending (top row = highest), cols = x (or z) across bot,
+//   sliced along the axis the bot faces.
+//
+// Character legend (fixed): . air  # solid  s dirt/grass  S sand/gravel
+//   G glass  D door/trapdoor/gate  C chest/barrel  T wood/planks/log
+//   F leaves  W water  L lava  O ores/precious blocks  l light source
+//   B bed  ? unloaded/unknown
+// ============================================================================
+
+const VISION_LEGEND = '. air  # solid  s soil  S sand/gravel  G glass  D door  C chest  T wood  F leaves  W water  L lava  O ore  l light  B bed  @ you'
+
+function categoryChar (block) {
+  if (!block) return '?'
+  const n = block.name || ''
+  if (n === 'air' || n === 'cave_air' || n === 'void_air') return '.'
+  if (/chest|barrel|shulker/.test(n)) return 'C'
+  if (/door|trapdoor|fence_gate/.test(n)) return 'D'
+  if (/glass/.test(n)) return 'G'
+  if (/log|wood|planks|stem|hyphae/.test(n)) return 'T'
+  if (/leaves/.test(n)) return 'F'
+  if (n === 'water' || n === 'flowing_water') return 'W'
+  if (n === 'lava' || n === 'flowing_lava') return 'L'
+  if (/ore$|ore_/.test(n) || /block_of_(iron|gold|diamond|netherite|emerald)/.test(n)) return 'O'
+  if (/torch|lantern|glowstone|sea_lantern|campfire/.test(n)) return 'l'
+  if (/bed/.test(n)) return 'B'
+  if (/grass_block|dirt|podzol|mycelium|coarse_dirt|rooted_dirt|moss_block/.test(n)) return 's'
+  if (/sand|gravel|red_sand/.test(n)) return 'S'
+  return '#'
+}
+
+/**
+ * Top-down ASCII map centered on the bot. NOT frustum-culled (a builder needs
+ * the whole footprint), purely local (range-bounded).
+ * @returns {string}
+ */
+function buildTopDownGrid (bot, { range = 6 } = {}) {
+  const pos = bot.entity?.position
+  if (!pos) return '(no position)'
+  const cx = Math.floor(pos.x)
+  const cy = Math.floor(pos.y)
+  const cz = Math.floor(pos.z)
+  const lines = [`top view y=${cy} (rows z=${cz - range}..${cz + range}, cols x=${cx - range}..${cx + range})`]
+  for (let dz = -range; dz <= range; dz++) {
+    let row = ''
+    for (let dx = -range; dx <= range; dx++) {
+      if (dx === 0 && dz === 0) { row += '@'; continue }
+      let block = null
+      try { block = bot.blockAt(pos.floored().offset(dx, 0, dz)) } catch { /* unloaded */ }
+      row += categoryChar(block)
+    }
+    lines.push((dz >= 0 ? '+' : '') + String(dz), ' ', row)
+  }
+  // join line chunks into real lines
+  const out = []
+  for (let i = 0; i < lines.length; i += 3) out.push(String(lines[i]).padStart(4) + ' ' + lines[i + 2])
+  return out.join('\n')
+}
+
+/**
+ * Cross-section (vertical slice) through the bot, along the axis it faces.
+ * Rows descend from highest y to lowest. Useful for checking wall height,
+ * arch springing, and roof slope before placing.
+ */
+function buildCrossSection (bot, { radius = 6, heightUp = 5, heightDown = 2 } = {}) {
+  const pos = bot.entity?.position
+  if (!pos) return '(no position)'
+  const yaw = lookYaw(bot)
+  const alongX = Math.abs(Math.sin(yaw)) >= Math.abs(Math.cos(yaw)) // facing mostly ±x?
+  const bx = Math.floor(pos.x), by = Math.floor(pos.y), bz = Math.floor(pos.z)
+  const lines = [`cross-section through ${alongX ? 'x' : 'z'} axis (rows y, cols ${alongX ? 'z' : 'x'})`]
+  for (let dy = heightUp; dy >= -heightDown; dy--) {
+    let row = ''
+    for (let d = -radius; d <= radius; d++) {
+      if (d === 0 && dy === 0) { row += '@'; continue }
+      const off = alongX ? [0, dy, d] : [d, dy, 0]
+      let block = null
+      try { block = bot.blockAt(pos.floored().offset(off[0], off[1], off[2])) } catch { /* unloaded */ }
+      row += categoryChar(block)
+    }
+    lines.push(`${String(by + dy).padStart(3)} ${row}`)
+  }
+  return lines.join('\n')
+}
+
+/**
+ * The "vision" block injected into System-2 prompts while building.
+ * Top-down always; cross-section when the bot is in builder mode.
+ */
+function buildVisionBlock (bot, { mode = 'explorer', range = 6, radius = 6, heightUp = 5, heightDown = 2 } = {}) {
+  const parts = [`vision legend: ${VISION_LEGEND}`, buildTopDownGrid(bot, { range })]
+  if (mode === 'builder') parts.push(buildCrossSection(bot, { radius, heightUp, heightDown }))
+  return parts.join('\n')
+}
+
+module.exports = { visibleBlocks, visibleEntities, buildVoxelGrid, buildPerceptionText, inHorizontalFov, buildTopDownGrid, buildCrossSection, buildVisionBlock, categoryChar, VISION_LEGEND }

@@ -312,7 +312,8 @@ async function runScenes (h, { server, model, friend }) {
     }, 15_000, 250)
     const a3 = await server.player(name); const z3 = await server.ask('entity', { id: zombie.id })
     check(tag('runs from a zombie that appears 5 blocks away'), fled, `distance ${z3.exists ? dist(a3.position, z3.position).toFixed(1) : '?'}`)
-    check(tag('tells the model it is fleeing, and from what'), Boolean(await until(() => prompts().find((p) => /fleeing from 1 — zombie/.test(p)), 10_000)))
+    const toldFleeing = await until(() => prompts().find((p) => h.toldFleeing.test(p)), 10_000)
+    check(tag('tells the model it is fleeing, and from what'), Boolean(toldFleeing), toldFleeing ? (String(toldFleeing).split('\n').find((l) => /FLEEING/.test(l)) || '').trim().slice(0, 150) : `last prompt: ${String(prompts().slice(-1)[0]).slice(0, 400)}`)
     await sleep(2000)
     check(tag('does not touch the zombie without a decision'), (await server.ask('entity', { id: zombie.id })).health === 20, `zombie hp ${(await server.ask('entity', { id: zombie.id })).health}`)
 
@@ -327,6 +328,10 @@ async function runScenes (h, { server, model, friend }) {
     check(tag('never crashed or dropped out'), !proc.exited(), proc.exited() ? JSON.stringify(proc.exited()) : '')
     const errors = proc.lines.filter((l) => /\[error\]|Unhandled|TypeError|ReferenceError/.test(l))
     check(tag('logged no errors'), errors.length === 0, errors.slice(0, 3).join(' | ').slice(0, 300))
+    // A flat world has no dead ends. (This rig caught the escape planner calling
+    // the ground beside a player who keeps up "the only safe ground is a dead end".)
+    const cornered = prompts().find((p) => /CORNERED|TRAPPED|SURROUNDED|STUCK/.test(p))
+    check(tag('never tells the model it is cornered on flat, open ground'), !cornered, cornered ? (String(cornered).split('\n').find((l) => /CORNERED|TRAPPED|SURROUNDED|STUCK/.test(l)) || '').trim().slice(0, 150) : '')
     log(`${name}: model calls in total: ${prompts().length}`)
   } finally {
     await proc.stop()
@@ -363,6 +368,7 @@ function zincai (model) {
     env: {},
     readyRe: /ZincAI ready/,
     sawRequest: /Gabriel says: zinc vem aqui/,
+    toldFleeing: /reflex: FLEEING for \d+s from zombie/,
     prompts: (m, before) => [...m.prompts.chat.slice(before.chat), ...m.prompts.act.slice(before.act)],
     immediateReply: true,
     comeStarted: () => true,
@@ -392,6 +398,7 @@ function zinc (model) {
     env: { MC_USERNAME: 'Zinc' },
     readyRe: /harness ready/,
     sawRequest: /"user":"Gabriel","msg":"zinc vem aqui","at":"-?\d+,-?\d+,-?\d+"/,
+    toldFleeing: /threats 1 in sight — zombie[^\n]* — you are FLEEING by reflex/,
     prompts: (m, before) => m.prompts.zinc.slice(before.zinc),
     immediateReply: false,
     comeStarted: () => saidComing,

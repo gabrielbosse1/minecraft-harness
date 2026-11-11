@@ -60,7 +60,7 @@ test('a zombie appears: the reflex flees and reports; nothing is attacked until 
   const bot = simulatedBot({ items: [['iron_sword']], held: 'iron_sword' })
   // First answer about the zombie: idle (keep fleeing). Second: fight it.
   let asked = 0
-  const s = startTestSession({ bot, actions: (p) => (/you are FLEEING by reflex/.test(p) && ++asked >= 2 ? { a: 'attack', target: 'zombie' } : null) })
+  const s = startTestSession({ bot, actions: (p) => (/^doing: FLEEING by reflex$/m.test(p) && ++asked >= 2 ? { a: 'attack', target: 'zombie' } : null) })
   try {
     s.spawn()
     await sleep(200)
@@ -73,15 +73,22 @@ test('a zombie appears: the reflex flees and reports; nothing is attacked until 
     assert.ok(await s.until(() => s.internals().system1.fleeing, 2000), 'flee reflex')
     assert.equal(s.internals().arbiter.owner(), 'survival')
     // The model answers "idle" first: that means keep fleeing — and still no swing.
-    assert.ok(await s.until(() => s.prompts.action.some((p) => /you are FLEEING by reflex/.test(p)), 3000))
+    assert.ok(await s.until(() => s.prompts.action.some((p) => /^doing: FLEEING by reflex$/m.test(p)), 3000))
     assert.equal(bot.log.attack.length, 0, 'no attack without the model')
     await sleep(300)
     assert.equal(s.internals().system1.fleeing, true, 'idle keeps fleeing')
     // Nothing else wakes it while it runs, so nudge it the way a second event would.
     s.internals().brain.wake('still fleeing')
-    const told = s.prompts.action.find((p) => /you are FLEEING by reflex/.test(p))
-    assert.match(line(told, 'threats:'), /^threats: 1 — zombie \(\d+m S\) — you are FLEEING by reflex\. Decide: attack, go_to, hold; or idle to keep fleeing\.$/)
-    assert.match(line(told, 'why now:'), /fleeing from 1 — zombie/)
+    const told = s.prompts.action.find((p) => /^doing: FLEEING by reflex$/m.test(p))
+    // One block says it all: who (one count), how hard they press and which ways
+    // are open, what a fight would cost, what the body is doing, what may be decided.
+    assert.match(line(told, 'threats:'), /^threats: 1 in sight — zombie \(\d+m S\)$/)
+    assert.match(line(told, '  pressure:'), /^ {2}pressure: \d within 8m.* \| ways out: open /)
+    assert.match(line(told, '  if you fight:'), /iron_sword 6 dmg, armor 0\/20, hp 20: ≈ \d+s to kill it, you would take ≈ \d+ dmg → GOOD$/)
+    assert.match(line(told, '  reflex:'), /^ {2}reflex: FLEEING for \d+s from zombie — ran \d+m from 0,64,0\. The body did this by itself; idle keeps it running\.$/)
+    assert.match(line(told, '  decide:'), /idle = keep fleeing \| attack = fight \| go_to \/ follow = go there instead \| hold = stop running/)
+    assert.match(line(told, 'why now:'), /reflex: started FLEEING — zombie came close \(\d+m S\)/)
+    assert.ok(!/cannot reach you/.test(told), 'the zombie it runs from is not also listed as unable to reach it')
 
     // Then it decides to fight.
     assert.ok(await s.until(() => hits >= 3, 10_000), 'the fight happens only after attack')
@@ -124,7 +131,7 @@ test('a player hits the bot: it backs off and talks; PvP happens only when the m
     s.internals().brain.wake('Gabriel keeps hitting')
     const told = s.prompts.action.find((p) => /hit by player Gabriel/.test(p))
     assert.match(line(told, 'why now:'), /hurt: hit by player Gabriel \(hp 17\)/)
-    assert.match(line(told, 'threats:'), /Gabriel \(\d+m \w+; player, hit you\)/)
+    assert.match(line(told, 'threats:'), /Gabriel \(\d+m \w+; player, hit you; diamond_sword, armor 0\/20\)/)
     assert.ok(!/Pedro/.test(line(told, 'threats:')), 'the bystander is not a threat')
     assert.equal(bot.log.attack.length, 0)
 
@@ -209,7 +216,8 @@ test('dying once does not break doors or leave anything owned', async () => {
     bot.entity.position.set(0.5, 64, 0.5)
     s.spawn() // respawn
     const movements = bot.pathfinder.movements
-    assert.equal(movements.canOpenDoors, true)
+    assert.equal(movements._zincaiDoors?.attached, true, 'door routing is attached to the fresh Movements')
+    assert.equal(movements.canOpenDoors, false, 'upstream door handling stays off (doors.js replaces it)')
     assert.equal(movements.allow1by1towers, false)
     assert.equal(movements._zincaiThreatCost, true)
     assert.ok(s.shared.places.getPlace('last death'), 'the death point is remembered for item recovery')

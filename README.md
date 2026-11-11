@@ -52,7 +52,11 @@ set `AMD_MODEL` to an endpoint-supported model. Do not put real credentials in
   reach the bot, immediate hazards such as lit creepers, and entities that
   recently hurt it. Pets, named mobs, decorative entities, and peaceful players
   merely nearby are not treated as active threats. A player who hits the bot
-  triggers a flee and a named wake-up, not retaliation.
+  triggers a flee and a named wake-up, not retaliation. The escape route is
+  planned over the ground the bot can actually walk (no walls, drops or dead
+  ends when there is a way out), one escape is reported as one episode, and
+  both harnesses are told what the body did by itself: that it is fleeing, or
+  that it fled, from what and how far.
 - **The model owns the fight decision.** `idle` keeps the bot fleeing. `attack`
   is the only way a fight starts. Mob attacks require the exact type or
   `any` (hostiles only), line of sight, and a non-protected target. PvP requires
@@ -89,7 +93,9 @@ bounds and defaults.
 
 ### ZincAI (`zincai/`)
 
-A fuller agent with an independent chat-reply lane and an action-planning lane.
+A fuller agent with an independent chat-reply lane and an action-planning lane
+(a reply never waits for the body's call, and part of the call budget is
+reserved for chat).
 Its action schemas are in `zincai/api_wrapper.js`; it sends
 `tool_choice: "required"` and falls back to `"auto"` if the endpoint rejects
 that setting. If a compatible endpoint ignores tools and returns JSON text, the
@@ -120,6 +126,12 @@ API_KEY=rc-dummy node zincai/index.js --dry-run
 
 The unit/session suites use mocked Mineflayer bots and a scripted local model;
 they do not call the real AMD API or join a production server.
+
+[`audit/REPORT.md`](audit/REPORT.md) is a pre-release audit of both harnesses
+against five play scenes; [`audit/FIXES.md`](audit/FIXES.md) lists what was
+fixed afterwards, how each fix was checked and what is still open.
+`audit/repro/*.js` are the scripts behind the numbers (`node audit/repro/<name>`
+from the repository root).
 
 ### Local Minecraft loopback E2E
 

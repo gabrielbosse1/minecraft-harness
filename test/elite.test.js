@@ -25,6 +25,8 @@ const {
   weaponProfile,
   cooldownProgress,
   classifyThreat,
+  forecastImpact,
+  closestApproach,
   heldItemName,
   CRIT_THRESHOLD
 } = require('../src/combat')
@@ -405,35 +407,83 @@ test('melee crit jumps first and only attacks on the falling tick', () => {
   assert.equal(combat.critArmed, false)
 })
 
-test('mace panic: measured from motion, runs away facing away, never dumps water', () => {
+test('mace: a hop is ignored, a real dive is dodged before it lands — and no water is dumped', () => {
   let t = 10_000
   const { bot, target, controls, calls } = combatFixture({
     targetDist: 3.4,
     inventoryItems: [{ name: 'water_bucket', count: 1 }]
   })
-  target.heldItem = { name: 'mace' }
+  Object.assign(target, { type: 'player', name: 'player', username: 'Gabriel', heldItem: { name: 'mace' } })
   const events = []
   const combat = new AdvancedCombat(bot, { now: () => t, onEvent: (e) => events.push(e) })
   combat.state = 'melee'
   combat.target = target
+  const step = (y) => { t += 50; target.position = pos(0, y, 3.4); combat._tick() }
+  const dodges = () => events.filter((e) => /dodged|braced|broke away/.test(e.msg))
 
   // Standing there with a mace is not a threat (mineflayer reports onGround
   // true for everyone else, forever).
   combat._tick()
-  t += 50
-  combat._tick()
+  step(64)
   assert.equal(combat.state, 'melee', 'a held mace alone must not trigger anything')
 
-  // The opponent actually jumps: its position rises between two ticks.
-  t += 50
-  target.position = pos(0, 64.42, 3.4)
-  combat._tick()
-  assert.equal(combat.state, 'retreat')
+  // A hop on the spot: up 1.25 blocks and down again. The old trigger was
+  // "mace in hand and any vertical motion", so every hop sent the bot running.
+  let y = 64
+  let v = 0.42
+  for (let i = 0; i < 14; i++) { y = Math.max(64, y + v); v = (v - 0.08) * 0.98; step(y); if (y === 64) break }
+  assert.equal(combat.state, 'melee', 'a jump is not a mace smash')
+  assert.equal(dodges().length, 0)
+
+  // A real dive from 8 blocks up, coming down next to the bot.
+  y = 72
+  v = 0
+  step(y)
+  let dodgedAt = null
+  for (let i = 0; i < 40 && y > 64; i++) {
+    v = (v - 0.08) * 0.98
+    y = Math.max(64, y + v)
+    step(y)
+    if (dodgedAt === null && combat.state === 'retreat') dodgedAt = y
+  }
+  assert.ok(dodgedAt !== null, 'the dive is dodged')
+  assert.ok(dodgedAt - 64 >= 2, `…while the attacker is still well above the ground (y ${dodgedAt})`)
   assert.equal(controls.forward, true, 'turns away and runs forward')
   assert.equal(controls.sprint, true)
   assert.ok(!controls.back, 'no sprinting backwards')
   assert.equal(calls.activate, 0, 'no water bucket is emptied on the floor')
-  assert.ok(events.some((e) => /broke away \(mace\)/.test(e.msg)), JSON.stringify(events))
+  assert.ok(dodges().some((e) => /dodged Gabriel's mace smash/.test(e.msg)), JSON.stringify(events))
+})
+
+test('forecastImpact: stairs and hops are nothing; a glide on a hitting line is a charge', () => {
+  const me = { position: pos(0, 64, 0), velocity: { x: 0, y: 0, z: 0 } }
+  const mace = { position: pos(0, 66, 2), heldItem: { name: 'mace' } }
+  // Walking down a staircase: steady slow descent, each step resets the fall.
+  assert.equal(forecastImpact(mace, me, { vx: 0, vy: -0.2, vz: -0.2, falling: true, fallen: 0.5 }), null)
+  // The end of an ordinary jump: fast, but only 1.25 blocks of fall.
+  assert.equal(forecastImpact(mace, me, { vx: 0, vy: -0.44, vz: 0, falling: true, fallen: 1.25 }), null)
+  // A real fall onto the bot.
+  const smash = forecastImpact(mace, me, { vx: 0, vy: -0.6, vz: -0.1, falling: true, fallen: 2.4 })
+  assert.equal(smash.kind, 'smash')
+  assert.ok(smash.inSec > 0 && smash.inSec < 0.5, `lands in ${smash.inSec}s`)
+  // The same fall, but coming down 8 blocks away: not our problem.
+  assert.equal(forecastImpact({ position: pos(0, 66, 8), heldItem: { name: 'mace' } }, me, { vx: 0, vy: -0.6, vz: 0, falling: true, fallen: 2.4 }), null)
+
+  // A level glide at head height with a spear, 20 m/s straight at the bot, 12 blocks out.
+  const glider = { position: pos(0, 65, 12), heldItem: { name: 'iron_spear' } }
+  const level = { vx: 0, vy: 0, vz: -1.0, falling: false, fallen: 0 }
+  const charge = forecastImpact(glider, me, level, { gliding: true })
+  assert.equal(charge.kind, 'charge', 'no vertical speed needed (the old trigger wanted some)')
+  assert.ok(charge.inSec > 0.5 && charge.inSec <= 0.9, `impact in ${charge.inSec}s — acted on with time to move`)
+  // The same glide passing 6 blocks to the side is left alone.
+  assert.equal(forecastImpact({ position: pos(6, 65, 12), heldItem: { name: 'iron_spear' } }, me, level, { gliding: true }), null)
+  // A spear driven in on foot (item in use), walking speed.
+  const lunge = forecastImpact({ position: pos(0, 64, 3), heldItem: { name: 'iron_spear' } }, me, { vx: 0, vy: 0, vz: -0.22, falling: false, fallen: 0 }, { usingItem: true })
+  assert.equal(lunge.kind, 'charge')
+  // Somebody merely running at the bot with a sword is ordinary melee.
+  assert.equal(forecastImpact({ position: pos(0, 64, 4), heldItem: { name: 'diamond_sword' } }, me, { vx: 0, vy: 0, vz: -0.28, falling: false, fallen: 0 }), null)
+  const ca = closestApproach({ x: 0, y: 0, z: 10 }, { x: 0, y: 0, z: -20 })
+  assert.ok(Math.abs(ca.t - 0.5) < 1e-9 && ca.miss < 1e-9)
 })
 
 test('ranged engagement backs off inside 10m and never fires an uncharged bow', () => {
@@ -493,6 +543,7 @@ test('reflexes never fight: a zombie in reach makes the bot run, and the keys ar
   const s1 = new System1(bot, {
     registry: new ReflexRegistry(),
     logger: { info () {}, warn () {}, debug () {} },
+    calmMs: 600,
     onEvent: (e) => events.push(e)
   })
   s1.registerBuiltins()
@@ -502,15 +553,22 @@ test('reflexes never fight: a zombie in reach makes the bot run, and the keys ar
   assert.equal(heldKeys(bot), 'forward+jump+sprint', 'runs away (no forward+back tug of war)')
   // The zombie is to the south (+z): the bot must face north (yaw 0).
   assert.ok(Math.abs(bot.entity.yaw) < 0.2, `faces away from the zombie, yaw=${bot.entity.yaw}`)
-  assert.ok(events.some((e) => e.type === 'threat' && e.wake && /zombie/.test(e.text)), 'the model is told')
+  assert.ok(events.some((e) => e.type === 'threat' && e.wake && /started FLEEING/.test(e.text) && /zombie/.test(e.text)), 'the model is told')
+  assert.match(s1.reflexLine(), /^FLEEING for \d+s from zombie/, 'and every prompt can say what the body is doing')
 
   delete bot.entities[5]
   await s1.tick()
-  await wait(850)
+  // Nothing follows: the keys are let go at once, but the escape is only
+  // declared over after the calm period (no "safe" / "fleeing" flip-flop).
+  assert.equal(heldKeys(bot), '(none)', 'stops and looks back as soon as nothing follows')
+  assert.equal(s1.fleeing, true, 'still inside the calm period')
+  await wait(650)
   await s1.tick()
   assert.equal(s1.fleeing, false)
   assert.equal(heldKeys(bot), '(none)', 'nothing stays held')
-  assert.ok(events.some((e) => e.type === 'safe'))
+  const safe = events.find((e) => e.type === 'safe')
+  assert.ok(safe && /safe again — fled \d+s from zombie/.test(safe.text), 'the end is reported with what happened')
+  assert.match(s1.reflexLine(), /ago you FLED by reflex for \d+s from zombie/, 'the escape stays known afterwards')
   s1.stop()
 })
 
@@ -711,10 +769,17 @@ test('prompts: flee-first policy, phased building, vanilla-only, PT-BR voice', (
   assert.ok(/you are a bot/i.test(prompt), 'one honest answer to "are you a bot?"')
   assert.ok(prompt.length < 4500, 'prompt must stay lean for KV-cache economy')
 
+  // The body's own doing is something the model is told about, in both prompts.
+  assert.ok(/reflex: what your body did BY ITSELF/.test(prompt), 'the model is told what the reflex line is')
+  assert.ok(/only PAUSE/.test(prompt), 'short jobs no longer cancel the long task')
+  assert.ok(/ALWAYS write in informal Brazilian Portuguese/.test(prompt))
+
   const chat = fs.readFileSync(path.join(__dirname, '..', 'zincai', 'chat_prompt.txt'), 'utf8')
-  assert.ok(/Brazilian Portuguese/.test(chat))
-  assert.ok(/language of the message/.test(chat))
+  assert.ok(/ALWAYS answer in informal Brazilian Portuguese/.test(chat))
+  assert.ok(!/language of the message/.test(chat), 'the server speaks PT-BR whatever the message is written in')
   assert.ok(/Keep the accents/.test(chat))
   assert.ok(/You are a bot/.test(chat))
+  assert.ok(/reflex line is what your body did by itself/.test(chat), 'the voice knows when the body is fleeing')
+  assert.ok(/`remember`/.test(chat), 'the voice can write a memory')
 })
 

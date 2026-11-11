@@ -7,7 +7,19 @@
  *   tell the model, which then decides: attack, go somewhere, hold, or keep
  *   fleeing (idle). Once the model has decided about the threats it was shown,
  *   those threats stop triggering the reflex for that decision. New threats,
- *   a lit creeper, or low health trigger it again.
+ *   a lit creeper, low health, or an accepted threat that hits after all
+ *   trigger it again.
+ *
+ * THE BOT KNOWS WHAT ITS BODY DID
+ *   An escape is one EPISODE: it starts when a real threat is close, it lasts
+ *   while anything still follows inside the release ring, and it ends when
+ *   nothing has followed for a few seconds (or the model decides). The model
+ *   is told when it starts, when something material changes (a lit fuse, the
+ *   horde doubling, health dropping, cornered), every half minute while it
+ *   lasts, and when it ends — with what it ran from, how far and what it cost.
+ *   reflexLine() puts the same facts in every prompt, during the escape and
+ *   for a few minutes after, so neither the action lane nor the chat lane has
+ *   to guess why the bot is where it is.
  *
  * Reflexes are still registry-driven (same `register()` call an operator
  * would use), but the built-ins are now:
@@ -31,6 +43,10 @@
 
 const { ControlArbiter, PRIORITY } = require('./control')
 const { ThreatSense } = require('./threats')
+const { mobSpeed, mobStats, statsOf, reachOf, cornerText } = require('./tactics')
+const { runnableHeading } = require('./custom_mineflayer/escape')
+
+const byDistance = (a, b) => a.distance - b.distance
 
 // ---------------------------------------------------------------------------
 // Food. `points` = hunger restored, `sat` = saturation. Only items listed here
@@ -76,6 +92,11 @@ const FOODS = {
 /** Healing items: never a snack. Only the health_low reflex may eat them. */
 const HEALING = { golden_apple: 8, enchanted_golden_apple: 6 } // name -> eat at or below this health
 
+/** Natural regeneration needs this much hunger. */
+const REGEN_FOOD = 18
+/** Below this health, getting the hunger bar back to 18 matters more than not wasting food. */
+const HURT_BELOW = 17
+
 /** Legacy export: every edible item name this layer may ever consume. */
 const FOOD_RE = new RegExp(`^(${[...Object.keys(FOODS), ...Object.keys(HEALING)].join('|')})$`)
 
@@ -101,6 +122,10 @@ function chooseFood (items, { food = 20, health = 20, healing = false } = {}) {
   if (!pool.length) return null
   const cooked = pool.filter((i) => !FOODS[i.name].raw)
   const ranked = (cooked.length ? cooked : pool).slice().sort((a, b) => FOODS[b.name].sat - FOODS[a.name].sat)
+  // Hurt and below 18 hunger: health does not come back until the bar is at
+  // 18. Eating is not waste then, whatever the item overshoots by — a bot
+  // carrying only steak used to sit at 4 hearts until it was down to 12 food.
+  if (health < HURT_BELOW && food < REGEN_FOOD) return ranked[0]
   // No waste: the best item that fits the deficit; when really hungry, anything.
   const fits = ranked.find((i) => FOODS[i.name].points <= deficit)
   if (fits) return fits
@@ -149,15 +174,36 @@ class System1 {
     this._lastElytra = 0
     this._eating = false
 
+    // An escape starts inside the trigger ring (threats.js) and is over only
+    // when nothing has followed inside this wider ring for `calmMs`.
+    this.releaseRadius = opts.releaseRadius ?? 22
+    this.calmMs = opts.calmMs ?? 4000
+    // While an escape lasts: at most one report per `reportGapMs` for changes,
+    // and one "still fleeing" every `stillFleeingMs` (0 = never).
+    this.reportGapMs = opts.reportGapMs ?? 6000
+    this.stillFleeingMs = opts.stillFleeingMs ?? 30_000
+    // How long the last escape stays in the prompts after it ended.
+    this.recallMs = opts.recallMs ?? 180_000
+
     /** threat id -> expiry. The model has decided about these. */
     this._acked = new Map()
+    // id -> { at, until }: threats the model called harmless or accepted
+    // ("hold"). That is a statement about those mobs, not about a task, so it
+    // outlives whatever the bot does next.
+    this._holds = new Map()
     /** threat type names the model chose to fight (extends to newcomers). */
     this._ackedTypes = new Set()
     this._ackAll = 0 // until when every non-hard threat is acknowledged
-    /** Threats that currently drive the flee reflex. */
+    this._decision = null // { label, at, until, count, types, all }
+    this._expired = null // a decision whose safety-net ttl ran out, until it has been reported
+    /** Threats that currently drive the flee reflex (inside the trigger ring, undecided). */
     this.live = []
+    /** What the escape in progress is running from (live + whatever still follows). */
+    this.chasers = []
     this._flee = null
     this._episode = null
+    /** The escape that ended most recently: { endedAt, why, seconds, from, ran, lost, start, end }. */
+    this.lastEpisode = null
     this._calmSince = 0
     this._fall = { startY: null, fallen: 0 }
     this._mlg = null
@@ -212,12 +258,17 @@ class System1 {
   /** Death / respawn: forget every decision and every claim. */
   reset () {
     this._acked.clear()
+    this._holds.clear()
     this._ackedTypes.clear()
     this._ackAll = 0
+    this._decision = null
+    this._expired = null
     this._flee = null
     this._episode = null
+    this.lastEpisode = null
     this._mlg = null
     this.live = []
+    this.chasers = []
     this._fall = { startY: null, fallen: 0 }
     this.hands.release('reset')
     this.buoyancy.release('reset')
@@ -240,26 +291,42 @@ class System1 {
 
   /**
    * The model has seen these threats and chosen what to do about them. They
-   * stop triggering the flee reflex until `ttlMs` passes or clearDecision().
+   * stop triggering the flee reflex until the decision ends:
+   *   - clearDecision() (the task it belonged to finished, the fight is over),
+   *   - one of them hurts the bot after all (not during a chosen fight),
+   *   - a lit fuse, low health, or `ttlMs` (a long safety net, reported when
+   *     it runs out — never a silent bolt).
+   *
+   * `label: 'hold'` is different in one way: "these are harmless or accepted"
+   * is about the mobs, not about a task, so clearDecision() leaves it alone.
+   * It used to be wiped when any task ended — the bot bolted from an exhibit
+   * it had been told to ignore as soon as it finished handing over a loaf.
    *
    * @param {Iterable<number>} ids threat ids from the prompt the model answered
    * @param {{ types?: string[], all?: boolean, ttlMs?: number, label?: string }} [opts]
    *   types — "fight zombies" also covers zombies that show up later
    *   all   — "fight anything hostile"
    */
-  acknowledge (ids = [], { types = [], all = false, ttlMs = 60_000, label = 'decision' } = {}) {
-    const until = this.now() + ttlMs
-    for (const id of ids) this._acked.set(id, until)
-    for (const t of types) this._ackedTypes.add(String(t).toLowerCase())
-    if (all) this._ackAll = until
-    this._decision = label
+  acknowledge (ids = [], { types = [], all = false, ttlMs = 10 * 60_000, label = 'decision' } = {}) {
+    const now = this.now()
+    const until = now + ttlMs
+    const list = [...ids]
+    if (label === 'hold') {
+      for (const id of list) this._holds.set(id, { at: now, until })
+    } else {
+      for (const id of list) this._acked.set(id, until)
+      for (const t of types) this._ackedTypes.add(String(t).toLowerCase())
+      if (all) this._ackAll = until
+      this._decision = { label, at: now, until, count: list.length, types: types.map((t) => String(t).toLowerCase()), all: Boolean(all) }
+    }
+    this._expired = null
     // Stop running at once if nothing live is left.
     this._refreshLive()
-    if (!this.live.length) this._endFlee('model decided')
+    if (!this.live.length && !this._chasers(now).length) this._endFlee('decided', label)
     return this.live.length === 0
   }
 
-  /** Back to the default: flee from everything. */
+  /** The task (or fight) a decision belonged to is over: flee from those again. Holds stay. */
   clearDecision () {
     this._acked.clear()
     this._ackedTypes.clear()
@@ -269,6 +336,9 @@ class System1 {
 
   get fleeing () { return Boolean(this._flee) }
 
+  /** The model's standing decision about threats, if any: { label, at, until, count }. */
+  get decision () { return this._decision }
+
   /** Is this threat still up to the reflex (true) or already decided (false)? */
   _isLive (t, now) {
     const targetId = this.combat?.isEngaged ? this.combat.target?.id : null
@@ -276,6 +346,15 @@ class System1 {
     if (t.hard) return true
     const hp = Number(this.bot.health)
     if (Number.isFinite(hp) && hp <= this.fleeBelowHealth) return true // too hurt to honour old decisions
+    const hit = t.attacker ? this.sense.attackers?.get?.(t.id) : null
+    const held = this._holds.get(t.id)
+    if (held && now < held.until) {
+      // "Harmless or accepted" stopped being true when it landed a hit.
+      if (hit && hit.at > held.at) this._holds.delete(t.id)
+      else return false
+    }
+    const d = this._decision
+    if (d && d.label !== 'fight' && hit && hit.at > d.at) return true
     if (now < this._ackAll) return false
     if (this._ackedTypes.has(t.name)) return false
     const until = this._acked.get(t.id)
@@ -285,8 +364,36 @@ class System1 {
   _refreshLive () {
     const now = this.now()
     for (const [id, until] of this._acked) if (now >= until) this._acked.delete(id)
+    for (const [id, h] of this._holds) {
+      if (now < h.until) continue
+      this._holds.delete(id)
+      // Worth a word only if the mob it was about is still around.
+      if (!this._expired && this.bot.entities?.[id]) this._expired = { label: 'hold', at: h.at, endedAt: now }
+    }
+    if (this._decision && now >= this._decision.until) {
+      // The safety net ran out. Remember it so the next report can say why the body moved.
+      this._expired = { label: this._decision.label, at: this._decision.at, endedAt: now }
+      this.clearDecision()
+    }
     this.live = this.sense.last.threats.filter((t) => this._isLive(t, now))
     return this.live
+  }
+
+  /**
+   * What an escape in progress is still running from: the live threats, plus
+   * anything undecided in the open that is inside the release ring or still
+   * closing from further out, plus the ones from this episode that went out
+   * of sight but not out of range (a zombie around the corner is still
+   * coming). An escape is over when this is empty for `calmMs`.
+   */
+  _chasers (now = this.now()) {
+    const last = this.sense.last
+    const out = [...this.live]
+    const R = this.releaseRadius
+    for (const t of last.watch || []) if ((t.distance <= R || t.closing > 0.5) && this._isLive(t, now)) out.push(t)
+    const ep = this._episode
+    if (ep) for (const t of last.hidden || []) if (t.distance <= R && !t.caged && ep.ids.has(t.id) && this._isLive(t, now)) out.push(t)
+    return out.sort(byDistance)
   }
 
   // ------------------------------------------------------------- the tick
@@ -299,18 +406,37 @@ class System1 {
     const now = this.now()
 
     // 1. Real threats → flee (unless the model already decided about them).
+    //    A threat inside the trigger ring STARTS an escape; once running, it
+    //    lasts while anything still follows inside the wider release ring.
+    //    One ring for both made the bot flip between "fleeing" and "safe" at
+    //    the 12-block line and wake the model at every flip.
     this.sense.assess()
     const live = this._refreshLive()
-    if (live.length) {
+    const from = (this._flee || live.length) ? this._chasers(now) : []
+    if (from.length) {
+      this.chasers = from
+      // Back from a look-back pause: the "not making ground" clock starts afresh.
+      if (this._calmSince && this._flee) this._flee.lastMoveAt = now
       this._calmSince = 0
-      this._noteEpisode(live, now)
-      await this.registry.evaluate({ type: 'threat_near', distance: live[0].distance, entity: live[0].entity, item: live[0].name, threats: live }, ctx)
+      // Move first, then tell: the first report already knows whether there is a way out.
+      await this.registry.evaluate({ type: 'threat_near', distance: from[0].distance, entity: from[0].entity, item: from[0].name, threats: from }, ctx)
+      if (this._flee) this._trackEpisode(from, now)
     } else if (this._flee) {
-      if (!this._calmSince) this._calmSince = now
-      if (now - this._calmSince >= 800) this._endFlee('safe')
+      this.chasers = []
+      if (!this._calmSince) {
+        // Nothing follows right now: stop and look back instead of running on
+        // to a goal chosen a second ago. If they are still coming they will be
+        // seen closing, and the same escape simply continues.
+        this._calmSince = now
+        this._flee.target = null
+        this._flee.planAt = -Infinity
+        this.hands.setGoal(null)
+        this.hands.clearControlStates()
+      }
+      if (now - this._calmSince >= this.calmMs) this._endFlee('safe')
       else this.hands.touch(1500)
-    } else if (this._episode && this.sense.last.threats.length === 0) {
-      this._episode = null
+    } else {
+      this.chasers = []
     }
 
     // 2. Health and hunger.
@@ -327,34 +453,175 @@ class System1 {
     else if (this.buoyancy.active) this.buoyancy.release('surfaced')
   }
 
-  /** Tell the model once per episode, and again when the picture changes. */
-  _noteEpisode (live, now) {
-    const ids = new Set(live.map((t) => t.id))
-    const ep = this._episode
-    let reason = null
-    if (!ep) reason = 'new'
-    else {
-      const fresh = live.filter((t) => !ep.ids.has(t.id))
-      const urgent = fresh.some((t) => t.hard || t.attacker)
-      if (urgent || (fresh.length && now - ep.notifiedAt >= 5000)) reason = 'changed'
+  // --------------------------------------------------------- episodes ----
+
+  /**
+   * "zombie x24, skeleton x3" for a list of threat entries (or a name→count
+   * map). `counts: false` gives the kinds only — wake-up texts are read
+   * seconds later next to a fresh `threats:` block, and two different head
+   * counts for one horde is exactly what the model must not be shown.
+   */
+  _kinds (source, { counts: withCounts = true } = {}) {
+    const counts = source instanceof Map ? source : new Map()
+    if (!(source instanceof Map)) for (const t of source) counts.set(t.name, (counts.get(t.name) || 0) + 1)
+    const parts = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4).map(([name, n]) => (withCounts && n > 1 ? `${name} x${n}` : name))
+    if (counts.size > 4) parts.push(`+${counts.size - 4} more kinds`)
+    return parts.join(', ')
+  }
+
+  _hpBand (hp) { return hp <= this.fleeBelowHealth ? 2 : (hp <= this.lowHealth ? 1 : 0) }
+
+  /**
+   * Keep the episode's books and decide whether the model needs to hear about
+   * it now: once at the start, then only for material changes (never more
+   * often than every `reportGapMs`, except for a lit fuse or being cornered),
+   * and every `stillFleeingMs` while it drags on.
+   */
+  _trackEpisode (from, now) {
+    const bot = this.bot
+    const pos = bot.entity.position
+    const hp = Number(bot.health ?? 20)
+    const names = new Map()
+    for (const t of from) names.set(t.name, (names.get(t.name) || 0) + 1)
+    let ep = this._episode
+    if (!ep) {
+      ep = this._episode = {
+        startedAt: now,
+        start: { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) },
+        ids: new Set(),
+        kinds: new Map(),
+        peak: 0,
+        hpStart: hp,
+        hpMin: hp,
+        run: 0,
+        lastPos: { x: pos.x, z: pos.z },
+        cornered: false,
+        corneredWhy: '',
+        reportedAt: now,
+        reported: { count: Math.max(from.length, this.sense.coming().length), kinds: new Set(names.keys()), hard: from.some((t) => t.hard), band: this._hpBand(hp), cornered: false }
+      }
+      for (const t of from) ep.ids.add(t.id)
+      for (const [name, n] of names) ep.kinds.set(name, n)
+      ep.peak = from.length
+      // The escape plan was made a moment ago: say at once if there is no good way out.
+      const plan = this._flee?.plan
+      if (plan && plan.why !== 'vector') { ep.cornered = Boolean(plan.cornered); ep.corneredWhy = plan.why; ep.chased = plan.why === 'chased' }
+      ep.reported.cornered = ep.cornered
+      // A decision that ran out is the reason only if it ran out just now.
+      const expired = this._expired && now - this._expired.endedAt <= 10_000 ? this._expired : null
+      this._expired = null
+      const why = expired ? ` (your "${expired.label}" decision from ${Math.round((now - expired.at) / 1000)}s ago ran out)` : ''
+      const text = `reflex: started FLEEING — ${this._kinds(from, { counts: false })} came close (${from[0].where})${why}${ep.cornered ? `; ${cornerText(ep.corneredWhy)}` : ''}`
+      this.logger?.info?.('reflex', text)
+      this.onEvent({ type: 'threat', text, wake: true, urgent: true, threatIds: [...ep.ids] })
+      return
     }
-    if (!reason) { if (ep) for (const id of ids) ep.ids.add(id); return }
-    this._episode = { ids, startedAt: ep?.startedAt || now, notifiedAt: now }
-    const text = `fleeing from ${this.sense.describe(live)}`
+    for (const t of from) ep.ids.add(t.id)
+    for (const [name, n] of names) if (n > (ep.kinds.get(name) || 0)) ep.kinds.set(name, n)
+    ep.peak = Math.max(ep.peak, from.length)
+    ep.hpMin = Math.min(ep.hpMin, hp)
+    const step = Math.hypot(pos.x - ep.lastPos.x, pos.z - ep.lastPos.z)
+    if (step >= 0.5) { ep.run += step; ep.lastPos = { x: pos.x, z: pos.z } }
+
+    const r = ep.reported
+    const changes = []
+    let urgent = false
+    const hard = from.filter((t) => t.hard)
+    if (hard.length && !r.hard) { changes.push(hard.some((t) => t.name === 'tnt') ? 'TNT is primed close by' : "a creeper's FUSE IS LIT"); urgent = true }
+    const fresh = [...names.keys()].filter((name) => !r.kinds.has(name))
+    const dangerous = fresh.filter((name) => { const s = mobStats(name); return s.ranged || s.explosive || from.some((t) => t.name === name && t.kind === 'player') })
+    if (dangerous.length) changes.push(`now also ${dangerous.join(', ')}`)
+    const total = Math.max(from.length, this.sense.coming().length)
+    if (total >= r.count * 2 && total >= r.count + 3) changes.push('many more of them now')
+    const band = this._hpBand(hp)
+    if (band > r.band) changes.push(`hp down to ${Math.round(hp)}`)
+    if (ep.cornered && !r.cornered) { changes.push(cornerText(ep.corneredWhy)); urgent = true }
+    const dragging = this.stillFleeingMs > 0 && now - ep.reportedAt >= this.stillFleeingMs
+    if (!changes.length && !dragging) return
+    if (!urgent && !dragging && now - ep.reportedAt < this.reportGapMs) return
+    ep.reportedAt = now
+    ep.reported = { count: Math.max(r.count, total), kinds: new Set([...r.kinds, ...names.keys()]), hard: r.hard || hard.length > 0, band: Math.max(r.band, band), cornered: r.cornered || ep.cornered }
+    const secs = Math.round((now - ep.startedAt) / 1000)
+    const text = `reflex: still FLEEING after ${secs}s${changes.length ? ' — ' + changes.join('; ') : ' — they keep coming'}`
     this.logger?.info?.('reflex', text)
-    this.onEvent({ type: 'threat', text, wake: true, threatIds: [...ids] })
+    this.onEvent({ type: 'threat', text, wake: true, urgent, threatIds: [...ep.ids] })
+  }
+
+  /**
+   * What the reflex is doing or just did, as one line for a prompt; null when
+   * there is nothing to tell. Both lanes show it, so the bot always knows that
+   * it ran, from what, how far, and that it was the body's doing.
+   */
+  reflexLine ({ brief = false } = {}) {
+    const now = this.now()
+    const ep = this._episode
+    const at = (p) => `${p.x},${p.y},${p.z}`
+    if (this._flee && ep) {
+      const secs = Math.max(1, Math.round((now - ep.startedAt) / 1000))
+      const lost = Math.round(ep.hpStart - Number(this.bot.health ?? ep.hpStart))
+      const state = ep.cornered ? `; ${cornerText(ep.corneredWhy).split(' — ')[0]}` : ''
+      if (brief) return `FLEEING by reflex ${secs}s, ran ${Math.round(ep.run)}m${lost > 0 ? `, lost ${lost} hp` : ''}${state}`
+      return `FLEEING for ${secs}s from ${this._kinds(ep.kinds)} — ran ${Math.round(ep.run)}m from ${at(ep.start)}${lost > 0 ? `, lost ${lost} hp` : ''}${state}. The body did this by itself; idle keeps it running.`
+    }
+    const last = this.lastEpisode
+    if (last && now - last.endedAt <= this.recallMs) {
+      const ago = Math.max(1, Math.round((now - last.endedAt) / 1000))
+      const ended = last.why === 'safe' ? 'nothing followed any more' : (last.why === 'decided' ? `you chose ${last.label || 'to stop'}` : last.why)
+      if (brief) return `fled by reflex ${last.seconds}s from ${last.from} (ran ${last.ran}m${last.lost > 0 ? `, lost ${last.lost} hp` : ''}), over ${ago}s ago`
+      return `${ago}s ago you FLED by reflex for ${last.seconds}s from ${last.from} (ran ${last.ran}m from ${at(last.start)}${last.lost > 0 ? `, lost ${last.lost} hp` : ''}); it ended because ${ended}.`
+    }
+    return null
+  }
+
+  /** The decisions in force, in words: "you chose hold 40s ago about 3 listed threats; …". */
+  decisionLine () {
+    const now = this.now()
+    const parts = []
+    const some = (n) => `${n} listed threat${n === 1 ? '' : 's'}`
+    let held = 0
+    let since = 0
+    for (const [id, h] of this._holds) if (now < h.until && this.bot.entities?.[id]) { held++; since = Math.max(since, h.at) }
+    if (held) parts.push(`you chose hold ${Math.max(1, Math.round((now - since) / 1000))}s ago about ${some(held)}; the body will not run from them, whatever you do next, unless one of them hurts you`)
+    const d = this._decision
+    if (d) {
+      const ago = Math.max(1, Math.round((now - d.at) / 1000))
+      const about = d.all ? 'every hostile' : (d.types.length ? `${d.types.join(', ')} (any number)` : some(d.count))
+      const until = d.label === 'fight' ? 'until the fight ends' : 'until one of them hurts you, something new shows up or that task ends'
+      parts.push(`you chose ${d.label} ${ago}s ago about ${about}; the body will not run from them ${until}`)
+    }
+    return parts.length ? parts.join('; ') : null
   }
 
   // ------------------------------------------------------------- flee ----
 
+  /** Pursuers as the escape planner wants them: where, how fast, how close is too close. */
+  _pursuers (threats) {
+    const out = []
+    for (const t of threats) {
+      const p = t.entity?.position
+      if (!p) continue
+      let reach = reachOf(t)
+      if (t.lit) reach = Math.max(reach, t.charged ? 11 : 7.5) // inside the blast is not "arrived first"
+      const speed = t.kind === 'player' ? statsOf(t).speed : mobSpeed(t.entity, t.name)
+      out.push({ x: p.x, y: p.y, z: p.z, speed, reach, name: t.name })
+    }
+    return out
+  }
+
   /**
-   * Reflex action: run from the live threats. Plans with the threat-aware
-   * pathfinder; if A* has no route (or the bot is not making ground) it turns
-   * away and sprints — standing still is never the answer.
+   * Reflex action: run from the live threats.
+   *
+   * The destination comes from the escape planner (escape.js): the reachable
+   * cell where the bot arrives well before any mob could, on a branch that
+   * leads out. The pathfinder walks there; the plan is refreshed several
+   * times a second but the goal only moves when the old one stopped being
+   * good, so the run is not chopped up by replans. If A* has no route or the
+   * bot is not making ground, it sprints along the first leg of the plan
+   * instead — after checking there is ground to sprint on.
    */
   flee (event) {
     const bot = this.bot
-    const threats = event?.threats?.length ? event.threats : this.live
+    const threats = event?.threats?.length ? event.threats : (this.chasers.length ? this.chasers : this.live)
     const pos = bot.entity?.position
     if (!pos || !threats?.length) return 'no_threat'
     const now = this.now()
@@ -362,21 +629,21 @@ class System1 {
     const names = [...new Set(threats.map((t) => t.name))].slice(0, 3).join(', ')
     const started = !this._flee
     lane.acquire({ ttlMs: 1500, reason: `fleeing ${names}` })
-    const f = this._flee || (this._flee = { startedAt: now, planAt: -Infinity, direct: false, directUntil: 0, lastPos: { x: pos.x, z: pos.z }, lastMoveAt: now, dir: null })
+    const f = this._flee || (this._flee = { startedAt: now, planAt: -Infinity, direct: false, directUntil: 0, lastPos: { x: pos.x, z: pos.z }, lastMoveAt: now, dir: null, target: null, leadsOut: false, plan: null })
     if (started) this.logger?.warn?.('reflex', `flee: ${names} (${threats.length})`)
 
     // Progress check: 600 ms without moving 0.4 blocks → stop trusting the path.
     if (Math.hypot(pos.x - f.lastPos.x, pos.z - f.lastPos.z) >= 0.4) {
       f.lastPos = { x: pos.x, z: pos.z }
       f.lastMoveAt = now
-    } else if (now - f.lastMoveAt > 600 && !f.direct) {
+    } else if (now - f.lastMoveAt > 600 && !f.direct && !(f.plan && f.plan.cornered && f.arrived)) {
       f.direct = true
     }
 
     // Direct mode lasts one second at a time; then the planner gets another go.
     if (f.direct && !f.directUntil) {
       f.directUntil = now + 1000
-      f.dir = this._escapeDirection(threats)
+      f.target = null
       lane.setGoal(null)
     } else if (f.direct && now >= f.directUntil) {
       f.direct = false
@@ -384,24 +651,74 @@ class System1 {
       f.planAt = -Infinity
       f.lastMoveAt = now
     }
-    if (!f.direct && now - f.planAt >= 2000) {
+
+    if (now - f.planAt >= (f.plan?.cornered ? 500 : 700)) {
       f.planAt = now
-      const lit = threats.some((t) => t.lit)
-      let plan = null
-      try { plan = this.pathfinder?.fleePlan?.({ distance: lit ? this.fleeDistance + 4 : this.fleeDistance }) } catch { plan = null }
-      if (plan?.goal) {
-        f.dir = plan.direction
-        lane.clearControlStates()
-        lane.setGoal(plan.goal, true)
-      } else {
+      const plan = this._planEscape(threats)
+      f.plan = plan
+      const ep = this._episode
+      if (ep && plan) { ep.cornered = Boolean(plan.cornered) && plan.why !== 'vector'; ep.corneredWhy = plan.why; ep.chased = plan.why === 'chased' }
+      if (plan?.direction) f.dir = plan.direction
+      if (plan?.goal && !f.direct) {
+        const t = plan.target
+        const here = Math.hypot(pos.x - (t.x + 0.5), pos.z - (t.z + 0.5))
+        f.arrived = here <= 1.2 || (Boolean(f.target) && Math.hypot(pos.x - (f.target.x + 0.5), pos.z - (f.target.z + 0.5)) < 1.6)
+        if (here <= 1.2) {
+          // Already on the best ground there is (a pocket with nowhere better):
+          // stand, face what is coming, and leave the next move to the model.
+          if (f.target) { f.target = null; lane.setGoal(null); lane.clearControlStates() }
+          const facing = threats[0]?.entity?.position
+          if (facing && plan.cornered) { try { Promise.resolve(bot.lookAt(facing.offset ? facing.offset(0, 1.4, 0) : facing, false)).catch(() => {}) } catch { /* mock */ } }
+        } else {
+          // Keep the goal while it is still a good one: a replan every 700 ms that
+          // also reset the pathfinder would make the bot stutter instead of run.
+          let keep = false
+          if (f.target && !f.arrived) {
+            const toOld = Math.hypot(pos.x - (f.target.x + 0.5), pos.z - (f.target.z + 0.5))
+            const slack = this._slackAt(f.target, threats, toOld)
+            keep = toOld > 4 && slack > 0.8 && !(plan.leadsOut && !f.leadsOut) && Math.hypot(t.x - f.target.x, t.z - f.target.z) < 12
+          }
+          if (!keep) {
+            // Coming out of a stand (a pocket) the progress clock starts afresh:
+            // the pathfinder gets its 600 ms before the straight sprint takes over.
+            if (!f.target) f.lastMoveAt = now
+            f.target = { x: t.x, y: t.y, z: t.z }
+            f.leadsOut = Boolean(plan.leadsOut)
+            lane.clearControlStates()
+            lane.setGoal(plan.goal, true)
+          }
+        }
+      } else if (!plan?.goal && !f.direct) {
         f.direct = true
         f.directUntil = now + 1000
-        f.dir = this._escapeDirection(threats)
+        f.target = null
         lane.setGoal(null)
       }
     }
     if (f.direct) this._sprintAlong(f.dir || this._escapeDirection(threats))
     return 'flee'
+  }
+
+  /** Seconds in hand at `cell` if the bot still has `distance` blocks to go. */
+  _slackAt (cell, threats, distance) {
+    let tm = Infinity
+    for (const m of this._pursuers(threats)) {
+      const d = Math.hypot(m.x - (cell.x + 0.5), (m.y - cell.y) * 0.5, m.z - (cell.z + 0.5))
+      tm = Math.min(tm, Math.max(0, d - m.reach) / m.speed)
+    }
+    return tm - distance / 5.4
+  }
+
+  /** The escape plan: the safety field when the ground can be flooded, the old "point away" otherwise. */
+  _planEscape (threats) {
+    const lit = threats.some((t) => t.lit)
+    let plan = null
+    try { plan = this.pathfinder?.escapePlan?.(this._pursuers(threats), { radius: lit ? 22 : 18, budgetMs: 18 }) || null } catch (err) { this.logger?.debug?.('reflex', `escape plan failed: ${err.message || err}`); plan = null }
+    if (plan) return plan
+    let old = null
+    try { old = this.pathfinder?.fleePlan?.({ distance: lit ? this.fleeDistance + 4 : this.fleeDistance }) } catch { old = null }
+    if (!old?.goal) return null
+    return { goal: old.goal, target: { x: old.x, y: old.y, z: old.z }, direction: old.direction, cornered: false, leadsOut: true, why: 'vector', margin: 0 }
   }
 
   /** Unit vector away from the weighted centre of the threats. */
@@ -425,28 +742,66 @@ class System1 {
     return { x: sx / len, z: sz / len }
   }
 
-  /** Face a direction and sprint-jump along it (no pathfinder involved). */
+  /**
+   * Face a direction and sprint-jump along it (no pathfinder involved) — but
+   * only where there is ground: not into a wall, not off a ledge, not into
+   * lava. With nowhere to run it stands still rather than jump.
+   */
   _sprintAlong (dir) {
     const bot = this.bot
     const lane = this.hands
-    try { Promise.resolve(bot.look(Math.atan2(-dir.x, -dir.z), 0, true)).catch(() => {}) } catch { /* mock */ }
+    const heading = runnableHeading(bot, dir)
     lane.setControlState('back', false)
     lane.setControlState('left', false)
     lane.setControlState('right', false)
+    if (!heading) {
+      lane.setControlState('forward', false)
+      lane.setControlState('sprint', false)
+      lane.setControlState('jump', false)
+      const ep = this._episode
+      if (ep && !ep.cornered) { ep.cornered = true; ep.corneredWhy = 'pocket' }
+      return false
+    }
+    try { Promise.resolve(bot.look(Math.atan2(-heading.x, -heading.z), 0, true)).catch(() => {}) } catch { /* mock */ }
     lane.setControlState('forward', true)
     lane.setControlState('sprint', true)
     lane.setControlState('jump', Boolean(bot.entity.onGround))
+    return true
   }
 
-  _endFlee (why) {
+  _endFlee (why, label = null) {
     if (!this._flee) return
-    const secs = Math.max(1, Math.round((this.now() - this._flee.startedAt) / 1000))
+    const now = this.now()
+    const ep = this._episode
+    const secs = Math.max(1, Math.round((now - (ep?.startedAt ?? this._flee.startedAt)) / 1000))
     this._flee = null
     this._calmSince = 0
+    this.chasers = []
     this.hands.release(why)
+    this._episode = null
+    if (!ep) return
+    const pos = this.bot.entity?.position
+    const summary = {
+      endedAt: now,
+      why,
+      label,
+      seconds: secs,
+      from: this._kinds(ep.kinds),
+      peak: ep.peak,
+      ran: Math.round(ep.run),
+      lost: Math.max(0, Math.round(ep.hpStart - Number(this.bot.health ?? ep.hpStart))),
+      start: ep.start,
+      end: pos ? { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) } : ep.start
+    }
+    this.lastEpisode = summary
+    const cost = summary.lost > 0 ? `, lost ${summary.lost} hp` : ''
     if (why === 'safe') {
-      this._episode = null
-      this.onEvent({ type: 'safe', text: `safe again after fleeing ${secs}s`, wake: true })
+      const text = `reflex: safe again — fled ${secs}s from ${summary.from} (ran ${summary.ran}m${cost}); nothing hostile follows within ${this.releaseRadius}m`
+      this.logger?.info?.('reflex', text)
+      this.onEvent({ type: 'safe', text, wake: true, episode: summary })
+    } else {
+      // The model ended it; it does not need waking, but the escape is still part of what happened.
+      this.onEvent({ type: 'fled', text: `fled ${secs}s from ${summary.from} (ran ${summary.ran}m${cost}), then chose ${label || 'to stop'}`, wake: false, episode: summary })
     }
   }
 
@@ -469,7 +824,7 @@ class System1 {
     // Eating roots the bot for 1.6 s and takes the sword out of its hand: not
     // with something within arm's reach, and not in the middle of a fight.
     const isHealing = HEALING[food.name] !== undefined
-    const nearest = this.live[0]
+    const nearest = this.chasers[0] || this.live[0]
     if (!isHealing && nearest && nearest.distance < 6) return 'eat_unsafe'
     if (!isHealing && this.combat?.isEngaged) return 'eat_fighting'
     this._lastEat = now

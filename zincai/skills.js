@@ -22,6 +22,31 @@ const { chooseFood, FOODS, HEALING } = require('./system1')
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const fold = (text) => String(text ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim()
+
+/**
+ * Which of these item stacks does the model mean by `name`?
+ *
+ * The exact id, its plural, or its head noun ("sword" → iron_sword,
+ * "planks" → oak_planks). Never the material: "diamond" used to match
+ * diamond_pickaxe by substring, so "give Gabriel a diamond" handed over the
+ * pickaxe when no loose diamonds were carried.
+ */
+function matchItem (items, name) {
+  const q = fold(name).replace(/\s+/g, '_')
+  if (!q) return null
+  const singular = q.length > 3 && q.endsWith('s') ? q.slice(0, -1) : q
+  return items.find((i) => i.name === q) ||
+    items.find((i) => i.name === singular) ||
+    items.find((i) => i.name.endsWith('_' + q) || i.name.endsWith('_' + singular)) ||
+    null
+}
+
+/** Item names that merely contain the word — offered in the failure message, never used. */
+function nearMisses (items, name) {
+  const q = fold(name).replace(/\s+/g, '_')
+  if (!q) return []
+  return [...new Set(items.filter((i) => i.name.includes(q)).map((i) => i.name))].slice(0, 4)
+}
 const ok = (msg, extra = {}) => ({ ok: true, msg, ...extra })
 const fail = (msg, extra = {}) => ({ ok: false, msg, ...extra })
 
@@ -105,10 +130,13 @@ class Skills {
   }
 
   _item (name) {
-    const q = fold(name).replace(/\s+/g, '_')
-    if (!q) return null
-    const items = this.bot.inventory.items()
-    return items.find((i) => i.name === q) || items.find((i) => i.name.includes(q)) || null
+    return matchItem(this.bot.inventory.items(), name)
+  }
+
+  /** "I am not carrying any diamond (closest: diamond_pickaxe)". */
+  _notCarrying (name) {
+    const near = nearMisses(this.bot.inventory.items(), name)
+    return `I am not carrying any ${name}${near.length ? ` (closest: ${near.join(', ')} — name it exactly if that is what you mean)` : ''}`
   }
 
   _countOf (name) {
@@ -310,13 +338,39 @@ class Skills {
     } finally { try { win.close() } catch { /* already closed */ } }
   }
 
-  /** Take items out of a container (or the output of a furnace). */
+  /**
+   * Take items out of a container (or the output of a furnace).
+   *
+   * Without `where` it goes to a container KNOWN to hold the item (opened
+   * before), or one labelled like it. It never guesses: the old fallback
+   * opened the nearest furnace and reported success with whatever was in its
+   * output — "take diamond" returned "took iron_ingot x9 from furnace1".
+   */
   take ({ item, count = null, where = '' } = {}) {
     return this._run('take', async (token) => {
       const want = fold(item).replace(/\s+/g, '_')
       if (!want) return fail('take needs an item name')
-      const entry = this._resolveBlock(where || item, CONTAINER_KINDS) || this._resolveBlock(where, new Set(['furnace']))
-      if (!entry) return fail(`no container${where ? ` matching "${where}"` : ''} nearby`)
+      const pos = this.bot.entity?.position
+      const dim = this._dim()
+      let entry = null
+      if (String(where || '').trim()) {
+        entry = this._resolveBlock(where, new Set([...CONTAINER_KINDS, 'furnace']))
+        if (!entry) return fail(`no container matching "${where}" nearby`)
+        if (!CONTAINER_KINDS.has(entry.kind) && entry.kind !== 'furnace') return fail(`${entry.id} is not a container`)
+      } else if (pos) {
+        try { this.places.scan(this.bot, { force: true }) } catch { /* mock */ }
+        entry = this.places.findItem(want, pos, { dim })[0] || this.places.findLabel(want, pos, { dim }).find((e) => CONTAINER_KINDS.has(e.kind)) || null
+        if (!entry) {
+          const around = this.places.near(pos, { dim, radius: 32 })
+          const unopened = around.filter((e) => CONTAINER_KINDS.has(e.kind) && !e.contents)
+          const furnaces = around.filter((e) => e.kind === 'furnace').slice(0, 3).map((e) => e.id)
+          const hint = []
+          if (unopened.length) hint.push(`${unopened.length} container${unopened.length === 1 ? '' : 's'} here not opened yet (nearest: ${unopened.slice(0, 3).map((e) => `${e.id}${e.label ? ` "${e.label}"` : ''}`).join(', ')})`)
+          if (furnaces.length) hint.push(`furnaces: ${furnaces.join(', ')}`)
+          return fail(`I do not know where ${want} is: no opened container holds it and no label matches${hint.length ? ` — ${hint.join('; ')}` : ''}. Name a container in \`where\`, or look_in first. Nothing was taken.`)
+        }
+      }
+      if (!entry) return fail('no container nearby')
       token.label = `taking ${want} from ${entry.id}`
       const { win, err } = await this._open(token, entry)
       if (err) return fail(err)
@@ -324,19 +378,22 @@ class Skills {
         if (entry.kind === 'furnace') {
           const out = win.outputItem()
           if (!out) return fail(`${entry.id} has nothing in its output yet`)
+          if (!matchItem([out], want)) return fail(`${entry.id}'s output is ${out.name} x${out.count}, not ${want} — nothing was taken`)
           const got = await win.takeOutput()
           return ok(`took ${got?.name || out.name} x${got?.count || out.count} from ${entry.id}`)
         }
-        const stacks = win.containerItems().filter((i) => i.name === want)
-        const loose = stacks.length ? stacks : win.containerItems().filter((i) => i.name.includes(want))
-        if (!loose.length) {
-          this._remember(entry, win)
-          return fail(`${entry.id} has no ${want}`)
+        const inside = win.containerItems()
+        const first = matchItem(inside, want)
+        if (!first) {
+          const { counts } = this._remember(entry, win)
+          const near = nearMisses(inside, want)
+          const top = Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 6).map(([n, c]) => `${n} x${c}`)
+          return fail(`${entry.id}${entry.label ? ` "${entry.label}"` : ''} has no ${want}${near.length ? ` (closest: ${near.join(', ')})` : ''}; it holds ${top.length ? top.join(', ') : 'nothing'}`)
         }
-        const name = loose[0].name
-        const have = loose.filter((i) => i.name === name).reduce((n, i) => n + i.count, 0)
+        const name = first.name
+        const have = inside.filter((i) => i.name === name).reduce((n, i) => n + i.count, 0)
         const n = Math.max(1, Math.min(have, Number.isFinite(Number(count)) && Number(count) > 0 ? Math.trunc(Number(count)) : have))
-        await win.withdraw(loose[0].type, null, n)
+        await win.withdraw(first.type, null, n)
         this._remember(entry, win)
         return ok(`took ${name} x${n} from ${entry.id} (${have - n} left there)`)
       } finally { try { win.close() } catch { /* already closed */ } }
@@ -347,7 +404,7 @@ class Skills {
   put ({ item, count = null, where = '' } = {}) {
     return this._run('put', async (token) => {
       const mine = this._item(item)
-      if (!mine) return fail(`I am not carrying any ${item}`)
+      if (!mine) return fail(this._notCarrying(item))
       const entry = this._resolveBlock(where, CONTAINER_KINDS)
       if (!entry) return fail(`no container${where ? ` matching "${where}"` : ''} nearby`)
       token.label = `putting ${mine.name} into ${entry.id}`
@@ -367,7 +424,7 @@ class Skills {
   smelt ({ item, count = null, where = '' } = {}) {
     return this._run('smelt', async (token) => {
       const mine = this._item(item)
-      if (!mine) return fail(`I am not carrying any ${item}`)
+      if (!mine) return fail(this._notCarrying(item))
       const entry = this._resolveBlock(where || 'furnace', new Set(['furnace']))
       if (!entry || entry.kind !== 'furnace') return fail('no furnace nearby')
       const have = this._countOf(mine.name)
@@ -418,7 +475,7 @@ class Skills {
     const { GoalFollow } = this._goals()
     return this._run('give', async (token) => {
       const mine = this._item(item)
-      if (!mine) return fail(`I am not carrying any ${item}`)
+      if (!mine) return fail(this._notCarrying(item))
       const { name, entity } = this._playerEntity(player)
       if (!name) return fail(`no player named "${player}" is online`)
       if (!entity) return fail(`${name} is too far away to see`)
@@ -440,7 +497,7 @@ class Skills {
     try {
       if (item) {
         food = this._item(item)
-        if (!food) return fail(`I am not carrying any ${item}`)
+        if (!food) return fail(this._notCarrying(item))
         if (!FOODS[food.name] && HEALING[food.name] === undefined) return fail(`${food.name} is not food`)
       } else {
         food = chooseFood(bot.inventory.items(), { food: Number(bot.food ?? 20), health: Number(bot.health ?? 20), healing: true })
@@ -456,7 +513,7 @@ class Skills {
   /** Equip an item by name. */
   async equip ({ item, where = 'hand' } = {}) {
     const mine = this._item(item)
-    if (!mine) return fail(`I am not carrying any ${item}`)
+    if (!mine) return fail(this._notCarrying(item))
     const dest = EQUIP_SLOTS[fold(where)] || 'hand'
     try {
       await this.bot.equip(mine, dest)
@@ -498,28 +555,47 @@ class Skills {
     return entry ? ok(`remembered "${entry.name}" at ${entry.x},${entry.y},${entry.z}`) : fail('remember_here needs a name')
   }
 
-  /** Where is a block type, or which container holds an item? */
-  find ({ what } = {}) {
+  /**
+   * Where is something? A block type, an item (in the containers opened so
+   * far), a chest label ("Diamantes"), a named place — or "storage" for the
+   * list of every container around, in pages.
+   */
+  find ({ what, page = 1 } = {}) {
     const bot = this.bot
     const pos = bot.entity?.position
     const q = fold(what).replace(/\s+/g, '_')
     if (!pos || !q) return fail('find needs a name')
+    const dim = this._dim()
+    try { this.places.scan(bot, { force: true }) } catch { /* partial mock */ }
+    if (/^(storage|chests?|containers?|labels?|baus?|estoque|armazem|all)$/.test(q)) {
+      const list = this.places.listStorage(pos, { dim, page })
+      if (!list.total) return fail('no containers indexed within 32 blocks')
+      return ok(`storage: ${list.total} containers, page ${list.page}/${list.pages} (nearest first): ${list.lines.join('; ')}${list.page < list.pages ? ` — find {what:"storage", page:${list.page + 1}} continues` : ''}`)
+    }
     const parts = []
-    const stored = this.places.findItem(q, pos, { dim: this._dim() }).slice(0, 3)
+    const stored = this.places.findItem(q, pos, { dim }).slice(0, 3)
     for (const e of stored) parts.push(`${e.id}${e.label ? ` "${e.label}"` : ''} (${whereIs(pos, e)}) holds ${e.hits.map(([n, c]) => `${n} x${c}`).join(', ')}`)
+    const known = new Set(stored.map((e) => e.id))
+    for (const e of this.places.findLabel(what, pos, { dim }).filter((e) => !known.has(e.id)).slice(0, 3)) {
+      parts.push(`${e.id} is labelled "${e.label}" (${whereIs(pos, e)} at ${e.x},${e.y},${e.z}; ${e.contents ? 'opened before' : 'not opened yet — look_in to see what it holds'})`)
+    }
     const carried = bot.inventory.items().filter((i) => i.name.includes(q))
     if (carried.length) parts.push(`carrying ${carried.map((i) => `${i.name} x${i.count}`).join(', ')}`)
-    try {
-      const ids = bot.registry.blocksArray.filter((b) => b.name === q || b.name.includes(q)).map((b) => b.id)
-      if (ids.length) {
-        const found = bot.findBlocks({ matching: ids, maxDistance: 48, count: 3 })
-        for (const p of found) parts.push(`${bot.blockAt(p)?.name || q} block at ${p.x},${p.y},${p.z} (${whereIs(pos, p)})`)
-      }
-    } catch { /* partial mock */ }
+    const indexed = this.places.near(pos, { dim, radius: 64 }).filter((e) => e.kind !== 'sign' && (e.kind === q || e.block === q)).slice(0, 2)
+    for (const e of indexed) parts.push(`${e.id} at ${e.x},${e.y},${e.z} (${whereIs(pos, e)})`)
+    if (!indexed.length) {
+      try {
+        const ids = bot.registry.blocksArray.filter((b) => b.name === q || b.name.includes(q)).map((b) => b.id)
+        if (ids.length) {
+          const found = bot.findBlocks({ matching: ids, maxDistance: 48, count: 3 })
+          for (const p of found) parts.push(`${bot.blockAt(p)?.name || q} block at ${p.x},${p.y},${p.z} (${whereIs(pos, p)})`)
+        }
+      } catch { /* partial mock */ }
+    }
     const place = this.places.getPlace(what)
     if (place) parts.push(`place "${place.name}" at ${place.x},${place.y},${place.z} (${whereIs(pos, place)})`)
-    return parts.length ? ok(parts.join('; ')) : fail(`nothing known about "${what}" (no block within 48, no opened container holds it)`)
+    return parts.length ? ok(parts.join('; ')) : fail(`nothing known about "${what}" (no block within 48, no opened container holds it, no label matches)`)
   }
 }
 
-module.exports = { Skills, FUELS }
+module.exports = { Skills, FUELS, matchItem, nearMisses }

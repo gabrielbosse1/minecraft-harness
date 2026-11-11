@@ -246,6 +246,10 @@ test('combat engage cooldown after low-health disengage', async () => {
   const dis = combat.disengage('low_hp')
   assert.equal(dis.ok, true)
   assert.ok(events.some((e) => e.msg === 'disengaged low_hp'))
+  // Still that hurt: the reason given is the one that matters ("eat first"), not "wait 10 s".
+  assert.equal((await combat.engage('zombie')).why, 'low_hp')
+  // Healed, but the lockout after a forced break-off still runs.
+  bot.health = 20
   const res = await combat.engage('zombie')
   assert.equal(res.why, 'disengage_cooldown')
 })

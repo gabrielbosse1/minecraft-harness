@@ -42,16 +42,20 @@ const {
   HOSTILE_NAMES: SENSE_HOSTILE,
   isPlayer,
   isProtected,
+  isHostileMob,
+  isGliding,
+  isUsingItem,
   creeperFuseLit,
   hasLineOfSight
 } = require('../zincai/threats')
+const { runnableHeading, clearToRun } = require('../zincai/custom_mineflayer/escape')
 
 const TAG = 'combat'
 
 /** Hostile mob type names (exact). Shared with the threat sensor. */
 const HOSTILE_NAMES = SENSE_HOSTILE
 
-const WEAPON_TIERS = ['netherite', 'diamond', 'iron', 'stone', 'golden', 'wooden']
+const WEAPON_TIERS = ['netherite', 'diamond', 'iron', 'copper', 'stone', 'golden', 'wooden']
 /**
  * Fraction of the attack indicator required before a swing. Vanilla scales
  * damage by 0.2 + s²·0.8 and only allows a critical hit above 0.9, so the old
@@ -77,7 +81,7 @@ const WEAPON_PROFILES = {
 }
 
 /** Vanilla axe attack speed depends on the material. */
-const AXE_APS = { wooden: 0.8, stone: 0.8, iron: 0.9, golden: 1.0, diamond: 1.0, netherite: 1.0 }
+const AXE_APS = { wooden: 0.8, stone: 0.8, copper: 0.9, iron: 0.9, golden: 1.0, diamond: 1.0, netherite: 1.0 }
 
 /** Weapon profile for an item id (null/unknown → fists). Never throws. */
 function weaponProfile (itemName) {
@@ -194,27 +198,53 @@ function hasElytra (entity) {
 class MotionTracker {
   constructor ({ now = () => Date.now() } = {}) {
     this.now = now
-    this._last = new Map() // id -> { x, y, z, at, vy, rising, falling }
+    this._last = new Map() // id -> { hist: [{x,y,z,at}…] newest last, motion, flat }
   }
 
-  /** Sample one entity. Returns { vx, vy, vz, airborne, rising, falling }. */
+  /**
+   * Sample one entity. Returns { vx, vy, vz, airborne, rising, falling, fallen }
+   * — speeds in blocks per tick; `fallen` is how far it has dropped in the
+   * descent it is in (0 on the ground).
+   *
+   * A server does not deliver every entity's position on every client tick: a
+   * tick with no update is followed by one with two. Speed is therefore taken
+   * over the last three samples when there are that many, and a descent only
+   * counts as over after two still samples (or when the entity rises) —
+   * otherwise one late packet would reset a real fall, and one early packet
+   * would turn a staircase into a dive.
+   */
   update (entity) {
-    if (!entity?.position) return { vx: 0, vy: 0, vz: 0, airborne: false, rising: false, falling: false }
+    const none = { vx: 0, vy: 0, vz: 0, airborne: false, rising: false, falling: false, fallen: 0 }
+    if (!entity?.position) return none
     const t = this.now()
     const p = entity.position
     const prev = this._last.get(entity.id)
-    let m = { vx: 0, vy: 0, vz: 0, airborne: false, rising: false, falling: false }
+    let m = none
+    let flat = 0
+    const hist = prev ? prev.hist : []
     if (prev) {
-      const ticks = Math.max(1, (t - prev.at) / 50)
-      if (t - prev.at < 5) return prev.motion // same tick: keep the last reading
-      const vx = (p.x - prev.x) / ticks
-      const vy = (p.y - prev.y) / ticks
-      const vz = (p.z - prev.z) / ticks
+      const last = hist[hist.length - 1]
+      if (t - last.at < 5) return prev.motion // same tick: keep the last reading
+      // The oldest sample of the last 175 ms (three ticks back at most).
+      let ref = last
+      for (let i = hist.length - 1; i >= 0 && t - hist[i].at <= 175; i--) ref = hist[i]
+      const ticks = Math.max(1, (t - ref.at) / 50)
+      const vx = (p.x - ref.x) / ticks
+      const vy = (p.y - ref.y) / ticks
+      const vz = (p.z - ref.z) / ticks
       const rising = vy > 0.08
       const falling = vy < -0.15
-      m = { vx, vy, vz, airborne: rising || falling, rising, falling }
+      let fallen = prev.motion.fallen || 0
+      const step = last.y - p.y
+      if (step > 0.02) { fallen += step; flat = 0 } else if (step < -0.02) { fallen = 0; flat = 0 } else {
+        flat = (prev.flat || 0) + 1
+        if (flat >= 2) fallen = 0
+      }
+      m = { vx, vy, vz, airborne: rising || falling, rising, falling, fallen }
     }
-    this._last.set(entity.id, { x: p.x, y: p.y, z: p.z, at: t, motion: m })
+    hist.push({ x: p.x, y: p.y, z: p.z, at: t })
+    if (hist.length > 4) hist.shift()
+    this._last.set(entity.id, { hist, motion: m, flat, at: t })
     if (this._last.size > 64) for (const [id, v] of this._last) if (t - v.at > 5000) this._last.delete(id)
     return m
   }
@@ -271,6 +301,73 @@ function classifyThreat (entity, { botPos = null, distance = null, motion = null
 }
 
 // ---------------------------------------------------------------------------
+// Evasion by time-to-impact.
+//
+// The old triggers were "mace in hand and any vertical motion" and "spear,
+// elytra and vertical motion". A hop or a staircase set off the first (the
+// bot ran for 1.4 s every time a friend jumped), a level glide never set off
+// the second, and both fired a quarter of a second before the hit. What is
+// about to hit is a question of geometry: where will that body be, and when.
+// ---------------------------------------------------------------------------
+const GRAVITY = 0.08 // blocks per tick², with 2 % drag per tick
+
+/** Closest approach of something at `rel` (from the bot) moving at `vel` (blocks/s). */
+function closestApproach (rel, vel) {
+  const speed2 = vel.x * vel.x + vel.y * vel.y + vel.z * vel.z
+  if (speed2 < 1e-6) return { t: Infinity, miss: Math.hypot(rel.x, rel.y, rel.z), speed: 0 }
+  const t = -(rel.x * vel.x + rel.y * vel.y + rel.z * vel.z) / speed2
+  return { t, miss: Math.hypot(rel.x + vel.x * t, rel.y + vel.y * t, rel.z + vel.z * t), speed: Math.sqrt(speed2) }
+}
+
+/**
+ * What is about to hit the bot, from measured motion — never from what is
+ * merely held. Pure and unit-tested.
+ *
+ *   smash   a mace coming down: a real fall (1.5 blocks or more, at falling
+ *           speed — not a hop, not a staircase) that lands within reach.
+ *   charge  a body arriving faster than a sprint (elytra, riptide, mount), or
+ *           a spear or trident being driven in, on a line that passes within
+ *           2.5 blocks in under 0.9 s.
+ *
+ * @param {object} attacker { position, heldItem | equipment }
+ * @param {object} me the bot's entity { position, velocity (blocks/tick) }
+ * @param {{vx:number,vy:number,vz:number,falling:boolean,fallen:number}} motion the attacker's measured motion
+ * @param {{ gliding?: boolean, usingItem?: boolean, held?: string }} [seen]
+ * @returns {null | { kind:'smash'|'charge', inSec:number, miss:number, line:{x:number,z:number}|null, at:{x:number,z:number}|null }}
+ */
+function forecastImpact (attacker, me, motion, seen = {}) {
+  const a = attacker?.position
+  const b = me?.position
+  if (!a || !b || !motion) return null
+  const held = seen.held ?? heldItemName(attacker)
+
+  if (held === 'mace') {
+    if (!(motion.falling && motion.fallen >= 1.5 && motion.vy <= -0.42)) return null
+    let v = motion.vy
+    let dropped = 0
+    let ticks = 0
+    const height = a.y - b.y
+    while (dropped < height && ticks < 40) { v = (v - GRAVITY) * 0.98; dropped -= v; ticks++ }
+    const at = { x: a.x + motion.vx * ticks, z: a.z + motion.vz * ticks }
+    const miss = Math.hypot(at.x - b.x, at.z - b.z)
+    return miss <= 3.5 ? { kind: 'smash', inSec: ticks / 20, miss, line: null, at } : null
+  }
+
+  const mine = me.velocity || {}
+  const rel = { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z }
+  const vel = { x: (motion.vx - (Number(mine.x) || 0)) * 20, y: motion.vy * 20, z: (motion.vz - (Number(mine.z) || 0)) * 20 }
+  const ca = closestApproach(rel, vel)
+  const thrust = /^(trident|spear)$|_spear$/.test(held)
+  const fast = ca.speed >= 8 // faster than a sprint-jump
+  const lunge = thrust && (seen.usingItem || seen.gliding) && ca.speed >= 3
+  const glide = Boolean(seen.gliding) && ca.speed >= 6
+  if (!(fast || lunge || glide)) return null
+  if (!(ca.t > 0 && ca.t <= 0.9) || ca.miss > 2.5) return null
+  const flat = Math.hypot(vel.x, vel.z)
+  return { kind: 'charge', inSec: ca.t, miss: ca.miss, line: flat > 0.5 ? { x: vel.x / flat, z: vel.z / flat } : null, at: null }
+}
+
+// ---------------------------------------------------------------------------
 
 class AdvancedCombat {
   /**
@@ -282,7 +379,9 @@ class AdvancedCombat {
    *   critThreshold, recoveryMs, bowChargeThreshold,
    *   hands — control lane (zincai/control.js); default presses the bot directly,
    *   fleeOnDisengage — set false when a survival layer handles running away,
-   *   lineOfSight(entity) — override for the caged-mob check
+   *   lineOfSight(entity) — override for the caged-mob check,
+   *   watch() — other entities to dodge during a fight (players who hit the
+   *             bot recently): a third player diving in used to go unseen
    */
   constructor (bot, {
     maxHealth = 20,
@@ -298,7 +397,8 @@ class AdvancedCombat {
     bowChargeThreshold = 1.0,
     hands = null,
     fleeOnDisengage = true,
-    lineOfSight = null
+    lineOfSight = null,
+    watch = null
   } = {}) {
     this.bot = bot
     this.maxHealth = maxHealth
@@ -317,6 +417,8 @@ class AdvancedCombat {
     this.fleeOnDisengage = fleeOnDisengage !== false
     this.lineOfSight = typeof lineOfSight === 'function' ? lineOfSight : (e) => hasLineOfSight(this.bot, e)
     this.motion = new MotionTracker({ now: this.now })
+    this.watch = typeof watch === 'function' ? watch : () => []
+    this._evadeDir = null
 
     this.state = 'idle' // idle | approach | melee | retreat | cooldown
     this.target = null
@@ -447,7 +549,7 @@ class AdvancedCombat {
         if (dist > this.engageRadius) continue
         if (asPlayer) continue
         const nameL = String(e.name).toLowerCase()
-        if (anyHostile ? !HOSTILE_NAMES.has(nameL) : nameL !== wanted) continue
+        if (anyHostile ? !isHostileMob(nameL, this.bot) : nameL !== wanted) continue
         if (isProtected(e)) { sawProtected = true; continue }
         if (!this.lineOfSight(e)) { sawHidden = true; continue }
       }
@@ -472,6 +574,12 @@ class AdvancedCombat {
   async engage (request) {
     if (this.bot.health !== undefined && this.bot.health <= 0) {
       return { ok: false, why: 'dead' }
+    }
+    // A fight the very next tick would break off is not started. It used to
+    // engage, call the flee off for a moment, break off at once and lock
+    // fighting out for 10 s — one model call per round for nothing.
+    if (Number(this.bot.health) <= this.disengageAt) {
+      return { ok: false, why: 'low_hp' }
     }
     if (this.now() < this.cooldownUntil) {
       return { ok: false, why: 'disengage_cooldown' }
@@ -579,7 +687,7 @@ class AdvancedCombat {
       let best = null
       let bestScore = -1
       for (const item of items) {
-        const m = /^(netherite|diamond|iron|stone|golden|wooden)_(sword|axe)$/.exec(item.name)
+        const m = /^(netherite|diamond|iron|copper|stone|golden|wooden)_(sword|axe)$/.exec(item.name)
         if (!m) continue
         const tier = WEAPON_TIERS.indexOf(m[1])
         const kindBonus = m[2] === 'sword' ? 2 : 1
@@ -680,6 +788,8 @@ class AdvancedCombat {
     if (this.state === 'retreat' && now >= this.evadeUntil && now >= this._backoffUntil) {
       this.state = this.target ? 'approach' : 'idle'
       this.evadeReason = null
+      this._evadeDir = null
+      this._shield(false)
       this._clearControls()
     }
     if (this.state === 'approach' || this.state === 'melee' || this.state === 'retreat') {
@@ -717,8 +827,9 @@ class AdvancedCombat {
   _tick () {
     if (this.state !== 'approach' && this.state !== 'melee' && this.state !== 'retreat') return
     if (!this.target || !this.bot.entity) return
-    // A higher-priority lane (survival) is driving: do not swing or steer.
-    if (this.hands.active === false || this.hands.isTop === false) return
+    // A higher-priority lane (survival) is driving: do not swing or steer —
+    // and do not keep the shield up while running (it slows the escape to a walk).
+    if (this.hands.active === false || this.hands.isTop === false) { this._shield(false); return }
     const now = this.now()
 
     const botPos = this.bot.entity.position
@@ -734,9 +845,10 @@ class AdvancedCombat {
     const threat = classifyThreat(this.target, { botPos, distance: dist3, motion })
     this.lastThreat = threat
 
-    // ---- RETREAT state (mace panic / creeper back-off) ---------------------
+    // ---- RETREAT state (dodge / creeper back-off) --------------------------
     if (this.state === 'retreat') {
-      this._runFrom(tPos)
+      if (this._evadeDir) this._runAlong(this._evadeDir)
+      else this._runFrom(tPos)
       return
     }
 
@@ -746,15 +858,9 @@ class AdvancedCombat {
       this.bot.lookAt(tPos.offset(0, height * 0.6, 0), false).catch(() => {})
     } catch { /* look failed; non-fatal */ }
 
-    // ---- WEAPON-SPECIFIC EVASION (highest priority) ------------------------
-    if (threat.tags.includes('mace_airborne') && dist3 <= 6) {
-      this._panicRetreat('mace', now)
-      return
-    }
-    if (threat.tags.includes('elytra_charge') && dist3 <= 8) {
-      this._lateralEvade('elytra', now)
-      return
-    }
+    // ---- EVASION by time-to-impact (highest priority) ----------------------
+    const incoming = this._incoming(motion)
+    if (incoming && this._evade(incoming, now)) return
 
     // ---- CREEPER: hit and run ---------------------------------------------
     if (threat.explosive && this._creeperTick({ dist3, now })) return
@@ -871,6 +977,12 @@ class AdvancedCombat {
    */
   _creeperTick ({ dist3, now }) {
     const lit = creeperFuseLit(this.target)
+    // Hit-and-run needs somewhere to run. With a wall or a drop behind, the
+    // "run" ends inside the blast: do not go in at all.
+    if (!lit && now >= this._backoffUntil && dist3 <= 6 && !this._roomToBackOff(this.target.position, 6)) {
+      this._end('no room to back off from the creeper here (wall or drop behind you) — not going in', 'aborted')
+      return true
+    }
     if (now >= this._backoffUntil && dist3 <= this.profile.reach + 0.2 && this.cooldown.ready(this.critThreshold)) {
       this._swing({ keepSprint: true })
       this._backoffUntil = now + 1500
@@ -880,6 +992,7 @@ class AdvancedCombat {
         if (this.state !== 'retreat') {
           this.state = 'retreat'
           this.evadeReason = 'creeper'
+          this._evadeDir = null
           this.evadeUntil = now + 500
           this.activeGoal = null
           this.hands.setGoal(null)
@@ -927,31 +1040,125 @@ class AdvancedCombat {
     h.setControlState('right', Boolean(strafe) && this.strafeSign > 0)
   }
 
-  /** Turn away from a point and sprint: the only honest way to retreat fast. */
-  _runFrom (danger) {
+  /** Unit vector from `danger` to the bot (horizontal). */
+  _awayFrom (danger) {
     const pos = this.bot.entity?.position
-    if (!pos || !danger) return
-    let dx = pos.x - danger.x
-    let dz = pos.z - danger.z
+    if (!pos || !danger) return null
+    const dx = pos.x - danger.x
+    const dz = pos.z - danger.z
     const len = Math.hypot(dx, dz)
-    if (len < 0.01) { dx = 1; dz = 0 } else { dx /= len; dz /= len }
-    try { Promise.resolve(this.bot.look(Math.atan2(-dx, -dz), 0, true)).catch(() => {}) } catch { /* mock */ }
+    return len < 0.01 ? { x: 1, z: 0 } : { x: dx / len, z: dz / len }
+  }
+
+  /** Is there ground to retreat on, roughly away from `danger`, for `blocks` blocks? */
+  _roomToBackOff (danger, blocks = 6) {
+    const away = this._awayFrom(danger)
+    if (!away) return true
+    return Boolean(runnableHeading(this.bot, away, { blocks, maxTurn: 1.2 }))
+  }
+
+  /**
+   * Turn away from a point and sprint: the only honest way to retreat fast —
+   * along the nearest heading that has ground. It used to sprint-jump straight
+   * back with no look at walls or ledges.
+   */
+  _runFrom (danger) {
+    const away = this._awayFrom(danger)
+    if (!away) return false
+    return this._runAlong(runnableHeading(this.bot, away, { blocks: 3, maxTurn: 1.6 }))
+  }
+
+  /** Face a horizontal direction and sprint-jump along it; with no direction, stand and cover. */
+  _runAlong (dir) {
     const h = this.hands
     h.setControlState('back', false)
     h.setControlState('left', false)
     h.setControlState('right', false)
+    if (!dir) {
+      // Nowhere to run: stop pushing into the wall and take it on the shield.
+      h.setControlState('forward', false)
+      h.setControlState('sprint', false)
+      h.setControlState('jump', false)
+      this._shield(true)
+      return false
+    }
+    try { Promise.resolve(this.bot.look(Math.atan2(-dir.x, -dir.z), 0, true)).catch(() => {}) } catch { /* mock */ }
     h.setControlState('forward', true)
     h.setControlState('sprint', true)
     h.setControlState('jump', Boolean(this.bot.entity.onGround))
+    return true
   }
 
-  /** Mace smash incoming: break away from the target for a moment. */
+  /**
+   * The nearest impact on its way: from the target (its motion was just
+   * measured) or from any other player being watched.
+   */
+  _incoming (targetMotion) {
+    const me = this.bot.entity
+    let best = null
+    const consider = (entity, motion) => {
+      if (!entity?.position || !isPlayer(entity)) return
+      const f = forecastImpact(entity, me, motion, { gliding: isGliding(entity), usingItem: isUsingItem(entity) })
+      if (f && (!best || f.inSec < best.inSec)) best = { ...f, entity }
+    }
+    consider(this.target, targetMotion)
+    let others = []
+    try { others = this.watch() || [] } catch { others = [] }
+    for (const e of others) {
+      if (!e || e === this.target || e === me) continue
+      consider(e, this.motion.update(e))
+    }
+    return best
+  }
+
+  /** Get out of the way of a forecast impact. Returns true when it took over this tick. */
+  _evade (f, now) {
+    if (now - this._panicAt < 500) return this.state === 'retreat'
+    const me = this.bot.entity.position
+    let dir = null
+    if (f.kind === 'smash') {
+      // Out of the landing circle, directly away from where it comes down.
+      const dx = me.x - f.at.x
+      const dz = me.z - f.at.z
+      const len = Math.hypot(dx, dz)
+      const away = len > 0.05 ? { x: dx / len, z: dz / len } : this._awayFrom(f.entity.position)
+      // 3.5 blocks at a sprint take about 0.6 s. With less time than it takes
+      // to clear the circle, the shield is the better answer.
+      if (f.inSec >= 0.3 || !this.hasShield()) dir = runnableHeading(this.bot, away, { blocks: 3, maxTurn: 1.6 })
+    } else {
+      // Step off the line, to the side the bot is already on, if there is ground there.
+      const line = f.line || this._awayFrom(f.entity.position)
+      const side = { x: -line.z, z: line.x }
+      const rel = { x: me.x - f.entity.position.x, z: me.z - f.entity.position.z }
+      const sign = side.x * rel.x + side.z * rel.z >= 0 ? 1 : -1
+      for (const k of [sign, -sign]) {
+        const cand = { x: side.x * k, z: side.z * k }
+        if (clearToRun(this.bot, cand, { blocks: 3 })) { dir = cand; break }
+      }
+    }
+    this._panicAt = now
+    this.state = 'retreat'
+    this.evadeReason = f.kind
+    this.evadeUntil = now + Math.round((f.inSec + 0.35) * 1000)
+    this._evadeDir = dir
+    this.critArmed = false
+    this.activeGoal = null
+    this.hands.setGoal(null)
+    if (dir) this._shield(false)
+    this._runAlong(dir)
+    const who = f.entity.username || f.entity.name || 'attacker'
+    this.onEvent({ type: 'combat', msg: `${dir ? 'dodged' : 'braced for'} ${who}'s ${f.kind === 'smash' ? 'mace smash' : 'charge'}` })
+    return true
+  }
+
+  /** Break away from the target for a moment (public hook; kept for scripts). */
   _panicRetreat (reason, now) {
     if (now - this._panicAt < 900) return
     this._panicAt = now
     this.state = 'retreat'
     this.evadeReason = reason
     this.evadeUntil = now + 1400
+    this._evadeDir = null
     this.critArmed = false
     this.activeGoal = null
     this._shield(false)
@@ -961,10 +1168,7 @@ class AdvancedCombat {
     logger.warn(TAG, `panic retreat — ${reason}`)
   }
 
-  /**
-   * Elytra / spear or trident dive: break the linear collision trajectory
-   * with a sideways step and a jump.
-   */
+  /** Sidestep the target's line (public hook; kept for scripts). */
   _lateralEvade (reason, now) {
     if (now - this._panicAt < 650) return
     this._panicAt = now
@@ -1096,5 +1300,7 @@ module.exports = {
   cooldownProgress,
   heldItemName,
   hasElytra,
-  classifyThreat
+  classifyThreat,
+  closestApproach,
+  forecastImpact
 }

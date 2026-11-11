@@ -14,13 +14,14 @@
  * the process when upstream shifts underneath us.
  *
  * Implements:
- *   1. Door/trapdoor sub-routine: route through doors (useOne "open" step),
- *      track the door the bot opened, CLOSE it once the bot has passed.
- *      Never breaks doors; iron doors are treated as solid.
+ *   1. Doors and fence gates (see doors.js): judged by their state, opened by
+ *      the bot when they are in its way, and put back afterwards — but only
+ *      the ones this bot touched. Never broken; iron doors and all trapdoors
+ *      are never operated.
  *   2. Settable digging: config.allowDigging=false => pathfinder treats
  *      every block as unbreakable (canDig=false + safeToBreak()=>false).
- *   3. Door cost override: routing through a door costs `doorCost` (default
- *      4) extra — the bot prefers going around when reasonably short.
+ *   3. Door cost override: a door that needs a click costs `doorCost`
+ *      (default 4) extra — the bot prefers going around when reasonably short.
  *   4. Human movement mimicry: ±2° yaw/pitch micro-jitter, variable
  *      sprint/walk cycles (never 100% sprint), forced walk near hazards,
  *      and 200–800ms idle pauses when the heading changes abruptly.
@@ -41,6 +42,10 @@
 const PATCH_MARK = Symbol.for('zincai.pathfinder.patched')
 const DEG = Math.PI / 180
 const TICK_MS = 50
+
+const { Vec3 } = require('vec3')
+const doors = require('./doors')
+const { planEscape } = require('./escape')
 
 const isDoorOrTrapdoorName = (name) => (/_door$/i.test(name) || /_trapdoor$/i.test(name)) && !/iron/i.test(name)
 
@@ -665,6 +670,10 @@ function findGroundY (bot, x, z, { up = 3, down = 6 } = {}) {
 }
 
 const HAZARD_NAMES = /lava|fire|magma|cactus|sweet_berry|powder_snow|wither_rose|campfire/
+/** Blocks that burn whoever stands on them. */
+const FLOOR_HAZARD = /^(magma_block|campfire|soul_campfire)$/
+/** Blocks a player must not walk INTO (upstream already avoids fire, lava and cobwebs). */
+const WALK_IN_HAZARDS = ['sweet_berry_bush', 'powder_snow', 'wither_rose', 'cactus']
 
 /**
  * Where to run from the threats in `threatMap`. Pure planning — it never
@@ -699,6 +708,83 @@ function fleePlan (bot, threatMap, { distance = 14 } = {}) {
   // XZ goal: any height will do, so a hill or a pit never makes "away" unreachable.
   const goal = new goals.GoalNearXZ(Math.floor(best.x), Math.floor(best.z), 2)
   return { goal, direction: best.dir || base, x: Math.floor(best.x), y: Math.floor(best.y), z: Math.floor(best.z), threat: best.threat }
+}
+
+/**
+ * Upstream avoids fire, cobwebs and lava. These also hurt or trap a player who
+ * walks into them, and one of them (farmland) is somebody's work.
+ */
+function configureHazards (bot, movements) {
+  const registry = bot.registry
+  if (!registry?.blocksByName || !movements.blocksToAvoid) return
+  for (const name of WALK_IN_HAZARDS) {
+    const block = registry.blocksByName[name]
+    if (block) movements.blocksToAvoid.add(block.id)
+  }
+  // Standing ON these: magma and campfires burn; farmland is trampled by a jump or a drop.
+  if (Array.isArray(movements.exclusionAreasStep) && !movements.exclusionAreasStep.some((f) => f && f._zincaiFloorHazard)) {
+    const fee = (block) => {
+      if (!block?.position) return 0
+      let below = null
+      try { below = bot.blockAt(block.position.offset(0, -1, 0), false) } catch { below = null }
+      if (!below) return 0
+      if (FLOOR_HAZARD.test(below.name)) return 20
+      if (below.name === 'farmland') return 6
+      return 0
+    }
+    fee._zincaiFloorHazard = true
+    movements.exclusionAreasStep.push(fee)
+  }
+}
+
+/** A Movements used only to flood the ground for an escape: geometry, no building, no parkour, no drop that hurts. */
+function escapeMovementsFor (bot, Movements, configureDoors) {
+  const m = new Movements(bot)
+  m.canDig = false
+  m.digCost = 1000
+  m.allow1by1towers = false
+  m.scafoldingBlocks = []
+  m.allowParkour = false
+  m.allowSprinting = true
+  m.allowEntityDetection = false
+  m.maxDropDown = 3
+  configureDoors(m)
+  configureHazards(bot, m)
+  return m
+}
+
+/** Run the escape planner over `movements` and attach a pathfinder goal to the result. */
+function escapePlanWith (bot, movements, pursuers, opts = {}) {
+  const floorHazard = (x, y, z) => {
+    let below = null
+    try { below = bot.blockAt(new Vec3(x, y - 1, z), false) } catch { below = null }
+    return below && FLOOR_HAZARD.test(below.name) ? 12 : 0
+  }
+  const plan = planEscape(bot, movements, pursuers, { avoid: floorHazard, ...opts })
+  if (!plan) return null
+  const { goals } = require('mineflayer-pathfinder')
+  plan.goal = new goals.GoalNear(plan.target.x, plan.target.y, plan.target.z, 1)
+  return plan
+}
+
+/**
+ * The wall-aware escape planner for a harness that does not run the whole
+ * wrapper (harness A). Nothing there clicks doors, so only doors that already
+ * stand open count as a way through.
+ * @returns {(pursuers: object[], opts?: object) => object|null}
+ */
+function makeEscapePlanner (bot, { Movements } = {}) {
+  let movements = null
+  let builtFor = null
+  return function escapePlan (pursuers, opts = {}) {
+    if (!Movements || !bot?.entity) return null
+    const live = bot.pathfinder?.movements || null
+    if (!movements || builtFor !== live) {
+      try { movements = escapeMovementsFor(bot, Movements, (m) => doors.attachDoors(m, { operate: false })) } catch { return null }
+      builtFor = live
+    }
+    return escapePlanWith(bot, movements, pursuers, opts)
+  }
 }
 
 /**
@@ -890,7 +976,14 @@ class PathfinderWrapper {
     // "Urgent" = someone is fleeing or fighting. The humanizer (pauses, walk
     // phases, look jitter) must never slow that down.
     this.isUrgent = typeof opts.isUrgent === 'function' ? opts.isUrgent : () => false
-    this._pendingClose = null // { position: Vec3-like, openedAt: number }
+    // Doors and gates THIS bot opened: key → { position, kind, name, restoreOpen, at, lastClick }.
+    // Only these are ever closed again.
+    this._opened = new Map()
+    this._doorClicks = new Map() // key → { at, open, tries }
+    this._jammed = new Map() // key → until (ms): would not open, routed around
+    this.lastJam = null // { x, y, z, name, at } — for "why is there no path"
+    this._path = null // the pathfinder's live path (same array it consumes)
+    this._onPathSeen = null
     this._jitterTimer = null
     this._sprintTimer = null
     this._sprintWalkPhase = 'sprint'
@@ -981,8 +1074,12 @@ class PathfinderWrapper {
     this._configureDigging(movements)
     this._configureScaffolding(movements)
     this._configureDoors(movements)
+    this._configureHazards(movements)
     this._applyMode(movements)
     this.threat.attachToMovements(movements)
+    // Build the escape planner's own Movements now, not in the first tick of
+    // the first escape (it costs a few tens of milliseconds once).
+    if (movements === this._movements()) { try { this._escapeMovements() } catch { /* built on demand instead */ } }
     return true
   }
 
@@ -999,6 +1096,8 @@ class PathfinderWrapper {
     if (this._appliedOnce) return this._applied
     this._appliedOnce = true
     this._patchDigging()
+    this._onPathSeen = (result) => { if (result && Array.isArray(result.path)) this._path = result.path }
+    this.bot.on('path_update', this._onPathSeen)
     this._onTick(this._doorTick.bind(this))
     this._startHumanizer()
     this._startThreatMap()
@@ -1077,6 +1176,37 @@ class PathfinderWrapper {
 
   // ---------------------------------------------------------------- flee --
   /**
+   * A second Movements used only to flood the ground for an escape: geometry
+   * and doors, no threat costs (the escape planner has its own clock), no
+   * building, no parkour, no drop that hurts.
+   */
+  _escapeMovements () {
+    const live = this._movements()
+    if (!live) return null
+    if (this._escapeMov && this._escapeMovFor === live) return this._escapeMov
+    let m = null
+    try { m = escapeMovementsFor(this.bot, live.constructor, (mov) => this._configureDoors(mov)) } catch (err) { this.log('debug', `escape movements: ${err.message || err}`); return null }
+    this._escapeMov = m
+    this._escapeMovFor = live
+    return m
+  }
+
+  /**
+   * Where to run, walls and time included (escape.js). Pure planning.
+   * @param {Array<{x:number,y:number,z:number,speed:number,reach:number}>} pursuers
+   * @param {object} [opts] passed to planEscape (radius, botSpeed, …)
+   * @returns {null | (ReturnType<typeof planEscape> & { goal: object })}
+   */
+  escapePlan (pursuers, opts = {}) {
+    const m = this._escapeMovements()
+    if (!m) return null
+    return escapePlanWith(this.bot, m, pursuers, opts)
+  }
+
+  /**
+   * The old vector plan: a point "away". Kept as the fallback for when the
+   * ground cannot be flooded (no Movements yet).
+   *
    * Where to run. Pure planning — it never touches the controls; the survival
    * reflex (system1.js) owns those through its arbiter lane.
    *
@@ -1126,79 +1256,156 @@ class PathfinderWrapper {
     movements.scafoldingBlocks = [] // (sic) upstream's spelling
   }
 
+  // ------------------------------------------------------------ hazards--
+  /**
+   * Upstream avoids fire, cobwebs and lava. These also hurt or trap a player
+   * who walks into them, and one of them (farmland) is somebody's work.
+   */
+  _configureHazards (movements) {
+    configureHazards(this.bot, movements)
+  }
+
   // -------------------------------------------------------------- doors--
   _configureDoors (movements) {
     const registry = this.bot.registry
-    if (!registry?.blocksArray || !movements.openable) return
-    let added = 0
-    const doorIds = new Set()
-    for (const block of registry.blocksArray) {
-      if (!isDoorOrTrapdoorName(block.name)) continue
-      doorIds.add(block.id)
-      if (!movements.openable.has(block.id)) {
-        movements.openable.add(block.id)
-        added++
-      }
+    // Even with digging allowed, a door is opened or routed around, never broken.
+    if (registry?.blocksArray && movements.blocksCantBreak) {
+      for (const block of registry.blocksArray) if (doors.kindOf(block.name)) movements.blocksCantBreak.add(block.id)
     }
-    // canOpenDoors flips the upstream branch where a move step into the door
-    // emits a "useOne" (right-click) instead of blocking.
-    movements.canOpenDoors = true
-
-    // Door cost override: every candidate step through a door/trapdoor pays
-    // `doorCost` extra — detours are preferred when reasonably short.
-    const doorCost = this.doorCost
-    if (Array.isArray(movements.exclusionAreasStep) && !movements.exclusionAreasStep.some((f) => f && f._zincaiDoorCost)) {
-      const fn = (block) => (block && doorIds.has(block.type) ? doorCost : 0)
-      fn._zincaiDoorCost = true
-      movements.exclusionAreasStep.push(fn)
-    }
-    if (added) this.log('debug', `door routing: ${added} door/trapdoor ids registered, doorCost=${this.doorCost}`)
+    const attached = doors.attachDoors(movements, { operate: true, isJammed: (key) => this._doorJammed(key), stepCost: this.doorCost })
+    if (!attached) this.log('warn', 'door routing not attached — Movements.getBlock missing')
+    return attached
   }
 
+  _doorJammed (key) {
+    const until = this._jammed.get(key)
+    if (!until) return false
+    if (Date.now() > until) { this._jammed.delete(key); return false }
+    return true
+  }
+
+  /** Doors this bot opened and has not put back yet. */
+  openedDoors () {
+    return [...this._opened.values()].map((e) => ({ x: e.position.x, y: e.position.y, z: e.position.z, name: e.name }))
+  }
+
+  /**
+   * Open what is in the way; put back exactly what this bot opened.
+   * Runs on every physics tick, works every 100 ms.
+   */
   _doorTick () {
     const bot = this.bot
     if (!bot.entity) return
     const now = Date.now()
+    if (now - (this._lastDoorScan || 0) < 100) return
+    this._lastDoorScan = now
+    try { this._openAhead(now) } catch (err) { this.log('debug', `door tick (open): ${err.message || err}`) }
+    try { this._closeBehind(now) } catch (err) { this.log('debug', `door tick (close): ${err.message || err}`) }
+  }
 
-    // Detect a door the bot just opened (state flipped to open, adjacent).
-    if (!this._pendingClose) {
-      const since = now - (this._lastDoorScan || 0)
-      if (since < 250) return
-      this._lastDoorScan = now
-      try {
-        const door = this._adjacentOpenDoor()
-        if (door) this._pendingClose = { position: door.position, openedAt: now }
-      } catch { /* transient */ }
-      return
-    }
-    // Bot passed through (or 9s elapsed): close it again. Never break doors.
-    const p = this._pendingClose.position
-    const dx = bot.entity.position.x - (p.x + 0.5)
-    const dy = bot.entity.position.y - p.y
-    const dz = bot.entity.position.z - (p.z + 0.5)
-    const dist = Math.hypot(dx, dy, dz)
-    if (dist > 1.8 || now - this._pendingClose.openedAt > 9000) {
-      const target = bot.blockAt(p)
-      if (target && isDoorOrTrapdoorName(target.name) && target.getProperties?.().open) {
-        this.bot.activateBlock(target).catch((err) => this.log('debug', `door close failed: ${err.message || err}`))
-      }
-      this._pendingClose = null
+  /** The cells the bot is about to walk through, nearest first (its own cell included). */
+  _cellsAhead (count = 3) {
+    const bot = this.bot
+    const me = bot.entity.position
+    const cells = [{ x: Math.floor(me.x), y: Math.floor(me.y), z: Math.floor(me.z) }]
+    const moving = Boolean(bot.pathfinder?.isMoving?.())
+    if (moving && Array.isArray(this._path)) for (const node of this._path.slice(0, count)) cells.push({ x: Math.floor(node.x), y: Math.floor(node.y), z: Math.floor(node.z) })
+    return { cells, moving }
+  }
+
+  _openAhead (now) {
+    const bot = this.bot
+    const { cells, moving } = this._cellsAhead(3)
+    if (!moving || cells.length < 2) return // only a walk along a planned route opens anything
+    const me = bot.entity.position
+    for (const cell of cells) {
+      const pos = new Vec3(cell.x, cell.y, cell.z)
+      const block = bot.blockAt(pos, false)
+      const d = doors.describe(block)
+      if (!d || d.kind === 'trapdoor' || !d.byHand) continue
+      if (!doors.blocksWalk(d, doors.passageAxis(bot, pos, d))) continue
+      const reach = Math.hypot(pos.x + 0.5 - me.x, pos.y + 0.5 - (me.y + 1.62), pos.z + 0.5 - me.z)
+      if (reach > 3.6) return // not there yet
+      this._click(block, d, now)
+      return // one at a time
     }
   }
 
-  _adjacentOpenDoor () {
+  /**
+   * One right-click on a door or gate, spaced so the server's answer is seen
+   * before the next one (a second click would shut it again). A door that
+   * stays as it was after three clicks is somebody's locked door: remember it,
+   * and let the planner find another way.
+   */
+  _click (block, d, now) {
     const bot = this.bot
-    const pos = bot.entity.position.floored()
-    for (let dy = -1; dy <= 1; dy++) {
-      for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
-        const block = bot.blockAt(pos.offset(dx, dy, dz))
-        if (block && isDoorOrTrapdoorName(block.name)) {
-          const props = block.getProperties?.() || {}
-          if (props.open === true || props.open === 'true') return block
-        }
-      }
+    const key = doors.keyOf(block.position, d)
+    if (this._doorJammed(key)) return false
+    const last = this._doorClicks.get(key)
+    const sameState = Boolean(last) && last.open === d.open
+    if (sameState && now - last.at < 500 + 300 * last.tries) return false
+    if (sameState && last.tries >= 3) {
+      this._doorClicks.delete(key)
+      this._opened.delete(key)
+      this._jammed.set(key, now + 60_000)
+      this.lastJam = { x: block.position.x, y: block.position.y, z: block.position.z, name: d.name, at: now }
+      this.log('info', `${d.name} at ${block.position.x},${block.position.y},${block.position.z} will not open — routing around it for a minute`)
+      try { bot.pathfinder.setMovements(bot.pathfinder.movements) } catch { /* replan on the next goal instead */ }
+      return false
     }
-    return null
+    this._doorClicks.set(key, { at: now, open: d.open, tries: sameState ? last.tries + 1 : 1 })
+    const entry = this._opened.get(key)
+    if (entry) entry.lastClick = now
+    else {
+      const y = d.kind === 'door' && d.half === 'upper' ? block.position.y - 1 : block.position.y
+      this._opened.set(key, { position: new Vec3(block.position.x, y, block.position.z), kind: d.kind, name: d.name, restoreOpen: d.open, at: now, lastClick: now })
+    }
+    Promise.resolve()
+      .then(() => bot.activateBlock(block))
+      .catch((err) => this.log('debug', `door click failed: ${err.message || err}`))
+    return true
+  }
+
+  _closeBehind (now) {
+    if (!this._opened.size) return
+    const bot = this.bot
+    const me = bot.entity.position
+    const { cells } = this._cellsAhead(6)
+    for (const [key, entry] of this._opened) {
+      const p = entry.position
+      const block = bot.blockAt(p, false)
+      const d = doors.describe(block)
+      if (!d || d.kind !== entry.kind) { this._opened.delete(key); this._doorClicks.delete(key); continue } // gone or replaced
+      const age = now - entry.lastClick
+      if (d.open === entry.restoreOpen) {
+        // As the bot found it: either the click has not been answered yet, or the job is done.
+        if (age > 1500) { this._opened.delete(key); this._doorClicks.delete(key) }
+        continue
+      }
+      const dx = me.x - (p.x + 0.5)
+      const dz = me.z - (p.z + 0.5)
+      const flat = Math.hypot(dx, dz)
+      const level = Math.abs(me.y - p.y) < 1.6
+      if (level && flat < 1.25) continue // still in the doorway
+      if (cells.some((c) => c.x === p.x && c.z === p.z && Math.abs(c.y - p.y) <= 1)) continue // still on the way to it
+      const reach = Math.hypot(dx, me.y + 1.62 - (p.y + 0.5), dz)
+      if (reach > 4.2) {
+        // Out of reach (a sprinting escape, a teleport). Nothing more to do from here.
+        if (now - entry.at > 4000) { this._opened.delete(key); this._doorClicks.delete(key); this.log('debug', `left ${entry.name} at ${p.x},${p.y},${p.z} open — out of reach`) }
+        continue
+      }
+      if (this._someoneInDoorway(p) && now - entry.at < 10_000) continue // do not shut it on a friend
+      this._click(block, d, now)
+    }
+  }
+
+  _someoneInDoorway (p) {
+    const bot = this.bot
+    for (const e of Object.values(bot.entities || {})) {
+      if (!e || e === bot.entity || e.type !== 'player' || !e.position) continue
+      if (Math.abs(e.position.x - (p.x + 0.5)) < 0.9 && Math.abs(e.position.z - (p.z + 0.5)) < 0.9 && Math.abs(e.position.y - p.y) < 1.6) return true
+    }
+    return false
   }
 
   /**
@@ -1264,9 +1471,10 @@ class PathfinderWrapper {
         this._sprintWalkPhase = 'sprint'
       }
       const hazard = this._nearHazard()
+      // Running for its life (or fighting) the bot sprints — builder mode included.
+      if (this.isUrgent()) { movements.allowSprinting = true; return }
       if (this.mode === 'builder') { movements.allowSprinting = false; return }
-      // Running for its life (or fighting) the bot sprints; the stroll cadence waits.
-      movements.allowSprinting = this.isUrgent() ? true : (this._sprintWalkPhase === 'sprint' && !hazard)
+      movements.allowSprinting = this._sprintWalkPhase === 'sprint' && !hazard
     }
     cycle()
 
@@ -1321,6 +1529,13 @@ class PathfinderWrapper {
       try { this.bot.removeListener('path_update', this._onPathUpdate) } catch { /* bot gone */ }
       this._onPathUpdate = null
     }
+    if (this._onPathSeen) {
+      try { this.bot.removeListener('path_update', this._onPathSeen) } catch { /* bot gone */ }
+      this._onPathSeen = null
+    }
+    this._path = null
+    this._opened.clear()
+    this._doorClicks.clear()
     for (const fn of this._tickHandlers) {
       try { this.bot.removeListener('physicsTick', fn) } catch { /* bot gone */ }
     }
@@ -1333,6 +1548,8 @@ module.exports = {
   PathfinderWrapper,
   PredictiveThreatMap,
   fleePlan,
+  makeEscapePlanner,
+  configureHazards,
   WindChargeTraversal,
   scoutSafeAnchor,
   findGroundY,

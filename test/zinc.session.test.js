@@ -39,8 +39,9 @@ test('A: a zombie appears — the body flees and reports; idle keeps fleeing; on
     assert.equal(s.agent.arbiter.owner(), 'survival')
     assert.ok(await s.until(() => s.prompts.length >= 1, 2000), 'the model is woken')
     const told = s.prompts[0]
-    assert.match(told, /^threats 1 — zombie \(\d+m \w+\) — you are fleeing$/m)
-    assert.match(told, /"type":"threat","msg":"fleeing from 1 — zombie/)
+    // One honest count, and what the body is doing by itself — in the same line.
+    assert.match(told, /^threats 1 in sight — zombie \(\d+m \w+\) — you are FLEEING by reflex \d+s, ran \d+m$/m)
+    assert.match(told, /"type":"threat","msg":"reflex: started FLEEING — zombie came close/)
     // It answered idle: that means keep running, and still no swing.
     await sleep(400)
     assert.equal(s.agent.reflex.fleeing, true, 'idle keeps fleeing')
@@ -68,7 +69,7 @@ test('A: a player hits the bot — it backs off and says who; vague attacks neve
   const s = startZincSession({
     bot,
     model: (p) => {
-      if (!has(p, /Gabriel \(\d+m \w+; player, hit you\)/)) return { a: 'idle' }
+      if (!has(p, /Gabriel \(\d+m \w+; player, hit you; diamond_sword, armor 0\/20\)/)) return { a: 'idle' }
       const refused = (p.match(/"type":"action_err","a":"attack"/g) || []).length + answers.filter((a) => a === 'refused').length
       if (has(p, /name_the_player|no_target/)) answers.push('refused')
       const n = answers.filter((a) => a === 'refused').length

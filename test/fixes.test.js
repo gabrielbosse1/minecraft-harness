@@ -440,6 +440,38 @@ test('escape: a ring of zombies with one gap — the plan goes through the gap',
   assert.ok(p.path.every((c) => nearestTo(pursuers, c) > 2.4), 'and it threads the gap, not a zombie')
 })
 
+test('escape: a player who keeps up on open ground is "chased", never "cornered" — only walls make a dead end', () => {
+  // Found by the loopback run against a real server: one player on a flat world, 5-6
+  // blocks away. A few cells beside the bot were safe by a hair and none further out
+  // (he is as fast as the bot), so the plan was a "pocket": the model was told
+  // "CORNERED — the only safe ground is a dead end" in the middle of a field.
+  const verdicts = new Set()
+  for (let gap = 3; gap <= 12; gap += 0.25) {
+    for (const [ux, uz] of [[1, 0], [0, 1], [0.7071, 0.7071], [-0.8, 0.6], [0.3162, -0.9487]]) {
+      const p = escapeRig(world.flat, [[0.5 + ux * gap, 0.5 + uz * gap, 5.6, 3]]).plan()
+      verdicts.add(p.why)
+      assert.equal(p.cornered, false, `player ${gap} blocks off (${ux},${uz}): ${p.why}`)
+      // …and the run goes away from him, a real distance — not to a "safe" cell next door.
+      const away = -((p.target.x + 0.5 - 0.5) * ux + (p.target.z + 0.5 - 0.5) * uz)
+      assert.ok(away > 6, `player ${gap} blocks off (${ux},${uz}): runs ${away.toFixed(1)} blocks away (${p.why})`)
+    }
+  }
+  assert.deepEqual([...verdicts].sort(), ['chased', 'open'])
+  // The reflex's own budget (the flood stops early) must not change the answer.
+  const hurried = escapeRig(world.flat, [[6.0, 0.5, 5.6, 3]]).plan({ budgetMs: 18 })
+  assert.equal(hurried.cornered, false)
+  assert.equal(hurried.why, 'chased')
+
+  // Walls still do: the same player at the mouth of a dead-end corridor is a pocket.
+  const corridor = (x, y, z) => y <= 63 ||
+    (y >= 64 && y <= 66 && (((x === -2 || x === 2) && z >= -1 && z <= 20) || (z === -1 && x >= -2 && x <= 2))) ||
+    (y === 67 && x >= -2 && x <= 2 && z >= -1 && z <= 20)
+  const boxed = escapeRig(corridor, [[0.5, 16.5, 5.6, 3]], [0.5, 8.5]).plan()
+  assert.equal(boxed.why, 'pocket')
+  assert.equal(boxed.cornered, true)
+  assert.ok(boxed.target.z < 8, 'backs toward the closed end')
+})
+
 test('escape: what kind of fix it is — chased by something as fast, surrounded on open ground, trapped in a closed room', () => {
   // A player with a sword 2.5 blocks away is as fast as the bot: nothing is "safe", but the field is open.
   const chased = escapeRig(world.flat, [[3.0, 0.5, 5.6, 3]]).plan()

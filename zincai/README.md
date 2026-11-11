@@ -50,9 +50,14 @@ compares two clocks per cell — when the bot gets there, when a mob could — s
 | Plan | Meaning | What the body does |
 | --- | --- | --- |
 | `open` | safe ground that leads out | runs there |
-| `pocket` | safe for a few seconds, but a dead end | backs into it, faces them, reports **CORNERED** |
-| `chased` | nothing is safe but the ground goes on (a pursuer as fast as the bot, or already on it) | runs anyway |
+| `pocket` | safe for a few seconds, but walled in: a dead end | backs into it, faces them, reports **CORNERED** |
+| `chased` | the ground goes on, but nothing far is safe (a pursuer as fast as the bot, or already on it) | runs anyway |
 | `surrounded` / `trapped` | nothing is safe; pursuers on most sides / the ground ends | breaks out by the route that touches the fewest of them, and reports it |
+
+Only walls make a pocket. If the edge of the search can be reached without
+coming closer to any pursuer than the bot already is, the plan is `chased`
+even when a few cells beside the bot are still safe — a player who keeps up on
+an open field is not a dead end.
 
 If A* has no route or the bot stops making ground it sprints along the first
 leg of the plan — after checking there is ground to sprint on (no wall, no drop

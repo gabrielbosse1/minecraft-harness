@@ -2,10 +2,11 @@
 
 `REPORT.md` describes the harness as it was. This file lists what changed afterwards, by the defect ids of section 8 of the report, how each change was checked, and what is still open.
 
-Everything here was checked in the repository's own rig: a synthetic block world with the real mineflayer-pathfinder A*, a simulated bot, and a scripted model. **Nothing was run against a Minecraft server or the AMD endpoint.** The rig has no jump physics and no mob AI, uses 1.21.4 block data, and treats mobs as points.
+Everything here was checked in the repository's own rig: a synthetic block world with the real mineflayer-pathfinder A*, a simulated bot, and a scripted model. The rig has no jump physics and no mob AI, uses 1.21.4 block data, and treats mobs as points. At the end the loopback rig of `test/e2e` was run as well: the real harness processes against a local flying-squid 1.16.5 server and a scripted model. **Nothing was run against the production server, any 26.3 server, or the AMD endpoint.**
 
-- Tests: `npm test` runs 195 tests (150 before). `test/fixes.test.js` (31) and `test/fixes.session.test.js` (12) are new and named by defect id. Two tests were added to older files, and 13 older tests were updated because they asserted the old behaviour (listed at the end).
+- Tests: `npm test` runs 196 tests (150 before). `test/fixes.test.js` (32) and `test/fixes.session.test.js` (12) are new and named by defect id. Two tests were added to older files, and 13 older tests were updated because they asserted the old behaviour (listed at the end).
 - Scripts: `node audit/repro/<name>` from the repository root. Scripts 03, 06, 07, 09 and 11 were rewritten or extended to show before and after.
+- Loopback: `cd test/e2e && npm install && node loopback.js` passes 43 of 43 checks for both harnesses. Its first run failed two checks and found a defect the rig had missed (the "cornered on open ground" row below). Its mobs stand still and never attack.
 
 ## The design asked for: the body flees by itself, the model still decides, and the bot knows it fled
 
@@ -25,7 +26,7 @@ The owner policy is unchanged: no reflex attacks, no fight unless the model call
 | --- | --- | --- | --- | --- | --- |
 | 1 | Doors and gates | M1, M2 | Every door and every gate newer than dark oak: `noPath`. The wrapper closed doors and trapdoors it never opened. | All wooden doors and gates pass, open or closed. The bot closes only what it opened. Trapdoors and iron doors are never clicked. A door that will not open is given up after 3 clicks and named in the `go_to` result. | 11 tests `M1` / `M2`; scripts 01, 02 |
 | 2 | Pets on 26.3 | T1 | Tame flag read at index 17; on 26.3 it is at 18, so every pet read as wild. | Metadata is read by key name from the server's game data. An unreadable tame state counts as protected. Startup logs any key the data lacks. | 2 tests `T1`; script 07 |
-| 3 | Chase: a call every 3 s, wrong picture, chat silenced | T2, T3, B4 | 13 action calls in 40 s. `threats: 1` beside `zombie x18 (cannot reach you)`. Chat unanswered once the 18-call budget was spent. | 2 calls in 40 s (3 in 70 s). `threats: 27 in sight — zombie x24, skeleton x3`. Six lines from a friend during a 60 s chase all answered in 1.7–1.8 s (model latency 1.5 s). With the action lane slowed to 15 s per call, four lines in 40 s were answered in 1.5–1.8 s. | tests `T2`, `T3`, `T2 + T3`, `B4`; scripts 04, 11 |
+| 3 | Chase: a call every 3 s, wrong picture, chat silenced | T2, T3, B4 | 13 action calls in 40 s. `threats: 1` beside `zombie x18 (cannot reach you)`. Chat unanswered once the 18-call budget was spent. | 2 calls in 40 s (3 in 70 s). `threats: 27 in sight — zombie x24, skeleton x3`. Six lines from a friend during a 60 s chase all answered in 1.5–1.8 s (model latency 1.5 s). With the action lane slowed to 15 s per call, four lines in 40 s were answered in 1.5–1.8 s. | tests `T2`, `T3`, `T2 + T3`, `B4`; scripts 04, 11 |
 | 4 | Storage room | S1, S2, S3, S4, S5 | 42 of 48 chests indexed, no stations, prompt was nine sign texts and "+77 more". `take diamond` took iron from a furnace. | 48 of 48 chests, all labels, all stations; a 753-character summary in which every label is an address. `find` knows labels and lists storage in pages. `take` never guesses and "diamond" is never the diamond pickaxe. | tests `S1` (2), `S3`, `S2 + S4`; scripts 06, 07 |
 
 ## The per-scene items
@@ -37,6 +38,7 @@ The owner policy is unchanged: no reflex attacks, no fight unless the model call
 | Horde | Eating | T4 | Hurt and below 18 hunger: eat the best food even if it overshoots. | test `T4`; script 07 |
 | Horde | `hold` expiring silently | T5 | `hold` lasts 30 min, cancels nothing, and is not wiped when some other task ends (it was: the bot bolted from mobs it had been told to ignore as soon as it finished handing over an item). A paused task gets its decision back when it resumes. Any new escape is announced with its reason. | tests `T5` (2), `T5 + B3`; script 09 |
 | House | Animals | C1 | `attack cow` kills one cow; `count` for more. Hostile mobs are still chained. | test `C1`; script 07 |
+| PvP | Cornered on open ground | not in the report; found by the loopback run | Fleeing from a player on a flat world, the model was told "CORNERED — the only safe ground is a dead end" and woken for it. A player is as fast as the bot, so only a few cells beside it were safe and the planner took that for a pocket. Now only walls make a pocket: if the edge of the search can be reached without coming closer to a pursuer than the bot is, the plan is `chased`. | test "escape: a player who keeps up…"; loopback check "never tells the model it is cornered on flat, open ground" |
 | PvP | Evasion by time-to-impact | scene 3, options A and B | A mace smash is recognised by a real fall on course to land in reach (a hop or a staircase is ignored, with or without packet jitter). A charge is recognised by closing speed and line (a level glide counts; a spear in use on foot counts). Other players who hit the bot recently are watched too. Copper sword and axe are auto-equipped. The shield is lowered when the flee reflex takes over. | 4 tests ("mace: a hop is ignored…", "forecastImpact…", "PvP: packet jitter…", "PvP: during a duel…"); script 07 |
 | Creeper | Retreat that checks walls and drops | scene 4 | Hit-and-run is refused where there is no ground to back off on. Every retreat picks a heading with ground. Reaction time is unchanged: 99–253 ms measured on the old code, 50–280 ms on the new, both set by the 200 ms reflex tick. | test "creeper: no hit-and-run…"; script 08 |
 | Chat | Language | B2 | Both prompts say always PT-BR. Every outgoing line is checked by function words; a foreign chat reply is retried once, then replaced; a foreign `say` is held back and re-asked once. | tests `B2` (2) |
@@ -46,13 +48,13 @@ The owner policy is unchanged: no reflex attacks, no fight unless the model call
 
 ## Escape planner: old and new on five maps
 
-Script 03 plays each map for 12 s. Zombies walk at the bot at 2.3 blocks per second and stop at walls; the bot runs its plan at 5.4 and replans every 700 ms. This compares the two planners' routes only: there is no collision between bodies and a "hit" is a zombie within 1.2 blocks once a second. Four of the five maps gave the same numbers in all seven runs recorded in full. The cliff map was run 15 times: the old planner's result there depends on A* timing, and it let the zombies within 0.8–1.0 blocks 13 times (0–3 hits) and got clean away twice (9.0 blocks, no hits). The new planner gave 8.0 blocks and no hits in all 15.
+Script 03 plays each map for 12 s. Zombies walk at the bot at 2.3 blocks per second and stop at walls; the bot runs its plan at 5.4 and replans every 700 ms. This compares the two planners' routes only: there is no collision between bodies and a "hit" is a zombie within 1.2 blocks once a second. Four of the five maps gave the same numbers in every run recorded in full (ten for the old planner, three for the final code). The cliff map was run 18 times: the old planner's result there depends on A* timing. It let the zombies within 0.8–1.0 blocks 15 times (0–3 hits), within 0.5 blocks once (10 hits), and got clean away twice (9.0 blocks, no hits). The new planner gave 8.0 blocks and no hits in all 18.
 
 | Map | Old: nearest, hits | New: nearest, hits | New tells the model |
 | --- | --- | --- | --- |
 | Dead-end corridor, no way out | 0.3 blocks, 29 | 0.3 blocks, 1 | CORNERED first, then breaks out |
-| Room with one doorway, zombies coming in | 0.6 blocks, 10 | 0.7 blocks, 2 | CORNERED first, then breaks out |
-| Cliff behind the bot | 0.8–1.0 blocks, 0–3 in 13 of 15 runs; 9.0 blocks, 0 in 2 | 8.0 blocks, 0 | nothing (ordinary escape) |
+| Room with one doorway, zombies coming in | 0.6 blocks, 10 | 1.1 blocks, 0 | CORNERED first, then breaks out |
+| Cliff behind the bot | 0.8–1.0 blocks, 0–3 in 15 of 18 runs; 0.5 blocks, 10 in 1; 9.0 blocks, 0 in 2 | 8.0 blocks, 0 | nothing (ordinary escape) |
 | Ring of 13 zombies with one gap | 0.7 blocks, 15 | 3.5 blocks, 0 | nothing |
 | Room with a second doorway | 1.2 blocks, 19 | 6.4 blocks, 0 | nothing |
 
@@ -71,7 +73,7 @@ These were in the report but not in the list that was agreed to fix first.
 
 ## Not verified
 
-- No run against a real server: door clicks under real latency, real mob pathing around the bot, sprint-jump physics, shield timing, sign and item-frame data on 26.3.
+- No run against the production server or any 26.3 server. The loopback run is on 1.16.5 with mobs that do not move, so it shows login, chat with accents, pathfinding, the flee from a player's hit, an explicit fight and the flee from a zombie over the real protocol, and nothing about doors, storage, pets, a horde or PvP evasion. Still unverified: door clicks under real latency, real mob pathing around the bot, sprint-jump physics, shield timing, sign and item-frame data on 26.3.
 - No run against the AMD endpoint: two calls in flight at once, `tool_choice`, the model's use of the new `remember` and `count` fields, how a small model reads the threat block.
 - The 26.3 metadata layout comes from the vendored data file, not from a 26.3 server.
 - The fight estimate is arithmetic on vanilla numbers. It ignores enchantments, effects, terrain and skill.
@@ -91,4 +93,5 @@ Added to older files: `elite.test.js` "forecastImpact…" and `rework.test.js` "
 | `rework.test.js` "brain: wake-ups…", "brain: a failed call…" | Asserted one call in flight for both lanes; chat now runs beside the action call, and the action lane leaves chat a reserve. |
 | `session.test.js` "a zombie appears…", "a player hits the bot…" | Prompt formats: one threat block, the reflex line, the attacker's gear. |
 | `zinc.session.test.js` (2) | Harness A's threat line and event text. |
+| `test/e2e/loopback.js` "tells the model it is fleeing…" | Matched the old threat line (`fleeing from 1 — zombie`); now matches each harness's new wording. One check per harness was added ("never tells the model it is cornered on flat, open ground"), so the rig has 43 checks instead of 41. |
 | `harness.test.js` "combat engage cooldown…" | Asserted "cooldown" as the reason at 4 health; the reason there is now "too hurt", and the cooldown is asserted after healing. |

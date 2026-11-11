@@ -20,6 +20,13 @@
  * LEADS OUT (its branch reaches the edge of the search) — a pocket with no
  * exit is used only when there is nothing better, and reported as cornered.
  *
+ * A pocket is made of walls. Safe ground also "ends" on an open field when
+ * the pursuer is as fast as the bot (a player): far cells are lost to the
+ * clock, not to terrain. If the edge of the search can be reached without
+ * ever coming closer to a pursuer than the bot is now, that is being chased,
+ * not cornered (a real server showed the difference: one player on a flat
+ * world was reported as "the only safe ground is a dead end").
+ *
  * The mob clock deliberately ignores walls (a straight line is the fastest a
  * mob could ever be), so every error is on the safe side.
  *
@@ -81,6 +88,16 @@ function mobClock (pursuers, x, y, z) {
   return best
 }
 
+/** Blocks to the nearest pursuer from (x, y, z). */
+function nearestPursuer (pursuers, x, y, z) {
+  let best = Infinity
+  for (const m of pursuers) {
+    const d = Math.hypot(m.x - x, (m.y - y) * 0.5, m.z - z)
+    if (d < best) best = d
+  }
+  return best
+}
+
 /**
  * @param {object} bot
  * @param {object} movements a Movements instance WITHOUT threat costs (pure geometry)
@@ -91,8 +108,8 @@ function mobClock (pursuers, x, y, z) {
  * @returns {null | { target:{x:number,y:number,z:number}, path:Array<{x:number,y:number,z:number}>,
  *   direction:{x:number,z:number}, margin:number, safe:boolean, leadsOut:boolean,
  *   cornered:boolean, why:string, explored:number, safeCells:number, ms:number }}
- *   why: open (safe ground that leads out) | pocket (safe, but a dead end) |
- *        chased (open ground, but the pursuer is too close or as fast: no cell is safe) |
+ *   why: open (safe ground that leads out) | pocket (safe, but walled in: a dead end) |
+ *        chased (the ground goes on, but the pursuer is too close or as fast as the bot) |
  *        surrounded (no safe cell, pursuers on most sides) |
  *        trapped (no safe cell and the ground ends: shut in with them) |
  *        stuck (cannot move at all)
@@ -113,11 +130,13 @@ function planEscape (bot, movements, pursuers, opts = {}) {
 
   const sx = Math.floor(pos.x); const sy = Math.floor(pos.y); const sz = Math.floor(pos.z)
   const keyOf = (x, y, z) => x + ',' + y + ',' + z
-  /** key -> { x, y, z, g, parent, safe, via, margin, tm, frontier, leadsOut, closed } */
+  /** key -> { x, y, z, g, parent, safe, via, margin, tm, near, frontier, leadsOut, closed } */
   const nodes = new Map()
   const open = new Heap()
   const start = { x: sx, y: sy, z: sz, g: 0, parent: null, via: false, closed: false, frontier: false, leadsOut: false }
   start.tm = mobClock(pursuers, sx + 0.5, sy, sz + 0.5)
+  // The closest the way to a cell ever comes to a pursuer (see runsOn below).
+  start.near = nearestPursuer(pursuers, sx + 0.5, sy, sz + 0.5)
   start.margin = start.tm
   start.safe = start.margin >= minMargin
   nodes.set(keyOf(sx, sy, sz), start)
@@ -151,7 +170,8 @@ function planEscape (bot, movements, pursuers, opts = {}) {
       if (seen && (seen.closed || (seen.via === via ? seen.g <= g : !seen.via))) continue
       const tm = mobClock(pursuers, n.x + 0.5, n.y, n.z + 0.5)
       const margin = tm - g / botSpeed
-      const next = { x: n.x, y: n.y, z: n.z, g, parent: node, via, closed: false, frontier: false, leadsOut: false, tm, margin, safe: !via && margin >= minMargin }
+      const near = Math.min(node.near, nearestPursuer(pursuers, n.x + 0.5, n.y, n.z + 0.5))
+      const next = { x: n.x, y: n.y, z: n.z, g, parent: node, via, closed: false, frontier: false, leadsOut: false, tm, margin, near, safe: !via && margin >= minMargin }
       nodes.set(key, next)
       open.push({ key: g + (via ? 1e6 : 0), node: next })
     }
@@ -185,6 +205,17 @@ function planEscape (bot, movements, pursuers, opts = {}) {
     //    model gets those seconds to decide.
     for (const node of nodes.values()) if (node.safe) consider(node, node.margin + (node.leadsOut ? 6 : 0))
     why = best.leadsOut ? 'open' : 'pocket'
+  }
+  if (best && why === 'pocket') {
+    // Walls make a dead end; a pursuer that keeps up does not. Does the ground
+    // go on — to the edge of the search, or past where the budget stopped it —
+    // by a way that never comes closer to any of them than the bot is now?
+    // Then nothing shuts the bot in: it is being chased, and C picks the run.
+    let runsOn = false
+    for (const node of nodes.values()) {
+      if ((node.frontier || (cutShort && !node.closed)) && node.near >= start.near - 1.5) { runsOn = true; break }
+    }
+    if (runsOn) best = null
   }
   if (!best) {
     // C. Nothing is safe, not even here. Go where the mobs get last, by the way

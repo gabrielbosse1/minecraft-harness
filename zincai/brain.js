@@ -15,6 +15,13 @@
  *   - Finished/failed/interrupted actions wake the model with their result.
  *   - Idle back-off only slows the heartbeat (self-prompts), never events.
  *   - Chat is answered before anything else.
+ *   - Chat has its OWN in-flight slot and a reserved share of the budget. A
+ *     chase used to spend all 18 calls a minute on the action lane, and a
+ *     slow action call (20 s timeout × 3) held the single slot: a friend's
+ *     line then waited 20 s or more (audit/repro/11). Now a reply never waits
+ *     for the body's call, and `chatReserve` calls a minute are chat's alone.
+ *   - An URGENT wake (the body just started running for its life, or is
+ *     cornered) may run sooner than the normal spacing.
  *
  * No Minecraft code here: everything world-specific is injected.
  */
@@ -27,6 +34,7 @@ class Brain {
    *   talk: (sender: string, lines: Array<{text:string, whisper:boolean}>) => Promise<void>,  one CHAT-lane turn
    *   logger?: (level:string, msg:string) => void,
    *   minIntervalMs?: number, chatMinIntervalMs?: number, rpm?: number,
+   *   chatReserve?: number, urgentMinIntervalMs?: number,
    *   heartbeatMs?: number, maxSelfChain?: number, selfChainPauseMs?: number,
    *   now?: () => number }} opts
    */
@@ -37,6 +45,8 @@ class Brain {
     minIntervalMs = 3000,
     chatMinIntervalMs = 1200,
     rpm = 18,
+    chatReserve = 4,
+    urgentMinIntervalMs = 1000,
     heartbeatMs = 90_000,
     maxSelfChain = 12,
     selfChainPauseMs = 30_000,
@@ -48,16 +58,22 @@ class Brain {
     this.minIntervalMs = minIntervalMs
     this.chatMinIntervalMs = chatMinIntervalMs
     this.rpm = rpm
+    // Calls per minute only the chat lane may use: the action lane stops at
+    // rpm - chatReserve. Never more than a third of the budget, so a small rpm
+    // still leaves the body most of it.
+    this.chatReserve = Math.max(0, Math.min(Math.trunc(chatReserve) || 0, Math.floor(rpm / 3)))
+    this.urgentMinIntervalMs = Math.min(urgentMinIntervalMs, minIntervalMs)
     this.heartbeatMs = heartbeatMs
     this.maxSelfChain = maxSelfChain
     this.selfChainPauseMs = selfChainPauseMs
     this.now = now
 
-    /** Pending ACTION-lane reasons: { text, external } — consumed all at once. */
+    /** Pending ACTION-lane reasons: { text, external, urgent, at } — consumed all at once. */
     this.pending = []
     /** Pending CHAT-lane lines: { sender, text, whisper } in arrival order. */
     this.chatQueue = []
-    this.busy = false
+    this.busyAction = false
+    this.busyChat = false
     this.paused = false
     this.lastActionAt = -Infinity
     this.lastChatAt = -Infinity
@@ -65,7 +81,7 @@ class Brain {
     this.failStreak = 0
     this.selfChain = 0
     this.selfChainUntil = 0
-    this.calls = [] // timestamps of the last minute (shared rate limit)
+    this.calls = [] // { at, lane } of the last minute (shared rate limit)
     this.stats = { actionTurns: 0, chatTurns: 0, heartbeats: 0, queuedPeak: 0 }
     this._timer = null
   }
@@ -85,15 +101,23 @@ class Brain {
    * (chat task, threat, damage, death). `false` = the bot's own action
    * reported back; a long run of only those is rate-capped (self-chain).
    */
-  wake (text, { external = true } = {}) {
-    const reason = String(text || 'event').replace(/\s+/g, ' ').trim().slice(0, 160)
-    if (!this.pending.some((p) => p.text === reason)) {
-      this.pending.push({ text: reason, external: Boolean(external) })
+  wake (text, { external = true, urgent = false } = {}) {
+    const reason = String(text || 'event').replace(/\s+/g, ' ').trim().slice(0, 200)
+    const same = this.pending.find((p) => p.text === reason)
+    if (same) same.urgent = same.urgent || Boolean(urgent)
+    else {
+      this.pending.push({ text: reason, external: Boolean(external), urgent: Boolean(urgent), at: this.now() })
       if (this.pending.length > 8) this.pending.splice(0, this.pending.length - 8)
     }
     if (external) { this.selfChain = 0; this.selfChainUntil = 0 }
     this.stats.queuedPeak = Math.max(this.stats.queuedPeak, this.pending.length)
   }
+
+  /** True while either lane has a model call in flight. */
+  get busy () { return this.busyAction || this.busyChat }
+
+  /** A turn made one more call than usual (a retry): count it against the budget. */
+  spent (lane = 'chat') { this.calls.push({ at: this.now(), lane }) }
 
   /** Queue a line for the CHAT lane. */
   hear (sender, text, { whisper = false } = {}) {
@@ -101,9 +125,14 @@ class Brain {
     if (this.chatQueue.length > 12) this.chatQueue.splice(0, this.chatQueue.length - 12)
   }
 
-  _rateOk (now) {
-    while (this.calls.length && now - this.calls[0] > 60_000) this.calls.shift()
-    return this.calls.length < this.rpm
+  /** May `lane` make a call now? Chat may use the whole budget; the body leaves chat its reserve. */
+  _rateOk (now, lane = 'action') {
+    while (this.calls.length && now - this.calls[0].at > 60_000) this.calls.shift()
+    if (this.calls.length >= this.rpm) return false
+    if (lane === 'chat') return true
+    let actions = 0
+    for (const c of this.calls) if (c.lane === 'action') actions++
+    return actions < this.rpm - this.chatReserve
   }
 
   _failWait () {
@@ -116,64 +145,77 @@ class Brain {
     return this.heartbeatMs * Math.min(4, 1 + this.idleStreak)
   }
 
-  /** One scheduling step. Runs at most one model call. */
+  /** One scheduling step. Starts at most one call per lane; the lanes do not wait for each other. */
   async tick () {
-    if (this.busy || this.paused) return
+    if (this.paused) return
+    const jobs = []
+    if (!this.busyChat) { const job = this._chatStep(); if (job) jobs.push(job) }
+    if (!this.busyAction) { const job = this._actionStep(); if (job) jobs.push(job) }
+    if (jobs.length) await Promise.all(jobs)
+  }
+
+  // 1. People first.
+  _chatStep () {
     const now = this.now()
-    if (!this._rateOk(now)) return
+    if (!this.chatQueue.length || now - this.lastChatAt < this.chatMinIntervalMs) return null
+    if (!this._rateOk(now, 'chat')) return null
+    const sender = this.chatQueue[0].sender
+    const lines = this.chatQueue.filter((l) => l.sender === sender)
+    this.chatQueue = this.chatQueue.filter((l) => l.sender !== sender)
+    this.busyChat = true
+    this.lastChatAt = now
+    this.calls.push({ at: now, lane: 'chat' })
+    this.stats.chatTurns++
+    return Promise.resolve()
+      .then(() => this.talk(sender, lines))
+      .catch((err) => this.log('error', `chat lane failed: ${err.message || err}`))
+      .finally(() => { this.busyChat = false })
+  }
 
-    // 1. People first.
-    if (this.chatQueue.length && now - this.lastChatAt >= this.chatMinIntervalMs) {
-      const sender = this.chatQueue[0].sender
-      const lines = this.chatQueue.filter((l) => l.sender === sender)
-      this.chatQueue = this.chatQueue.filter((l) => l.sender !== sender)
-      this.busy = true
-      this.lastChatAt = now
-      this.calls.push(now)
-      this.stats.chatTurns++
-      try {
-        await this.talk(sender, lines)
-      } catch (err) {
-        this.log('error', `chat lane failed: ${err.message || err}`)
-      } finally {
-        this.busy = false
-      }
-      return
-    }
-
-    // 2. The body.
-    if (now - this.lastActionAt < Math.max(this.minIntervalMs, this._failWait())) return
+  // 2. The body.
+  _actionStep () {
+    const now = this.now()
+    const urgent = this.pending.some((p) => p.urgent)
+    const spacing = Math.max(urgent ? this.urgentMinIntervalMs : this.minIntervalMs, this._failWait())
+    if (now - this.lastActionAt < spacing) return null
     if (!this.pending.length) {
-      if (now - this.lastActionAt < this._heartbeatEvery()) return
-      this.pending.push({ text: 'heartbeat (nothing new — idle is fine)', external: true })
+      if (now - this.lastActionAt < this._heartbeatEvery()) return null
+      if (!this._rateOk(now, 'action')) return null
+      this.pending.push({ text: 'heartbeat (nothing new — idle is fine)', external: true, urgent: false, at: now })
       this.stats.heartbeats++
-    }
+    } else if (!this._rateOk(now, 'action')) return null
     const onlySelf = this.pending.every((p) => !p.external)
-    if (onlySelf && now < this.selfChainUntil) return
-    const reasons = this.pending.map((p) => p.text)
+    if (onlySelf && now < this.selfChainUntil) return null
+    // A reason that had to wait says for how long: "… (6s ago)".
+    const reasons = this.pending.map((p) => {
+      const waited = Math.round((now - (p.at ?? now)) / 1000)
+      return waited >= 4 ? `${p.text} (${waited}s ago)` : p.text
+    })
+    const raw = this.pending.map((p) => p.text)
     this.pending = []
-    this.busy = true
+    this.busyAction = true
     this.lastActionAt = now
-    this.calls.push(now)
+    this.calls.push({ at: now, lane: 'action' })
     this.stats.actionTurns++
-    try {
-      const { idle } = await this.act(reasons)
-      this.failStreak = 0
-      this.idleStreak = idle ? this.idleStreak + 1 : 0
-      if (idle || !onlySelf) this.selfChain = 0
-      else if (++this.selfChain >= this.maxSelfChain) {
-        this.selfChain = 0
-        this.selfChainUntil = this.now() + this.selfChainPauseMs
-        this.log('warn', `self-chain cap (${this.maxSelfChain}) reached — pausing self-prompted turns for ${Math.round(this.selfChainPauseMs / 1000)}s`)
-      }
-    } catch (err) {
-      this.failStreak++
-      this.log('error', `action lane failed: ${err.message || err}`)
-      // Do not lose what the turn was about.
-      for (const text of reasons) if (!/^heartbeat/.test(text)) this.wake(text, { external: true })
-    } finally {
-      this.busy = false
-    }
+    return Promise.resolve()
+      .then(() => this.act(reasons))
+      .then(({ idle }) => {
+        this.failStreak = 0
+        this.idleStreak = idle ? this.idleStreak + 1 : 0
+        if (idle || !onlySelf) this.selfChain = 0
+        else if (++this.selfChain >= this.maxSelfChain) {
+          this.selfChain = 0
+          this.selfChainUntil = this.now() + this.selfChainPauseMs
+          this.log('warn', `self-chain cap (${this.maxSelfChain}) reached — pausing self-prompted turns for ${Math.round(this.selfChainPauseMs / 1000)}s`)
+        }
+      })
+      .catch((err) => {
+        this.failStreak++
+        this.log('error', `action lane failed: ${err.message || err}`)
+        // Do not lose what the turn was about.
+        for (const text of raw) if (!/^heartbeat/.test(text)) this.wake(text, { external: true })
+      })
+      .finally(() => { this.busyAction = false })
   }
 }
 

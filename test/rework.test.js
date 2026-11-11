@@ -298,8 +298,13 @@ test('respawn: a fresh Movements object gets doors, mode, digging guard and thre
   wrapper.apply()
   wrapper.stop()
 
-  assert.equal(again.canOpenDoors, true, 'doors still open after dying once')
-  assert.equal(again.openable.has(door), true)
+  // Doors are handled by the wrapper's own block-state logic (custom_mineflayer/
+  // doors.js); upstream's type-based handling is switched off on purpose.
+  assert.equal(again._zincaiDoors?.attached, true, 'door routing is attached again after dying once')
+  assert.equal(again._zincaiDoors.operate, true, 'and it may still open them by hand')
+  assert.equal(again.canOpenDoors, false, 'upstream door handling stays off')
+  assert.equal(again.openable.has(door), false)
+  assert.equal(again.blocksCantBreak.has(door), true, 'a door is opened or walked around, never broken')
   assert.equal(again.allowSprinting, false, 'builder mode is still applied, not just reported')
   assert.equal(again.maxDropDown, 1)
   assert.equal(again.canDig, false)
@@ -320,7 +325,7 @@ test('yaw helpers face where they say (yaw 0 = north)', () => {
 test('combat targeting: exact names, no players by accident, no pets, no caged mobs', async () => {
   const bot = makeBot({ items: [{ name: 'iron_sword' }], held: 'iron_sword' })
   bot.entities[2] = ent(2, 'player', 2.5, 0.5, { username: 'Gabriel' })
-  bot.entities[3] = ent(3, 'piglin', 3.5, 0.5)
+  bot.entities[3] = ent(3, 'zombified_piglin', 3.5, 0.5) // neutral until provoked
   bot.entities[4] = ent(4, 'wolf', 0.5, 2.5, { metadata: Object.assign([], { 17: 0x04 }) }) // tamed
   bot.entities[5] = ent(5, 'villager', 0.5, 3.5)
   bot.entities[6] = ent(6, 'armor_stand', 1.5, 1.5)
@@ -328,7 +333,13 @@ test('combat targeting: exact names, no players by accident, no pets, no caged m
 
   assert.deepEqual(await combat.engage('player'), { ok: false, why: 'name_the_player' })
   assert.deepEqual(await combat.engage('any'), { ok: false, why: 'no_target' }, '"any" never means a player')
-  assert.deepEqual(await combat.engage('pig'), { ok: false, why: 'no_target' }, '"pig" is not a piglin')
+  assert.deepEqual(await combat.engage('pig'), { ok: false, why: 'no_target' }, '"pig" is not a zombified_piglin')
+  // A piglin is hostile to anyone not wearing gold — and to nobody who is.
+  const nether = makeBot({ items: [{ name: 'iron_sword' }], held: 'iron_sword' })
+  nether.entities[9] = ent(9, 'piglin', 0.5, 3.5)
+  assert.deepEqual(await new AdvancedCombat(nether, {}).engage('any'), { ok: true, target: 'piglin' })
+  nether.inventory.slots[5] = { name: 'golden_helmet' }
+  assert.deepEqual(await new AdvancedCombat(nether, {}).engage('any'), { ok: false, why: 'no_target' }, 'in gold, "any" leaves piglins alone')
   assert.deepEqual(await combat.engage('wolf'), { ok: false, why: 'protected' }, 'someone\'s dog')
   assert.deepEqual(await combat.engage('villager'), { ok: false, why: 'protected' })
   assert.deepEqual(await combat.engage('armor_stand'), { ok: false, why: 'protected' })
@@ -767,20 +778,68 @@ test('brain: wake-ups are queued, never dropped; chat is answered first', async 
   brain.wake('hurt: hit by zombie')
   brain.hear('Gabriel', 'zinc vem aqui')
   brain.hear('Gabriel', 'rapido')
-  await brain.tick() // busy: nothing may run, nothing may be lost
-  assert.equal(calls.length, 1)
-  unblock(); release = null
-  await running
-
-  t = 1000 // inside the action spacing — but chat does not wait for it
+  // The body's call is still in flight. The reply does not wait for it (it
+  // used to: one slot for both lanes, so a slow action call held chat back).
   await brain.tick()
   assert.deepEqual(calls[1], ['talk', 'Gabriel', ['zinc vem aqui', 'rapido']])
+  assert.equal(calls.length, 2, 'the second action turn is queued behind the first, not run beside it')
+  assert.equal(brain.busyAction, true)
+  unblock(); release = null
+  await running
+  assert.equal(brain.busy, false)
 
-  await brain.tick() // still inside the 3 s spacing: queued, not dropped
+  t = 1000
+  await brain.tick() // inside the 3 s spacing: queued, not dropped
   assert.equal(calls.length, 2)
   t = 3100
   await brain.tick()
   assert.deepEqual(calls[2], ['act', ['hurt: hit by zombie']])
+})
+
+test('brain: chat keeps a reserved share of the call budget; an urgent wake may run sooner', async () => {
+  let t = 0
+  const calls = []
+  const brain = new Brain({
+    now: () => t,
+    minIntervalMs: 3000,
+    urgentMinIntervalMs: 1000,
+    chatMinIntervalMs: 1000,
+    heartbeatMs: 0,
+    rpm: 18,
+    chatReserve: 4,
+    act: async (r) => { calls.push(['act', r]); return { idle: true } },
+    talk: async (sender, lines) => { calls.push(['talk', lines.map((l) => l.text)]) }
+  })
+  // A chase that wakes the body as often as the spacing allows.
+  for (let i = 0; i < 20; i++) { brain.wake(`event ${i}`); await brain.tick(); t += 3000 }
+  // 20 × 3 s = one minute: the body got 14 of the 18 calls and no more.
+  const inWindow = () => brain.calls.filter((c) => t - c.at <= 60_000)
+  assert.equal(inWindow().filter((c) => c.lane === 'action').length, 14, 'the action lane stops at rpm - chatReserve')
+  brain.wake('one more event')
+  await brain.tick()
+  assert.equal(calls.filter((c) => c[0] === 'act').length, 14, 'still capped — the reasons wait in the queue')
+  assert.ok(brain.pending.length > 0, 'and none of them was dropped')
+  // A friend speaks now: the reserve is theirs. (This is the moment chat went silent.)
+  const before = calls.filter((c) => c[0] === 'talk').length
+  brain.hear('Gabriel', 'zinc ta tudo bem?')
+  await brain.tick()
+  assert.equal(calls.filter((c) => c[0] === 'talk').length, before + 1, 'answered although the body used up its share')
+
+  // Urgency: a normal reason waits out the 3 s spacing, an urgent one only 1 s.
+  const b2calls = []
+  let t2 = 0
+  const b2 = new Brain({ now: () => t2, minIntervalMs: 3000, urgentMinIntervalMs: 1000, heartbeatMs: 0, act: async (r) => { b2calls.push(r); return { idle: true } }, talk: async () => {} })
+  b2.wake('first'); await b2.tick()
+  t2 = 1200
+  b2.wake('walk finished', { external: false }); await b2.tick()
+  assert.equal(b2calls.length, 1, 'an ordinary reason waits')
+  b2.wake('reflex: started FLEEING — creeper came close (4m S)', { urgent: true }); await b2.tick()
+  assert.equal(b2calls.length, 2, 'the start of an escape does not wait 3 s')
+  assert.deepEqual(b2calls[1], ['walk finished', 'reflex: started FLEEING — creeper came close (4m S)'])
+  // A reason that had to wait says for how long.
+  t2 = 2000
+  b2.wake('safe again'); t2 = 9000; await b2.tick()
+  assert.deepEqual(b2calls[2], ['safe again (7s ago)'])
 })
 
 test('brain: idle answers slow the heartbeat only — an event still runs at once', async () => {
@@ -802,7 +861,7 @@ test('brain: a failed call keeps its reasons and backs off; the shared rate limi
   let t = 0
   let fail = true
   const seen = []
-  const brain = new Brain({ now: () => t, minIntervalMs: 1000, heartbeatMs: 0, rpm: 3, act: async (r) => { seen.push(r); if (fail) throw new Error('HTTP 500'); return { idle: false } }, talk: async () => {}, logger: () => {} })
+  const brain = new Brain({ now: () => t, minIntervalMs: 1000, heartbeatMs: 0, rpm: 3, chatReserve: 0, act: async (r) => { seen.push(r); if (fail) throw new Error('HTTP 500'); return { idle: false } }, talk: async () => {}, logger: () => {} })
   brain.wake('chat request from Gabriel: go to Gabriel')
   await brain.tick()
   assert.equal(brain.pending.length, 1, 'the reason survives the failure')

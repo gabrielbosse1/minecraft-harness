@@ -74,6 +74,7 @@ const ATTACK_WHY = {
   protected: 'refused: that is a pet, a name-tagged mob, a villager or a golem',
   name_the_player: 'refused: to fight a player name them exactly in attack.player',
   disengage_cooldown: 'still recovering from the last fight (10 s)',
+  low_hp: 'too hurt to fight — the body would break it off at once; get away and eat first',
   dead: 'I am dead',
   no_position: 'not spawned yet'
 }
@@ -139,7 +140,7 @@ function makeShared (cfg, { dataDir = DATA_DIR } = {}) {
   const { BlueprintParser } = require('./builder')
   const at = (configured, fallback) => path.join(dataDir, String(configured || fallback).replace(/^zincai-data[/\\]/, ''))
   const memoryFile = at(cfg.memory.file, 'memories.json')
-  return {
+  const shared = {
     cfg,
     memoryFile,
     memory: new MemorySystem({
@@ -157,7 +158,10 @@ function makeShared (cfg, { dataDir = DATA_DIR } = {}) {
       timeoutMs: cfg.amd.timeoutMs,
       maxRetries: cfg.amd.maxRetries,
       temperature: cfg.amd.temperature,
-      maxTokens: cfg.amd.maxTokens
+      maxTokens: cfg.amd.maxTokens,
+      maxConcurrent: cfg.amd.maxConcurrent ?? 2,
+      chatTimeoutMs: cfg.amd.chatTimeoutMs ?? null,
+      chatMaxRetries: cfg.amd.chatMaxRetries ?? 1
     }),
     parser: new BlueprintParser({ scaffoldBlocks: cfg.build.scaffoldBlocks, reach: cfg.build.reach }),
     /** per-player conversation, oldest first: name -> [{ who:'them'|'me', text, ts }] */
@@ -169,12 +173,31 @@ function makeShared (cfg, { dataDir = DATA_DIR } = {}) {
     attempts: 0,
     session: null
   }
+  // Conversations survive a restart: "what were we talking about" used to be
+  // lost with the process.
+  const convoFile = path.join(dataDir, 'conversations.json')
+  try {
+    const saved = JSON.parse(fs.readFileSync(convoFile, 'utf8'))
+    const fresh = Date.now() - 7 * 24 * 3600_000
+    for (const [name, lines] of Object.entries(saved.convo || {})) {
+      const kept = (Array.isArray(lines) ? lines : []).filter((l) => l && l.text && l.ts > fresh).slice(-10)
+      if (kept.length) shared.convo.set(name, kept)
+    }
+  } catch { /* first run */ }
+  shared.saveConvo = () => {
+    try {
+      const tmp = convoFile + '.tmp'
+      fs.writeFileSync(tmp, JSON.stringify({ convo: Object.fromEntries(shared.convo) }), 'utf8')
+      fs.renameSync(tmp, convoFile)
+    } catch { /* best effort */ }
+  }
+  return shared
 }
 
 // ============================================================ boot ====
 function main () {
   if (process.argv.includes('--check')) {
-    for (const m of ['./api_wrapper', './memory', './perception', './filter', './builder', './custom_mineflayer/pathfinder_wrapper', './system1', './reflex_registry', './vanilla_guard', './control', './threats', './places', './skills', './observe', './brain']) require(m)
+    for (const m of ['./api_wrapper', './memory', './perception', './filter', './builder', './custom_mineflayer/pathfinder_wrapper', './custom_mineflayer/doors', './custom_mineflayer/escape', './system1', './tactics', './reflex_registry', './vanilla_guard', './control', './threats', './places', './skills', './observe', './brain']) require(m)
     require('minecraft-data')('26.3') // postinstall patch must be in place
     logger.info(TAG, '--check OK — all modules load, 26.3 data present')
     return
@@ -216,6 +239,7 @@ function main () {
     try { shared.session?.dispose(true) } catch { /* noop */ }
     try { shared.memory.save() } catch { /* best effort */ }
     try { shared.places.save(true) } catch { /* best effort */ }
+    try { shared.saveConvo() } catch { /* best effort */ }
     summary()
     // Hard-exit safety net: the process must die with `code` even if the
     // socket never closes (join failure before spawn, etc.).
@@ -266,7 +290,9 @@ function startSession (shared, onEnded) {
   const { System1 } = require('./system1')
   const { ReflexRegistry, runScript } = require('./reflex_registry')
   const { ControlArbiter, PRIORITY } = require('./control')
-  const { ThreatSense, HurtTracker, makeReachabilityCheck } = require('./threats')
+  const { ThreatSense, HurtTracker, makeReachabilityCheck, useRegistry, isHostileMob } = require('./threats')
+  const tactics = require('./tactics')
+  const { clearToRun } = require('./custom_mineflayer/escape')
   const { PlaceIndex } = require('./places')
   const { Skills } = require('./skills')
   const { Brain } = require('./brain')
@@ -329,9 +355,20 @@ function startSession (shared, onEnded) {
   const timers = new Set()
   const every = (ms, fn) => { const t = setInterval(fn, ms); timers.add(t); return t }
 
-  const note = (evt, opts) => { try { memory.addEvent(evt, opts) } catch { /* never let memory break the loop */ } }
+  // Chat, results, requests and what the reflex did each have a section of
+  // their own in the prompt; they stay out of the five-line event window so
+  // they cannot push a real event ("hit by player Gabriel") out of it.
+  const OWN_SECTION = new Set(['chat', 'said', 'result', 'request', 'threat', 'safe', 'fled'])
+  const note = (evt, opts = {}) => { try { memory.addEvent(evt, { window: !OWN_SECTION.has(evt?.type), ...opts }) } catch { /* never let memory break the loop */ } }
   const here = () => bot.entity?.position
   const dim = () => PlaceIndex.dimensionOf(bot)
+  const ago = (ts) => { const sec = Math.max(0, Math.round((Date.now() - ts) / 1000)); return sec < 90 ? `${sec}s` : `${Math.round(sec / 60)}m` }
+
+  // The server's language. Every outgoing line is checked (filter.js): the
+  // prompts and tool results are English, and telling the model is not enough.
+  const LANGUAGE = String(cfg.behavior.language ?? 'pt-BR').toLowerCase()
+  const inLanguage = (text) => !LANGUAGE.startsWith('pt') || filter.checkPortuguese(text, { names: Object.keys(bot.players || {}) }).ok
+  let foreignSays = { n: 0, at: 0 }
 
   // ------------------------------------------------------------- speech --
   const convoOf = (name) => { if (!shared.convo.has(name)) shared.convo.set(name, []); return shared.convo.get(name) }
@@ -384,7 +421,9 @@ function startSession (shared, onEnded) {
    */
   function report (label, result, { wake = null } = {}) {
     const r = result && typeof result === 'object' ? result : { ok: true, msg: String(result ?? 'done') }
-    const msg = String(r.msg || (r.ok ? 'done' : 'failed')).slice(0, 220)
+    // What the model asked to be told (a chest's contents, a storage list) is
+    // not cut to a headline: at 220 characters a full chest lost its second half.
+    const msg = String(r.msg || (r.ok ? 'done' : 'failed')).slice(0, INFORMATIONAL.has(label) ? 900 : 260)
     results.push({ label, ok: Boolean(r.ok), msg, ts: Date.now() })
     if (results.length > 5) results.splice(0, results.length - 5)
     logger.info(TAG, `${label}: ${r.ok ? 'ok' : 'FAILED'} — ${msg}`)
@@ -393,25 +432,149 @@ function startSession (shared, onEnded) {
     if (shouldWake) brain?.wake(`${label} ${r.ok ? 'done' : 'failed'}: ${msg}`, { external: false })
   }
 
+  // ------------------------------------------------------------ agenda ---
+  /**
+   * What the bot is meant to be doing, beyond the one skill that happens to
+   * be running:
+   *
+   *   main     a long task (go_to, follow, a build). A short side job — give,
+   *            take, put, look_in, smelt, use_block, sleep, a fight — PAUSES
+   *            it and it carries on by itself afterwards. It used to be
+   *            cancelled: "Zinc, me dá um pão" ended the build. `stop` ends it.
+   *   shelved  a build that a newer main task replaced: not running, shown so
+   *            the model can pick it up again.
+   *   asked    requests the chat voice handed over that the body has not
+   *            acted on yet (the turn they arrived in answered idle or failed).
+   */
+  const agenda = { main: null, shelved: [], asked: [] }
+  const MAIN_MAX_AGE_MS = 30 * 60_000
+
+  function pruneAgenda () {
+    const now = Date.now()
+    agenda.shelved = agenda.shelved.filter((x) => now - x.at < MAIN_MAX_AGE_MS)
+    agenda.asked = agenda.asked.filter((x) => now - x.at < 5 * 60_000)
+  }
+
+  /** Start (or restart after a pause) the main task. */
+  function launch (main) {
+    main.seq = (main.seq || 0) + 1
+    // A restart waits until the previous run has really stopped: a cancelled
+    // build needs a moment to notice, and two builds must never run at once.
+    const again = () => main.run()
+    main.running = main.running ? main.running.then(again, again) : main.run()
+    background(main.tool, main.running, { showAs: main.showAs || null, main, seq: main.seq })
+  }
+
+  /**
+   * A long task begins. Whatever ran before ends (the newest decision wins);
+   * a build that was in progress is set aside, not forgotten.
+   * @param {{ tool:string, label:string, run:() => Promise<object>, askedBy?:string|null, showAs?:string, resumable?:boolean }} spec
+   */
+  function startMain (spec) {
+    const prev = agenda.main
+    if (prev && /^build/.test(prev.tool) && !/^build/.test(spec.tool)) {
+      agenda.shelved.push({ label: prev.label, askedBy: prev.askedBy || null, at: Date.now() })
+      if (agenda.shelved.length > 3) agenda.shelved.shift()
+    }
+    agenda.shelved = agenda.shelved.filter((x) => x.label !== spec.label)
+    replaceTask()
+    const main = { ...spec, startedAt: Date.now(), paused: null, resumes: 0, seq: 0 }
+    agenda.main = main
+    launch(main)
+  }
+
+  /** Make room for something short without losing the main task. @returns true when a main task was paused */
+  function pauseMain (by, { until = null } = {}) {
+    const main = agenda.main
+    if (!main) return false
+    if (main.resumable === false) { agenda.main = null; return false }
+    main.paused = { by, at: Date.now(), until }
+    return true
+  }
+
+  /**
+   * A short job: the main task waits for it and resumes afterwards.
+   * @param {string} label tool name
+   * @param {() => Promise<object>} run
+   */
+  function startSide (label, run, opts = {}) {
+    if (pauseMain(label, opts)) {
+      try { skills?.cancel('paused') } catch { /* noop */ }
+      try { executor?.cancel() } catch { /* noop */ }
+      leaveFight('new task')
+    } else replaceTask()
+    return background(label, run(), { side: true })
+  }
+
+  /** The side job is over: back to the main task, if one is waiting and nothing else runs. */
+  function resumeMain (after) {
+    const main = agenda.main
+    if (!main || !main.paused || ended) return false
+    if (main.paused.until === 'wake' && bot.isSleeping) return false // the wake event resumes it
+    if (skills?.current() || combat?.isEngaged) return false // whatever is running calls this again when it ends
+    if (Date.now() - main.startedAt > MAIN_MAX_AGE_MS || main.resumes >= 8) {
+      agenda.main = null
+      note({ type: 'dropped', msg: `gave up on ${main.label} (interrupted too often or too old)` })
+      return false
+    }
+    main.paused = null
+    main.resumes++
+    // The decision that came with the task comes back with it (the side job
+    // replaced it) — except about anything that hit the bot in the meantime.
+    const d = main.decision
+    if (d?.ids?.length) {
+      const still = d.ids.filter((id) => { const e = bot.entities?.[id]; return e && !sense.isRecentAttacker(e) })
+      if (still.length) system1?.acknowledge(still, d.opts)
+    }
+    note({ type: 'resumed', msg: `back to ${main.label} after ${after}` })
+    logger.info(TAG, `resuming ${main.label} after ${after}`)
+    launch(main)
+    return true
+  }
+
+  /** The agenda as one prompt line, or null when there is nothing beyond what "doing:" says. */
+  function agendaLine () {
+    pruneAgenda()
+    const parts = []
+    const m = agenda.main
+    if (m && m.paused) parts.push(`[main, PAUSED for ${m.paused.by}] ${m.label}${m.askedBy ? `, asked by ${m.askedBy}` : ''} (${ago(m.startedAt)} ago) — carries on by itself afterwards; stop cancels it`)
+    for (const x of agenda.shelved) parts.push(`[set aside] ${x.label}${x.askedBy ? `, asked by ${x.askedBy}` : ''} (${ago(x.at)} ago) — call it again to continue`)
+    for (const x of agenda.asked) parts.push(`[asked, not started] ${x.from}: ${x.text} (${ago(x.at)} ago)`)
+    return parts.length ? `agenda: ${parts.join(' | ')}` : null
+  }
+
   /**
    * Run long work in the background; the model is told how it ended.
    * `showAs` labels work that is not a Skill (builds, scripts) in "doing:".
+   * `main` / `seq` mark the agenda's main task; `side` a job it is paused for.
    */
-  function background (label, promise, { showAs = null } = {}) {
+  function background (label, promise, { showAs = null, main = null, seq = 0, side = false } = {}) {
     const id = ++taskSeq
     if (showAs) task = { id, label: showAs, startedAt: Date.now() }
     Promise.resolve(promise)
       .then((r) => r, (err) => ({ ok: false, msg: String(err?.message || err) }))
       .then((r) => {
         if (task?.id === id) task = null
+        if (main) {
+          // An earlier run of this task, or a task the agenda no longer holds: not news.
+          if (agenda.main !== main || main.seq !== seq) return
+          // Cancelled to make room for a side job: it will be launched again.
+          if (main.paused) return
+          agenda.main = null
+        }
         if (!combat?.isEngaged) system1?.clearDecision()
         // Replaced by the model's own next instruction: not news.
-        if (/\breplaced\b/.test(String(r?.msg || ''))) return
+        if (/\b(replaced|paused)\b/.test(String(r?.msg || ''))) { if (side) resumeMain(label); return }
+        // "No path" has a reason more often than not: say it.
+        const jam = wrapper.lastJam
+        if (label === 'go_to' && r && !r.ok && jam && Date.now() - jam.at < 30_000) {
+          r = { ...r, msg: `${r.msg} — the ${jam.name} at ${jam.x},${jam.y},${jam.z} would not open (locked or protected); there may be another way in` }
+        }
         report(label, r, { wake: true })
+        if (side) resumeMain(label)
       })
   }
 
-  /** A new task replaces whatever task was running (not a fight). */
   /**
    * The model started something new: whatever the body was doing ends. That
    * includes a fight — the newest decision wins, and the model can always
@@ -432,9 +595,17 @@ function startSession (shared, onEnded) {
     return was ? opponent : null
   }
 
-  /** The model answered while threats were on screen: it has decided about them. */
+  /**
+   * The model answered while threats were on screen: it has decided about
+   * them — all the ones it was shown, near or still approaching. The decision
+   * lasts as long as the task it belongs to (background() clears it), not a
+   * fixed minute: a bot that bolts 60 s into a walk it was told to make is
+   * worse than one that never obeyed.
+   */
   function decided (snap, opts) {
-    if (snap?.threatIds?.length) system1?.acknowledge(snap.threatIds, opts)
+    const ids = snap?.threatIds || []
+    if (ids.length) system1?.acknowledge(ids, opts)
+    return { ids, opts }
   }
 
   // ---------------------------------------------------------- prompts ----
@@ -443,19 +614,58 @@ function startSession (shared, onEnded) {
     if (bot.isSleeping) parts.push('sleeping')
     if (combat?.isEngaged) parts.push(`fighting ${fight?.label || combat.wantedName || 'target'}${fight?.kills ? ` (${fight.kills} down)` : ''}`)
     const cur = skills?.current()
-    if (cur) parts.push(`${cur.label} (${cur.seconds}s)${cur.paused ? ' — paused while fleeing, resumes after' : ''}`)
-    else if (task) parts.push(`${task.label} (${Math.round((Date.now() - task.startedAt) / 1000)}s)`)
+    const main = agenda.main && !agenda.main.paused ? agenda.main : null
+    const asker = main?.askedBy ? `, asked by ${main.askedBy}` : ''
+    if (cur) parts.push(`${cur.label} (${cur.seconds}s${asker})${cur.paused ? ' — paused while the body flees, resumes by itself after' : ''}`)
+    else if (task) parts.push(`${task.label} (${Math.round((Date.now() - task.startedAt) / 1000)}s${asker})`)
     if (system1?.fleeing) parts.push('FLEEING by reflex')
     return `doing: ${parts.length ? parts.join('; ') : 'nothing'}`
   }
 
-  function threatLine () {
-    const all = sense.last.threats
-    if (!all.length) return 'threats: none'
-    const base = `threats: ${sense.describe(all)}`
-    if (system1?.fleeing) return `${base} — you are FLEEING by reflex. Decide: attack, go_to, hold; or idle to keep fleeing.`
-    if (combat?.isEngaged) return `${base} — you chose to fight.`
-    return `${base} — you already decided about these.`
+  /** The escape route as the reflex sees it right now (wall-aware), or null. */
+  function routeNow () {
+    const plan = system1?.fleeing ? system1._flee?.plan : null
+    return plan && plan.why !== 'vector' ? { cornered: Boolean(plan.cornered), why: plan.why } : null
+  }
+
+  /**
+   * Everything about danger in one block: who is coming (one count, by type),
+   * how hard they press, which ways are open, what a fight would cost — then
+   * what the body is doing about it and what the model may decide.
+   */
+  function threatLines () {
+    const coming = sense.coming()
+    const reflex = system1?.reflexLine() || null
+    if (!coming.length) return reflex ? ['threats: none', `reflex: ${reflex}`] : ['threats: none']
+    const picture = tactics.situation(bot, coming, { canRun: (dir) => clearToRun(bot, dir, { blocks: 4 }) })
+    const [head, ...rest] = tactics.describeSituation(picture, { route: routeNow() })
+    const lines = [`threats: ${head}`, ...rest.map((l) => '  ' + l)]
+    if (reflex) lines.push(`  reflex: ${reflex}`)
+    if (system1?.fleeing) lines.push('  decide: idle = keep fleeing | attack = fight | go_to / follow = go there instead | hold = stop running, they are harmless or accepted')
+    else if (combat?.isEngaged) lines.push('  you chose to fight.')
+    else {
+      const d = system1?.decisionLine()
+      lines.push(d ? `  ${d}.` : '  not close enough to make the body run yet.')
+    }
+    return lines
+  }
+
+  /** The same facts for the chat voice, short: who is there, and what the body is doing about it. */
+  function threatBrief () {
+    const coming = sense.coming()
+    const reflex = system1?.reflexLine() || null
+    const out = []
+    const picture = coming.length ? tactics.situation(bot, coming) : null
+    out.push(picture ? `threats: ${tactics.describeSituation(picture)[0]}` : 'threats: none')
+    if (reflex) out.push(`reflex: ${reflex}`)
+    return out
+  }
+
+  /** Why each hostile that is NOT coming at the bot is not a threat. */
+  function hostileNotes () {
+    const notes = new Map()
+    for (const t of sense.last.hidden || []) notes.set(t.id, t.caged ? 'hostile, shut in — cannot reach you' : 'hostile, no line on you')
+    return notes
   }
 
   function chatLines (max = 6) {
@@ -466,7 +676,11 @@ function startSession (shared, onEnded) {
     const pos = here()
     sense.assess()
     try { places.scan(bot, { radius: cfg.places.scanRadius ?? 16 }) } catch { /* partial world */ }
-    const threatIds = [...sense.last.ids]
+    // Everything shown as coming at the bot is what a decision this turn is
+    // about — and everything the body is running from right now, including
+    // the ones that slipped behind a corner a moment ago (they are not in the
+    // threat block, and "hold" used to leave the bot running from them).
+    const threatIds = [...new Set([...sense.last.dangerIds, ...(system1?.chasers || []).map((t) => t.id)])]
     const mode = wrapper.mode || 'explorer'
     const nearby = pos ? places.describeNearby(pos, { dim: dim() }) : ''
     const named = pos ? places.describeNamed(pos, { dim: dim() }) : ''
@@ -476,15 +690,16 @@ function startSession (shared, onEnded) {
     const chat = chatLines()
     const res = results.slice(-4).map((r) => `  - ${r.label}: ${r.ok ? '' : 'FAILED — '}${r.msg}`).join('\n')
     const events = memory.working.last(6)
-      .filter((e) => !['chat', 'said', 'result'].includes(e.type))
+      .filter((e) => !OWN_SECTION.has(e.type))
       .map((e) => `  - ${e.type}: ${e.text || e.msg || ''}${e.count > 1 ? ` (x${e.count})` : ''}`).join('\n')
     const lines = [
       observe.selfLine(bot, { mode }),
       observe.inventoryLine(bot),
       doingLine(),
-      threatLine(),
+      agendaLine(),
+      ...threatLines(),
       observe.playersLine(bot),
-      observe.mobsLine(bot, { threatIds: sense.last.ids }),
+      observe.mobsLine(bot, { threatIds: sense.last.dangerIds, notes: hostileNotes() }),
       nearby ? `nearby:\n${nearby.split('\n').map((l) => '  ' + l).join('\n')}` : 'nearby: no chests, furnaces or beds seen within 24 blocks',
       named ? `places: ${named}` : null,
       prefs || null,
@@ -497,7 +712,9 @@ function startSession (shared, onEnded) {
     if (mode === 'builder') {
       try { lines.push(`grid (builder mode; legend: ${VISION_LEGEND}):\n${buildVisionBlock(bot, { mode, range: 6, radius: 6, heightUp: 5, heightDown: 2 })}`) } catch { /* cosmetic */ }
     }
-    return { text: lines.filter(Boolean).join('\n'), threatIds }
+    // Who asked for what this turn is about (the newest chat request among the reasons).
+    const asked = /^chat request from (\S+?):/.exec([...reasons].reverse().find((r) => /^chat request from /.test(r)) || '')
+    return { text: lines.filter(Boolean).join('\n'), threatIds, askedBy: asked ? asked[1] : null, reasons }
   }
 
   function buildChatPrompt (sender, incoming) {
@@ -508,14 +725,18 @@ function startSession (shared, onEnded) {
     const latest = incoming.map((l) => `${l.whisper ? '(whisper) ' : ''}${l.text}`).join(' / ')
     const recalled = memory.recallBlock(latest, cfg.memory.topK ?? 3)
     const prefs = memory.preferencesLine(sender)
+    // What this player told the bot before, in the model's own words.
+    const known = memory.factsAbout(sender, cfg.memory.factsPerPlayer ?? 6)
     const lines = [
       observe.selfLine(bot, { mode: wrapper.mode || 'explorer' }),
       observe.inventoryLine(bot, { max: 16 }),
       doingLine(),
-      threatLine().replace(/ — you.*$/, ''),
+      agendaLine(),
+      ...threatBrief(),
       observe.playersLine(bot),
       named ? `places: ${named}` : null,
       prefs || null,
+      known.length ? `you know from ${sender}:\n${known.map((t) => `  - ${t}`).join('\n')}` : null,
       recalled || null,
       history ? `conversation with ${sender} so far:\n${history}` : null,
       `${sender} says: ${latest}`
@@ -524,6 +745,9 @@ function startSession (shared, onEnded) {
   }
 
   // ------------------------------------------------------- model turns ---
+  /** Tools that start or change something in the world: after one of them a request counts as taken up. */
+  const PASSIVE = new Set(['idle', 'say', 'hold', 'find', 'equip', 'eat', 'set_mode', 'remember_here'])
+
   async function act (reasons) {
     const snap = buildActionPrompt(reasons)
     logger.debug(TAG, `action turn (${reasons.join(' | ')})`)
@@ -532,19 +756,50 @@ function startSession (shared, onEnded) {
       { role: 'user', content: snap.text }
     ], ZINC_TOOLS)
     await executeAction(action, snap)
+    // The body took something up: what was asked is no longer "not started".
+    // The request this turn was woken for, or — when the turn was about
+    // something else and the model started a task anyway — the oldest one.
+    if (!PASSIVE.has(action.a) && agenda.asked.length) {
+      const mine = reasons.filter((r) => /^chat request from /.test(r))
+      const before = agenda.asked.length
+      agenda.asked = agenda.asked.filter((x) => !mine.some((r) => r.startsWith(`chat request from ${x.from}: ${x.text}`.slice(0, 160))))
+      if (agenda.asked.length === before && action.a !== 'attack') agenda.asked.shift()
+    }
     return { idle: action.a === 'idle' && !action._prose }
   }
 
   async function talk (sender, lines) {
     const text = buildChatPrompt(sender, lines)
-    const { reply } = await amd.chatReply([
+    const messages = [
       { role: 'system', content: CHAT_PROMPT },
       { role: 'user', content: text }
-    ], { maxTokens: cfg.inference.chatMaxTokens ?? 120 })
+    ]
+    const maxTokens = cfg.inference.chatMaxTokens ?? 120
+    let { reply } = await amd.chatReply(messages, { maxTokens })
+    // Language guard: one more try with a plain instruction, then a fixed line.
+    if (reply.text && !inLanguage(reply.text)) {
+      logger.warn(TAG, `chat reply was not ${LANGUAGE} ("${reply.text.slice(0, 80)}") — asking once more`)
+      brain?.spent?.('chat')
+      try {
+        const again = await amd.chatReply([
+          ...messages,
+          { role: 'assistant', content: reply.text },
+          { role: 'user', content: 'That reply was not in Brazilian Portuguese. Call reply again: the same meaning in informal Brazilian Portuguese (PT-BR), nothing else changed.' }
+        ], { maxTokens })
+        reply = { ...again.reply, task: again.reply.task || reply.task, remember: again.reply.remember || reply.remember }
+      } catch (err) { logger.debug(TAG, `language retry failed: ${err.message || err}`) }
+      if (reply.text && !inLanguage(reply.text)) reply = { ...reply, text: reply.task ? 'blz, já vou' : 'foi mal, me enrolei aqui kkk' }
+    }
     const whisper = lines.some((l) => l.whisper)
     if (reply.text) speak(reply.text, { to: whisper ? sender : null, about: sender })
+    if (reply.remember) {
+      const kept = memory.rememberFact(reply.remember, { about: sender })
+      if (kept) logger.info(TAG, `remembered (from ${sender}): ${kept.text}`)
+    }
     if (reply.task) {
       note({ type: 'request', sender, text: `${sender} asked: ${reply.task}` })
+      agenda.asked.push({ from: sender, text: reply.task, at: Date.now() })
+      if (agenda.asked.length > 4) agenda.asked.shift()
       brain.wake(`chat request from ${sender}: ${reply.task}`, { external: true })
     }
     logger.info(TAG, `chat ${sender}: "${lines.map((l) => l.text).join(' / ').slice(0, 80)}" -> ${reply.text ? `"${reply.text.slice(0, 80)}"` : '(silent)'}${reply.task ? ` [task: ${reply.task.slice(0, 60)}]` : ''}`)
@@ -555,6 +810,7 @@ function startSession (shared, onEnded) {
     fight = null
     system1?.clearDecision()
     report('fight', { ok: okFlag, msg: text }, { wake: true })
+    resumeMain('the fight')
   }
 
   function onCombatEvent (evt) {
@@ -565,9 +821,10 @@ function startSession (shared, onEnded) {
     if (evt.result === 'won') {
       f.kills++
       // "attack zombie" means the zombies, not one zombie: take the next one of
-      // the same kind without another model call. Never chained for players.
-      const maxChain = cfg.combat.maxChainKills ?? 6
-      if (!f.player && f.kills < maxChain && Number(bot.health) > combat.disengageAt + 2) {
+      // the same kind without another model call — for HOSTILE mobs. An animal
+      // is one animal unless a count was given ("attack cow" beside a pen used
+      // to empty the pen). Never chained for players.
+      if (!f.player && f.kills < f.limit && Number(bot.health) > combat.disengageAt + 2) {
         combat.engage(f.request).then((r) => {
           if (fight !== f) return
           if (r.ok) note({ type: 'combat', msg: `next ${r.target}` })
@@ -627,23 +884,32 @@ function startSession (shared, onEnded) {
         else if (action._badArgs) report('reply', { ok: false, msg: `arguments for ${action._badArgs} were not valid JSON` })
         return
       case 'say': {
-        const said = speak(action.t ?? action.text, { to: action.to ? String(action.to) : null })
+        const text = String(action.t ?? action.text ?? '')
+        if (text.trim() && !inLanguage(text)) {
+          // Not the server's language: hold it back and ask again — once.
+          const again = Date.now() - foreignSays.at < 60_000 ? foreignSays.n + 1 : 1
+          foreignSays = { n: again, at: Date.now() }
+          logger.warn(TAG, `say held back (not ${LANGUAGE}): "${text.slice(0, 80)}"`)
+          return report('say', { ok: false, msg: again <= 1 ? `NOT SENT — "${text.slice(0, 60)}" is not Brazilian Portuguese. Say it again in informal PT-BR.` : 'not sent (still not Brazilian Portuguese); dropped' }, { wake: again <= 1 })
+        }
+        foreignSays = { n: 0, at: 0 }
+        const said = speak(text, { to: action.to ? String(action.to) : null })
         if (!said) report('say', { ok: false, msg: 'empty text' })
         return
       }
       case 'move': // legacy name
       case 'go_to': {
-        replaceTask()
-        decided(snap, { label: 'go_to' })
-        return background('go_to', skills.goTo({ player: action.player, place: action.place, x: action.x, y: action.y, z: action.z }))
+        const target = { player: action.player, place: action.place, x: action.x, y: action.y, z: action.z }
+        const where = action.player || action.place || (Number.isFinite(Number(action.x)) ? `${Math.round(Number(action.x))},${Math.round(Number(action.z))}` : 'somewhere')
+        return startMain({ tool: 'go_to', label: `go to ${where}`, askedBy: snap.askedBy, decision: decided(snap, { label: 'go_to' }), run: () => skills.goTo(target) })
       }
       case 'follow': {
-        replaceTask()
-        decided(snap, { label: 'follow', ttlMs: 10 * 60_000 })
-        return background('follow', skills.follow({ player: action.player }))
+        return startMain({ tool: 'follow', label: `follow ${action.player}`, askedBy: snap.askedBy, decision: decided(snap, { label: 'follow', ttlMs: 30 * 60_000 }), run: () => skills.follow({ player: action.player }) })
       }
       case 'stop': {
         const duel = fight?.player ? combat?.target : null
+        agenda.main = null
+        agenda.asked = []
         replaceTask()
         system1.clearDecision()
         // A duel the model agreed to and then called off: the hits were part
@@ -652,9 +918,14 @@ function startSession (shared, onEnded) {
         return report('stop', { ok: true, msg: 'stopped' }, { wake: false })
       }
       case 'hold': {
-        replaceTask()
-        decided(snap, { label: 'hold', ttlMs: 120_000 })
-        return report('hold', { ok: true, msg: snap.threatIds.length ? `holding; ignoring ${snap.threatIds.length} listed threat(s) until something new appears` : 'holding (no threats listed)' }, { wake: false })
+        // "They are harmless or accepted": the body stops running from them. It
+        // does NOT cancel what the bot was doing — a paused task resumes; `stop`
+        // is the tool that ends a task. (It used to cancel, and to expire
+        // silently two minutes later.)
+        decided(snap, { label: 'hold', ttlMs: 30 * 60_000 })
+        const n = snap.threatIds.length
+        const cur = skills?.current()
+        return report('hold', { ok: true, msg: n ? `no longer running from ${n} listed threat${n === 1 ? '' : 's'}${cur ? `; carrying on with ${cur.label}` : ''}. The body runs again if one of them hurts you, a fuse is lit, or something new shows up` : 'nothing to hold against (no threats listed)' }, { wake: false })
       }
       case 'attack': {
         const request = action.player
@@ -662,40 +933,46 @@ function startSession (shared, onEnded) {
           : String(action.target ?? action.n ?? action.name ?? 'any').toLowerCase().trim()
         const r = await combat.engage(request)
         if (!r.ok) return report('attack', { ok: false, msg: ATTACK_WHY[r.why] || r.why })
-        replaceTask({ keepFight: true })
+        // A fight is a side job: the main task waits for it.
+        if (pauseMain('a fight')) { try { skills?.cancel('paused') } catch { /* noop */ }; try { executor?.cancel() } catch { /* noop */ } } else replaceTask({ keepFight: true })
         const anyHostile = typeof request === 'string' && ['any', 'hostile', 'hostiles', 'mob'].includes(request)
-        fight = { request, label: r.target, kills: 0, player: typeof request === 'object' }
-        // Fighting zombies covers the zombies that arrive later, too.
-        system1.acknowledge(snap.threatIds, { types: fight.player || anyHostile ? [] : [r.target], all: anyHostile, ttlMs: 120_000, label: 'fight' })
+        const isPlayerFight = typeof request === 'object'
+        const wanted = Math.trunc(Number(action.count))
+        const hostileKind = !isPlayerFight && (anyHostile || isHostileMob(r.target, bot))
+        const limit = isPlayerFight ? 1 : (Number.isFinite(wanted) && wanted > 0 ? Math.min(wanted, 24) : (hostileKind ? (cfg.combat.maxChainKills ?? 6) : 1))
+        fight = { request, label: r.target, kills: 0, player: isPlayerFight, limit }
+        // Fighting zombies covers the zombies that arrive later, too — for as long as the fight lasts.
+        system1.acknowledge(snap.threatIds, { types: fight.player || anyHostile ? [] : [r.target], all: anyHostile, ttlMs: 10 * 60_000, label: 'fight' })
         return report('attack', { ok: true, msg: `fighting ${r.target}` }, { wake: false })
       }
+      // Short jobs: a main task (follow, go_to, a build) waits for them and resumes.
       case 'look_in':
-        replaceTask(); decided(snap, { label: 'look_in' })
-        return background('look_in', skills.lookIn({ where: action.where }))
+        decided(snap, { label: 'look_in' })
+        return startSide('look_in', () => skills.lookIn({ where: action.where }))
       case 'take':
-        replaceTask(); decided(snap, { label: 'take' })
-        return background('take', skills.take({ item: action.item, count: action.count, where: action.where }))
+        decided(snap, { label: 'take' })
+        return startSide('take', () => skills.take({ item: action.item, count: action.count, where: action.where }))
       case 'put':
-        replaceTask(); decided(snap, { label: 'put' })
-        return background('put', skills.put({ item: action.item, count: action.count, where: action.where }))
+        decided(snap, { label: 'put' })
+        return startSide('put', () => skills.put({ item: action.item, count: action.count, where: action.where }))
       case 'smelt':
-        replaceTask(); decided(snap, { label: 'smelt' })
-        return background('smelt', skills.smelt({ item: action.item, count: action.count, where: action.where }))
+        decided(snap, { label: 'smelt' })
+        return startSide('smelt', () => skills.smelt({ item: action.item, count: action.count, where: action.where }))
       case 'sleep':
-        replaceTask(); decided(snap, { label: 'sleep' })
-        return background('sleep', skills.sleep())
+        decided(snap, { label: 'sleep' })
+        return startSide('sleep', () => skills.sleep(), { until: 'wake' })
       case 'give':
-        replaceTask(); decided(snap, { label: 'give' })
-        return background('give', skills.give({ player: action.player, item: action.item, count: action.count }))
+        decided(snap, { label: 'give' })
+        return startSide('give', () => skills.give({ player: action.player, item: action.item, count: action.count }))
       case 'use_block':
-        replaceTask(); decided(snap, { label: 'use_block' })
-        return background('use_block', skills.useBlock({ what: action.what }))
+        decided(snap, { label: 'use_block' })
+        return startSide('use_block', () => skills.useBlock({ what: action.what }))
       case 'eat':
         return background('eat', skills.eat({ item: action.item }))
       case 'equip':
         return report('equip', await skills.equip({ item: action.item, where: action.where }), { wake: null })
       case 'find':
-        return report('find', skills.find({ what: action.what }))
+        return report('find', skills.find({ what: action.what, page: action.page }))
       case 'remember_here':
         return report('remember_here', skills.rememberHere({ name: action.name, note: action.note }), { wake: null })
       case 'craft': {
@@ -713,8 +990,9 @@ function startSession (shared, onEnded) {
           else if (Array.isArray(action.grid)) planned = parser.parseInline(action)
           else return report('build', { ok: false, msg: `need a blueprint name (${parser.listAvailable().join(', ')}) or an inline grid` })
         } catch (err) { return report('build', { ok: false, msg: String(err.message || err) }) }
-        replaceTask(); decided(snap, { label: 'build', ttlMs: 5 * 60_000 })
-        return background('build', buildBlocks(planned.blocks, String(action.blueprint || 'inline'), stage, action.at), { showAs: `building ${action.blueprint || 'inline grid'}` })
+        const what = `${action.blueprint || 'inline grid'}${stage ? ` (${stage})` : ''}`
+        // Re-running a phase is idempotent, so a paused build simply runs again.
+        return startMain({ tool: 'build', label: `build ${what}`, askedBy: snap.askedBy, showAs: `building ${what}`, decision: decided(snap, { label: 'build', ttlMs: 30 * 60_000 }), run: () => buildBlocks(planned.blocks, String(action.blueprint || 'inline'), stage, action.at) })
       }
       case 'build_shape': {
         if (!executor) return report('build_shape', { ok: false, msg: 'not ready yet' })
@@ -724,18 +1002,18 @@ function startSession (shared, onEnded) {
         if (!shape || !block) return report('build_shape', { ok: false, msg: 'need shape and block' })
         let blocks
         try { blocks = generateShape(shape, params, block) } catch (err) { return report('build_shape', { ok: false, msg: String(err.message || err) }) }
-        replaceTask(); decided(snap, { label: 'build', ttlMs: 5 * 60_000 })
-        return background('build_shape', buildBlocks(blocks, `shape:${shape}`, normalizeStage(action.stage), action.at), { showAs: `building ${shape} of ${block}` })
+        return startMain({ tool: 'build_shape', label: `build ${shape} of ${block}`, askedBy: snap.askedBy, showAs: `building ${shape} of ${block}`, decision: decided(snap, { label: 'build', ttlMs: 30 * 60_000 }), run: () => buildBlocks(blocks, `shape:${shape}`, normalizeStage(action.stage), action.at) })
       }
       case 'run_script': {
         const name = String(action.name || '')
         if (!name) return report('run_script', { ok: false, msg: 'need a script name' })
-        replaceTask(); decided(snap, { label: 'script' })
+        decided(snap, { label: 'script' })
         const ctx = {
           bot, goals, memory, combat, pathfinder: wrapper, executor, system1, logger, arbiter, skills, places,
           escalate: (event) => brain.wake(`${event.type} ${event.item || event.text || ''}`.trim())
         }
-        return background(`run_script ${name}`, runScript(name, {}, ctx).then((out) => ({ ok: true, msg: typeof out === 'string' ? out : 'done' })), { showAs: `running script ${name}` })
+        // A script is not safe to run twice, so a side job ends it instead of pausing it.
+        return startMain({ tool: `run_script ${name}`, label: `script ${name}`, askedBy: snap.askedBy, showAs: `running script ${name}`, resumable: false, run: () => runScript(name, {}, ctx).then((out) => ({ ok: true, msg: typeof out === 'string' ? out : 'done' })) })
       }
       case 'set_mode': {
         const applied = wrapper.setMode(String(action.mode || ''))
@@ -801,6 +1079,12 @@ function startSession (shared, onEnded) {
     systemsReady = true
     logger.info(TAG, `spawn OK — model=${cfg.amd.model}`)
 
+    // Entity metadata is read by key name from the server's game data, so a
+    // version that reorders it (26.x moved the tame flag) cannot turn pets wild.
+    const data = useRegistry(bot.registry)
+    for (const problem of data.problems) logger.warn(TAG, `game data: ${problem} — pets of that kind are treated as protected`)
+    if (data.newHostiles.length) logger.info(TAG, `game data lists hostile mobs this harness has no notes on, treated as hostile: ${data.newHostiles.join(', ')}`)
+
     combat = new AdvancedCombat(bot, {
       maxHealth: 20,
       disengageHealthFraction: cfg.combat.disengageHealthFraction ?? 0.3,
@@ -812,6 +1096,15 @@ function startSession (shared, onEnded) {
       hands: arbiter.lane('combat', PRIORITY.combat),
       // Running away is the survival layer's job here.
       fleeOnDisengage: false,
+      // During a fight, also dodge any other player who hit the bot lately.
+      watch: () => {
+        const out = []
+        for (const [id, a] of sense.attackers) {
+          const e = a.player ? bot.entities?.[id] : null
+          if (e && sense.isRecentAttacker(e)) out.push(e)
+        }
+        return out
+      },
       onEvent: onCombatEvent
     })
     combat.start()
@@ -828,6 +1121,8 @@ function startSession (shared, onEnded) {
       minIntervalMs: cfg.inference.minIntervalMs ?? 3000,
       chatMinIntervalMs: cfg.inference.chatMinIntervalMs ?? 1200,
       rpm: cfg.inference.rpm ?? 18,
+      chatReserve: cfg.inference.chatReserve ?? 4,
+      urgentMinIntervalMs: cfg.inference.urgentMinIntervalMs ?? 1000,
       heartbeatMs: cfg.inference.heartbeatMs ?? 90_000,
       maxSelfChain: cfg.inference.maxSelfChain ?? 12
     })
@@ -845,13 +1140,30 @@ function startSession (shared, onEnded) {
       fleeBelowHealth: cfg.system1.fleeBelowHealth ?? 6,
       mlgFallBlocks: cfg.system1.mlgFallBlocks ?? 5,
       fleeDistance: cfg.system1.fleeDistance ?? 14,
+      releaseRadius: cfg.system1.releaseRadius ?? 22,
+      calmMs: cfg.system1.calmMs ?? 4000,
+      reportGapMs: cfg.system1.reportGapMs ?? 6000,
+      stillFleeingMs: cfg.system1.stillFleeingMs ?? 30_000,
+      recallMs: cfg.system1.recallMs ?? 180_000,
       tickMs: cfg.system1.tickMs ?? 200,
       autoElytra: cfg.behavior.autoElytra !== false,
       escalate: (event) => brain.wake(`${event.type} ${event.item || event.text || ''}`.trim()),
-      // The reflex reports; the model decides.
+      // The reflex reports; the model decides. The start of an escape (and
+      // anything that makes it worse) may jump the queue; its end may not.
       onEvent: (evt) => {
         note({ type: evt.type, msg: evt.text })
-        if (evt.wake) brain.wake(evt.text, { external: true })
+        if (evt.wake) brain.wake(evt.text, { external: true, urgent: evt.urgent === true })
+        // An escape that cost health or dragged on says something about that
+        // place. Written in a fixed form (kinds, 16-block cell, day or night)
+        // so the tenth escape from the same spot is the same memory, not a tenth one.
+        const ep = evt.episode
+        if (ep && (ep.lost > 0 || ep.seconds >= 20)) {
+          const tod = bot.time?.timeOfDay
+          const when = Number.isFinite(tod) && tod >= 13000 && tod < 23000 ? 'at night' : 'by day'
+          const cell = (v) => Math.round(v / 16) * 16
+          const kinds = String(ep.from).replace(/ x\d+/g, '')
+          try { memory.longTerm.add(`dangerous ${when} around ${cell(ep.start.x)},${cell(ep.start.z)} (${dim()}): had to run from ${kinds}`, ['danger'], 1) } catch { /* never let memory break the loop */ }
+        }
       }
     })
     system1.start()
@@ -862,7 +1174,7 @@ function startSession (shared, onEnded) {
     arbiter.on('resume', ({ lane }) => { if (lane === 'task') note({ type: 'resumed', msg: 'task resumed after the interruption' }) })
 
     every(3000, () => { try { places.scan(bot, { radius: cfg.places.scanRadius ?? 16 }) } catch { /* partial world */ } })
-    every(60_000, () => { try { memory.save(); places.save() } catch { /* best effort */ } })
+    every(60_000, () => { try { memory.save(); places.save(); shared.saveConvo?.() } catch { /* best effort */ } })
 
     try { bot.armorManager?.equipAll?.() } catch { /* cosmetic */ }
     logger.info(TAG, 'ZincAI ready — reflexes flee, the model decides; chat lane + action lane on demand')
@@ -899,6 +1211,7 @@ function startSession (shared, onEnded) {
     note({ type: 'death', msg: `I died at ${where}${lastHurt.text ? ` — ${lastHurt.text}` : ''}` }, { promote: true })
     if (p) places.remember('last death', p, { dim: dim(), note: lastHurt.text })
     fight = null
+    agenda.main = null // a new life: the model is told and decides what to pick up again
     try { skills?.cancel('died') } catch { /* noop */ }
     try { executor?.cancel() } catch { /* noop */ }
     try { combat?.stop(); combat?.start() } catch { /* noop */ }
@@ -909,7 +1222,12 @@ function startSession (shared, onEnded) {
     timers.add(t)
   })
 
-  bot.on('wake', () => { if (systemsReady) { note({ type: 'woke', msg: 'woke up' }); brain.wake('woke up (morning)') } })
+  bot.on('wake', () => {
+    if (!systemsReady) return
+    note({ type: 'woke', msg: 'woke up' })
+    // A task that waited for the night carries on; only an idle bot needs a thought.
+    if (!resumeMain('sleeping')) brain.wake('woke up (morning)')
+  })
 
   bot.on('vanilla_command_blocked', (line) => {
     logger.warn(TAG, `vanilla guard blocked: ${String(line).slice(0, 80)}`)
@@ -977,7 +1295,7 @@ function startSession (shared, onEnded) {
   })
 
   // `internals` exists for the session test; nothing in the harness uses it.
-  return { dispose, bot, internals: () => ({ arbiter, sense, wrapper, combat, system1, skills, brain, results, executeAction, buildActionPrompt, buildChatPrompt }) }
+  return { dispose, bot, internals: () => ({ arbiter, sense, wrapper, combat, system1, skills, brain, results, agenda, executeAction, buildActionPrompt, buildChatPrompt }) }
 }
 
 if (require.main === module) main()

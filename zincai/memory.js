@@ -255,9 +255,14 @@ class MemorySystem {
   /**
    * Record an event in working + short-term memory; promote to long-term when
    * (a) it clears the importance threshold or (b) the caller forces it.
+   *
+   * `window: false` keeps it out of the small working window (the "events:"
+   * lines of the prompt). Use it for things the prompt already shows in a
+   * section of their own — chat, results, what the reflex did — so that they
+   * cannot push "hit by player Gabriel" out of a five-line window.
    */
-  addEvent (evt, { promote = null } = {}) {
-    this.working.push(evt)
+  addEvent (evt, { promote = null, window = true } = {}) {
+    if (window) this.working.push(evt)
     this.shortTerm.push(evt)
     this.ephemeral.push(evt)
     const importance = scoreImportance(evt)
@@ -330,9 +335,43 @@ class MemorySystem {
     // Only statements worth recalling later: where things are, what is whose,
     // numbers. "zinc vem aqui" is a request, not a memory.
     const f = fold(t)
-    const factual = /\d|\b(base|casa|house|home|bau|chest|farm|fazenda|mina|mine|portal|bed|cama|guard|coloc|deix|fica|ficam|is at|are at|put|stored|keep|meu|minha|my|nosso|nossa|our)\b/.test(f)
+    // This filter is the fallback, for lines nobody answered. What a player
+    // tells the bot directly is written down by the chat model itself
+    // (rememberFact). The stems used to sit inside word boundaries — "guard"
+    // never matched "guardei" — so three of them matched nothing at all.
+    const factual = /\d|\b(base|casa|house|home|bau|baus|chest|farm|fazenda|mina|mine|portal|bed|cama|guard\w*|coloc\w*|coloqu\w*|deix\w*|escond\w*|fica|ficam|ficou|is at|are at|put|stored|keep|meu|minha|meus|minhas|my|nosso|nossa|our|amanha|hoje|ontem|semana|aniversario|irmao|irma|pai|mae|pais|amigo|amiga|alergic\w*|odeio|adoro|prefiro|vamos|vou|vai|combinad\w*)\b/.test(f)
     if (!factual || /\?\s*$/.test(t)) return null
     return this.longTerm.add(`${sender} said: ${t.slice(0, 160)}`, ['chat', String(sender)], addressed ? 2 : 1)
+  }
+
+  /**
+   * A fact the MODEL chose to keep (the chat lane's `remember` field): where
+   * something is, whose it is, a plan, a preference — in its own words.
+   * @param {string} text one sentence
+   * @param {{ about?: string }} [opts] the player it came from / concerns
+   */
+  rememberFact (text, { about = '' } = {}) {
+    const t = String(text || '').replace(/\s+/g, ' ').trim().slice(0, 200)
+    if (t.length < 6) return null
+    const who = String(about || '').trim()
+    return this.longTerm.add(t, who ? ['fact', who] : ['fact'], 3)
+  }
+
+  /**
+   * What the bot knows from or about one player, newest first: the facts the
+   * model wrote down, then lines of theirs the fallback filter kept.
+   */
+  factsAbout (name, limit = 6) {
+    const who = String(name || '').trim()
+    if (!who) return []
+    const low = fold(who)
+    const mine = this.longTerm.entries.filter((e) => {
+      const tags = e.tags || []
+      if (!tags.includes('fact') && !tags.includes('chat')) return false
+      return tags.includes(who) || fold(e.text).includes(low)
+    })
+    mine.sort((a, b) => (Number((b.tags || []).includes('fact')) - Number((a.tags || []).includes('fact'))) || (b.ts - a.ts))
+    return mine.slice(0, limit).map((e) => e.text)
   }
 
   /** Recent chat lines (10-minute window), oldest first — survives event spam. */

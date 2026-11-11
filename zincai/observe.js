@@ -11,7 +11,7 @@
  */
 'use strict'
 
-const { whereIs, isPlayer, isDecor, isNamed, isTamed, HOSTILE_NAMES } = require('./threats')
+const { whereIs, isPlayer, isDecor, isNamed, isTamed, isHostileMob, HOSTILE_NAMES } = require('./threats')
 const { heldItemName } = require('../src/combat')
 
 const ARMOR_SLOTS = [5, 6, 7, 8]
@@ -70,9 +70,10 @@ function playersLine (bot, { max = 8 } = {}) {
  * Creatures around that are NOT current threats, as totals by type with the
  * nearest one's direction. Decor (armor stands, item frames, dropped items)
  * is left out; pets and named mobs are marked so nobody mistakes them for
- * wild ones. `threatIds` are excluded — they have their own line.
+ * wild ones. `threatIds` (everything coming at the bot) are excluded — they
+ * have their own block. `notes` maps an entity id to why it is not a threat.
  */
-function mobsLine (bot, { radius = 24, threatIds = new Set(), max = 8 } = {}) {
+function mobsLine (bot, { radius = 24, threatIds = new Set(), max = 8, notes = null } = {}) {
   const me = bot.entity?.position
   if (!me) return ''
   const groups = new Map()
@@ -85,7 +86,14 @@ function mobsLine (bot, { radius = 24, threatIds = new Set(), max = 8 } = {}) {
     if (d > radius) continue
     if (name === 'item') { items++; continue }
     if (isDecor(e) || threatIds.has(e.id)) continue
-    const tag = isTamed(e) ? ' (pet)' : (isNamed(e) ? ' (named)' : (HOSTILE_NAMES.has(name) ? ' (hostile, cannot reach you)' : ''))
+    // Why a hostile is listed here and not under threats: the sense says so
+    // per mob (shut in / out of sight). "Cannot reach you" used to be stamped
+    // on every hostile more than 12 blocks away, walking toward the bot or not.
+    let tag = ''
+    if (isTamed(e)) tag = ' (pet)'
+    else if (isNamed(e)) tag = ' (named)'
+    else if (isHostileMob(name, bot)) tag = ` (${notes?.get(e.id) || 'hostile, not coming at you'})`
+    else if (HOSTILE_NAMES.has(name)) tag = ' (leaves you alone while you wear gold)'
     const key = name + tag
     const g = groups.get(key) || { key, count: 0, nearest: e, d: Infinity }
     g.count++

@@ -50,10 +50,11 @@ const { ElytraController } = require('./elytra')
 const { AntiStuckWatchdog } = require('./watchdog')
 const { decideReconnect } = require('./reconnect')
 const { ControlArbiter, PRIORITY } = require('../zincai/control')
-const { ThreatSense, HurtTracker, makeReachabilityCheck } = require('../zincai/threats')
+const { ThreatSense, HurtTracker, makeReachabilityCheck, useRegistry } = require('../zincai/threats')
 const { System1 } = require('../zincai/system1')
 const { ReflexRegistry } = require('../zincai/reflex_registry')
-const { PredictiveThreatMap, fleePlan } = require('../zincai/custom_mineflayer/pathfinder_wrapper')
+const { PredictiveThreatMap, fleePlan, makeEscapePlanner } = require('../zincai/custom_mineflayer/pathfinder_wrapper')
+const { describeGroup, situation } = require('../zincai/tactics')
 const { parseChatLine, chatAddressesBot, botNames } = require('../zincai/filter')
 
 const TAG = 'agent'
@@ -366,6 +367,11 @@ class ZincAgent {
     bot.pathfinder.setMovements(movements)
 
     // --- the shared body: controls, threat sense --------------------------------
+    // Pets and fuses are read from entity metadata by key name (26.x moved them).
+    try {
+      const data = useRegistry(bot.registry)
+      for (const problem of data.problems) logger.warn(TAG, `game data: ${problem}`)
+    } catch (err) { logger.debug(TAG, `game data check skipped: ${err.message || err}`) }
     this.arbiter = new ControlArbiter(bot)
     this.sense = new ThreatSense(bot, { reachable: makeReachabilityCheck(bot, { Movements, goals }) })
     // A* pays extra to walk near real threats, and the flee planner uses the
@@ -389,6 +395,8 @@ class ZincAgent {
       hands: this.arbiter.lane('combat', PRIORITY.combat),
       threatMap: this.threatMap,
       fleeOnDisengage: false, // running away is the reflex layer's job
+      // During a fight, also dodge any other player who hit the bot lately.
+      watch: () => this._recentPlayerAttackers(),
       onEvent: (evt) => this._onCombatEvent(evt) // combat outcome = trigger delta
     })
     this.combat.start()
@@ -401,7 +409,8 @@ class ZincAgent {
       arbiter: this.arbiter,
       sense: this.sense,
       combat: this.combat,
-      pathfinder: { fleePlan: (opts) => fleePlan(bot, this.threatMap, opts) },
+      // Where to run: the wall-aware planner first, the old "point away" as its fallback.
+      pathfinder: { escapePlan: makeEscapePlanner(bot, { Movements }), fleePlan: (opts) => fleePlan(bot, this.threatMap, opts) },
       autoElytra: false, // the ElytraController below owns gliding
       tickMs: this.cfg.reflexTickMs,
       onEvent: (evt) => this._onReflexEvent(evt)
@@ -622,10 +631,30 @@ class ZincAgent {
     // Deliberately O(1) size — this is the ONLY state we always send.
     const vitals = `vitals hp=${hp} food=${food} pos=${pos} tod=${tod}`
     // …plus one line while something dangerous is around, so the model knows
-    // what its answer is deciding about.
-    const threats = this.sense?.last?.threats || []
-    if (!threats.length) return vitals
-    return `${vitals}\nthreats ${this.sense.describe(threats)} — ${this.reflex?.fleeing ? 'you are fleeing' : 'not fleeing (you decided)'}`
+    // what its answer is deciding about — and what its body did by itself.
+    // One count: everything hostile that has a line on the bot, near or still
+    // approaching (it used to count only the ones inside 12 blocks, so a horde
+    // of 27 read as "1").
+    const coming = this.sense?.coming?.() || []
+    const reflex = this.reflex?.reflexLine?.({ brief: true }) || null
+    if (!coming.length) return reflex ? `${vitals}\nreflex you ${reflex}` : vitals
+    const picture = situation(bot, coming)
+    const kinds = picture ? picture.groups.slice(0, 4).map(describeGroup).join(', ') : this.sense.describe(coming)
+    const state = this.reflex?.fleeing ? `you are ${reflex || 'FLEEING by reflex'}` : 'not fleeing (you decided)'
+    return `${vitals}\nthreats ${coming.length} in sight — ${kinds} — ${state}`
+  }
+
+  /** Players who hit the bot within the threat sense's memory and are still in view. */
+  _recentPlayerAttackers () {
+    const out = []
+    const bot = this.bot
+    if (!bot || !this.sense?.attackers) return out
+    for (const [id, a] of this.sense.attackers) {
+      if (!a.player) continue
+      const e = bot.entities?.[id]
+      if (e && this.sense.isRecentAttacker(e)) out.push(e)
+    }
+    return out
   }
 
   // ---------------------------------------------------- inference engine--
@@ -646,7 +675,8 @@ class ZincAgent {
     try {
       const body = this.buffer.buildBody(this._vitalsLine())
       // The threats this prompt shows: the model's answer decides about these.
-      const shown = [...(this.sense?.last?.ids || [])]
+      // …and whatever the body is running from right now, in sight or not.
+      const shown = [...new Set([...(this.sense?.last?.dangerIds || this.sense?.last?.ids || []), ...(this.reflex?.chasers || []).map((t) => t.id)])]
       const messages = [
         // Byte-identical static system prompt → KV prefix cache hit.
         { role: 'system', content: SYSTEM_PROMPT },
@@ -746,7 +776,8 @@ class ZincAgent {
           // fight covers that player only.
           const any = ['any', 'hostile', 'hostiles', 'mob'].includes(String(action.n).toLowerCase().trim())
           const versusPlayer = this.combat.target?.type === 'player'
-          this.reflex?.acknowledge(shown, { types: versusPlayer || any ? [] : [r.target], all: any, ttlMs: 120_000, label: 'fight' })
+          // For as long as the fight lasts (it is cleared when the fight ends); two minutes was a silent bolt mid-fight.
+          this.reflex?.acknowledge(shown, { types: versusPlayer || any ? [] : [r.target], all: any, ttlMs: 10 * 60_000, label: 'fight' })
         } else push({ type: 'action_err', a: 'attack', why: r.why })
         logger.info(TAG, r.ok ? `attacking ${r.target}` : `attack failed: ${r.why}`)
         break

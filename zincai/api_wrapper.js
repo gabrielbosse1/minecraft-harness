@@ -12,7 +12,10 @@
  * Design notes:
  *   - Same discipline as ../src/amdClient.js: Bearer auth, exponential backoff
  *     with jitter (429/5xx), timeout via AbortController, secrets redacted
- *     from every error/log path, serialized in-flight (one call at a time).
+ *     from every error/log path. Each lane (action, chat) sends one call at
+ *     a time; the two lanes do not queue behind each other, and a waiting
+ *     chat reply goes first — a slow action call (20 s × 3 tries) used to
+ *     hold a friend's answer for a minute.
  *   - KV-cache economy is preserved: byte-identical system prompt, small
  *     delta user message, cached-token accounting exposed via getStats().
  *   - Tolerant fallback: if the endpoint ignores `tools` and answers with raw
@@ -47,7 +50,7 @@ const tool = (name, description, properties = {}, required = []) => ({ name, des
 
 const ACTION_TOOLS = [
   tool('say', 'Say one short chat line. Set `to` for a private message to one player.', {
-    text: STR('Plain text, max 200 chars, in the language the players use.'),
+    text: STR('Plain text, max 200 chars, always in Brazilian Portuguese.'),
     to: STR('Player name for a private message (optional).')
   }, ['text']),
   tool('go_to', 'Walk somewhere: a player, a remembered place or a listed id (chest2, bed1), or coordinates. You are told when you arrive or fail.', {
@@ -58,17 +61,18 @@ const ACTION_TOOLS = [
     z: INT('Z coordinate.')
   }),
   tool('follow', 'Follow a player until you call stop or another movement.', { player: STR('Player name.') }, ['player']),
-  tool('stop', 'Stop the current task, follow or fight and stand still.'),
+  tool('stop', 'Stop the current task, follow or fight (and anything paused behind it) and stand still.'),
   tool('attack', 'Fight. The ONLY way a fight ever starts. `target` = exact mob type ("zombie") or "any" hostile mob. `player` = exact player name — PvP only on your explicit decision (a duel they asked for, or someone who keeps hitting you).', {
     target: STR('Mob type, or "any".'),
-    player: STR('Exact player name (PvP).')
+    player: STR('Exact player name (PvP).'),
+    count: INT('How many to kill. Default: ONE animal; hostile mobs: keep going while more of them come.')
   }),
-  tool('hold', 'Stay put and stop fleeing from the threats listed now (they are harmless or you accept the risk). New threats make you flee again.'),
+  tool('hold', 'Stop fleeing from the threats listed now: they are harmless or you accept the risk. Your task carries on. A hit from one of them, a lit fuse or a new threat makes you flee again.'),
   tool('look_in', 'Open a container and read its contents. Empty `where` = nearest.', { where: STR('Id from "nearby" (chest2), a label, or empty.') }),
-  tool('take', 'Take items from a container, or the output of a furnace.', {
+  tool('take', 'Take items from a container, or the output of a furnace (name the furnace in `where`).', {
     item: STR('Item id, e.g. "diamond".'),
     count: INT('How many (default: all).'),
-    where: STR('Container id or label (default: nearest that has it).')
+    where: STR('Container id or label. Default: a container already known to hold it.')
   }, ['item']),
   tool('put', 'Put carried items into a container.', {
     item: STR('Item id.'),
@@ -92,7 +96,10 @@ const ACTION_TOOLS = [
     where: { type: 'string', enum: ['hand', 'off-hand', 'head', 'torso', 'legs', 'feet'] }
   }, ['item']),
   tool('use_block', 'Walk to the nearest block of this name and right-click it (door, gate, lever, button, bell).', { what: STR('Block id.') }, ['what']),
-  tool('find', 'Where is a block type, or which opened container holds an item?', { what: STR('Block or item id.') }, ['what']),
+  tool('find', 'Where is it? A block type, an item (searches the containers you opened), a chest label, or "storage" to list every container around.', {
+    what: STR('Block or item id, a label, or "storage".'),
+    page: INT('Page of the storage list (default 1).')
+  }, ['what']),
   tool('remember_here', 'Save the current position under a name (home, mina, casa do Gabriel).', {
     name: STR('Place name.'),
     note: STR('Optional note.')
@@ -115,14 +122,15 @@ const ACTION_TOOLS = [
   tool('set_mode', 'Switch movement mode: builder (no sprint, no drops), hunter (sprint + jump-run), explorer (default).', {
     mode: { type: 'string', enum: ['builder', 'hunter', 'explorer'] }
   }, ['mode']),
-  tool('idle', 'Do nothing this turn. While threats are listed this means: keep fleeing.')
+  tool('idle', 'Do nothing this turn. While you are FLEEING this means: keep fleeing.')
 ]
 
 /** The chat lane has exactly one tool: answer, and optionally hand over a task. */
 const CHAT_TOOLS = [
   tool('reply', 'Answer the player. Leave `text` empty to stay silent.', {
-    text: STR('One short chat line in the player\'s language. Empty = say nothing.'),
-    task: STR('Only when the player asked you to DO something in the game: a short imperative for your body, e.g. "go to Gabriel", "bring Gabriel 3 diamonds from the chest". Otherwise omit.')
+    text: STR('One short chat line in Brazilian Portuguese. Empty = say nothing.'),
+    task: STR('Only when the player asked you to DO something in the game: a short imperative for your body, e.g. "go to Gabriel", "bring Gabriel 3 diamonds from the chest". Otherwise omit.'),
+    remember: STR('Only when the player told you something worth knowing later (where a thing is, whose it is, a plan, a date, what they like): that fact as one short sentence naming the player, e.g. "Gabriel keeps his diamonds in the chest on the second floor". Otherwise omit.')
   }, ['text'])
 ]
 
@@ -205,13 +213,13 @@ function coerceReply (message) {
   if (toolCalls.length > 0) {
     const parsed = parseToolCall(toolCalls[0], CHAT_TOOLS)
     if (!parsed.error) {
-      return { text: String(parsed.args.text ?? '').trim(), task: String(parsed.args.task ?? '').trim(), _via: 'tool' }
+      return { text: String(parsed.args.text ?? '').trim(), task: String(parsed.args.task ?? '').trim(), remember: String(parsed.args.remember ?? '').trim(), _via: 'tool' }
     }
   }
   const content = typeof message?.content === 'string' ? message.content.trim() : ''
   // Some models wrap the answer in quotes or prefix their own name.
   const text = content.replace(/^["'“”]+|["'“”]+$/g, '').replace(/^(zinc(ai)?|me)\s*:\s*/i, '').split('\n')[0].trim()
-  return { text, task: '', _via: 'prose' }
+  return { text, task: '', remember: '', _via: 'prose' }
 }
 
 /**
@@ -239,7 +247,7 @@ class AmdToolsClient {
    * Drop-in replacement for AmdClient at the call site, with the same
    * constructor contract and the same getStats() shape (plus tool metrics).
    */
-  constructor ({ apiKey, baseUrl, model, timeoutMs = 20_000, maxRetries = 2, temperature = 0.25, maxTokens = 256, toolChoice = 'required' }) {
+  constructor ({ apiKey, baseUrl, model, timeoutMs = 20_000, maxRetries = 2, temperature = 0.25, maxTokens = 256, toolChoice = 'required', maxConcurrent = 2, chatTimeoutMs = null, chatMaxRetries = 1 }) {
     if (!apiKey) {
       // Never include the (missing) key in the error — only the variable name.
       throw new Error('AMD API key missing: set AMD_API_KEY (or API_KEY) in .env')
@@ -266,7 +274,14 @@ class AmdToolsClient {
       chatReplies: 0
     }
     this.toolChoice = toolChoice
-    this._chain = Promise.resolve()
+    // 2 = one call per lane at a time. 1 = strictly one call at a time (for an
+    // endpoint that refuses parallel requests); chat still jumps the queue.
+    this.maxConcurrent = Math.max(1, Math.trunc(Number(maxConcurrent)) || 1)
+    // A chat reply that arrives a minute late is worth nothing: shorter leash.
+    this.chatTimeoutMs = Number.isFinite(chatTimeoutMs) && chatTimeoutMs > 0 ? chatTimeoutMs : Math.min(timeoutMs, 12_000)
+    this.chatMaxRetries = Math.max(0, Math.min(maxRetries, Math.trunc(Number(chatMaxRetries)) || 0))
+    this._queue = [] // { lane, run, resolve, reject }
+    this._running = new Set() // lanes with a call in flight
   }
 
   async _fetchWithTimeout (url, options, timeoutMs) {
@@ -280,18 +295,34 @@ class AmdToolsClient {
   }
 
   /**
-   * One request, retried on 429/5xx/timeouts, serialised against every other
-   * call of this client (two lanes share one endpoint and one rate limit).
+   * One request, retried on 429/5xx/timeouts. Calls of the same lane run one
+   * after another; different lanes may run side by side (up to
+   * `maxConcurrent`), and a waiting chat call is always started first.
    * @returns {Promise<{message:object, usage:object, raw:object}>}
    */
-  async _complete ({ messages, tools, maxTokens = this.maxTokens, temperature = this.temperature }) {
-    const run = () => this._completeNow({ messages, tools, maxTokens, temperature })
-    const next = this._chain.then(run, run)
-    this._chain = next.then(() => {}, () => {})
-    return next
+  _complete ({ messages, tools, maxTokens = this.maxTokens, temperature = this.temperature, lane = 'action', timeoutMs = this.timeoutMs, maxRetries = this.maxRetries }) {
+    return new Promise((resolve, reject) => {
+      this._queue.push({ lane, resolve, reject, run: () => this._completeNow({ messages, tools, maxTokens, temperature, timeoutMs, maxRetries }) })
+      this._pump()
+    })
   }
 
-  async _completeNow ({ messages, tools, maxTokens, temperature }) {
+  _pump () {
+    while (this._running.size < this.maxConcurrent && this._queue.length) {
+      const free = (job) => !this._running.has(job.lane)
+      let i = this._queue.findIndex((job) => job.lane === 'chat' && free(job))
+      if (i < 0) i = this._queue.findIndex(free)
+      if (i < 0) return
+      const [job] = this._queue.splice(i, 1)
+      this._running.add(job.lane)
+      Promise.resolve()
+        .then(job.run)
+        .then(job.resolve, job.reject)
+        .finally(() => { this._running.delete(job.lane); this._pump() })
+    }
+  }
+
+  async _completeNow ({ messages, tools, maxTokens, temperature, timeoutMs = this.timeoutMs, maxRetries = this.maxRetries }) {
     const url = `${this.baseUrl}/chat/completions`
     const headers = {
       Authorization: `Bearer ${this._apiKey}`,
@@ -301,7 +332,7 @@ class AmdToolsClient {
 
     let attempt = 0
     let lastError = null
-    while (attempt <= this.maxRetries) {
+    while (attempt <= maxRetries) {
       if (attempt > 0) {
         this.stats.retries += 1
         await sleep(backoffMs(attempt - 1))
@@ -310,20 +341,21 @@ class AmdToolsClient {
       this.stats.requests += 1
       const payload = buildToolsPayload({ model: this.model, messages, temperature, maxTokens, tools, toolChoice: this.toolChoice })
       try {
-        const res = await this._fetchWithTimeout(url, { method: 'POST', headers, body: JSON.stringify(payload) }, this.timeoutMs)
+        const res = await this._fetchWithTimeout(url, { method: 'POST', headers, body: JSON.stringify(payload) }, timeoutMs)
 
         if (res.status === 429 || res.status >= 500) {
           const snippet = redactSecrets((await res.text().catch(() => '')).slice(0, 200), this._apiKey)
           lastError = new Error(`HTTP ${res.status}: ${snippet}`)
-          logger.warn(TAG, `retryable HTTP ${res.status} (attempt ${attempt}/${this.maxRetries + 1})`)
+          logger.warn(TAG, `retryable HTTP ${res.status} (attempt ${attempt}/${maxRetries + 1})`)
           continue
         }
 
         if (!res.ok) {
           const snippet = redactSecrets((await res.text().catch(() => '')).slice(0, 300), this._apiKey)
           // Some OpenAI-compatible servers only know tool_choice "auto"/"none".
-          if (res.status === 400 && this.toolChoice === 'required' && /tool_choice|required/i.test(snippet)) {
-            logger.warn(TAG, 'endpoint rejected tool_choice "required" — falling back to "auto" for this session')
+          // (Judged by what THIS request sent: the other lane may have switched already.)
+          if (res.status === 400 && payload.tool_choice === 'required' && /tool_choice|required/i.test(snippet)) {
+            if (this.toolChoice === 'required') logger.warn(TAG, 'endpoint rejected tool_choice "required" — falling back to "auto" for this session')
             this.toolChoice = 'auto'
             attempt -= 1 // not the model's fault: do not burn a retry
             continue
@@ -353,7 +385,7 @@ class AmdToolsClient {
         const isNetwork = err instanceof TypeError
         if (isAbort || isNetwork) {
           lastError = new Error(redactSecrets(err.message || String(err), this._apiKey))
-          logger.warn(TAG, `retryable ${isAbort ? 'timeout' : 'network'} error (attempt ${attempt}/${this.maxRetries + 1})`)
+          logger.warn(TAG, `retryable ${isAbort ? 'timeout' : 'network'} error (attempt ${attempt}/${maxRetries + 1})`)
           continue
         }
         throw err
@@ -371,7 +403,7 @@ class AmdToolsClient {
    * @returns {Promise<{action:object, content:string, usage:object, raw:object}>}
    */
   async chatWithTools (messages, tools = createZincTools()) {
-    const { message, usage, raw } = await this._complete({ messages, tools })
+    const { message, usage, raw } = await this._complete({ messages, tools, lane: 'action' })
     const action = coerceAction(message)
     if (action._via === 'tool') this.stats.toolCalls += 1
     else if (action._fallback || action._badArgs) this.stats.jsonFallbacks += 1
@@ -385,7 +417,10 @@ class AmdToolsClient {
    * @returns {Promise<{reply:{text:string, task:string}, usage:object}>}
    */
   async chatReply (messages, { maxTokens = 120 } = {}) {
-    const { message, usage } = await this._complete({ messages, tools: createChatTools(), maxTokens, temperature: Math.max(this.temperature, 0.5) })
+    const { message, usage } = await this._complete({
+      messages, tools: createChatTools(), maxTokens, temperature: Math.max(this.temperature, 0.5),
+      lane: 'chat', timeoutMs: this.chatTimeoutMs, maxRetries: this.chatMaxRetries
+    })
     this.stats.chatReplies += 1
     return { reply: coerceReply(message), usage }
   }

@@ -32,10 +32,70 @@ function botNames (username, aliases = []) {
   return [...out]
 }
 
-/** Does the line mention one of the bot's names as a word? */
+/**
+ * Does the line mention one of the bot's names as a word?
+ *
+ * Brazilian nicknames count: "zincão", "zinquinho", "zinczinho" are the name.
+ * "Zinco" is also what friends type — but it is the Portuguese word for the
+ * metal, so it only counts when it is plainly a call: "Zinco, cadê você?",
+ * "bora, zinco!", or the word alone.
+ */
 function mentionsBot (text, names) {
   const f = fold(text)
-  return names.some((n) => new RegExp(`(^|[^a-z0-9_])${n}([^a-z0-9_]|$)`).test(f))
+  return names.some((n) => {
+    if (new RegExp(`(^|[^a-z0-9_])${n}([^a-z0-9_]|$)`).test(f)) return true
+    if (n.length < 4) return false
+    const stem = n.endsWith('c') ? `(?:${n}|${n.slice(0, -1)}qu)` : n
+    if (new RegExp(`(^|[^a-z0-9_])${stem}(?:ao|zao|inho|zinho|uinho|ito)([^a-z0-9_]|$)`).test(f)) return true
+    return new RegExp(`^\\s*${n}o\\s*([,!?:]|$)|,\\s*${n}o\\s*[!?.]*\\s*$`).test(f)
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Language guard. The server speaks Brazilian Portuguese; the prompts, the
+// tool results and the model's own habits are English. Telling the model is
+// not enough, so every outgoing line is checked: function words do not lie.
+// ---------------------------------------------------------------------------
+const PT_WORDS = new Set((
+  'de da dos das que nao o os um uma pra para com em na nos nas eu voce vc vcs ele ela eles elas meu minha seu sua teu tua isso esse essa ' +
+  'isto este esta aqui ali ja ta tava tao vou vai vamos bora tem tenho tinha foi sou estou estava mas por se como quando onde cade sim ' +
+  'blz beleza valeu vlw opa oi ola eai tb tambem agora depois ainda muito mais menos bem bom boa obrigado obrigada desculpa mal pode posso ' +
+  'quer quero queria tudo nada daqui dai entao pq porque ne kk kkk kkkk tchau ate fui cheguei peguei guardei coloquei achei fiz vi te lhe nem ou ' +
+  'ao aos pelo pela num numa dele dela mim ti vem ir indo ficar fica perto longe hoje amanha ontem noite dia aquele aquela quem qual sem sobre ' +
+  'tive tava to precisa preciso consigo consegui deu da faz fazer fazendo falta acabou pronto calma espera pera opa eita nossa cara mano galera ' +
+  'la ai so correndo fugindo voltei voltando chegando seguindo parei dormir comer'
+).split(' '))
+const EN_WORDS = new Set((
+  'the is are was were i you he she it we they my your his her this that these those and but not of in on at for with from have has had ' +
+  'does did will would can could should there here what where when why how yes thanks thank sorry please just now then im ill dont cant ' +
+  'its got get going coming be been an hello hey sure okay right some any all out up if about over by too very need want take give found ' +
+  'done wait let lets nothing something am hi nearby away back again still running fleeing following arrived cannot didnt wont youre ive'
+).split(' '))
+// Words both languages use ("a", "as", "do", "no", "me", "so", "to", "come", "ok"…) are in neither list.
+const STRONG_EN = new Set(['hello', 'thanks', 'sorry', 'yes', 'sure', 'please', 'done', 'wait', 'coming', 'here', 'there', 'nothing', 'what', 'why', 'where', 'how', 'okay'])
+
+/**
+ * Is this outgoing chat line in the server's language?
+ * @param {string} text
+ * @param {{ names?: string[] }} [opts] player names to ignore ("Gabriel" is not a word of any language)
+ * @returns {{ ok: boolean, pt: number, en: number, words: number }}
+ */
+function checkPortuguese (text, { names = [] } = {}) {
+  const raw = String(text || '')
+  const skip = new Set(names.map((n) => fold(n)))
+  const words = fold(raw).split(/[^a-z_0-9]+/).filter((w) => w && !/[_0-9]/.test(w) && !skip.has(w))
+  let pt = 0
+  let en = 0
+  for (const w of words) {
+    if (PT_WORDS.has(w)) pt++
+    else if (EN_WORDS.has(w)) en++
+  }
+  if (/[ãõçáéíóúâêôà]/i.test(raw)) pt += 2
+  let ok = true
+  if (words.length === 1) ok = !STRONG_EN.has(words[0])
+  else if (en >= 2 && en > pt) ok = false
+  else if (en >= 1 && pt === 0 && words.length >= 2) ok = false
+  return { ok, pt, en, words: words.length }
 }
 
 /**
@@ -135,6 +195,7 @@ module.exports = {
   fold,
   botNames,
   mentionsBot,
+  checkPortuguese,
   chatAddressesBot,
   chatTriggersSystem2,
   parseChatLine,

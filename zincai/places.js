@@ -15,6 +15,12 @@
  * and tools address things by the short ids shown there — never by raw
  * coordinates the model would have to invent.
  *
+ * A STORAGE ROOM (more containers in one cluster than fit on a line) is shown
+ * as a summary instead: how many, the nearest few with their ids, and every
+ * label — because a label is an address (`where: "Diamantes"`). The full list
+ * is one `find {what:"storage"}` away. It used to collapse into nine sign
+ * texts and "+77 more", with no chest id in sight.
+ *
  * Pure w.r.t. the network; `scan()` only reads the already-loaded world.
  */
 'use strict'
@@ -28,6 +34,7 @@ const fold = (text) => String(text ?? '').normalize('NFD').replace(/[\u0300-\u03
 /** Block name → kind. Order matters: first match wins. */
 const KIND_RULES = [
   [/^(trapped_)?chest$/, 'chest'],
+  [/^(waxed_)?((exposed|weathered|oxidized)_)?copper_chest$/, 'chest'], // 1.21.9+
   [/^barrel$/, 'barrel'],
   [/shulker_box$/, 'shulker'],
   [/^ender_chest$/, 'ender_chest'],
@@ -41,11 +48,42 @@ const KIND_RULES = [
   [/_sign$/, 'sign']
 ]
 const CONTAINER_KINDS = new Set(['chest', 'barrel', 'shulker', 'ender_chest'])
+const STATION_KINDS = new Set(['station', 'crafting_table', 'enchanting_table', 'brewing_stand', 'anvil'])
+
+const FACING = { north: [0, -1], east: [1, 0], south: [0, 1], west: [-1, 0] }
+const CLOCKWISE = { north: 'east', east: 'south', south: 'west', west: 'north' }
+const COUNTER = { north: 'west', west: 'south', south: 'east', east: 'north' }
+
+/** Block state of a block as a plain object ({} when the block cannot say). */
+function propsOf (block) {
+  try { return (typeof block?.getProperties === 'function' && block.getProperties()) || {} } catch { return {} }
+}
+
+/**
+ * Where the other half of a chest is, from its block state:
+ *   [dx, dz]  it is a double chest and the other half is there
+ *   null      it is a single chest
+ *   undefined the block exposes no state (partial mock): decide by adjacency
+ */
+function chestPartner (block) {
+  const { type, facing } = propsOf(block)
+  if (type === undefined) return undefined
+  if (type !== 'left' && type !== 'right') return null
+  const dir = type === 'left' ? CLOCKWISE[facing] : COUNTER[facing]
+  return FACING[dir] || null
+}
 
 function kindOf (blockName) {
   const n = String(blockName || '')
   for (const [re, kind] of KIND_RULES) if (re.test(n)) return kind
   return null
+}
+
+/** The block a wall sign hangs on, or null for a standing sign. */
+function signSupport (block, p) {
+  if (!/wall_(hanging_)?sign$/.test(String(block?.name || ''))) return null
+  const dir = FACING[propsOf(block).facing]
+  return dir ? { x: p.x - dir[0], y: p.y, z: p.z - dir[1] } : null
 }
 
 /** Flatten whatever a sign block exposes into one short line. */
@@ -157,9 +195,14 @@ class PlaceIndex {
   /**
    * Index the useful blocks in the loaded world around the bot. Cheap enough
    * to call every few seconds; it skips when the bot has not moved.
+   *
+   * `max` is a safety limit, not a budget: one scan used to stop at 128
+   * blocks, and a storage room has more than that (48 double chests with a
+   * sign each are 144), so the far chests and every work station were never
+   * indexed.
    * @returns {number} entries added or refreshed
    */
-  scan (bot, { radius = 16, max = 128, force = false } = {}) {
+  scan (bot, { radius = 16, max = 4096, force = false } = {}) {
     const pos = bot?.entity?.position
     if (!pos || typeof bot.findBlocks !== 'function') return 0
     const dim = PlaceIndex.dimensionOf(bot)
@@ -180,11 +223,10 @@ class PlaceIndex {
       if (!kind) continue
       const key = `${dim}:${p.x},${p.y},${p.z}`
       seen.add(key)
-      if (kind === 'sign') { signs.push({ x: p.x, y: p.y, z: p.z, text: signTextOf(block) }); }
       let entry = this.blocks.get(key)
       if (!entry) {
         // The second half of a double chest is the same inventory: keep one entry.
-        if (kind === 'chest' && this._twinOf(dim, p, block.name)) continue
+        if (kind === 'chest' && this._twinOf(dim, p, block)) continue
         entry = { id: this._nextId(kind), kind, block: block.name, x: p.x, y: p.y, z: p.z, dim, label: '', contents: null, seenAt: this.now(), lookedAt: 0 }
         this.blocks.set(key, entry)
         this._dirty = true
@@ -194,7 +236,8 @@ class PlaceIndex {
         if (entry.block !== block.name) { entry.block = block.name; this._dirty = true }
       }
       if (kind === 'sign') {
-        const text = signs[signs.length - 1].text
+        const text = signTextOf(block)
+        signs.push({ x: p.x, y: p.y, z: p.z, text, entry, support: signSupport(block, p) })
         if (entry.text !== text) { entry.text = text; this._dirty = true; touched++ }
       }
     }
@@ -209,30 +252,110 @@ class PlaceIndex {
       this.blocks.delete(key)
       this._dirty = true
     }
-    // People label storage with signs: attach the nearest sign's text.
-    if (signs.length) {
-      for (const e of this.blocks.values()) {
-        if (e.dim !== dim || e.kind === 'sign') continue
-        if (Math.hypot(e.x - pos.x, e.y - pos.y, e.z - pos.z) > radius) continue
-        let best = null
-        let bestD = 2.3
-        for (const s of signs) {
-          if (!s.text) continue
-          const d = Math.hypot(s.x - e.x, s.y - e.y, s.z - e.z)
-          if (d < bestD) { bestD = d; best = s }
-        }
-        const label = best ? best.text : ''
-        if (label && e.label !== label) { e.label = label; this._dirty = true }
-      }
-    }
+    this._attachLabels(bot, dim, pos, radius, signs)
     if (this._dirty) this.save()
     return touched
   }
 
-  _twinOf (dim, p, blockName) {
-    for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+  /** The indexed container occupying a block position (either half of a double chest). */
+  _containerAt (dim, x, y, z) {
+    const e = this.blocks.get(`${dim}:${x},${y},${z}`)
+    if (e) return e.kind === 'sign' ? null : e
+    for (const o of this.blocks.values()) {
+      if (o.dim === dim && o.double && o.tx === x && o.tz === z && o.y === y) return o
+    }
+    return null
+  }
+
+  /** Distance from a point to a container, counting both halves of a double chest. */
+  _distanceTo (e, x, y, z) {
+    const d = Math.hypot(e.x - x, e.y - y, e.z - z)
+    return e.double && Number.isFinite(e.tx) ? Math.min(d, Math.hypot(e.tx - x, e.y - y, e.tz - z)) : d
+  }
+
+  /**
+   * People label storage with signs and item frames. A wall sign labels the
+   * block it hangs on; any other sign labels the nearest container within
+   * 2.3 blocks; an item frame on a container labels it with the item shown.
+   * A sign that ended up as a label is marked, so the prompt does not list it
+   * a second time as a sign.
+   */
+  _attachLabels (bot, dim, pos, radius, signs) {
+    const containers = []
+    for (const e of this.blocks.values()) {
+      if (e.dim !== dim || e.kind === 'sign') continue
+      if (Math.hypot(e.x - pos.x, e.y - pos.y, e.z - pos.z) > radius + 2) continue
+      containers.push(e)
+    }
+    const claimed = new Map() // container -> { text, d }
+    const claim = (e, text, d, sign) => {
+      const cur = claimed.get(e)
+      if (cur && cur.d <= d) return false
+      if (cur?.sign) cur.sign.entry.labels = false
+      claimed.set(e, { text, d, sign })
+      return true
+    }
+    for (const s of signs) {
+      s.entry.labels = false
+      if (!s.text) continue
+      // 1. A wall sign on the container itself.
+      const direct = s.support ? this._containerAt(dim, s.support.x, s.support.y, s.support.z) : null
+      if (direct) { if (claim(direct, s.text, 0, s)) s.entry.labels = true; continue }
+      // 2. Otherwise the nearest container within 2.3 blocks.
+      let best = null
+      let bestD = 2.3
+      for (const e of containers) {
+        const d = this._distanceTo(e, s.x, s.y, s.z)
+        if (d < bestD) { bestD = d; best = e }
+      }
+      if (best && claim(best, s.text, bestD, s)) s.entry.labels = true
+    }
+    // 3. Item frames: the item shown is the label ("[diamond]").
+    for (const frame of this._itemFrames(bot, pos, radius)) {
+      let best = null
+      let bestD = 1.3
+      for (const e of containers) {
+        if (!CONTAINER_KINDS.has(e.kind)) continue
+        const d = this._distanceTo(e, frame.x - 0.5, frame.y - 0.5, frame.z - 0.5)
+        if (d < bestD) { bestD = d; best = e }
+      }
+      if (best && !claimed.has(best)) claimed.set(best, { text: `[${frame.item}]`, d: bestD, sign: null })
+    }
+    for (const [e, { text }] of claimed) {
+      if (e.label !== text) { e.label = text; this._dirty = true }
+    }
+  }
+
+  /** Item frames in view that show an item: [{ x, y, z, item }]. */
+  _itemFrames (bot, pos, radius) {
+    const out = []
+    let meta = null
+    try { meta = require('./threats').meta } catch { return out }
+    for (const e of Object.values(bot.entities || {})) {
+      const name = String(e?.name || '')
+      if (name !== 'item_frame' && name !== 'glow_item_frame') continue
+      const p = e.position
+      if (!p || Math.hypot(p.x - pos.x, p.y - pos.y, p.z - pos.z) > radius) continue
+      const stack = meta(e, 'item', 8)
+      const id = stack && typeof stack === 'object' ? (stack.itemId ?? stack.blockId ?? stack.type) : null
+      const item = stack?.name || (Number.isFinite(id) ? bot.registry?.items?.[id]?.name : null)
+      if (item) out.push({ x: p.x, y: p.y, z: p.z, item })
+    }
+    return out
+  }
+
+  /**
+   * The already-indexed other half of a double chest, if `block` at `p` is one.
+   * Decided by the chest's own state (two single chests side by side are two
+   * chests); only a block that cannot tell its state falls back to adjacency.
+   */
+  _twinOf (dim, p, block) {
+    const partner = chestPartner(block)
+    if (partner === null) return null
+    const candidates = partner === undefined ? [[1, 0], [-1, 0], [0, 1], [0, -1]] : [partner]
+    for (const [dx, dz] of candidates) {
       const e = this.blocks.get(`${dim}:${p.x + dx},${p.y},${p.z + dz}`)
-      if (e && e.block === blockName) { e.double = true; return e }
+      if (e && e.kind === 'chest' && e.block === block.name) { e.double = true; e.tx = p.x; e.tz = p.z; return e }
     }
     return null
   }
@@ -256,11 +379,7 @@ class PlaceIndex {
 
   _twinAt (dim, pos) {
     const x = Math.floor(pos.x); const y = Math.floor(pos.y); const z = Math.floor(pos.z)
-    for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
-      const e = this.blocks.get(`${dim}:${x + dx},${y},${z + dz}`)
-      if (e && e.kind === 'chest') return e
-    }
-    return null
+    return this._containerAt(dim, x, y, z)
   }
 
   /** All indexed entries of the current dimension, nearest first. */
@@ -278,8 +397,9 @@ class PlaceIndex {
   /**
    * Turn what the model wrote into one indexed block.
    *   "chest3"            → that id
-   *   "diamantes"         → the container labelled or containing that
+   *   "Diamantes"         → the container with that label (exact, then partial)
    *   "chest" / "furnace" → nearest of that kind
+   *   "iron"              → the container whose remembered contents include it
    *   "" / "nearest"      → nearest container (or nearest of `fallbackKinds`)
    */
   resolve (where, pos, { dim = 'overworld', fallbackKinds = CONTAINER_KINDS, radius = 48 } = {}) {
@@ -288,12 +408,33 @@ class PlaceIndex {
     if (!q || q === 'nearest' || q === 'closest' || q === 'here') return all.find((e) => fallbackKinds.has(e.kind)) || null
     const byId = all.find((e) => e.id === q) || [...this.blocks.values()].find((e) => e.id === q && e.dim === dim)
     if (byId) return byId
-    const kind = all.find((e) => e.kind === q || e.block === q || (q === 'container' && CONTAINER_KINDS.has(e.kind)))
+    const kind = all.find((e) => e.kind !== 'sign' && (e.kind === q || e.block === q || (q === 'container' && CONTAINER_KINDS.has(e.kind))))
     if (kind) return kind
-    const byLabel = all.find((e) => e.label && fold(e.label).includes(q))
+    const byLabel = this.findLabel(where, pos, { dim, radius })[0]
     if (byLabel) return byLabel
     const token = q.replace(/s$/, '')
     return all.find((e) => e.contents && Object.keys(e.contents).some((item) => item.includes(token))) || null
+  }
+
+  /**
+   * Containers and stations whose label matches, best match first: the exact
+   * text, then a whole word of it, then any part (singular or plural).
+   */
+  findLabel (text, pos, { dim = 'overworld', radius = 64 } = {}) {
+    const q = fold(text).replace(/^\[|\]$/g, '')
+    if (!q) return []
+    const stem = q.length > 3 ? q.replace(/(es|s)$/, '') : q
+    const out = []
+    for (const e of this.near(pos, { dim, radius })) {
+      if (e.kind === 'sign' || !e.label) continue
+      const label = fold(e.label).replace(/^\[|\]$/g, '')
+      let rank = 0
+      if (label === q) rank = 3
+      else if (label.split(/[^a-z0-9_]+/).some((w) => w === q || w === stem || (w.length > 3 && w.replace(/(es|s)$/, '') === stem))) rank = 2
+      else if (label.includes(stem) || (label.length > 3 && q.includes(label))) rank = 1
+      if (rank) out.push({ ...e, rank })
+    }
+    return out.sort((a, b) => b.rank - a.rank || a.distance - b.distance)
   }
 
   /** Containers whose remembered contents include an item (substring match). */
@@ -328,45 +469,88 @@ class PlaceIndex {
     return s
   }
 
-  /**
-   * Prompt block: what is around, grouped by floor and room-sized cluster,
-   * nearest first. Returns '' when nothing is indexed nearby.
-   */
-  describeNearby (pos, { dim = 'overworld', radius = 24, maxLines = 7, perLine = 9 } = {}) {
-    const entries = this.near(pos, { dim, radius })
-    if (!entries.length) return ''
-    // Single-link clusters: same floor (|dy| <= 2) and within 7 blocks.
+  /** Single-link clusters of indexed entries: same floor (|dy| <= 2) and within 7 blocks. */
+  _clusters (entries) {
     const clusters = []
     for (const e of entries) {
       const home = clusters.find((c) => c.some((o) => Math.abs(o.y - e.y) <= 2 && Math.hypot(o.x - e.x, o.z - e.z) <= 7))
       if (home) home.push(e)
       else clusters.push([e])
     }
+    return clusters
+  }
+
+  /**
+   * Prompt block: what is around, grouped by floor and room-sized cluster,
+   * nearest first. Returns '' when nothing is indexed nearby.
+   *
+   * A cluster with more containers than fit on a line is a storage room and
+   * is summarised (count, nearest few with ids, every label).
+   */
+  describeNearby (pos, { dim = 'overworld', radius = 24, maxLines = 7, perLine = 9, maxLabels = 60 } = {}) {
+    const entries = this.near(pos, { dim, radius })
+    if (!entries.length) return ''
+    const clusters = this._clusters(entries)
     const lines = []
     for (const c of clusters.slice(0, maxLines)) {
       const cx = c.reduce((s, e) => s + e.x, 0) / c.length
       const cy = c.reduce((s, e) => s + e.y, 0) / c.length
       const cz = c.reduce((s, e) => s + e.z, 0) / c.length
-      // Stations are listed once each, containers individually.
-      const seenStation = new Set()
-      const parts = []
+      const head = `y${Math.round(cy)} ${whereIs(pos, { x: cx, y: cy, z: cz })}`
+      const containers = c.filter((e) => CONTAINER_KINDS.has(e.kind))
+      // Stations are listed once each.
+      const stations = []
       for (const e of c) {
-        if (e.kind === 'station' || e.kind === 'crafting_table' || e.kind === 'enchanting_table' || e.kind === 'brewing_stand' || e.kind === 'anvil') {
-          const name = e.kind === 'station' ? e.block : e.kind
-          if (seenStation.has(name)) continue
-          seenStation.add(name)
-          parts.push(name)
-          continue
-        }
-        const r = this._render(e)
-        if (r) parts.push(r)
+        if (!STATION_KINDS.has(e.kind)) continue
+        const name = e.kind === 'station' ? e.block : e.kind
+        if (!stations.includes(name)) stations.push(name)
       }
+      const others = c.filter((e) => !CONTAINER_KINDS.has(e.kind) && !STATION_KINDS.has(e.kind) && !(e.kind === 'sign' && (e.labels || !e.text)))
+      const loose = others.filter((e) => e.kind === 'sign')
+      const rest = others.filter((e) => e.kind !== 'sign').map((e) => this._render(e)).filter(Boolean)
+      const signNote = loose.slice(0, 3).map((e) => this._render(e)).concat(loose.length > 3 ? [`+${loose.length - 3} more signs`] : [])
+
+      if (containers.length > perLine) {
+        const labelled = containers.filter((e) => e.label)
+        const opened = containers.filter((e) => e.contents)
+        const nearest = containers.slice(0, 4).map((e) => `${e.id}${e.label ? ` "${e.label}"` : ''} ${whereIs(pos, e)}`)
+        const labels = [...new Set(labelled.map((e) => e.label))].sort((x, y) => fold(x).localeCompare(fold(y)))
+        const shown = labels.slice(0, maxLabels)
+        let line = `${head}: STORAGE ROOM — ${containers.length} containers (${labelled.length} labelled, ${opened.length} opened). Nearest: ${nearest.join(', ')}.`
+        if (shown.length) line += ` Labels: ${shown.join(', ')}${labels.length > shown.length ? `, +${labels.length - shown.length} more` : ''}.`
+        line += ' A label or an id works as `where`; find {what:"<label or item>"} looks one up, find {what:"storage"} lists them all.'
+        const extra = [...rest, ...stations, ...signNote]
+        if (extra.length) line += ` Also here: ${extra.slice(0, perLine).join(', ')}.`
+        lines.push(line)
+        continue
+      }
+      const parts = [...containers.map((e) => this._render(e)).filter(Boolean), ...rest, ...stations, ...signNote]
       if (!parts.length) continue
       const more = parts.length > perLine ? `, +${parts.length - perLine} more` : ''
-      lines.push(`y${Math.round(cy)} ${whereIs(pos, { x: cx, y: cy, z: cz })}: ${parts.slice(0, perLine).join(', ')}${more}`)
+      lines.push(`${head}: ${parts.slice(0, perLine).join(', ')}${more}`)
     }
     if (clusters.length > maxLines) lines.push(`(+${clusters.length - maxLines} more groups further away)`)
     return lines.join('\n')
+  }
+
+  /**
+   * The storage around, one container per entry, nearest first, in pages:
+   * "chest12 "Ferro" 3m W [iron_ingot x64, …]". For find {what:"storage"}.
+   * @returns {{ total:number, page:number, pages:number, lines:string[] }}
+   */
+  listStorage (pos, { dim = 'overworld', radius = 32, page = 1, perPage = 20 } = {}) {
+    const all = this.near(pos, { dim, radius, kinds: CONTAINER_KINDS })
+    const pages = Math.max(1, Math.ceil(all.length / perPage))
+    const n = Math.min(pages, Math.max(1, Math.trunc(Number(page)) || 1))
+    const lines = all.slice((n - 1) * perPage, n * perPage).map((e) => {
+      let s = `${e.id}${e.label ? ` "${e.label}"` : ''} ${whereIs(pos, e)}`
+      if (e.contents) {
+        const top = Object.entries(e.contents).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([name, c]) => `${name} x${c}`)
+        s += top.length ? ` [${top.join(', ')}${Object.keys(e.contents).length > 3 ? ', …' : ''}]` : ' [empty]'
+      }
+      return s
+    })
+    return { total: all.length, page: n, pages, lines }
   }
 
   /** "home (12,64,-3 · 40m S), mina (…)" — named places, nearest first. */
@@ -382,4 +566,4 @@ class PlaceIndex {
   }
 }
 
-module.exports = { PlaceIndex, kindOf, signTextOf, CONTAINER_KINDS }
+module.exports = { PlaceIndex, kindOf, signTextOf, chestPartner, signSupport, CONTAINER_KINDS, STATION_KINDS }

@@ -34,6 +34,10 @@ class AntiStuckWatchdog {
    *   minDisplacement (0.5), cooldownMs (4000),
    *   goalActiveProvider () => bool   — is some goal currently commanded?
    *   goalProvider () => {goal, dynamic} | null — recalculation source
+   *   abortProvider () => bool — true when something more urgent took the
+   *     controls (the flee reflex): the routine stops at once
+   *   reapply () — how to put the interrupted driver's goal and keys back
+   *     (with an arbiter: arbiter.reassert()); default re-sets goalProvider()
    *   onUnstuck (err?) — delta sink hook
    */
   constructor (bot, {
@@ -43,6 +47,8 @@ class AntiStuckWatchdog {
     cooldownMs = 4_000,
     goalActiveProvider = () => false,
     goalProvider = () => null,
+    abortProvider = () => false,
+    reapply = null,
     onUnstuck = () => {},
     now = () => Date.now()
   } = {}) {
@@ -53,6 +59,8 @@ class AntiStuckWatchdog {
     this.cooldownMs = cooldownMs
     this.goalActiveProvider = goalActiveProvider
     this.goalProvider = goalProvider
+    this.abortProvider = abortProvider
+    this.reapply = reapply
     this.onUnstuck = onUnstuck
     this.now = now
 
@@ -107,8 +115,27 @@ class AntiStuckWatchdog {
     this._recovering = true
     this.lastUnstuckAt = this.now()
     this.samples = []
+    const bot = this.bot
+    // Put the driver's goal and keys back (or, without an arbiter, the goal).
+    const restore = () => {
+      try {
+        if (this.reapply) return this.reapply()
+        bot.setControlState('jump', false)
+        bot.setControlState('forward', false)
+        const recalc = this.goalProvider()
+        if (recalc && recalc.goal && bot.pathfinder) bot.pathfinder.setGoal(recalc.goal, Boolean(recalc.dynamic))
+      } catch (err) {
+        logger.debug(TAG, `goal re-set failed: ${err.message || err}`)
+      }
+    }
+    // Something more urgent (the flee reflex) took over: hands off, now.
+    const aborted = () => {
+      if (!this.abortProvider()) return false
+      logger.info(TAG, 'unstuck routine aborted: a reflex took the controls')
+      restore()
+      return true
+    }
     try {
-      const bot = this.bot
       logger.warn(TAG, 'stuck detected — running unstuck routine')
 
       // 1. Clear the current path.
@@ -121,6 +148,7 @@ class AntiStuckWatchdog {
         await sleep(120)
         bot.setControlState('jump', false)
         await sleep(80)
+        if (aborted()) return
       }
 
       // 3. Rotate 180°.
@@ -128,24 +156,20 @@ class AntiStuckWatchdog {
         const yaw = (bot.entity?.yaw ?? 0) + Math.PI
         await bot.look(yaw, 0, true)
       } catch { /* look is best-effort */ }
+      if (aborted()) return
 
       // 4. Short forward hop in the new facing.
       bot.setControlState('forward', true)
       bot.setControlState('jump', true)
       await sleep(350)
       bot.setControlState('jump', false)
+      if (aborted()) return
       await sleep(120)
       bot.setControlState('forward', false)
+      if (aborted()) return
 
       // 5. Recalculate: re-apply whatever goal we were working on.
-      const recalc = this.goalProvider()
-      if (recalc && recalc.goal && bot.pathfinder) {
-        try {
-          bot.pathfinder.setGoal(recalc.goal, Boolean(recalc.dynamic))
-        } catch (err) {
-          logger.debug(TAG, `goal re-set failed: ${err.message || err}`)
-        }
-      }
+      restore()
 
       this.unstuckCount += 1
       this.onUnstuck({ ok: true })

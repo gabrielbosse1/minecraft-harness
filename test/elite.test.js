@@ -30,6 +30,7 @@ const {
 } = require('../src/combat')
 const { System1 } = require('../zincai/system1')
 const { ReflexRegistry } = require('../zincai/reflex_registry')
+const { makeBot, ent, sleep: wait, heldKeys } = require('./helpers/mockbot')
 const {
   clusterBlocks,
   detectStructures,
@@ -154,22 +155,28 @@ test('costAt penalizes the projected kill sphere, not empty ground', () => {
   assert.equal(map.costAt({ x: 30, y: 64, z: -30 }), 0)
 })
 
-test('threat map penalizes the enemy→bot corridor through the A* exclusion hook', () => {
+test('threat cost is charged once per A* move and never around the bot itself', () => {
   const map = new PredictiveThreatMap()
   const bot = threatBot({ 1: hostile(1, 0, 64, 8) })
   map.sample(bot, true)
-  // A node on the straight line between the zombie and the bot.
-  assert.ok(map.costAt({ x: 0, y: 64, z: 4 }) > 0, 'corridor node must cost')
+  // A node on the straight line between the zombie and the bot costs…
+  assert.ok(map.costAt({ x: 0, y: 64, z: 5 }) > 0, 'corridor node must cost')
+  // …but every corridor ends on the bot, so the last 3 blocks are left free:
+  // otherwise the cells around the bot are the most expensive on the map.
+  assert.equal(map.costAt({ x: 0, y: 64, z: 1 }), 0)
 
-  const movements = { exclusionAreasStep: [] }
+  // The cost is added to each candidate move AFTER upstream built it — once,
+  // not per touched block (upstream discards any move that reaches 100).
+  const neighbors = () => [{ x: 0, y: 64, z: 5, cost: 1 }, { x: 40, y: 64, z: 40, cost: 1 }]
+  const movements = { getNeighbors: neighbors }
   assert.equal(map.attachToMovements(movements), true)
-  assert.equal(movements.exclusionAreasStep.length, 1)
-  const hook = movements.exclusionAreasStep[0]
-  assert.ok(hook({ position: { x: 0, y: 64, z: 4 } }) > 0)
-  assert.equal(hook({ position: { x: 40, y: 64, z: 40 } }), 0)
-  // Idempotent attach — never stack duplicate cost functions.
+  const out = movements.getNeighbors({ x: 0, y: 64, z: 4 })
+  assert.ok(out[0].cost > 1, 'threatened cell costs more')
+  assert.ok(out[0].cost <= 1 + map.maxPenalty, 'and never more than one capped penalty')
+  assert.equal(out[1].cost, 1, 'safe cell is untouched')
+  // Idempotent attach — never stack the wrapper.
   map.attachToMovements(movements)
-  assert.equal(movements.exclusionAreasStep.length, 1)
+  assert.equal(movements.getNeighbors({ x: 0, y: 64, z: 4 })[0].cost, out[0].cost)
 })
 
 test('priority routing prefers a longer route with lower cumulative threat', () => {
@@ -266,24 +273,30 @@ test('wind charge traverse chains charges while blocked and refuses with none', 
 })
 
 // ======================================================== combat mechanics ==
-test('weaponProfile maps held items to exact Goldilocks bands', () => {
+test('weaponProfile maps held items to vanilla reach, bands and attack speeds', () => {
   const sword = weaponProfile('diamond_sword')
-  assert.equal(sword.min, 2.5)
-  assert.equal(sword.max, 3.2)
+  assert.equal(sword.min, 2.0)
+  assert.equal(sword.max, 2.9)
+  assert.equal(sword.reach, 3.0, 'survival reach is 3 blocks')
   assert.equal(weaponProfile('netherite_axe').key, 'axe')
+  // Axe speed depends on the material in vanilla.
+  assert.equal(weaponProfile('stone_axe').aps, 0.8)
+  assert.equal(weaponProfile('iron_axe').aps, 0.9)
+  assert.equal(weaponProfile('netherite_axe').aps, 1.0)
   const bow = weaponProfile('bow')
   assert.ok(bow.min >= 10 && bow.kind === 'ranged')
-  const mace = weaponProfile('mace')
-  assert.ok(mace.min >= 4, 'mace needs >4m jump setup')
+  assert.ok(weaponProfile('mace').reach <= 3.0, 'a mace has no extra reach')
   assert.ok(weaponProfile('crossbow').min >= 10)
   assert.equal(weaponProfile(null).key, 'fists')
   assert.equal(weaponProfile('trident').key, 'trident')
+  assert.equal(weaponProfile('bowl').key, 'fists', '"bowl" is not a bow')
 })
 
-test('attack cooldown fills from vanilla attack speed and gates at 85%', () => {
+test('attack cooldown fills from vanilla attack speed and gates at a FULL indicator', () => {
   assert.equal(cooldownProgress(0, 1.6), 0)
   assert.equal(cooldownProgress(625, 1.6), 1)
-  assert.ok(Math.abs(cooldownProgress(531.25, 1.6) - CRIT_THRESHOLD) < 1e-9)
+  // Vanilla cannot crit below 90 % and scales damage down: wait for 100 %.
+  assert.equal(CRIT_THRESHOLD, 1)
 
   let t = 0
   const cd = new AttackCooldown({ now: () => t, profile: WEAPON_PROFILES.sword })
@@ -291,9 +304,10 @@ test('attack cooldown fills from vanilla attack speed and gates at 85%', () => {
   t = 100
   assert.equal(cd.ready(), false)
   t = 531.25
-  assert.equal(cd.ready(), true)
+  assert.equal(cd.ready(), false, '85 % is not enough')
   t = 625
   assert.equal(cd.progress(), 1)
+  assert.equal(cd.ready(), true)
 })
 
 test('classifyThreat tags airborne mace users and elytra spear/trident lunges', () => {
@@ -331,8 +345,8 @@ test('heldItemName reads equipment arrays from player entities', () => {
   assert.equal(heldItemName(null), '')
 })
 
-test('goldilocks melee backpedals when too close instead of pressing forward', () => {
-  const { bot, target, controls } = combatFixture({ targetDist: 2.0 })
+test('goldilocks melee backpedals when too close — without sprinting backwards', () => {
+  const { bot, target, controls } = combatFixture({ targetDist: 1.4 })
   const combat = new AdvancedCombat(bot, { now: () => 1000 })
   combat.state = 'melee'
   combat.target = target
@@ -340,9 +354,10 @@ test('goldilocks melee backpedals when too close instead of pressing forward', (
   assert.equal(controls.back, true, 'inside the minimum band → backpedal')
   assert.equal(controls.forward, false)
   assert.equal(controls.left || controls.right, true, 'must still strafe')
+  assert.ok(!controls.sprint, 'a real client cannot sprint backwards or sideways')
 })
 
-test('combat refuses to swing before the cooldown indicator reaches 85%', () => {
+test('combat refuses to swing before the cooldown indicator is full', () => {
   let t = 0
   const { bot, target, calls } = combatFixture({ targetDist: 3.0 })
   const combat = new AdvancedCombat(bot, { now: () => t })
@@ -355,6 +370,10 @@ test('combat refuses to swing before the cooldown indicator reaches 85%', () => 
   assert.equal(combat.critArmed, false)
 
   t = 550
+  combat._tick()
+  assert.equal(combat.critArmed, false, '88 % of a sword swing is still too early')
+
+  t = 700
   combat._tick()
   assert.equal(combat.critArmed, true, 'ready swing arms the micro-jump crit')
   assert.ok(calls.jump >= 1)
@@ -386,23 +405,35 @@ test('melee crit jumps first and only attacks on the falling tick', () => {
   assert.equal(combat.critArmed, false)
 })
 
-test('mace panic retreat sprints backwards and deploys a water bucket', () => {
-  const { bot, target, controls } = combatFixture({
-    targetDist: 4.0,
+test('mace panic: measured from motion, runs away facing away, never dumps water', () => {
+  let t = 10_000
+  const { bot, target, controls, calls } = combatFixture({
+    targetDist: 3.4,
     inventoryItems: [{ name: 'water_bucket', count: 1 }]
   })
   target.heldItem = { name: 'mace' }
-  target.onGround = false
-  target.velocity = { x: 0, y: 0.35, z: 0 }
   const events = []
-  const combat = new AdvancedCombat(bot, { now: () => 10_000, onEvent: (e) => events.push(e) })
+  const combat = new AdvancedCombat(bot, { now: () => t, onEvent: (e) => events.push(e) })
   combat.state = 'melee'
   combat.target = target
+
+  // Standing there with a mace is not a threat (mineflayer reports onGround
+  // true for everyone else, forever).
+  combat._tick()
+  t += 50
+  combat._tick()
+  assert.equal(combat.state, 'melee', 'a held mace alone must not trigger anything')
+
+  // The opponent actually jumps: its position rises between two ticks.
+  t += 50
+  target.position = pos(0, 64.42, 3.4)
   combat._tick()
   assert.equal(combat.state, 'retreat')
-  assert.equal(controls.back, true)
+  assert.equal(controls.forward, true, 'turns away and runs forward')
   assert.equal(controls.sprint, true)
-  assert.ok(events.some((e) => /panic retreat \(mace\)/.test(e.msg)), JSON.stringify(events))
+  assert.ok(!controls.back, 'no sprinting backwards')
+  assert.equal(calls.activate, 0, 'no water bucket is emptied on the floor')
+  assert.ok(events.some((e) => /broke away \(mace\)/.test(e.msg)), JSON.stringify(events))
 })
 
 test('ranged engagement backs off inside 10m and never fires an uncharged bow', () => {
@@ -418,67 +449,69 @@ test('ranged engagement backs off inside 10m and never fires an uncharged bow', 
 })
 
 // ============================================================ System 1 ring ==
-test('System1 registers the elite tactical reflexes with the registry', () => {
+test('System1 built-ins are survival only: flee, eat, fall protection, swim', () => {
   const registry = new ReflexRegistry()
   const s1 = new System1({ entity: null }, { registry, logger: { info () {}, warn () {}, debug () {} } })
   s1.registerBuiltins()
-  const names = registry.list().map((r) => r.name)
-  for (const expected of ['mace_panic_retreat', 'elytra_lunge_dodge', 'ranged_aim_strafe', 'melee_cooldown_pressure']) {
+  const list = registry.list()
+  const names = list.map((r) => r.name)
+  for (const expected of ['flee_from_threats', 'eat_when_hungry', 'heal_when_hurt', 'water_bucket_on_long_fall', 'glide_on_long_fall', 'swim_up']) {
     assert.ok(names.includes(expected), `missing ${expected}: ${names.join(', ')}`)
   }
-  const triggers = registry.list().map((r) => r.trigger)
-  for (const t of ['mace_threat', 'elytra_lunge', 'ranged_threat', 'melee_window']) {
-    assert.ok(triggers.includes(t), `missing trigger ${t}`)
+  // Nothing a reflex can do starts a fight.
+  for (const r of list) assert.ok(!/attack|pvp|combat|engage/.test(r.action), `${r.name} must not attack`)
+  for (const action of ['engage_pvp', 'combat_tick', 'panic_retreat', 'strafe_ranged']) {
+    assert.throws(() => registry.register({ name: 'x', trigger: 'threat_near', action }), /action must be one of/)
   }
 })
 
-test('tacticalScan fires mace, elytra and ranged reflexes in lethality order', async () => {
-  const maceUser = hostile(1, 0, 64, 4, {
-    name: 'player',
-    onGround: false,
-    velocity: { x: 0, y: 0.3, z: 0 },
-    heldItem: { name: 'mace' }
-  })
-  const lungeUser = hostile(2, 2, 66, 5, {
-    name: 'player',
-    onGround: false,
-    velocity: { x: 0, y: -0.1, z: 0 },
-    heldItem: { name: 'trident' },
-    equipment: [{ name: 'trident' }, null, null, { name: 'elytra' }]
-  })
-  const archer = hostile(3, 0, 64, 12, { name: 'skeleton', heldItem: { name: 'bow' } })
-  const bot = { entity: { position: pos(0, 64, 0) }, entities: { 1: maceUser, 2: lungeUser, 3: archer }, health: 20 }
-  const registry = new ReflexRegistry()
-  const logger = { info () {}, warn () {}, debug () {} }
-  const s1 = new System1(bot, { registry, logger })
-  const fired = []
-  s1.panicRetreat = () => { fired.push('mace'); return 'panic' }
-  s1.evadeLateral = () => { fired.push('elytra'); return 'lateral' }
-  s1.strafeRanged = () => { fired.push('ranged'); return 'strafe' }
-  s1.registerBuiltins()
-  const results = await s1.tacticalScan(s1._ctx())
-  assert.deepEqual(fired, ['mace', 'elytra', 'ranged'])
-  assert.ok(results.length >= 3)
+test('a player holding a bow, a mace or a bowl is not a threat; neither is an armor stand', async () => {
+  for (const item of ['bow', 'crossbow', 'mace', 'bowl', 'trident']) {
+    const bot = makeBot({ items: [{ name: 'iron_sword' }, { name: 'water_bucket' }], held: 'iron_sword' })
+    const friend = ent(2, 'player', 4.5, 0.5, { username: 'Gabriel' })
+    friend.equipment[0] = { name: item }
+    friend.equipment[4] = { name: 'elytra' }
+    bot.entities[2] = friend
+    const stand = ent(3, 'armor_stand', 0.5, 3.5)
+    stand.equipment[0] = { name: 'bow' }
+    bot.entities[3] = stand
+    const s1 = new System1(bot, { registry: new ReflexRegistry(), logger: { info () {}, warn () {}, debug () {} } })
+    s1.registerBuiltins()
+    for (let i = 0; i < 4; i++) await s1.tick()
+    assert.equal(heldKeys(bot), '(none)', `no key may be pressed for a friend holding ${item}`)
+    assert.equal(bot.log.setGoal.length, 0)
+    assert.equal(bot.log.activate, 0)
+    assert.equal(bot.log.attack.length, 0)
+    s1.stop()
+  }
 })
 
-test('combatTick auto-engages safe melee mobs but never a creeper', async () => {
-  const registry = new ReflexRegistry()
-  const bot = { entity: { position: pos(0, 64, 0) }, entities: {}, health: 20 }
-  const engaged = []
+test('reflexes never fight: a zombie in reach makes the bot run, and the keys are released after', async () => {
+  const bot = makeBot({ items: [{ name: 'iron_sword' }], held: 'iron_sword' })
+  bot.entities[5] = ent(5, 'zombie', 0.5, 3.0)
+  const events = []
   const s1 = new System1(bot, {
-    registry,
+    registry: new ReflexRegistry(),
     logger: { info () {}, warn () {}, debug () {} },
-    combat: {
-      disengageAt: 6,
-      isEngaged: false,
-      engage: async (name) => { engaged.push(name); return { ok: true } },
-      forceTick: () => { engaged.push('tick') }
-    }
+    onEvent: (e) => events.push(e)
   })
-  assert.equal(s1.combatTick({ entity: { name: 'zombie' } }), 'combat_engage')
-  assert.deepEqual(engaged, ['zombie'])
-  assert.equal(s1.combatTick({ entity: { name: 'creeper' } }), 'combat_tick')
-  assert.deepEqual(engaged, ['zombie', 'tick'], 'explosive mobs are never auto-engaged')
+  s1.registerBuiltins()
+  for (let i = 0; i < 5; i++) { await s1.tick(); await wait(20) }
+  assert.equal(bot.log.attack.length, 0, 'no swing without the model')
+  assert.equal(s1.fleeing, true)
+  assert.equal(heldKeys(bot), 'forward+jump+sprint', 'runs away (no forward+back tug of war)')
+  // The zombie is to the south (+z): the bot must face north (yaw 0).
+  assert.ok(Math.abs(bot.entity.yaw) < 0.2, `faces away from the zombie, yaw=${bot.entity.yaw}`)
+  assert.ok(events.some((e) => e.type === 'threat' && e.wake && /zombie/.test(e.text)), 'the model is told')
+
+  delete bot.entities[5]
+  await s1.tick()
+  await wait(850)
+  await s1.tick()
+  assert.equal(s1.fleeing, false)
+  assert.equal(heldKeys(bot), '(none)', 'nothing stays held')
+  assert.ok(events.some((e) => e.type === 'safe'))
+  s1.stop()
 })
 
 // ===================================================== Scout & Relocate ====
@@ -663,14 +696,25 @@ test('vanilla guard blocks slash-commands in chat and command-shaped actions', (
 })
 
 // ============================================================== system prompt
-test('system prompt enforces phased building, auto-tool offloading and vanilla-only play', () => {
+test('prompts: flee-first policy, phased building, vanilla-only, PT-BR voice', () => {
   const prompt = fs.readFileSync(path.join(__dirname, '..', 'zincai', 'system_prompt.txt'), 'utf8')
-  assert.ok(prompt.includes('The harness automatically equips the optimal tool, manages attack cooldowns, and handles mitigation. You only decide WHAT to build, mine, or fight, never HOW to equip or swing.'))
+  assert.ok(prompt.includes('The harness automatically equips the optimal tool and manages attack cooldowns.'))
   for (const phase of ['foundation', 'walls_with_windows', 'roof', 'interior_details']) {
     assert.ok(prompt.includes(phase), `prompt missing phase ${phase}`)
   }
   assert.ok(/no commands/i.test(prompt))
   assert.ok(/native tools/i.test(prompt))
+  assert.ok(/reflex is to FLEE/.test(prompt), 'the model must know fleeing is the default')
+  assert.ok(/Only you can start a fight/.test(prompt))
+  assert.ok(/never attack a player unless/i.test(prompt))
+  assert.ok(!/auto-engages players/i.test(prompt), 'the old false claim is gone')
+  assert.ok(/you are a bot/i.test(prompt), 'one honest answer to "are you a bot?"')
   assert.ok(prompt.length < 4500, 'prompt must stay lean for KV-cache economy')
+
+  const chat = fs.readFileSync(path.join(__dirname, '..', 'zincai', 'chat_prompt.txt'), 'utf8')
+  assert.ok(/Brazilian Portuguese/.test(chat))
+  assert.ok(/language of the message/.test(chat))
+  assert.ok(/Keep the accents/.test(chat))
+  assert.ok(/You are a bot/.test(chat))
 })
 

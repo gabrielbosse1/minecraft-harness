@@ -22,6 +22,15 @@
  *
  * Deltas flow: game events → DeltaBuffer (max 5 + 10-word memory) → tiny
  * user message → AMD → strict JSON action → parser → dispatcher.
+ *
+ * The BODY is shared with ZincAI (zincai/control.js, threats.js, system1.js):
+ *   - one arbiter owns the keys and the pathfinder goal
+ *     (survival > combat > task), so nothing here can leave a key held;
+ *   - the reflex layer FLEES from every real threat and tells the model;
+ *   - a fight only ever starts from the model's own {"a":"attack"} — a player
+ *     is only attacked when the model names that exact player.
+ * The model's answer to a threat is the decision: idle keeps fleeing, attack
+ * fights, move goes somewhere else.
  */
 'use strict'
 
@@ -39,6 +48,13 @@ const { craftItem } = require('./recipes')
 const { AdvancedCombat } = require('./combat')
 const { ElytraController } = require('./elytra')
 const { AntiStuckWatchdog } = require('./watchdog')
+const { decideReconnect } = require('./reconnect')
+const { ControlArbiter, PRIORITY } = require('../zincai/control')
+const { ThreatSense, HurtTracker, makeReachabilityCheck } = require('../zincai/threats')
+const { System1 } = require('../zincai/system1')
+const { ReflexRegistry } = require('../zincai/reflex_registry')
+const { PredictiveThreatMap, fleePlan } = require('../zincai/custom_mineflayer/pathfinder_wrapper')
+const { parseChatLine, chatAddressesBot, botNames } = require('../zincai/filter')
 
 const TAG = 'agent'
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -149,10 +165,23 @@ class ZincAgent {
     this.combat = null
     this.elytra = null
     this.watchdog = null
+    // Shared body (built on spawn): who owns the controls, what is dangerous,
+    // and the flee-first reflexes.
+    this.arbiter = null
+    this.sense = null
+    this.threatMap = null
+    this.reflex = null
+    this.hurts = null
+    this._threatTimer = null
+    this._moveSeq = 0
+    this._lastHurt = { at: 0, text: '' }
 
     this.started = false
     this.shuttingDown = false
     this._inferBusy = false
+    this._activeInferId = null
+    this._inferSequence = 0
+    this._sessionGeneration = 0
     this.selfChain = 0
     this.consecutiveErrors = 0
     this.nextInferAt = 0
@@ -191,20 +220,26 @@ class ZincAgent {
 
     bot.on('login', () => logger.info(TAG, `logged in as ${bot.username}`))
 
-    // ---- strict whitelist compliance: any join failure = abort ------------
-    bot.on('kicked', (reason) => this._fatalJoinFailure('kicked', reason))
+    // ---- strict whitelist compliance: a failed FIRST join = abort ---------
+    // After a session that did spawn, a dropped link or a server restart is
+    // retried with back-off under the same name (src/reconnect.js).
+    bot.on('kicked', (reason) => this._connectionOver('kicked', reason))
     bot.on('error', (err) => {
-      if (!this.started) this._fatalJoinFailure('error', err)
+      if (!this.started) this._connectionOver('error', err)
       else logger.error(TAG, `socket error: ${err.message || err}`)
     })
-    bot.on('end', (reason) => {
-      if (!this.started) this._fatalJoinFailure('end', reason)
-      else this.shutdown('server-ended', 0)
-    })
+    bot.on('end', (reason) => this._connectionOver('end', reason))
 
     bot.on('spawn', () => { this._onSpawn().catch((err) => logger.error(TAG, `spawn setup failed: ${err.message || err}`)) })
     bot.on('death', () => {
+      try { this.hurts?.flush() } catch { /* noop */ }
       this.buffer.push({ type: 'death' })
+      // Nobody owns anything any more, and every earlier decision is void.
+      this._moveSeq += 1
+      try { this.combat?.stop(); this.combat?.start() } catch { /* noop */ }
+      try { this.reflex?.reset() } catch { /* noop */ }
+      try { this.arbiter?.reset('death') } catch { /* noop */ }
+      try { this.threatMap?.clear() } catch { /* noop */ }
       // Real players respawn. Give the death screen a beat.
       setTimeout(() => { try { bot.respawn() } catch { /* not on death screen */ } }, 1500)
     })
@@ -229,6 +264,74 @@ class ZincAgent {
     }, 50)
   }
 
+  /** The connection is gone: abort, exit, or reconnect — per the shared policy. */
+  _connectionOver (kind, detail) {
+    if (this.shuttingDown || this._reconnecting) return // kicked + end both fire
+    const verdict = decideReconnect({
+      kind,
+      text: reasonToText(detail),
+      everSpawned: this._everSpawned === true,
+      attempts: this._attempts || 0,
+      reconnect: this.cfg.reconnect,
+      botName: this.cfg.mc.username
+    })
+    if (verdict.action === 'exit') {
+      if (verdict.reason === 'join-failed') return this._fatalJoinFailure(kind, detail)
+      for (const line of verdict.log) logger.error(TAG, line)
+      return this.shutdown(verdict.reason, verdict.code)
+    }
+    this._reconnecting = true
+    this._attempts = verdict.attempt
+    logger.warn(TAG, `connection over (${kind}) — reconnecting in ${Math.round(verdict.delayMs / 1000)}s (attempt ${verdict.attempt}/${verdict.maxAttempts})`)
+    this._teardownSession()
+    setTimeout(() => {
+      this._reconnecting = false
+      if (!this.shuttingDown) this.start().catch((err) => logger.error(TAG, `reconnect failed: ${err.message || err}`))
+    }, verdict.delayMs)
+  }
+
+  /** Stop everything attached to the dead bot so start() can build afresh. */
+  _teardownSession () {
+    // Invalidate any model response still in flight. Keep its busy lock until
+    // it settles: AmdClient deliberately serializes requests, and the new
+    // connection must not launch a concurrent completion.
+    this._sessionGeneration += 1
+    clearInterval(this._ticker)
+    clearTimeout(this._invDebounce)
+    this._stopBody()
+    try {
+      this.bot?.removeAllListeners()
+      // A dying socket can still emit 'error'; with no listener at all Node
+      // would throw it and take the process down mid-reconnect.
+      this.bot?.on('error', () => {})
+    } catch { /* noop */ }
+    try { this.bot?.end?.() } catch { /* already gone */ }
+    this.started = false
+    this._spawnCount = 0
+    this.lastMoveGoal = null
+    this.combat = null
+    this.elytra = null
+    this.watchdog = null
+    this.reflex = null
+    this.hurts = null
+    this.arbiter = null
+    this.sense = null
+    this.threatMap = null
+  }
+
+  /** Stop every subsystem that drives the bot (shutdown and reconnect). */
+  _stopBody () {
+    this._moveSeq += 1
+    clearInterval(this._threatTimer)
+    this._threatTimer = null
+    try { this.watchdog?.stop() } catch { /* noop */ }
+    try { this.hurts?.stop() } catch { /* noop */ }
+    try { this.reflex?.stop() } catch { /* noop */ }
+    try { this.combat?.stop() } catch { /* noop */ }
+    try { this.elytra?.stop() } catch { /* noop */ }
+    try { this.arbiter?.stop() } catch { /* noop */ }
+  }
+
   _fatalJoinFailure (kind, detail) {
     if (this.shuttingDown) return // mineflayer emits kicked + end/error — log FATAL only once
     const reason = reasonToText(detail)
@@ -249,12 +352,30 @@ class ZincAgent {
     }
 
     this.started = true
+    this._everSpawned = true
+    this._attempts = 0
 
     // --- pathfinder movements ------------------------------------------------
     const movements = new Movements(bot)
     movements.canDig = Boolean(this.cfg.mc.canDig) // default false: no block chewing
     movements.allowSprinting = true
+    // Upstream pillars up and bridges with dirt/cobblestone from the inventory.
+    // Around other people's builds that is griefing: off.
+    movements.allow1by1towers = false
+    movements.scafoldingBlocks = [] // (sic)
     bot.pathfinder.setMovements(movements)
+
+    // --- the shared body: controls, threat sense --------------------------------
+    this.arbiter = new ControlArbiter(bot)
+    this.sense = new ThreatSense(bot, { reachable: makeReachabilityCheck(bot, { Movements, goals }) })
+    // A* pays extra to walk near real threats, and the flee planner uses the
+    // same map. Only what the threat sense calls real counts: never a caged
+    // mob, never a player who is merely standing there.
+    this.threatMap = new PredictiveThreatMap({ entityFilter: (e) => this.sense.isThreat(e) })
+    this.threatMap.attachToMovements(movements)
+    this._threatTimer = setInterval(() => {
+      try { this.threatMap.sample(bot) } catch { /* no entity yet */ }
+    }, this.threatMap.sampleMs)
 
     // --- subsystems -----------------------------------------------------------
     this.chatGuard = new ChatGuard(bot, { cooldownMs: this.cfg.chatCooldownMs })
@@ -265,9 +386,31 @@ class ZincAgent {
       attackCooldownMs: this.cfg.attackCooldownMs,
       disengageCooldownMs: this.cfg.disengageCooldownMs,
       engageRadius: this.cfg.engageRadius,
-      onEvent: (evt) => this.buffer.push(evt) // combat outcome = trigger delta
+      hands: this.arbiter.lane('combat', PRIORITY.combat),
+      threatMap: this.threatMap,
+      fleeOnDisengage: false, // running away is the reflex layer's job
+      onEvent: (evt) => this._onCombatEvent(evt) // combat outcome = trigger delta
     })
     this.combat.start()
+
+    // The reflex layer: flee from every real threat until the model decides;
+    // eat, break a long fall, swim. It has no attack action at all.
+    this.reflex = new System1(bot, {
+      registry: new ReflexRegistry(),
+      logger,
+      arbiter: this.arbiter,
+      sense: this.sense,
+      combat: this.combat,
+      pathfinder: { fleePlan: (opts) => fleePlan(bot, this.threatMap, opts) },
+      autoElytra: false, // the ElytraController below owns gliding
+      tickMs: this.cfg.reflexTickMs,
+      onEvent: (evt) => this._onReflexEvent(evt)
+    })
+    this.reflex.start()
+    this.hurts = new HurtTracker(bot, this.sense, {
+      isReady: () => this.started && !this.shuttingDown,
+      onHurt: (cause, info) => this._onHurt(cause, info)
+    }).start()
 
     this.elytra = new ElytraController(bot, {
       minFallBlocks: this.cfg.elytraMinFallBlocks,
@@ -279,8 +422,18 @@ class ZincAgent {
     this.elytra.start()
 
     this.watchdog = new AntiStuckWatchdog(bot, {
-      goalActiveProvider: () => Boolean(this.lastMoveGoal) || Boolean(this.combat?.activeGoal) || Boolean(this.combat?.isEngaged),
+      // Only while the PATHFINDER is supposed to be moving us. A melee fight
+      // stands its ground on purpose; counting it as "stuck" made the bot turn
+      // its back on the enemy every few seconds.
+      // And never while fleeing: the reflex has its own no-progress handling,
+      // and a 180° turn there means turning back toward the danger.
+      goalActiveProvider: () => this.arbiter?.owner() !== 'survival' && (Boolean(this.lastMoveGoal) || Boolean(this.combat?.activeGoal)),
       goalProvider: () => this.combat?.activeGoal ?? this.lastMoveGoal,
+      // The routine taps keys and clears the path directly; if the flee
+      // reflex takes over meanwhile it stops, and either way the arbiter puts
+      // the current driver's goal and keys back afterwards.
+      abortProvider: () => this.arbiter?.owner() === 'survival',
+      reapply: () => this.arbiter?.reassert(),
       onUnstuck: () => this.buffer.push({ type: 'unstuck', ok: true })
     })
     this.watchdog.start()
@@ -299,7 +452,7 @@ class ZincAgent {
     logger.info(TAG, 'harness ready. Silence is default; acting only on deltas.')
 
     // Inference ticker — actual pacing is enforced in _maybeInfer.
-    this._ticker = setInterval(() => { this._maybeInfer().catch(() => {}) }, 500)
+    this._ticker = setInterval(() => { this._maybeInfer().catch(() => {}) }, this.cfg.inferenceTickMs || 500)
   }
 
   async shutdown (reason = 'manual', code = 0) {
@@ -309,9 +462,7 @@ class ZincAgent {
 
     clearInterval(this._ticker)
     clearTimeout(this._invDebounce)
-    try { this.watchdog?.stop() } catch { /* noop */ }
-    try { this.combat?.stop() } catch { /* noop */ }
-    try { this.elytra?.stop() } catch { /* noop */ }
+    this._stopBody()
 
     this._logKvStats()
 
@@ -348,8 +499,9 @@ class ZincAgent {
     }
     // Emit a delta only on meaningful movement: ≥2 hp swing, or crossing the
     // 30% disengage threshold (6 hp), or food ≥2 change / crossing 6.
+    // Losing health is reported by _onHurt, with the cause; this is recovery.
     const crossedLow = (prevHp > 6) !== (hp > 6)
-    if (Math.abs(hp - prevHp) >= 2 || crossedLow) {
+    if (hp > prevHp && (hp - prevHp >= 2 || crossedLow)) {
       this.buffer.push({ type: 'hp', v: hp })
     }
     const foodCrossed = (prevFood > 6) !== (food > 6)
@@ -358,17 +510,75 @@ class ZincAgent {
     }
   }
 
+  /** One hit on the bot, with its cause in words ("hit by zombie", "fall damage"). */
+  _onHurt (cause, { hp }) {
+    const now = Date.now()
+    const repeat = cause.text === this._lastHurt.text && now - this._lastHurt.at < 5000
+    this._lastHurt = { at: now, text: cause.text }
+    if (repeat || hp <= 0) return // same story again, or the death event tells it
+    this.buffer.push({ type: 'hurt', msg: cause.text, hp })
+    this._urgent()
+  }
+
+  /**
+   * Someone is waiting or something is dangerous: do not sit out the idle
+   * interval (15 s) or the self-chain pause. The minimum spacing between
+   * calls still holds, and so does the back-off after API errors.
+   */
+  _urgent () {
+    if (this.consecutiveErrors > 0) return
+    const earliest = (this._lastInferAt || 0) + this.cfg.inferenceMinIntervalMs
+    if (this.nextInferAt > earliest) this.nextInferAt = earliest
+  }
+
+  /** The reflex layer started or stopped fleeing. */
+  _onReflexEvent (evt) {
+    if (!evt || !evt.text) return
+    if (evt.type === 'threat') {
+      this.buffer.push({ type: 'threat', msg: evt.text }) // wakes the model: it decides
+      this._urgent()
+    } else this.buffer.push({ type: evt.type || 'reflex', msg: evt.text }, { trigger: false })
+  }
+
+  _onCombatEvent (evt) {
+    // Only the OUTCOME is news. The blow-by-blow (every hit, sidestep and
+    // arrow) used to wake the model on each swing and push chat out of the
+    // five-event window.
+    if (!evt || !evt.result) return
+    const name = this._fightLabel || 'target'
+    this._fightLabel = null
+    if (this._leavingFight) return // the model itself moved on: not news
+    const msg = evt.result === 'won' ? `${name} down` : evt.result === 'lost' ? `lost ${name}` : String(evt.msg || 'disengaged')
+    this.buffer.push({ type: 'combat', msg })
+    // The fight is over (won, lost or broken off): the decision to fight goes
+    // with it, and whatever is still around is fled from again.
+    try { this.reflex?.clearDecision() } catch { /* noop */ }
+  }
+
   _onChatLine (raw) {
     const bot = this.bot
-    // mineflayer messagestr gives "<Name> message" for chat. Ignore our own
-    // echoes and anything we can't attribute (system lines — usually noise).
-    const m = /^<([^>]{1,32})>\s?(.+)$/.exec(String(raw).trim())
-    if (!m) return
-    const user = m[1].trim()
-    const msg = m[2].trim().slice(0, 80)
+    // Vanilla "<Name> message" plus the usual plugin formats and whispers.
+    // Ignore our own echoes and anything we can't attribute (system lines).
+    const players = Object.keys(bot.players || {})
+    const parsed = parseChatLine(raw, { players })
+    if (!parsed) return
+    const user = String(parsed.sender).trim()
+    const msg = String(parsed.text).trim().slice(0, 80)
     if (!user || !msg) return
     if (user === bot.username) return
-    this.buffer.push({ type: 'chat', user, msg })
+    // Only lines meant for the bot wake the model; the rest is context.
+    const forMe = chatAddressesBot(msg, {
+      names: botNames(bot.username, this.cfg.aliases || ['zinc']),
+      whisper: parsed.whisper,
+      othersOnline: players.filter((p) => p !== bot.username).length
+    })
+    const evt = { type: 'chat', user, msg }
+    // Where the speaker stands, when the bot can see them: the only way this
+    // tiny prompt can answer "come here".
+    const at = bot.players?.[user]?.entity?.position
+    if (forMe && at) evt.at = `${Math.floor(at.x)},${Math.floor(at.y)},${Math.floor(at.z)}`
+    this.buffer.push(evt, { trigger: Boolean(forMe) })
+    if (forMe) this._urgent()
   }
 
   _countInventory () {
@@ -410,7 +620,12 @@ class ZincAgent {
     const pos = p ? `${Math.trunc(p.x)},${Math.trunc(p.y)},${Math.trunc(p.z)}` : '?,?,?'
     const tod = bot?.time?.isDay === false ? 'night' : 'day'
     // Deliberately O(1) size — this is the ONLY state we always send.
-    return `vitals hp=${hp} food=${food} pos=${pos} tod=${tod}`
+    const vitals = `vitals hp=${hp} food=${food} pos=${pos} tod=${tod}`
+    // …plus one line while something dangerous is around, so the model knows
+    // what its answer is deciding about.
+    const threats = this.sense?.last?.threats || []
+    if (!threats.length) return vitals
+    return `${vitals}\nthreats ${this.sense.describe(threats)} — ${this.reflex?.fleeing ? 'you are fleeing' : 'not fleeing (you decided)'}`
   }
 
   // ---------------------------------------------------- inference engine--
@@ -421,10 +636,17 @@ class ZincAgent {
     if (now < this.nextInferAt) return
     if (this.buffer.triggerCount() === 0) return // silent server = zero tokens
     this._inferBusy = true
+    const inferId = ++this._inferSequence
+    this._activeInferId = inferId
+    this._lastInferAt = now
     this.amdCallCounter += 1
 
+    const session = this.bot // a reconnect swaps the bot under a call in flight
+    const generation = this._sessionGeneration
     try {
       const body = this.buffer.buildBody(this._vitalsLine())
+      // The threats this prompt shows: the model's answer decides about these.
+      const shown = [...(this.sense?.last?.ids || [])]
       const messages = [
         // Byte-identical static system prompt → KV prefix cache hit.
         { role: 'system', content: SYSTEM_PROMPT },
@@ -434,7 +656,9 @@ class ZincAgent {
 
       const { content, usage } = await this.amd.chatCompletion(messages)
       this.consecutiveErrors = 0
-      this.buffer.commit()
+      // The answer belongs to a connection that no longer exists: keep the
+      // events for the next session instead of acting on a dead bot.
+      if (session !== this.bot || generation !== this._sessionGeneration || !this.started || this.shuttingDown) return
       if (this.amdCallCounter % 25 === 0) this._logKvStats()
       logger.debug(TAG, `usage prompt=${usage.promptTokens ?? '?'} cached=${usage.cachedTokens ?? '?'} :: ${truncate(content, 100)}`)
 
@@ -442,17 +666,32 @@ class ZincAgent {
       if (!parsed.ok) {
         this.amd.stats.parseFailures = (this.amd.stats.parseFailures || 0) + 1
         logger.warn(TAG, `unparseable action (${parsed.error}) :: ${truncate(content, 120)}`)
-        this._afterAction({ a: 'idle' }) // pay one idle — never feed garbage back
+        // The events are only consumed once an answer could be read: a
+        // malformed reply used to throw away the chat line it was about.
+        // One retry; a second garbage answer drops them so we never loop.
+        this._parseFails = (this._parseFails || 0) + 1
+        if (this._parseFails >= 2) { this.buffer.commit(); this._parseFails = 0; this._afterAction({ a: 'idle' }) } else { this.selfChain = 0; this.nextInferAt = Date.now() + this.cfg.inferenceMinIntervalMs }
         return
       }
-      await this._dispatch(parsed.action)
+      this._parseFails = 0
+      this.buffer.commit()
+      await this._dispatch(parsed.action, shown)
     } catch (err) {
+      // A timeout/rejection from a dead connection is not an error in the
+      // fresh session and must not impose its back-off on that session.
+      if (session !== this.bot || generation !== this._sessionGeneration || this.shuttingDown) return
       this.consecutiveErrors += 1
       const delay = Math.min(120_000, 5_000 * 2 ** (this.consecutiveErrors - 1))
       this.nextInferAt = Date.now() + delay
       logger.error(TAG, `inference failed (#${this.consecutiveErrors}): ${truncate(err.message || err, 160)} — backoff ${Math.round(delay / 1000)}s`)
     } finally {
-      this._inferBusy = false
+      // Only the request that owns this lock may release it. It stays held
+      // across reconnects until the old request settles, preserving the
+      // client's one-in-flight request guarantee.
+      if (this._activeInferId === inferId) {
+        this._activeInferId = null
+        this._inferBusy = false
+      }
     }
   }
 
@@ -472,7 +711,7 @@ class ZincAgent {
     this.nextInferAt = Date.now() + this.cfg.inferenceMinIntervalMs
   }
 
-  async _dispatch (action) {
+  async _dispatch (action, shown = []) {
     const push = (evt, opts) => this.buffer.push(evt, opts)
     switch (action.a) {
       case 'say': {
@@ -499,14 +738,30 @@ class ZincAgent {
       }
       case 'attack': {
         const r = await this.combat.engage(action.n)
-        if (r.ok) push({ type: 'attack', n: r.target })
-        else push({ type: 'action_err', a: 'attack', why: r.why })
+        if (r.ok) {
+          this._fightLabel = r.target
+          push({ type: 'attack', n: r.target })
+          // The model decided to fight: stop fleeing from what it was shown.
+          // "attack zombie" also covers zombies that arrive later; a player
+          // fight covers that player only.
+          const any = ['any', 'hostile', 'hostiles', 'mob'].includes(String(action.n).toLowerCase().trim())
+          const versusPlayer = this.combat.target?.type === 'player'
+          this.reflex?.acknowledge(shown, { types: versusPlayer || any ? [] : [r.target], all: any, ttlMs: 120_000, label: 'fight' })
+        } else push({ type: 'action_err', a: 'attack', why: r.why })
         logger.info(TAG, r.ok ? `attacking ${r.target}` : `attack failed: ${r.why}`)
         break
       }
       case 'move': {
-        const r = await this._doMove(action.x, action.y, action.z)
-        push({ type: 'move', x: action.x, y: action.y, z: action.z, ok: r.ok })
+        // The model decided to go somewhere: that is its answer to the threats
+        // it was shown, and it replaces a fight in progress (the newest
+        // decision wins). The walk runs in the background and reports when it
+        // ends, so chat and new dangers are still answered on the way.
+        if (this.combat?.isEngaged) {
+          this._leavingFight = true
+          try { this.combat.disengage('moved on', { cooldown: false }) } finally { this._leavingFight = false }
+        }
+        this.reflex?.acknowledge(shown, { label: 'move' })
+        this._startMove(action.x, action.y, action.z)
         break
       }
       case 'elytra': {
@@ -539,27 +794,58 @@ class ZincAgent {
     return this.bot.inventory.slots[index]?.name ?? item?.name ?? null
   }
 
-  /** Pathfind to a position with a hard timeout. Watchdog-friendly. */
-  async _doMove (x, y, z) {
+  /** Start a walk and report how it ended as a delta (the model's wake-up). */
+  _startMove (x, y, z) {
+    const seq = ++this._moveSeq
+    this._doMove(x, y, z, seq).then((r) => {
+      if (seq !== this._moveSeq) return // replaced by a newer move, death or shutdown: not news
+      if (!this.combat?.isEngaged) { try { this.reflex?.clearDecision() } catch { /* noop */ } }
+      this.buffer.push({ type: 'move', x, y, z, ok: r.ok, ...(r.why ? { why: r.why } : {}) })
+    })
+  }
+
+  /**
+   * Walk to a position through the arbiter's task lane, with a hard timeout.
+   * While a reflex (fleeing) or a fight drives, the walk is paused — that time
+   * does not count — and it resumes by itself afterwards. Watchdog-friendly.
+   */
+  async _doMove (x, y, z, seq = this._moveSeq) {
+    const bot = this.bot
     const goal = new goals.GoalNear(x, y, z, 1)
-    this.lastMoveGoal = { goal, dynamic: false }
+    const lane = this.arbiter.lane('task', PRIORITY.task)
+    const mine = { goal, dynamic: false }
+    this.lastMoveGoal = mine
+    let noPath = false
+    const onPath = (r) => { if (lane.isTop && r && r.status === 'noPath') noPath = true }
+    bot.on('path_update', onPath)
+    lane.acquire({ reason: 'move' })
+    lane.setGoal(goal, false)
+    let budget = this.cfg.moveTimeoutMs
+    let last = Date.now()
     try {
-      const outcome = await Promise.race([
-        this.bot.pathfinder.goto(goal).then(() => 'done', (err) => `err:${err.name || 'move_failed'}`),
-        sleep(this.cfg.moveTimeoutMs).then(() => 'timeout')
-      ])
-      if (outcome === 'timeout') {
-        try { this.bot.pathfinder.setGoal(null) } catch { /* noop */ }
-        logger.warn(TAG, `move to ${x},${y},${z} timed out after ${Math.round(this.cfg.moveTimeoutMs / 1000)}s`)
-        return { ok: false }
+      for (;;) {
+        await sleep(150)
+        const now = Date.now()
+        if (seq !== this._moveSeq) return { ok: false, why: 'replaced' }
+        const here = bot.entity?.position
+        if (!here) return { ok: false, why: 'no_position' }
+        if (!lane.isTop) { last = now; continue } // fleeing or fighting: paused
+        budget -= now - last
+        last = now
+        if (goal.isEnd(here.floored())) return { ok: true }
+        if (noPath) return { ok: false, why: 'no_path' }
+        if (budget <= 0) {
+          logger.warn(TAG, `move to ${x},${y},${z} timed out after ${Math.round(this.cfg.moveTimeoutMs / 1000)}s`)
+          return { ok: false, why: 'timeout' }
+        }
       }
-      if (typeof outcome === 'string' && outcome.startsWith('err:')) {
-        logger.debug(TAG, `move ended early: ${outcome}`)
-        return { ok: false }
-      }
-      return { ok: true }
     } finally {
-      this.lastMoveGoal = null
+      try { bot.removeListener('path_update', onPath) } catch { /* gone */ }
+      // A replaced walk must not wipe the goal its replacement just set.
+      if (seq === this._moveSeq) {
+        try { lane.setGoal(null); lane.clearControlStates(); lane.release('move over') } catch { /* bot gone */ }
+      }
+      if (this.lastMoveGoal === mine) this.lastMoveGoal = null
     }
   }
 }

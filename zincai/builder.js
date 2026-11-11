@@ -247,6 +247,9 @@ class BuilderExecutor {
     this.scaffoldBlocks = opts.scaffoldBlocks || ['dirt', 'cobblestone', 'netherrack']
     this.log = typeof opts.logger === 'function' ? opts.logger : () => {}
     this.stepDelayMs = opts.buildStepDelayMs ?? 60
+    // Optional ControlArbiter lane (zincai/control.js). Without it the builder
+    // drives the pathfinder directly, as before.
+    this.hands = opts.hands || null
     this.cancelRequested = false
     this.placedScaffolds = [] // { pos, name } — only blocks WE placed via pillar towers
     this._trackedKeys = new Set() // dedupe re-placements of the same cell
@@ -269,20 +272,34 @@ class BuilderExecutor {
     return this.bot.inventory.items().filter((i) => i.name === name).reduce((s, i) => s + i.count, 0)
   }
 
-  /** Walk within reach of a block; returns true when close enough to place. */
+  /**
+   * Walk within reach of a block. Goes through the task lane when one was
+   * injected, so a flee reflex can interrupt the build and the walk resumes
+   * afterwards; time spent interrupted does not count against the 20 s budget.
+   */
   async _approach (target, distance = 3) {
     const { goals } = require('mineflayer-pathfinder')
-    await new Promise((resolve, reject) => {
-      const t = setTimeout(() => reject(new Error('approach timeout')), 20_000)
-      this.bot.pathfinder.setGoal(new goals.GoalNear(target.x, target.y, target.z, distance), true)
-      const iv = setInterval(() => {
-        const p = this.bot.entity?.position
-        if (!p) return
-        const d = Math.hypot(p.x - target.x, p.y - target.y, p.z - target.z)
-        if (d <= distance + 0.6) { clearInterval(iv); clearTimeout(t); resolve() }
-      }, 150)
-    }).catch((err) => this.log('debug', `approach: ${err.message || err}`))
-    try { this.bot.pathfinder.setGoal(null) } catch { /* noop */ }
+    const goal = new goals.GoalNear(target.x, target.y, target.z, distance)
+    const setGoal = (g) => {
+      try {
+        if (this.hands) this.hands.setGoal(g, true)
+        else this.bot.pathfinder.setGoal(g, true)
+      } catch (err) { this.log('debug', `approach: ${err.message || err}`) }
+    }
+    setGoal(goal)
+    let budget = 20_000
+    let last = Date.now()
+    while (!this.cancelRequested) {
+      await new Promise((resolve) => setTimeout(resolve, 150))
+      const now = Date.now()
+      if (this.hands && this.hands.active && !this.hands.isTop) { last = now; continue }
+      budget -= now - last
+      last = now
+      const p = this.bot.entity?.position
+      if (p && Math.hypot(p.x - target.x, p.y - target.y, p.z - target.z) <= distance + 0.6) break
+      if (budget <= 0) { this.log('debug', 'approach: timeout'); break }
+    }
+    setGoal(null)
   }
 
   /**
@@ -463,6 +480,15 @@ class BuilderExecutor {
    */
   async build (plan, { stage = null } = {}) {
     this.cancelRequested = false
+    this.hands?.acquire?.({ reason: 'building' })
+    try {
+      return await this._build(plan, { stage })
+    } finally {
+      this.hands?.setGoal?.(null)
+    }
+  }
+
+  async _build (plan, { stage = null } = {}) {
     const bot = this.bot
     const wanted = normalizeStage(stage)
     let placed = 0

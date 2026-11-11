@@ -99,6 +99,20 @@ function loadConfig () {
     /** After disengaging, refuse to re-engage for this long. */
     disengageCooldownMs: int('DISENGAGE_COOLDOWN_MS', 10_000, { min: 1_000 }),
 
+    /** After a session that spawned: retry a dropped link / server restart. */
+    reconnect: {
+      enabled: bool('RECONNECT', true),
+      baseDelayMs: int('RECONNECT_BASE_MS', 5_000, { min: 500 }),
+      maxDelayMs: int('RECONNECT_MAX_MS', 120_000, { min: 1_000 }),
+      maxAttempts: int('RECONNECT_MAX_ATTEMPTS', 40, { min: 1 })
+    },
+    /** How often the loop checks whether an inference is due. */
+    inferenceTickMs: int('INFERENCE_TICK_MS', 500, { min: 20 }),
+    /** Reflex scan period (flee, eat, fall protection). */
+    reflexTickMs: int('REFLEX_TICK_MS', 200, { min: 50 }),
+    /** Names the bot answers to in chat, besides its login name. */
+    aliases: ['zinc'],
+
     moveTimeoutMs: int('MOVE_TIMEOUT_MS', 45_000, { min: 2_000 }),
     elytraMinFallBlocks: float('ELYTRA_MIN_FALL', 4, { min: 1 }),
     elytraGapBlocks: int('ELYTRA_GAP_BLOCKS', 24, { min: 8 }),

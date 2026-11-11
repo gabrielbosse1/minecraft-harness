@@ -20,7 +20,7 @@ const DEG = Math.PI / 180
 
 /** Angle (radians) of the bot's horizontal look vector. */
 function lookYaw (bot) {
-  // mineflayer keeps yaw on bot.entity.yaw (radians, 0 = south).
+  // mineflayer keeps yaw on bot.entity.yaw (radians, 0 = north / -z).
   return bot.entity ? bot.entity.yaw : 0
 }
 
@@ -32,9 +32,10 @@ function lookPitch (bot) {
 function inHorizontalFov (yaw, dx, dz, fovRad) {
   const dist = Math.hypot(dx, dz)
   if (dist < 1.5) return true // peripheral presence, always notice
-  // mineflayer yaw: 0=+z(south), π=-z; entity look vector (dx,dz) = (-sin(yaw), cos(yaw))
+  // mineflayer yaw: 0 = -z (north); look vector (dx,dz) = (-sin(yaw), -cos(yaw)).
+  // (The old +cos mirrored the cone whenever the bot faced north or south.)
   const lx = -Math.sin(yaw)
-  const lz = Math.cos(yaw)
+  const lz = -Math.cos(yaw)
   const dot = (dx * lx + dz * lz) / dist
   return dot >= Math.cos(fovRad / 2)
 }
@@ -197,7 +198,7 @@ function buildPerceptionText (bot, opts = {}) {
 //   B bed  ? unloaded/unknown
 // ============================================================================
 
-const VISION_LEGEND = '. air  # solid  s soil  S sand/gravel  G glass  D door  C chest  T wood  F leaves  W water  L lava  O ore  l light  B bed  @ you'
+const VISION_LEGEND = '. air  # solid  s soil  S sand/gravel  G glass  D door  C chest  T wood  F leaves  W water  L lava  O ore  l light  B bed  = stairs/slab  | fence/bars/wall  f furnace/station  i sign  @ you'
 
 function categoryChar (block) {
   if (!block) return '?'
@@ -205,6 +206,12 @@ function categoryChar (block) {
   if (n === 'air' || n === 'cave_air' || n === 'void_air') return '.'
   if (/chest|barrel|shulker/.test(n)) return 'C'
   if (/door|trapdoor|fence_gate/.test(n)) return 'D'
+  // Furniture and partial blocks used to be indistinguishable from a wall.
+  if (/_sign$/.test(n)) return 'i'
+  if (/^(furnace|blast_furnace|smoker|crafting_table|enchanting_table|brewing_stand|grindstone|smithing_table|stonecutter|loom|cartography_table|fletching_table|lectern)$|anvil$/.test(n)) return 'f'
+  if (/_bed$/.test(n)) return 'B' // "bedrock" is not a bed
+  if (/_stairs$|_slab$/.test(n)) return '='
+  if (/_fence$|_wall$|iron_bars|_pane$|chain$/.test(n)) return '|'
   if (/glass/.test(n)) return 'G'
   if (/log|wood|planks|stem|hyphae/.test(n)) return 'T'
   if (/leaves/.test(n)) return 'F'
@@ -212,7 +219,6 @@ function categoryChar (block) {
   if (n === 'lava' || n === 'flowing_lava') return 'L'
   if (/ore$|ore_/.test(n) || /block_of_(iron|gold|diamond|netherite|emerald)/.test(n)) return 'O'
   if (/torch|lantern|glowstone|sea_lantern|campfire/.test(n)) return 'l'
-  if (/bed/.test(n)) return 'B'
   if (/grass_block|dirt|podzol|mycelium|coarse_dirt|rooted_dirt|moss_block/.test(n)) return 's'
   if (/sand|gravel|red_sand/.test(n)) return 'S'
   return '#'
@@ -304,6 +310,8 @@ function classifyEntityName (name) {
   if (n === 'player') return 'player'
   if (HOSTILE_MOBS.has(n)) return 'hostile'
   if (n === 'item' || n === 'experience_orb' || n === 'arrow' || n === 'snowball' || n === 'fireball' || n === 'splash_potion' || n === 'egg' || n === 'trident') return 'item'
+  // Decor is an entity, not a creature: 16 item frames are not "mob clutter".
+  if (/^(armor_stand|item_frame|glow_item_frame|painting|leash_knot|end_crystal|falling_block)$|_boat$|_raft$|minecart$|_display$/.test(n)) return 'object'
   if (n.includes('bot')) return 'object'
   return 'mob'
 }
@@ -374,7 +382,7 @@ function clusterEntities (ents) {
 }
 
 // Block categories for structure inference.
-const WALL_BLOCKS = new Set(['cobblestone', 'stone', 'stone_bricks', 'mossy_cobblestone', 'mossy_stone_bricks', 'bricks', 'cracked_stone_bricks', 'deepslate_bricks', 'deepslate_tiles', 'oak_planks', 'spruce_planks', 'birch_planks', 'jungle_planks', 'acacia_planks', 'dark_oak_planks', 'mangrove_planks', 'cherry_planks', 'crimson_planks', 'warped_planks', 'oak_log', 'spruce_log', 'birch_log', 'deepslate_brick_wall', 'cobblestone_wall', 'stone_brick_wall'])
+const WALL_BLOCKS = new Set(['cobblestone', 'stone', 'stone_bricks', 'mossy_cobblestone', 'mossy_stone_bricks', 'bricks', 'cracked_stone_bricks', 'deepslate_bricks', 'deepslate_tiles', 'oak_planks', 'spruce_planks', 'birch_planks', 'jungle_planks', 'acacia_planks', 'dark_oak_planks', 'mangrove_planks', 'cherry_planks', 'crimson_planks', 'warped_planks', 'oak_log', 'spruce_log', 'birch_log', 'jungle_log', 'acacia_log', 'dark_oak_log', 'mangrove_log', 'cherry_log', 'bamboo_planks', 'pale_oak_planks', 'pale_oak_log', 'sandstone', 'smooth_stone', 'quartz_block', 'terracotta', 'white_concrete', 'deepslate_brick_wall', 'cobblestone_wall', 'stone_brick_wall'])
 const ROOF_BLOCKS = /(stairs|slab|terracotta|deepslate_tile|smooth_stone)$/
 const DOOR_BLOCKS = /(door|trapdoor|fence_gate)$/
 const GLASS_BLOCKS = /glass/

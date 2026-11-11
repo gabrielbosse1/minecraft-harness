@@ -1,86 +1,93 @@
 /**
- * AdvancedCombat — deterministic, tick-driven combat. The LLM only decides
- * WHO to fight ({"a":"attack","n":"zombie"}); everything from sprinting to
- * critical-hit timing is handled here in code, costing zero tokens.
+ * AdvancedCombat — deterministic, tick-driven combat. The LLM decides WHO to
+ * fight; everything from sprinting to critical-hit timing is handled here in
+ * code, costing zero tokens.
  *
- * v3 "elite" behaviour (vanilla 1.9+ mechanics, no commands, no cheats):
+ * RULES OF ENGAGEMENT (owner policy — a friendly server):
+ *   - This controller never starts a fight. It only acts on engage().
+ *   - Players are targeted ONLY by exact username. "player" / "any" never
+ *     match a player, so nobody is hit because they stood nearest.
+ *   - Mob requests match the exact type name (no substrings: "pig" is not a
+ *     piglin). Pets, name-tagged mobs, villagers, golems, armor stands and
+ *     item frames are never matched.
+ *   - A target needs line of sight: no swinging at a caged mob through bars.
  *
- *   TARGETING   nearest entity matching the requested name (or any hostile for
- *               n:"any") within ENGAGE_RADIUS blocks. Passive animals are never
- *               attacked unless explicitly named.
+ * MECHANICS (vanilla 1.9+, no commands, no cheats):
+ *   GOLDILOCKS  engagement band derived from the held item; inside it the bot
+ *               strafes at walking speed, too far → pathfinder, too close →
+ *               backpedal (never sprinting backwards: a real client cannot).
+ *   COOLDOWN    a swing is only issued at a FULL attack indicator. Below 90 %
+ *               vanilla refuses to crit and scales damage down.
+ *   CRITS       micro-jump, sprint released, swing on the falling tick.
+ *   EVASION     against the CURRENT TARGET only, from its measured motion
+ *               (position deltas — mineflayer never updates onGround for
+ *               other entities): airborne mace → run; elytra dive → sidestep.
+ *   CREEPER     hit-and-run: one sprint hit, back out, never stand next to a
+ *               lit fuse; shield up when it cannot be outrun.
+ *   SHIELD      carried shields go to the off hand; raised between swings in
+ *               a duel and against a fuse.
+ *   DISENGAGE   below 30 % max health → let go, report, 10 s cooldown.
  *
- *   GOLDILOCKS  the engagement band is derived from the held item:
- *                 sword / axe / trident / spear : 2.5 – 3.2 m
- *                 mace                          : 4.0 – 6.0 m (jump setup)
- *                 bow                           : 10 – 24 m
- *                 crossbow                      : 10 – 20 m
- *                 fists                         : 1.8 – 2.6 m
- *               Inside the band the bot strafes (A/D) instead of walking;
- *               too far → approach through the pathfinder; too close →
- *               backpedal. Never a static punching bag.
+ * CONTROLS go through injected "hands" (zincai/control.js lane). When the
+ * fight ends for ANY reason the hands are released, so no key outlives it.
  *
- *   COOLDOWN    every weapon has a vanilla attack speed. A swing is only
- *               issued when the cooldown indicator is >= 85 % (CRIT_THRESHOLD).
- *               No click spam: strafing and tracking continue while waiting.
- *
- *   CRITS       melee swings are preceded by a micro-jump; the attack lands on
- *               the falling tick (velocity.y < 0) for a vanilla critical hit,
- *               then the bot backpedals to reset threat distance.
- *
- *   EVASION     weapon-aware, zero LLM latency:
- *                 · enemy mace + airborne/close  → panic retreat: sprint back,
- *                   break line of sight with a placed block, or water bucket.
- *                 · elytra + spear/trident lunge → instant lateral strafe.
- *                 · bow/crossbow                  → keep >10 m, strafe
- *                   perpendicular to the shooter's aim vector, and only fire
- *                   when our own bow is 100 % charged.
- *
- *   DISENGAGE   below 30 % max health → pathfind ~14 blocks away (threat-aware
- *               when a PredictiveThreatMap is injected), then a 10 s cooldown.
- *
- * Events are pushed via the injected onEvent({type:'combat', msg}) callback
- * so the Delta-State Builder can fold combat outcomes into the LLM context.
+ * Events are pushed via the injected onEvent({type:'combat', msg, result?}).
  */
 'use strict'
 
 const { GoalNear, GoalFollow } = require('mineflayer-pathfinder').goals
 const logger = require('./logger')
+const { directHands } = require('../zincai/control')
+const {
+  HOSTILE_NAMES: SENSE_HOSTILE,
+  isPlayer,
+  isProtected,
+  creeperFuseLit,
+  hasLineOfSight
+} = require('../zincai/threats')
 
 const TAG = 'combat'
 
-const HOSTILE_NAMES = new Set([
-  'zombie', 'husk', 'drowned', 'zombie_villager',
-  'skeleton', 'stray', 'wither_skeleton',
-  'creeper', 'spider', 'cave_spider', 'enderman', 'witch',
-  'pillager', 'vindicator', 'evoker', 'vex', 'ravager', 'piglin_brute',
-  'phantom', 'silverfish', 'slime', 'magma_cube', 'blaze', 'ghast',
-  'hoglin', 'zoglin', 'guardian', 'elder_guardian', 'warden',
-  'breeze', 'bogged', 'creaking'
-])
+/** Hostile mob type names (exact). Shared with the threat sensor. */
+const HOSTILE_NAMES = SENSE_HOSTILE
 
 const WEAPON_TIERS = ['netherite', 'diamond', 'iron', 'stone', 'golden', 'wooden']
-const CRIT_THRESHOLD = 0.85
+/**
+ * Fraction of the attack indicator required before a swing. Vanilla scales
+ * damage by 0.2 + s²·0.8 and only allows a critical hit above 0.9, so the old
+ * 0.85 gate threw away both. Kept under its historical export name.
+ */
+const CRIT_THRESHOLD = 1.0
 
 // ---------------------------------------------------------------------------
 // Weapon table. `aps` is vanilla attacks/second; the cooldown indicator fills
 // in 20/aps ticks. Bands are metres (3D distance).
 // ---------------------------------------------------------------------------
 const WEAPON_PROFILES = {
-  sword: { key: 'sword', label: 'sword', kind: 'melee', min: 2.5, max: 3.2, aps: 1.6, reach: 3.2, crit: true },
-  axe: { key: 'axe', label: 'axe', kind: 'melee', min: 2.5, max: 3.2, aps: 1.0, reach: 3.0, crit: true },
-  mace: { key: 'mace', label: 'mace', kind: 'melee', min: 4.0, max: 6.0, aps: 0.6, reach: 4.5, crit: true, needsAir: true },
-  trident: { key: 'trident', label: 'trident', kind: 'melee', min: 2.5, max: 3.6, aps: 1.1, reach: 3.6, crit: true },
+  // `reach` is feet-to-feet distance. Vanilla survival reach is 3.0 from the
+  // eye to the hitbox, which is about 3.0–3.2 feet-to-feet for a standing mob.
+  sword: { key: 'sword', label: 'sword', kind: 'melee', min: 2.0, max: 2.9, aps: 1.6, reach: 3.0, crit: true },
+  axe: { key: 'axe', label: 'axe', kind: 'melee', min: 2.0, max: 2.9, aps: 1.0, reach: 3.0, crit: true },
+  mace: { key: 'mace', label: 'mace', kind: 'melee', min: 2.0, max: 2.9, aps: 0.6, reach: 3.0, crit: true, needsAir: true },
+  trident: { key: 'trident', label: 'trident', kind: 'melee', min: 2.0, max: 2.9, aps: 1.1, reach: 3.0, crit: true },
   spear: { key: 'spear', label: 'spear', kind: 'melee', min: 2.8, max: 3.8, aps: 1.1, reach: 3.8, crit: true },
   bow: { key: 'bow', label: 'bow', kind: 'ranged', min: 10, max: 24, aps: 1.0, reach: 24, chargeMs: 1000 },
   crossbow: { key: 'crossbow', label: 'crossbow', kind: 'ranged', min: 10, max: 20, aps: 0.8, reach: 20, chargeMs: 1250 },
-  fists: { key: 'fists', label: 'fists', kind: 'melee', min: 1.8, max: 2.6, aps: 4.0, reach: 2.8, crit: true }
+  fists: { key: 'fists', label: 'fists', kind: 'melee', min: 1.6, max: 2.6, aps: 4.0, reach: 3.0, crit: true }
 }
+
+/** Vanilla axe attack speed depends on the material. */
+const AXE_APS = { wooden: 0.8, stone: 0.8, iron: 0.9, golden: 1.0, diamond: 1.0, netherite: 1.0 }
 
 /** Weapon profile for an item id (null/unknown → fists). Never throws. */
 function weaponProfile (itemName) {
   const n = String(itemName || '').toLowerCase()
   if (/_sword$/.test(n)) return WEAPON_PROFILES.sword
-  if (/_axe$/.test(n)) return WEAPON_PROFILES.axe
+  const axe = /^([a-z]+)_axe$/.exec(n)
+  if (axe) {
+    const aps = AXE_APS[axe[1]]
+    return aps && aps !== WEAPON_PROFILES.axe.aps ? { ...WEAPON_PROFILES.axe, aps } : WEAPON_PROFILES.axe
+  }
   if (n === 'mace') return WEAPON_PROFILES.mace
   if (n === 'trident') return WEAPON_PROFILES.trident
   if (/_spear$/.test(n) || n === 'spear') return WEAPON_PROFILES.spear
@@ -111,7 +118,7 @@ class AttackCooldown {
   }
 
   setProfile (profile) {
-    if (profile && profile.key !== this.profile.key) this.profile = profile
+    if (profile && (profile.key !== this.profile.key || profile.aps !== this.profile.aps)) this.profile = profile
     return this.profile
   }
 
@@ -179,32 +186,75 @@ function hasElytra (entity) {
 }
 
 /**
- * Classify a threat from its equipment/pose. This is the pure heart of the
- * evasion reflexes and is unit-tested without a bot.
+ * Measures how another entity is actually moving, from its position between
+ * our own ticks. mineflayer leaves `onGround` at true for every remote entity
+ * and its velocity field is stale, so "is that mace user in the air?" can
+ * only be answered this way.
+ */
+class MotionTracker {
+  constructor ({ now = () => Date.now() } = {}) {
+    this.now = now
+    this._last = new Map() // id -> { x, y, z, at, vy, rising, falling }
+  }
+
+  /** Sample one entity. Returns { vx, vy, vz, airborne, rising, falling }. */
+  update (entity) {
+    if (!entity?.position) return { vx: 0, vy: 0, vz: 0, airborne: false, rising: false, falling: false }
+    const t = this.now()
+    const p = entity.position
+    const prev = this._last.get(entity.id)
+    let m = { vx: 0, vy: 0, vz: 0, airborne: false, rising: false, falling: false }
+    if (prev) {
+      const ticks = Math.max(1, (t - prev.at) / 50)
+      if (t - prev.at < 5) return prev.motion // same tick: keep the last reading
+      const vx = (p.x - prev.x) / ticks
+      const vy = (p.y - prev.y) / ticks
+      const vz = (p.z - prev.z) / ticks
+      const rising = vy > 0.08
+      const falling = vy < -0.15
+      m = { vx, vy, vz, airborne: rising || falling, rising, falling }
+    }
+    this._last.set(entity.id, { x: p.x, y: p.y, z: p.z, at: t, motion: m })
+    if (this._last.size > 64) for (const [id, v] of this._last) if (t - v.at > 5000) this._last.delete(id)
+    return m
+  }
+
+  forget (entity) { if (entity) this._last.delete(entity.id) }
+}
+
+/**
+ * Classify a threat from its equipment and motion. Pure and unit-tested.
+ *
+ * `motion` (from MotionTracker) is authoritative when given. Without it the
+ * entity's own fields are used, which is only meaningful for hand-built test
+ * entities and for the bot itself.
+ *
+ * Holding a weapon is NOT a threat: a mace only matters while its owner is in
+ * the air, a trident only during an elytra dive.
  *
  * @param {object} entity
- * @param {{botPos?:{x,y,z}, distance?:number, now?:number}} [opts]
+ * @param {{botPos?:{x,y,z}, distance?:number, motion?:{vy:number, airborne:boolean}}} [opts]
  * @returns {{name:string, heldItem:string, distance:number, airborne:boolean,
  *   elytra:boolean, tags:string[], explosive:boolean}}
  */
-function classifyThreat (entity, { botPos = null, distance = null } = {}) {
+function classifyThreat (entity, { botPos = null, distance = null, motion = null } = {}) {
   const tags = []
   const heldItem = heldItemName(entity)
   const pos = entity?.position
   const dist = Number.isFinite(distance)
     ? distance
     : (pos && botPos ? Math.hypot(pos.x - botPos.x, pos.y - botPos.y, pos.z - botPos.z) : Infinity)
-  const vy = Number(entity?.velocity?.y) || 0
-  const airborne = entity?.onGround === false || vy > 0.08
+  const vy = motion ? (Number(motion.vy) || 0) : (Number(entity?.velocity?.y) || 0)
+  const airborne = motion ? Boolean(motion.airborne) : (entity?.onGround === false || vy > 0.08)
   const elytra = hasElytra(entity)
-  const explosive = /creeper/i.test(String(entity?.name || ''))
-  const mace = /mace/.test(heldItem)
-  const ranged = /bow|crossbow/.test(heldItem)
-  const thrust = /trident|spear/.test(heldItem)
+  const explosive = /^creeper$/i.test(String(entity?.name || ''))
+  const mace = heldItem === 'mace'
+  const ranged = heldItem === 'bow' || heldItem === 'crossbow' // not "bowl"
+  const thrust = /^(trident|spear)$|_spear$/.test(heldItem)
 
-  if (mace && (airborne || vy > 0.05 || dist <= 5)) tags.push('mace_airborne')
+  if (mace && airborne) tags.push('mace_airborne')
   if (elytra) tags.push('elytra')
-  if (thrust && (elytra || airborne)) tags.push('elytra_charge')
+  if (thrust && elytra && airborne) tags.push('elytra_charge')
   if (ranged) tags.push('ranged')
   if (explosive) tags.push('explosive')
   if (!tags.length || tags.every((t) => t === 'elytra')) tags.push('melee')
@@ -229,7 +279,10 @@ class AdvancedCombat {
    *   maxHealth, disengageHealthFraction, attackCooldownMs, disengageCooldownMs,
    *   engageRadius, onEvent(fn) — delta sink, now() injectable for tests,
    *   threatMap — PredictiveThreatMap for escape routing,
-   *   critThreshold, recoveryMs, bowChargeThreshold
+   *   critThreshold, recoveryMs, bowChargeThreshold,
+   *   hands — control lane (zincai/control.js); default presses the bot directly,
+   *   fleeOnDisengage — set false when a survival layer handles running away,
+   *   lineOfSight(entity) — override for the caged-mob check
    */
   constructor (bot, {
     maxHealth = 20,
@@ -242,7 +295,10 @@ class AdvancedCombat {
     threatMap = null,
     critThreshold = CRIT_THRESHOLD,
     recoveryMs = 220,
-    bowChargeThreshold = 1.0
+    bowChargeThreshold = 1.0,
+    hands = null,
+    fleeOnDisengage = true,
+    lineOfSight = null
   } = {}) {
     this.bot = bot
     this.maxHealth = maxHealth
@@ -253,9 +309,14 @@ class AdvancedCombat {
     this.onEvent = onEvent
     this.now = now
     this.threatMap = threatMap
-    this.critThreshold = critThreshold
+    // Below 0.9 vanilla never crits; never let config drag the gate under it.
+    this.critThreshold = Math.max(0.9, Number(critThreshold) || CRIT_THRESHOLD)
     this.recoveryMs = recoveryMs
     this.bowChargeThreshold = bowChargeThreshold
+    this.hands = hands || directHands(bot)
+    this.fleeOnDisengage = fleeOnDisengage !== false
+    this.lineOfSight = typeof lineOfSight === 'function' ? lineOfSight : (e) => hasLineOfSight(this.bot, e)
+    this.motion = new MotionTracker({ now: this.now })
 
     this.state = 'idle' // idle | approach | melee | retreat | cooldown
     this.target = null
@@ -274,13 +335,21 @@ class AdvancedCombat {
     this.lastThreat = null
     this.bow = { charging: false, startedAt: 0, shots: 0 }
     this._panicAt = 0
-    this._shieldAt = 0
+    this._shieldUp = false
+    this._backoffUntil = 0
+    this._targetDead = false
+    // A kill can precede the destroy packet by a few ticks. Tombstone the
+    // entity object (not its numeric id, which a server may later reuse) so
+    // kill-chaining cannot reacquire that same dead mob in the gap.
+    this._deadEntities = new WeakSet()
+    this._hits = 0
     /** Goal object exposed to the anti-stuck watchdog for path recalculation. */
     this.activeGoal = null
 
     this._tick = this._tick.bind(this)
     this._housekeeping = this._housekeeping.bind(this)
     this._onEntityGone = this._onEntityGone.bind(this)
+    this._onEntityDead = this._onEntityDead.bind(this)
   }
 
   start () {
@@ -288,18 +357,19 @@ class AdvancedCombat {
     this._started = true
     this.bot.on('physicsTick', this._tick)
     this.bot.on('entityGone', this._onEntityGone)
+    this.bot.on('entityDead', this._onEntityDead)
     this._housekeepingTimer = setInterval(this._housekeeping, 250)
   }
 
   stop () {
     this.bot.removeListener('physicsTick', this._tick)
     this.bot.removeListener('entityGone', this._onEntityGone)
+    this.bot.removeListener('entityDead', this._onEntityDead)
     clearInterval(this._housekeepingTimer)
     this._started = false
-    this._clearControls()
+    this._letGo()
     this.state = 'idle'
     this.target = null
-    this.activeGoal = null
   }
 
   get isEngaged () {
@@ -328,8 +398,8 @@ class AdvancedCombat {
   refreshProfile () {
     const item = this.heldWeapon()
     const next = weaponProfile(item)
-    if (next.key !== this.profile.key) {
-      logger.debug(TAG, `weapon profile → ${next.label} (${next.min}–${next.max}m)`)
+    if (next.key !== this.profile.key || next.aps !== this.profile.aps) {
+      logger.debug(TAG, `weapon profile → ${next.label} (${next.min}–${next.max}m, ${next.aps}/s)`)
       this.profile = next
       this.cooldown.setProfile(next)
       this.critArmed = false
@@ -340,82 +410,145 @@ class AdvancedCombat {
 
   // ------------------------------------------------------------targeting--
 
-  /** Find best target: name substring match, or nearest hostile for 'any'. */
-  findTarget (name) {
+  /**
+   * Resolve an attack request to one entity, or explain why not.
+   *
+   * @param {string|{name?:string, player?:string}} request
+   *   "zombie"            → nearest zombie in line of sight (exact type name)
+   *   "any" / "hostile"   → nearest hostile mob in line of sight
+   *   {player:"Gabriel"}  → that player, and nobody else
+   *   "Gabriel"           → same, when an online player has exactly that name
+   * @returns {{ target: object|null, why?: string }}
+   */
+  resolveTarget (request) {
     const botPos = this.bot.entity?.position
-    if (!botPos) return null
-    const wanted = (name || 'any').toLowerCase()
+    if (!botPos) return { target: null, why: 'no_target' }
+    const asPlayer = request && typeof request === 'object' ? String(request.player || '').trim() : ''
+    const raw = asPlayer || String((request && typeof request === 'object' ? request.name : request) || 'any').trim()
+    const wanted = raw.toLowerCase()
+    if (!asPlayer && (wanted === 'player' || wanted === 'players')) return { target: null, why: 'name_the_player' }
+
     let best = null
     let bestDist = Infinity
+    let sawProtected = false
+    let sawHidden = false
+    const anyHostile = wanted === 'any' || wanted === 'hostile' || wanted === 'hostiles' || wanted === 'mob'
     for (const id of Object.keys(this.bot.entities)) {
       const e = this.bot.entities[id]
-      if (!e || !e.position || e === this.bot.entity) continue
+      if (!e || !e.position || e === this.bot.entity || this._deadEntities.has(e)) continue
       if (e.name === undefined || e.name === null) continue
-      const nameL = String(e.name).toLowerCase()
-      const hostile = HOSTILE_NAMES.has(nameL)
-      if (wanted === 'any') {
-        if (!hostile) continue
-      } else if (!nameL.includes(wanted)) {
-        continue
-      }
       const dist = e.position.distanceTo(botPos)
-      if (dist <= this.engageRadius && dist < bestDist) {
-        best = e
-        bestDist = dist
+      if (isPlayer(e)) {
+        // A player is only ever matched by exact username — and then at any
+        // distance they are visible from: the model named them on purpose
+        // (a duel is often called from across the field).
+        if (String(e.username || '').toLowerCase() !== wanted) continue
+      } else {
+        if (dist > this.engageRadius) continue
+        if (asPlayer) continue
+        const nameL = String(e.name).toLowerCase()
+        if (anyHostile ? !HOSTILE_NAMES.has(nameL) : nameL !== wanted) continue
+        if (isProtected(e)) { sawProtected = true; continue }
+        if (!this.lineOfSight(e)) { sawHidden = true; continue }
       }
+      if (dist < bestDist) { best = e; bestDist = dist }
     }
-    return best
+    if (best) return { target: best }
+    if (sawProtected) return { target: null, why: 'protected' }
+    if (sawHidden) return { target: null, why: 'no_line_of_sight' }
+    // A player who is named but not visible: say so, so the model can walk
+    // there (or give up) instead of concluding nothing can be attacked.
+    const online = Object.keys(this.bot.players || {}).some((n) => n.toLowerCase() === wanted && n !== this.bot.username)
+    if (asPlayer || online) return { target: null, why: 'player_not_in_sight' }
+    return { target: null, why: 'no_target' }
+  }
+
+  /** Back-compat: the entity for a request, or null. */
+  findTarget (request) {
+    return this.resolveTarget(request).target
   }
 
   /** Entry point for {"a":"attack","n":"zombie"}. Never throws. */
-  async engage (name) {
+  async engage (request) {
     if (this.bot.health !== undefined && this.bot.health <= 0) {
       return { ok: false, why: 'dead' }
     }
     if (this.now() < this.cooldownUntil) {
       return { ok: false, why: 'disengage_cooldown' }
     }
-    const target = this.findTarget(name)
-    if (!target) return { ok: false, why: 'no_target' }
+    const { target, why } = this.resolveTarget(request)
+    if (!target) return { ok: false, why: why || 'no_target' }
 
-    this.wantedName = name || 'any'
+    const label = isPlayer(target) ? String(target.username || 'player') : String(target.name).toLowerCase()
+    // Asked again for the fight already in progress: carry on, do not restart it.
+    if (this.isEngaged && this.target === target) return { ok: true, target: label, already: true }
+    this.wantedName = label
     this.target = target
     this.state = 'approach'
     this.strafeFlipAt = this.now() + 1200 + Math.floor(Math.random() * 1100)
     this.critArmed = false
+    this._targetDead = false
+    this._backoffUntil = 0
+    this._hits = 0
+    this.hands.acquire({ reason: `fight ${label}` })
     await this._equipBestWeapon()
+    await this._equipShield()
     this.refreshProfile()
     this._ensureFollowGoal()
-    this.onEvent({ type: 'combat', msg: `engaged ${String(target.name).toLowerCase()}` })
-    logger.info(TAG, `engaging ${target.name} (id ${target.id}) with ${this.profile.label} band ${this.profile.min}–${this.profile.max}m`)
-    return { ok: true, target: String(target.name).toLowerCase() }
+    this.onEvent({ type: 'combat', msg: `engaged ${label}` })
+    logger.info(TAG, `engaging ${label} (id ${target.id}) with ${this.profile.label} band ${this.profile.min}–${this.profile.max}m`)
+    return { ok: true, target: label }
   }
 
-  /** Force-disengage (also used internally at low health). */
-  disengage (reason = 'manual') {
-    this.bot.pathfinder?.setGoal?.(null)
-    this._clearControls()
-    this._releaseBow()
-    this.state = 'cooldown'
-    this.cooldownUntil = this.now() + this.disengageCooldownMs
-    const away = this._awayGoal()
+  /**
+   * Force-disengage (also used internally at low health).
+   * @param {string} reason
+   * @param {{ cooldown?: boolean }} opts cooldown=false when the MODEL ended
+   *   the fight (stop, or a new task): it may start another one right away.
+   *   The lockout is for break-offs the body forced (low health).
+   */
+  disengage (reason = 'manual', { cooldown = true } = {}) {
+    const danger = this.target?.position
+    this._letGo()
+    this.state = cooldown ? 'cooldown' : 'idle'
+    this.cooldownUntil = cooldown ? this.now() + this.disengageCooldownMs : 0
+    // Without a survival layer (harness A) the controller walks away itself.
+    const away = this.fleeOnDisengage ? this._awayGoal(danger) : null
     if (away) {
       this.activeGoal = { goal: away, dynamic: false }
-      try { this.bot.pathfinder.setGoal(away, false) } catch { /* pathfinder absent */ }
-    } else {
-      this.activeGoal = null
+      this.hands.acquire({ reason: 'disengage', ttlMs: this.disengageCooldownMs })
+      this.hands.setGoal(away, false)
     }
     const label = reason === 'low_hp' ? 'disengaged low_hp' : `disengaged ${reason}`
     this.target = null
-    this.onEvent({ type: 'combat', msg: label })
+    this.onEvent({ type: 'combat', msg: label, result: 'disengaged' })
     logger.warn(TAG, label)
     return { ok: true }
   }
 
   // ------------------------------------------------------------- internals--
 
+  /** Drop everything the fight was holding: keys, goal, bow, shield. */
+  _letGo () {
+    this._releaseBow()
+    this._shield(false)
+    this.critArmed = false
+    this.activeGoal = null
+    try { this.hands.release('fight over') } catch { /* bot gone */ }
+  }
+
+  _end (msg, result) {
+    logger.info(TAG, msg)
+    if (result === 'won' && this.target && typeof this.target === 'object') this._deadEntities.add(this.target)
+    this.motion.forget(this.target)
+    this.target = null
+    this.state = 'idle'
+    this._letGo()
+    this.onEvent({ type: 'combat', msg, result })
+  }
+
   /** Escape destination: predictive threat vector when available. */
-  _awayGoal () {
+  _awayGoal (danger = this.target?.position) {
     const botPos = this.bot.entity?.position
     if (!botPos) return null
     let dx = 1; let dz = 1
@@ -429,7 +562,6 @@ class AdvancedCombat {
       } catch { /* fall through to geometry */ }
     }
     if (dx === 1 && dz === 1) {
-      const danger = this.target?.position
       if (danger) {
         dx = botPos.x - danger.x
         dz = botPos.z - danger.z
@@ -454,10 +586,51 @@ class AdvancedCombat {
         const score = (WEAPON_TIERS.length - tier) * 10 + kindBonus
         if (score > bestScore) { bestScore = score; best = item }
       }
-      if (best) await this.bot.equip(best, 'hand')
+      if (best && this.bot.heldItem?.name !== best.name) await this.bot.equip(best, 'hand')
     } catch (err) {
       logger.debug(TAG, `weapon equip skipped: ${err.message || err}`)
     }
+  }
+
+  /** Item in the off hand, if any (slot 45 on every 1.9+ inventory). */
+  _offHandItem () {
+    try {
+      const slot = this.bot.getEquipmentDestSlot?.('off-hand')
+      return this.bot.inventory?.slots?.[Number.isFinite(slot) ? slot : 45] || null
+    } catch { return null }
+  }
+
+  hasShield () {
+    return this._offHandItem()?.name === 'shield'
+  }
+
+  /** Move a carried shield to the off hand (only into an empty off hand). */
+  async _equipShield () {
+    try {
+      if (this.profile.kind === 'ranged') return false
+      if (this._offHandItem()) return this.hasShield()
+      const shield = this.bot.inventory.items().find((i) => i.name === 'shield')
+      if (!shield) return false
+      await this.bot.equip(shield, 'off-hand')
+      return true
+    } catch (err) {
+      logger.debug(TAG, `shield equip skipped: ${err.message || err}`)
+      return false
+    }
+  }
+
+  /** Raise / lower the off-hand shield. Idempotent. */
+  _shield (up) {
+    if (Boolean(up) === this._shieldUp) return
+    try {
+      if (up) {
+        if (!this.hasShield()) return
+        this.bot.activateItem(true)
+      } else {
+        this.bot.deactivateItem()
+      }
+      this._shieldUp = Boolean(up)
+    } catch { /* gone */ }
   }
 
   _ensureFollowGoal () {
@@ -470,36 +643,29 @@ class AdvancedCombat {
       const followRange = Math.max(1, Math.round(this.profile.min))
       const goal = new GoalFollow(this.target, followRange)
       this.activeGoal = { goal, dynamic: true }
-      this.bot.pathfinder.setGoal(goal, true)
+      this.hands.setGoal(goal, true)
     } catch (err) {
       logger.debug(TAG, `follow goal failed: ${err.message || err}`)
     }
   }
 
   _clearControls () {
-    try {
-      for (const c of ['forward', 'back', 'left', 'right', 'sprint', 'jump', 'sneak']) {
-        this.bot.setControlState(c, false)
-      }
-    } catch { /* bot gone */ }
+    try { this.hands.clearControlStates() } catch { /* bot gone */ }
   }
 
   _entityAlive (e) {
     return Boolean(e && this.bot.entities[e.id])
   }
 
+  _onEntityDead (e) {
+    if (this.target && e && e.id === this.target.id) this._targetDead = true
+  }
+
   _onEntityGone (e) {
-    if (this.target && e && e.id === this.target.id) {
-      logger.info(TAG, 'target down')
-      this.onEvent({ type: 'combat', msg: 'target down' })
-      this.target = null
-      this.state = 'idle'
-      this.activeGoal = null
-      this.critArmed = false
-      this._releaseBow()
-      this._clearControls()
-      try { this.bot.pathfinder?.setGoal?.(null) } catch { /* noop */ }
-    }
+    if (!this.target || !e || e.id !== this.target.id) return
+    // Only a death is a kill. A despawn, a logout or walking out of view is not.
+    if (this._targetDead || (this._hits > 0 && Number(this.target.health) <= 0)) this._end('target down', 'won')
+    else this._end('target lost (left view)', 'lost')
   }
 
   /** Housekeeping at 4 Hz: health gate, cooldown expiry, target sanity. */
@@ -509,10 +675,12 @@ class AdvancedCombat {
     if (this.state === 'cooldown' && now >= this.cooldownUntil) {
       this.state = 'idle'
       this.activeGoal = null
+      try { this.hands.release('cooldown over') } catch { /* gone */ }
     }
-    if (this.state === 'retreat' && now >= this.evadeUntil) {
+    if (this.state === 'retreat' && now >= this.evadeUntil && now >= this._backoffUntil) {
       this.state = this.target ? 'approach' : 'idle'
       this.evadeReason = null
+      this._clearControls()
     }
     if (this.state === 'approach' || this.state === 'melee' || this.state === 'retreat') {
       if (this.bot.health <= this.disengageAt) {
@@ -520,43 +688,37 @@ class AdvancedCombat {
         return
       }
       if (!this._entityAlive(this.target)) {
-        this.target = null
-        this.state = 'idle'
-        this.activeGoal = null
-        this._clearControls()
-        this.onEvent({ type: 'combat', msg: 'target down' })
+        if (this._targetDead) this._end('target down', 'won')
+        else this._end('target lost (left view)', 'lost')
       }
     }
   }
 
-  /** Public hook for the System-1 `combat_tick` reflex (no LLM latency). */
+  /** Public hook: one combat mechanics tick (no-op unless a fight is on). */
   forceTick () {
     try { this._tick() } catch (err) { logger.debug(TAG, `forceTick: ${err.message || err}`) }
   }
 
-  /** Public hook for the System-1 `panic_retreat` reflex. */
+  /** Public hook: break away from the current target. No-op when idle. */
   panicRetreat (reason = 'mace') {
+    if (!this.isEngaged) return null
     this._panicRetreat(reason, this.now())
     return reason
   }
 
-  /** Public hook for the System-1 `evade_lateral` reflex. */
+  /** Public hook: sidestep the current target's line. No-op when idle. */
   evadeLateral (reason = 'elytra') {
+    if (!this.isEngaged) return null
     this._lateralEvade(reason, this.now())
     return reason
-  }
-
-  /** Public hook for the System-1 `strafe_ranged` reflex. */
-  strafeRanged () {
-    this._perpendicularStrafe(this.now())
-    this._applyStance({ forward: false, back: false, sprint: true, strafe: true })
-    return 'strafe'
   }
 
   /** Physics-tick pursuit + melee mechanics (20 Hz). */
   _tick () {
     if (this.state !== 'approach' && this.state !== 'melee' && this.state !== 'retreat') return
     if (!this.target || !this.bot.entity) return
+    // A higher-priority lane (survival) is driving: do not swing or steer.
+    if (this.hands.active === false || this.hands.isTop === false) return
     const now = this.now()
 
     const botPos = this.bot.entity.position
@@ -567,33 +729,35 @@ class AdvancedCombat {
     const horiz = Math.hypot(dx, dz)
     const dist3 = Math.sqrt(horiz * horiz + dy * dy)
 
+    const profile = this.refreshProfile()
+    const motion = this.motion.update(this.target)
+    const threat = classifyThreat(this.target, { botPos, distance: dist3, motion })
+    this.lastThreat = threat
+
+    // ---- RETREAT state (mace panic / creeper back-off) ---------------------
+    if (this.state === 'retreat') {
+      this._runFrom(tPos)
+      return
+    }
+
     // Face the target smoothly — force=false avoids violent snap-turns.
     try {
       const height = Number(this.target.height) || 1.8
       this.bot.lookAt(tPos.offset(0, height * 0.6, 0), false).catch(() => {})
     } catch { /* look failed; non-fatal */ }
 
-    const profile = this.refreshProfile()
-    const threat = classifyThreat(this.target, { botPos, distance: dist3 })
-    this.lastThreat = threat
-
     // ---- WEAPON-SPECIFIC EVASION (highest priority) ------------------------
-    if (threat.tags.includes('mace_airborne') && dist3 <= 5.5) {
-      if (this.evadeReason !== 'mace' || now > this.evadeUntil - 800) this._panicRetreat('mace', now)
+    if (threat.tags.includes('mace_airborne') && dist3 <= 6) {
+      this._panicRetreat('mace', now)
       return
     }
-    if (threat.tags.includes('elytra_charge') || threat.tags.includes('elytra')) {
-      if (threat.elytra && threat.airborne && dist3 <= 8) {
-        this._lateralEvade('elytra', now)
-        return
-      }
+    if (threat.tags.includes('elytra_charge') && dist3 <= 8) {
+      this._lateralEvade('elytra', now)
+      return
     }
 
-    // ---- RETREAT state (mace panic / manual) -------------------------------
-    if (this.state === 'retreat') {
-      this._retreatControls(now)
-      return
-    }
+    // ---- CREEPER: hit and run ---------------------------------------------
+    if (threat.explosive && this._creeperTick({ dist3, now })) return
 
     // ---- RANGED DUEL -------------------------------------------------------
     // Only when WE hold the bow. An enemy archer facing a swordsman should be
@@ -610,7 +774,7 @@ class AdvancedCombat {
       if (this.state !== 'approach') {
         this.state = 'approach'
         this.critArmed = false
-        try { this.bot.setControlState('jump', false) } catch { /* noop */ }
+        this._shield(false)
         this._clearControls()
       }
       this._ensureFollowGoal() // re-arm dynamic follow if pathfinder lost it
@@ -620,7 +784,7 @@ class AdvancedCombat {
     if (this.state !== 'melee') {
       this.state = 'melee'
       this.activeGoal = null
-      try { this.bot.pathfinder.setGoal(null) } catch { /* noop */ }
+      this.hands.setGoal(null)
       this._clearControls()
       this.strafeFlipAt = now + 900 + Math.floor(Math.random() * 900)
     }
@@ -631,22 +795,29 @@ class AdvancedCombat {
       this.strafeFlipAt = now + 1200 + Math.floor(Math.random() * 1100)
     }
 
+    // Shield between swings in a duel: up while the indicator recharges.
+    if (isPlayer(this.target) && this.hasShield() && !this.critArmed) {
+      this._shield(this.cooldown.progress() < 0.7 && dist3 <= 4.5)
+    }
+
     // Post-swing recovery: backpedal to reset the threat distance.
     if (now < this.recoveryUntil) {
-      this._applyStance({ forward: false, back: true, sprint: false, strafe: true })
+      this._applyStance({ forward: false, back: true, strafe: true })
       return
     }
 
     // Band-keeping: too close → backpedal, inside → orbit, too far was handled.
+    // Never sprint here: a real client cannot sprint sideways or backwards,
+    // and a sprinting attacker cannot land a critical hit.
     if (horiz < bandMin) {
-      this._applyStance({ forward: false, back: true, sprint: false, strafe: true })
+      this._applyStance({ forward: false, back: true, strafe: true })
     } else {
-      this._applyStance({ forward: false, back: false, sprint: true, strafe: true })
+      this._applyStance({ forward: false, back: false, strafe: true })
     }
 
-    // Weapon reach is shorter than the band for the mace: step in, don't idle.
+    // Out of reach but inside the band (mace jump setup): step in.
     if (dist3 > profile.reach + 0.2) {
-      this._applyCollisionStance()
+      this._applyStance({ forward: true, back: false, strafe: true })
       if (profile.needsAir && this.bot.entity.onGround && this.cooldown.ready(this.critThreshold)) {
         this._jumpPulse()
       }
@@ -658,20 +829,17 @@ class AdvancedCombat {
       const falling = !this.bot.entity.onGround && this.bot.entity.velocity.y < 0
       const expired = now > this.critDeadline
       if ((falling || expired) && this.cooldown.ready(this.critThreshold)) {
-        try { this.bot.setControlState('jump', false) } catch { /* noop */ }
         if (dist3 <= profile.reach + 0.3) this._swing()
         this.critArmed = false
         this.recoveryUntil = now + this.recoveryMs
       } else if (expired) {
-        try { this.bot.setControlState('jump', false) } catch { /* noop */ }
         this.critArmed = false
       }
       return
     }
 
-    // Vanilla cooldown gate: never spam-click. 85%+ only.
+    // Vanilla cooldown gate: never spam-click. Full indicator only.
     if (!this.cooldown.ready(this.critThreshold)) return
-    if (dist3 > profile.reach + 0.2) return
 
     if (profile.needsAir && !this.bot.entity.onGround) {
       // Mace: already airborne — swing on the falling tick for a smash.
@@ -680,7 +848,8 @@ class AdvancedCombat {
     }
 
     if (this.bot.entity.onGround) {
-      // Micro-jump into the swing → critical hit.
+      // Micro-jump into the swing → critical hit. Lower the shield first.
+      this._shield(false)
       this._jumpPulse()
       this.critArmed = true
       this.critDeadline = now + 900
@@ -690,11 +859,50 @@ class AdvancedCombat {
     }
   }
 
+  /**
+   * Creeper handling. Returns true when it took over this tick.
+   *
+   * A creeper starts its 1.5 s fuse within 3 blocks and only stops it once
+   * its target is more than 7 blocks away (or out of sight). So: walk in,
+   * land ONE sprint hit the moment it is in reach (knockback buys distance),
+   * then run until the fuse is out, and repeat. No crit jump — it costs the
+   * half second the escape needs. No shield either: blocking saves the bot
+   * but still leaves a crater in whatever is nearby.
+   */
+  _creeperTick ({ dist3, now }) {
+    const lit = creeperFuseLit(this.target)
+    if (now >= this._backoffUntil && dist3 <= this.profile.reach + 0.2 && this.cooldown.ready(this.critThreshold)) {
+      this._swing({ keepSprint: true })
+      this._backoffUntil = now + 1500
+    }
+    if (lit || now < this._backoffUntil) {
+      if (dist3 < 7.5) {
+        if (this.state !== 'retreat') {
+          this.state = 'retreat'
+          this.evadeReason = 'creeper'
+          this.evadeUntil = now + 500
+          this.activeGoal = null
+          this.hands.setGoal(null)
+        }
+        this._runFrom(this.target.position)
+        return true
+      }
+      this._clearControls()
+      return true // far enough: wait for the fuse to go out
+    }
+    return false // fuse out, not in reach yet: approach like any other mob
+  }
+
   /** One confirmed swing; arms the cooldown and starts the backpedal window. */
-  _swing () {
+  _swing ({ keepSprint = false } = {}) {
     try {
+      this._shield(false)
+      // Sprinting blocks critical hits; the pathfinder may have left it on.
+      // (Kept on purpose for the creeper hit: sprint knockback buys distance.)
+      if (!keepSprint) this.hands.setControlState('sprint', false)
       this.bot.attack(this.target)
       const now = this.now()
+      this._hits++
       this.cooldown.arm(this.profile)
       this.attackReadyAt = now + this.attackCooldownMs
       this.recoveryUntil = now + this.recoveryMs
@@ -704,32 +912,40 @@ class AdvancedCombat {
     }
   }
 
-  /** Close the final metre toward the target while still orbiting it. */
-  _applyCollisionStance () {
-    this._applyStance({ forward: true, back: false, sprint: false, strafe: true })
-  }
-
   _jumpPulse () {
-    try {
-      this.bot.setControlState('jump', true)
-      setTimeout(() => { try { this.bot.setControlState('jump', false) } catch { /* gone */ } }, 60)
-    } catch { /* gone */ }
+    try { this.hands.pulse('jump', 60) } catch { /* gone */ }
   }
 
   /** Press exactly the movement keys a stance needs. */
   _applyStance ({ forward, back, sprint, strafe }) {
-    const bot = this.bot
-    bot.setControlState('forward', Boolean(forward))
-    bot.setControlState('back', Boolean(back))
-    bot.setControlState('sprint', Boolean(sprint))
-    bot.setControlState('left', Boolean(strafe) && this.strafeSign < 0)
-    bot.setControlState('right', Boolean(strafe) && this.strafeSign > 0)
+    const h = this.hands
+    h.setControlState('forward', Boolean(forward))
+    h.setControlState('back', Boolean(back))
+    // Sprint only ever accompanies forward movement, as in the real client.
+    h.setControlState('sprint', Boolean(sprint) && Boolean(forward) && !back)
+    h.setControlState('left', Boolean(strafe) && this.strafeSign < 0)
+    h.setControlState('right', Boolean(strafe) && this.strafeSign > 0)
   }
 
-  /**
-   * Mace panic: sprint backwards, break LOS with a placed block, or deploy a
-   * water bucket to negate smash landing damage. Purely client-side.
-   */
+  /** Turn away from a point and sprint: the only honest way to retreat fast. */
+  _runFrom (danger) {
+    const pos = this.bot.entity?.position
+    if (!pos || !danger) return
+    let dx = pos.x - danger.x
+    let dz = pos.z - danger.z
+    const len = Math.hypot(dx, dz)
+    if (len < 0.01) { dx = 1; dz = 0 } else { dx /= len; dz /= len }
+    try { Promise.resolve(this.bot.look(Math.atan2(-dx, -dz), 0, true)).catch(() => {}) } catch { /* mock */ }
+    const h = this.hands
+    h.setControlState('back', false)
+    h.setControlState('left', false)
+    h.setControlState('right', false)
+    h.setControlState('forward', true)
+    h.setControlState('sprint', true)
+    h.setControlState('jump', Boolean(this.bot.entity.onGround))
+  }
+
+  /** Mace smash incoming: break away from the target for a moment. */
   _panicRetreat (reason, now) {
     if (now - this._panicAt < 900) return
     this._panicAt = now
@@ -738,72 +954,16 @@ class AdvancedCombat {
     this.evadeUntil = now + 1400
     this.critArmed = false
     this.activeGoal = null
-    try { this.bot.pathfinder?.setGoal?.(null) } catch { /* noop */ }
-    this._retreatControls(now)
-    const mitigation = this._mitigation()
-    if (mitigation) {
-      // Mitigation swapped our hand item; recover the weapon once we're clear.
-      setTimeout(() => {
-        this._equipBestWeapon().then(() => this.refreshProfile()).catch(() => {})
-      }, 700)
-    }
-    this.onEvent({ type: 'combat', msg: `panic retreat (${reason})${mitigation ? ' + ' + mitigation : ''}` })
-    logger.warn(TAG, `panic retreat — ${reason}${mitigation ? ` (${mitigation})` : ''}`)
-  }
-
-  /** Best available client-side mitigation for an incoming smash. */
-  _mitigation () {
-    try {
-      if (this._deployWaterBucket()) return 'water'
-      if (this._placeShieldBlock()) return 'block'
-    } catch { /* inventory mock */ }
-    return ''
-  }
-
-  _deployWaterBucket () {
-    const bot = this.bot
-    try {
-      const bucket = bot.inventory.items().find((i) => i.name === 'water_bucket')
-      if (!bucket) return false
-      bot.equip(bucket, 'hand').then(() => {
-        bot.activateItem()
-        setTimeout(() => { try { bot.deactivateItem() } catch { /* gone */ } }, 120)
-      }).catch(() => {})
-      return true
-    } catch { return false }
-  }
-
-  _placeShieldBlock () {
-    const bot = this.bot
-    if (!bot.entity?.position || !bot.blockAt || !bot.placeBlock) return false
-    try {
-      const block = bot.inventory.items().find((i) => /^(cobblestone|dirt|netherrack|oak_planks|stone)$/.test(i.name))
-      if (!block) return false
-      const t = this.target?.position
-      if (!t) return false
-      const pos = bot.entity.position
-      const dx = t.x - pos.x
-      const dz = t.z - pos.z
-      const len = Math.hypot(dx, dz) || 1
-      const { Vec3 } = require('vec3')
-      const head = pos.floored().offset(Math.round(dx / len), 0, Math.round(dz / len))
-      const below = bot.blockAt(head.offset(0, -1, 0))
-      if (!below || below.name === 'air') return false
-      bot.equip(block, 'hand')
-        .then(() => bot.placeBlock(below, new Vec3(0, 1, 0)))
-        .catch(() => {})
-      return true
-    } catch { return false }
-  }
-
-  _retreatControls (now) {
-    if (now > this.evadeUntil) return
-    this._applyStance({ forward: false, back: true, sprint: true, strafe: true })
+    this._shield(false)
+    this.hands.setGoal(null)
+    this._runFrom(this.target?.position)
+    this.onEvent({ type: 'combat', msg: `broke away (${reason})` })
+    logger.warn(TAG, `panic retreat — ${reason}`)
   }
 
   /**
-   * Elytra / spear or trident lunge: instantly break the linear collision
-   * trajectory with a lateral sprint strafe and a jump.
+   * Elytra / spear or trident dive: break the linear collision trajectory
+   * with a sideways step and a jump.
    */
   _lateralEvade (reason, now) {
     if (now - this._panicAt < 650) return
@@ -814,16 +974,15 @@ class AdvancedCombat {
     this.strafeFlipAt = now + 320
     this.critArmed = false
     this.activeGoal = null
-    try { this.bot.pathfinder?.setGoal?.(null) } catch { /* noop */ }
+    this.hands.setGoal(null)
     this._applyStance({ forward: true, back: false, sprint: true, strafe: true })
     this._jumpPulse()
-    this.onEvent({ type: 'combat', msg: `lateral evade (${reason})` })
+    this.onEvent({ type: 'combat', msg: `sidestepped (${reason})` })
   }
 
   // ---- ranged -------------------------------------------------------------
 
   _rangedTick ({ profile, threat, dist3, now }) {
-    const bot = this.bot
     this.critArmed = false
     const rangedProfile = profile.kind === 'ranged' ? profile : WEAPON_PROFILES.bow
 
@@ -834,21 +993,29 @@ class AdvancedCombat {
     if (dist3 < rangedProfile.min) {
       // Too close for a bow: back off while keeping the crosshair on target.
       this.state = 'approach'
-      this._applyStance({ forward: false, back: true, sprint: true, strafe: true })
+      this._applyStance({ forward: false, back: true, strafe: true })
       this.activeGoal = null
-      try { bot.pathfinder?.setGoal?.(null) } catch { /* noop */ }
+      this.hands.setGoal(null)
       return
     }
     if (dist3 > rangedProfile.max) {
-      this._applyStance({ forward: true, back: false, sprint: true, strafe: true })
       this._ensureFollowGoal()
       return
     }
 
     // In the firing band: hold still-ish and only loose a FULLY charged shot.
-    this.state = 'melee'
-    this._applyStance({ forward: false, back: false, sprint: false, strafe: true })
+    if (this.state !== 'melee') {
+      this.state = 'melee'
+      this.activeGoal = null
+      this.hands.setGoal(null)
+    }
+    this._applyStance({ forward: false, back: false, strafe: true })
     if (profile.kind !== 'ranged') return // no bow in hand — nothing to fire
+    if (!this._hasAmmo()) {
+      // An empty quiver would just stand there drawing nothing.
+      this._end('out of arrows', 'lost')
+      return
+    }
     const chargeMs = (profile.chargeMs || 1000) * this.bowChargeThreshold
     if (!this.bow.charging) {
       if (!this.cooldown.ready(this.critThreshold)) return
@@ -862,6 +1029,14 @@ class AdvancedCombat {
       this.cooldown.arm(profile)
       this.onEvent({ type: 'combat', msg: `arrow loosed (${Math.round(dist3)}m)` })
     }
+  }
+
+  _hasAmmo () {
+    try {
+      const items = this.bot.inventory.items()
+      if (!items.length) return true // partial mock: assume the caller knows
+      return items.some((i) => /(^|_)arrow$/.test(i.name)) || /arrow/.test(this._offHandItem()?.name || '')
+    } catch { return true }
   }
 
   _drawBow (now) {
@@ -891,9 +1066,11 @@ class AdvancedCombat {
     let rightThreat = 0
     if (this.threatMap?.threatScoreAt) {
       const yaw = this.bot.entity.yaw || 0
-      // Right of look direction = (cos yaw, sin yaw) in XZ; left is mirrored.
+      // mineflayer yaw 0 faces north (-z): forward = (-sin yaw, -cos yaw), so
+      // the right-hand vector is (cos yaw, -sin yaw). (The old +sin swapped
+      // left and right whenever the bot faced east or west.)
       const rx = Math.cos(yaw)
-      const rz = Math.sin(yaw)
+      const rz = -Math.sin(yaw)
       leftThreat = this.threatMap.threatScoreAt({ x: pos.x - rx * 2, y: pos.y, z: pos.z - rz * 2 })
       rightThreat = this.threatMap.threatScoreAt({ x: pos.x + rx * 2, y: pos.y, z: pos.z + rz * 2 })
     } else if (this.target?.position) {
@@ -908,10 +1085,10 @@ class AdvancedCombat {
   }
 }
 
-
 module.exports = {
   AdvancedCombat,
   AttackCooldown,
+  MotionTracker,
   HOSTILE_NAMES,
   WEAPON_PROFILES,
   CRIT_THRESHOLD,

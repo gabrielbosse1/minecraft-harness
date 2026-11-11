@@ -26,15 +26,29 @@ const path = require('path')
 
 const STOPWORDS = new Set([
   'a', 'an', 'the', 'and', 'or', 'but', 'of', 'at', 'in', 'on', 'to', 'for',
-  'me', 'you', 'i', 'my', 'your', 'is', 'it', 'this', 'that', 'with', 'from'
+  'me', 'you', 'i', 'my', 'your', 'is', 'it', 'this', 'that', 'with', 'from',
+  // Portuguese (accent-folded) — the players here speak PT-BR.
+  'de', 'do', 'da', 'dos', 'das', 'um', 'uma', 'uns', 'umas', 'ou', 'que', 'em',
+  'no', 'na', 'nos', 'nas', 'para', 'pra', 'pro', 'com', 'por', 'eu', 'voce', 'vc',
+  'meu', 'minha', 'seu', 'sua', 'ele', 'ela', 'isso', 'esse', 'essa', 'esta', 'este',
+  'onde', 'fica', 'ficam', 'tem', 'como', 'qual', 'quando', 'cade', 'la', 'ali', 'aqui',
+  'os', 'as', 'se', 'ao', 'mas', 'foi', 'era', 'ta', 'to', 'gente'
 ])
 
-/** Tokenize into a lowercase alphanumeric bag of meaningful words. */
+/** Lowercase and strip accents: "Baú" and "bau", "Não" and "nao" are one word. */
+function fold (text) {
+  return String(text ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
+}
+
+/**
+ * Tokenize into an accent-folded bag of meaningful words. A trailing plural
+ * "s" is dropped so "diamantes"/"diamante" and "chests"/"chest" meet.
+ */
 function tokenize (text) {
-  return String(text)
-    .toLowerCase()
+  return fold(text)
     .replace(/[^a-z0-9\-_. ,/]/g, ' ')
     .split(/[\s,]+/)
+    .map((w) => (w.length > 3 && w.endsWith('s') ? w.slice(0, -1) : w))
     .filter((w) => w.length > 1 && !STOPWORDS.has(w))
 }
 
@@ -80,7 +94,18 @@ class WorkingMemory {
     this.items = []
   }
 
+  /**
+   * Identical consecutive events collapse into one line with a count, so a
+   * fight ("hit zombie" x6) cannot push a friend's message out of the window.
+   */
   push (evt) {
+    const last = this.items[this.items.length - 1]
+    const text = evt?.text || evt?.msg || ''
+    if (last && last.type === evt?.type && (last.text || last.msg || '') === text && !evt?.sender) {
+      last.count = (last.count || 1) + 1
+      last.ts = Date.now()
+      return
+    }
     this.items.push({ ts: Date.now(), ...evt })
     while (this.items.length > this.max) this.items.shift()
   }
@@ -181,16 +206,17 @@ class LongTermMemory {
    * repeating a single detail.
    */
   grep (text, limit = 3) {
-    const q = String(text || '').trim().toLowerCase()
+    const q = fold(text).trim()
     if (!q || !this.entries.length) return []
     const terms = tokenize(q)
-    const literal = this.entries.filter((e) => e.text.toLowerCase().includes(q))
+    if (!terms.length) return []
+    const literal = this.entries.filter((e) => fold(e.text).includes(q))
     const scored = []
     if (literal.length) {
       for (const e of literal) scored.push({ text: e.text, score: 1 + (e.importance || 0) * 0.1 })
     } else {
       for (const e of this.entries) {
-        const low = e.text.toLowerCase()
+        const low = fold(e.text)
         const hits = terms.filter((t) => low.includes(t)).length
         if (hits > 0) scored.push({ text: e.text, score: hits / terms.length + (e.importance || 0) * 0.05 })
       }
@@ -250,7 +276,10 @@ class MemorySystem {
 
   /** True when the query smells like a recall request ("remember when..."). */
   static isRecallQuery (text) {
-    return /remember|recall|last time|when we|you (built|made|gave)|where.*(is|are|was)|what did we/i.test(String(text || ''))
+    const t = fold(text)
+    if (/remember|recall|last time|when we|you (built|made|gave)|where.*(is|are|was)|what did we/.test(t)) return true
+    // "lembra…", "onde fica o baú…", "cadê…", "da última vez…", "o que a gente fez…"
+    return /lembr|onde\s|cade\b|ultima vez|quando a gente|voce (construiu|fez|deu|guardou|colocou)|o que a gente|qual (era|foi)/.test(t)
   }
 
   /**
@@ -283,14 +312,36 @@ class MemorySystem {
     return parts.join('\n')
   }
 
-  /** Observe an inbound chat line (drives implicit preference tracking). */
+  /** Observe an inbound chat line (drives implicit, per-player preference tracking). */
   observeChat (sender, text) {
     if (!sender || !text) return null
-    return this.preferences.observe(text)
+    return this.preferences.observe(text, sender)
   }
 
-  /** One-line preferences fragment for the prompt, or '' */
-  preferencesLine () { return this.preferences.line() }
+  /**
+   * Keep what a player told the bot. Chat used to live only in the 5-event
+   * window; "o baú de diamantes fica no segundo andar" was gone a minute later
+   * while "craft stick failed" was kept forever.
+   * @param {boolean} addressed the line was said TO the bot
+   */
+  rememberChat (sender, text, { addressed = false } = {}) {
+    const t = String(text || '').trim()
+    if (!sender || t.length < 8) return null
+    // Only statements worth recalling later: where things are, what is whose,
+    // numbers. "zinc vem aqui" is a request, not a memory.
+    const f = fold(t)
+    const factual = /\d|\b(base|casa|house|home|bau|chest|farm|fazenda|mina|mine|portal|bed|cama|guard|coloc|deix|fica|ficam|is at|are at|put|stored|keep|meu|minha|my|nosso|nossa|our)\b/.test(f)
+    if (!factual || /\?\s*$/.test(t)) return null
+    return this.longTerm.add(`${sender} said: ${t.slice(0, 160)}`, ['chat', String(sender)], addressed ? 2 : 1)
+  }
+
+  /** Recent chat lines (10-minute window), oldest first — survives event spam. */
+  recentChat (limit = 6) {
+    return this.shortTerm.snapshot().filter((e) => e.type === 'chat').slice(-limit)
+  }
+
+  /** Preferences fragment for the prompt ('' when none). Pass a name for one player. */
+  preferencesLine (who) { return this.preferences.line(5, who) }
 
   save () { this.longTerm.save(); this.preferences.save() }
 }
@@ -363,52 +414,81 @@ class PreferenceTracker {
     } catch { /* non-fatal */ }
   }
 
-  /** Observe one chat line from a non-bot player. Returns detected pref or null. */
-  observe (text) {
+  /**
+   * Observe one chat line from a non-bot player. Returns detected pref or null.
+   * @param {string} text
+   * @param {string} [who] the speaker — preferences are kept per player
+   */
+  observe (text, who = '') {
     const t = String(text || '').trim()
     if (!t) return null
+    // Accent-folded so "não", "nao" and "NÃO" behave alike; the captured phrase
+    // keeps the folded form (it is only ever shown back to the model).
+    const f = fold(t)
+    const X = "([a-z0-9][a-z0-9 \\-_']{1,48})"
     const rules = [
-      { re: /\b(?:i|we)\s+(?:prefer|like|love|enjoy)\s+([a-z0-9][a-z0-9 \-_']{1,48})/i, polarity: 'like' },
-      { re: /\b(?:my\s+)?favou?rite\s+(?:block|style|build|material|thing)s?\s*(?:is|are)?\s*([a-z0-9][a-z0-9 \-_']{1,48})/i, polarity: 'like' },
-      { re: /\b(?:don't|do not|never|stop)\s+(?:use|using|place|placing|build(?:ing)?\s+with)\s+([a-z0-9][a-z0-9 \-_']{1,48})/i, polarity: 'dislike' },
-      { re: /\b(?:i|we)\s+hate\s+([a-z0-9][a-z0-9 \-_']{1,48})/i, polarity: 'dislike' }
+      { re: new RegExp(`\\b(?:i|we)\\s+(?:prefer|like|love|enjoy)\\s+${X}`), polarity: 'like' },
+      { re: new RegExp(`\\b(?:my\\s+)?favou?rite\\s+(?:block|style|build|material|thing)s?\\s*(?:is|are)?\\s*${X}`), polarity: 'like' },
+      { re: new RegExp(`\\b(?:don't|do not|never|stop)\\s+(?:use|using|place|placing|build(?:ing)?\\s+with)\\s+${X}`), polarity: 'dislike' },
+      { re: new RegExp(`\\b(?:i|we)\\s+hate\\s+${X}`), polarity: 'dislike' },
+      // Portuguese. Dislikes first: "não gosto de X" also contains "gosto de X".
+      { re: new RegExp(`\\b(?:nao\\s+gosto|nao\\s+curto|odeio|detesto)\\s+(?:de\\s+|da\\s+|do\\s+|das\\s+|dos\\s+)?${X}`), polarity: 'dislike' },
+      { re: new RegExp(`\\bnao\\s+(?:usa|use|usar|coloca|coloque|bota|constroi|construa)\\s+(?:com\\s+)?${X}`), polarity: 'dislike' },
+      { re: new RegExp(`\\b(?:eu\\s+)?(?:gosto|adoro|amo|curto|prefiro)\\s+(?:de\\s+|da\\s+|do\\s+|das\\s+|dos\\s+|mais\\s+de\\s+)?${X}`), polarity: 'like' },
+      { re: new RegExp(`\\b(?:meu|minha)\\s+(?:bloco|estilo|material|coisa)\\s+(?:favorit[oa]|preferid[oa])\\s+(?:e|sao)?\\s*${X}`), polarity: 'like' }
     ]
     for (const { re, polarity } of rules) {
-      const m = re.exec(t)
+      const m = re.exec(f)
       if (!m) continue
       const phrase = m[1].replace(/\s+/g, ' ').trim().replace(/[.!,]+$/, '')
       if (phrase.length < 2) continue
-      this._upsert(phrase, polarity)
+      this._upsert(phrase, polarity, who)
       this.save()
-      return { text: phrase, polarity }
+      return { text: phrase, polarity, who: who || null }
     }
     return null
   }
 
-  _upsert (text, polarity) {
+  _upsert (text, polarity, who = '') {
     const key = text.toLowerCase()
-    const hit = this.prefs.find((p) => p.text.toLowerCase() === key && p.polarity === polarity)
+    const hit = this.prefs.find((p) => p.text.toLowerCase() === key && p.polarity === polarity && (p.who || '') === who)
     if (hit) {
       hit.count += 1
       hit.ts = Date.now()
     } else {
-      this.prefs.push({ text, polarity, count: 1, ts: Date.now() })
+      this.prefs.push({ text, polarity, count: 1, ts: Date.now(), ...(who ? { who } : {}) })
       this.prefs.sort((a, b) => b.count - a.count || b.ts - a.ts)
-      this.prefs = this.prefs.slice(0, 50)
+      this.prefs = this.prefs.slice(0, 80)
     }
   }
 
-  /** Compact one-line prompt fragment: "likes: gothic style, stone bricks; dislikes: dirt towers" */
-  line (limit = 5) {
+  /**
+   * Compact prompt fragment. With `who`: that player's tastes only. Without:
+   * every player's, labelled by name — one merged line used to attribute
+   * Pedro's dislikes to Gabriel.
+   */
+  line (limit = 5, who) {
     if (!this.prefs.length) return ''
-    const likes = this.prefs.filter((p) => p.polarity === 'like').slice(0, limit).map((p) => p.text)
-    const dislikes = this.prefs.filter((p) => p.polarity === 'dislike').slice(0, limit).map((p) => p.text)
-    const bits = []
-    if (likes.length) bits.push(`likes: ${likes.join(', ')}`)
-    if (dislikes.length) bits.push(`dislikes: ${dislikes.join(', ')}`)
-    return bits.length ? `user preferences: ${bits.join('; ')}` : ''
+    const render = (list) => {
+      const likes = list.filter((p) => p.polarity === 'like').slice(0, limit).map((p) => p.text)
+      const dislikes = list.filter((p) => p.polarity === 'dislike').slice(0, limit).map((p) => p.text)
+      const bits = []
+      if (likes.length) bits.push(`likes: ${likes.join(', ')}`)
+      if (dislikes.length) bits.push(`dislikes: ${dislikes.join(', ')}`)
+      return bits.join('; ')
+    }
+    if (who !== undefined) {
+      const mine = render(this.prefs.filter((p) => (p.who || '') === who))
+      return mine ? `${who || 'user'} preferences: ${mine}` : ''
+    }
+    const names = [...new Set(this.prefs.map((p) => p.who || ''))]
+    if (names.length === 1 && names[0] === '') {
+      const all = render(this.prefs)
+      return all ? `user preferences: ${all}` : ''
+    }
+    const parts = names.slice(0, 6).map((n) => `${n || 'someone'} — ${render(this.prefs.filter((p) => (p.who || '') === n))}`).filter((x) => !x.endsWith('— '))
+    return parts.length ? `preferences: ${parts.join(' | ')}` : ''
   }
 }
 
-
-module.exports = { MemorySystem, WorkingMemory, ShortTermMemory, LongTermMemory, EphemeralMemory, PreferenceTracker, embed, cosine, tokenize, scoreImportance }
+module.exports = { MemorySystem, WorkingMemory, ShortTermMemory, LongTermMemory, EphemeralMemory, PreferenceTracker, embed, cosine, tokenize, fold, scoreImportance }

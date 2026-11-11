@@ -9,7 +9,7 @@ const os = require('os')
 
 const { MemorySystem, LongTermMemory, cosine, embed, scoreImportance } = require('../zincai/memory')
 const { BlueprintParser, BLUEPRINT_DIR } = require('../zincai/builder')
-const { chatTriggersSystem2, parseChatLine, blockEventTriggersSystem2 } = require('../zincai/filter')
+const { chatAddressesBot, botNames, parseChatLine, blockEventTriggersSystem2 } = require('../zincai/filter')
 
 // ------------------------------------------------------------- memory ---
 test('cosine similarity ranks related text above unrelated', () => {
@@ -82,17 +82,34 @@ test('inline grid parse matches file parse semantics', () => {
 })
 
 // ------------------------------------------------------------- filter ---
-test('chat filter: mentions/questions/friends trigger, chatter does not', () => {
-  assert.equal(chatTriggersSystem2('hey ZincAI come here', 'Steve', []), true)
-  assert.equal(chatTriggersSystem2('what is the time?', 'Steve', []), true)
-  assert.equal(chatTriggersSystem2('just a friendly hello there', 'Steve', []), false)
-  assert.equal(chatTriggersSystem2('lol nice one', 'BuilderBob', ['BuilderBob']), true)
+test('chat filter: the bot answers to its name, whispers and its own conversation — no friend list', () => {
+  const names = botNames('ZincAI', ['zinc'])
+  assert.deepEqual(names.sort(), ['zinc', 'zincai'])
+  assert.equal(chatAddressesBot('hey ZincAI come here', { names }), 'name')
+  assert.equal(chatAddressesBot('zinc vem aqui', { names }), 'name', 'everyone calls it "zinc"')
+  assert.equal(chatAddressesBot('ZINC!!', { names }), 'name')
+  assert.equal(chatAddressesBot('o zinco é um metal', { names }), false, 'a word that merely contains the name')
+  assert.equal(chatAddressesBot('oi', { names, whisper: true }), 'whisper')
+  assert.equal(chatAddressesBot('ok valeu', { names, inConversation: true }), 'conversation')
+  // A question is only "for the bot" when nobody else could be meant.
+  assert.equal(chatAddressesBot('what is the time?', { names, othersOnline: 1 }), 'question')
+  assert.equal(chatAddressesBot('what is the time?', { names, othersOnline: 3 }), false)
+  assert.equal(chatAddressesBot('just a friendly hello there', { names, othersOnline: 3 }), false)
 })
 
-test('chat line parser handles <name> and whisper formats', () => {
-  assert.deepEqual(parseChatLine('<Steve> hi zincAI'), { sender: 'Steve', text: 'hi zincAI' })
-  assert.deepEqual(parseChatLine('alex whispers to you: where are you?'), { sender: 'alex', text: 'where are you?' })
+test('chat line parser handles vanilla, whisper and common plugin formats', () => {
+  assert.deepEqual(parseChatLine('<Steve> hi zincAI'), { sender: 'Steve', text: 'hi zincAI', whisper: false })
+  assert.deepEqual(parseChatLine('alex whispers to you: where are you?'), { sender: 'alex', text: 'where are you?', whisper: true })
   assert.equal(parseChatLine('A zombie escapes the darkness'), null)
+  const players = ['Gabriel', 'Pedro']
+  assert.deepEqual(parseChatLine('[VIP] Gabriel: oi', { players }), { sender: 'Gabriel', text: 'oi', whisper: false })
+  assert.deepEqual(parseChatLine('Gabriel » oi', { players }), { sender: 'Gabriel', text: 'oi', whisper: false })
+  assert.deepEqual(parseChatLine('<[Admin] Gabriel> oi', { players }), { sender: 'Gabriel', text: 'oi', whisper: false })
+  assert.equal(parseChatLine('[Gabriel -> me] segredo', { players }).whisper, true)
+  // Loose formats only count for players who are actually online.
+  assert.equal(parseChatLine('Server: restarting in 5', { players }), null)
+  assert.equal(parseChatLine('Gabriel was slain by Zombie', { players }), null)
+  assert.equal(parseChatLine('Gabriel: oi'), null, 'without the player list the loose formats are off')
 })
 
 test('block events beyond 20 blocks never trigger System 2', () => {
@@ -221,7 +238,7 @@ const { createZincTools, coerceAction, buildToolsPayload } = require('../zincai/
 test('createZincTools emits OpenAI-format schemas with the full action set', () => {
   const tools = createZincTools()
   const names = tools.map((t) => t.function?.name)
-  for (const required of ['say', 'move', 'build', 'build_shape', 'run_script', 'set_mode', 'craft', 'attack', 'equip', 'idle']) {
+  for (const required of ['say', 'go_to', 'follow', 'stop', 'attack', 'hold', 'look_in', 'take', 'put', 'smelt', 'sleep', 'give', 'eat', 'equip', 'use_block', 'find', 'remember_here', 'craft', 'build', 'build_shape', 'run_script', 'set_mode', 'idle']) {
     assert.ok(names.includes(required), `missing tool ${required}`)
   }
   for (const t of tools) {
@@ -232,26 +249,40 @@ test('createZincTools emits OpenAI-format schemas with the full action set', () 
   }
   const shape = tools.find((t) => t.function.name === 'build_shape')
   assert.deepEqual(shape.function.parameters.properties.shape.enum, ['cylinder', 'dome', 'arch', 'wall', 'box', 'floor', 'ring'])
+  // Tools take names, never slot numbers; players are fought only by name.
+  const equip = tools.find((t) => t.function.name === 'equip')
+  assert.ok(equip.function.parameters.properties.item && !equip.function.parameters.properties.slot)
+  const attack = tools.find((t) => t.function.name === 'attack')
+  assert.ok(attack.function.parameters.properties.player, 'PvP needs an explicit player name')
+  assert.ok(/ONLY way a fight ever starts/.test(attack.function.description))
 })
 
-test('buildToolsPayload enforces single-call, auto tool_choice', () => {
+test('buildToolsPayload enforces a single REQUIRED tool call (prose used to vanish)', () => {
   const tools = createZincTools()
   const payload = buildToolsPayload({ model: 'Qwen3.8-Flash-Next', messages: [{ role: 'user', content: 'hi' }], temperature: 0.25, maxTokens: 256, tools })
-  assert.equal(payload.tool_choice, 'auto')
+  assert.equal(payload.tool_choice, 'required')
   assert.equal(payload.parallel_tool_calls, false)
   assert.equal(payload.stream, false)
   assert.equal(payload.tools.length, tools.length)
+  assert.equal(buildToolsPayload({ model: 'm', messages: [], temperature: 0, maxTokens: 1, tools, toolChoice: 'auto' }).tool_choice, 'auto')
 })
 
 test('coerceAction maps tool_calls onto the internal action shape', () => {
   const say = coerceAction({ tool_calls: [{ id: '1', type: 'function', function: { name: 'say', arguments: '{"text":"hello there"}' } }] })
-  assert.deepEqual(say, { a: 'say', t: 'hello there', _via: 'tool' })
+  assert.deepEqual(say, { a: 'say', text: 'hello there', t: 'hello there', _via: 'tool' })
   const shape = coerceAction({ tool_calls: [{ id: '2', type: 'function', function: { name: 'build_shape', arguments: '{"shape":"wall","block":"stone","params":{"l":4,"h":2}}' } }] })
   assert.equal(shape.a, 'build_shape')
   assert.equal(shape.shape, 'wall')
   assert.deepEqual(shape.params, { l: 4, h: 2 })
   const craft = coerceAction({ tool_calls: [{ id: '3', type: 'function', function: { name: 'craft', arguments: '{"item":"crafting_table"}' } }] })
-  assert.deepEqual(craft, { a: 'craft', i: 'crafting_table', _via: 'tool' })
+  assert.deepEqual(craft, { a: 'craft', item: 'crafting_table', i: 'crafting_table', _via: 'tool' })
+  const duel = coerceAction({ tool_calls: [{ id: '4', type: 'function', function: { name: 'attack', arguments: '{"player":"Gabriel"}' } }] })
+  assert.equal(duel.player, 'Gabriel')
+  assert.equal(duel.n, undefined, 'a player is never passed as a loose type name')
+  // Prose without a tool call is kept so the executor can tell the model.
+  const prose = coerceAction({ content: 'Sure, I will go there now.' })
+  assert.equal(prose.a, 'idle')
+  assert.equal(prose._prose, 'Sure, I will go there now.')
 })
 
 test('coerceAction falls back to legacy JSON content when tools are ignored', () => {

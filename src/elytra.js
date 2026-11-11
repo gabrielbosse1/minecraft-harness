@@ -85,6 +85,15 @@ class ElytraController {
     return Boolean(this.bot.entity?.elytraFlying)
   }
 
+  /** Is an elytra in the chest slot right now? */
+  _wearingElytra () {
+    try {
+      const slot = this.bot.getEquipmentDestSlot?.('torso')
+      const worn = this.bot.inventory?.slots?.[Number.isFinite(slot) ? slot : 6]
+      return worn?.name === 'elytra'
+    } catch { return false }
+  }
+
   async _equipElytraIfCarried () {
     const elytra = this.findElytra()
     if (!elytra) return false
@@ -128,8 +137,9 @@ class ElytraController {
       if (this.bot.entity?.isInWater) return { ok: false, why: 'in_water' }
       // Wear it if we carry one; otherwise hope it's already equipped (chest slot).
       const carried = await this._equipElytraIfCarried()
-      const mayBeWorn = !carried
-      if (!carried && !mayBeWorn) return { ok: false, why: 'no_elytra' }
+      // (The old check `!carried && !(!carried)` could never be true, so the
+      // bot hop-jumped with no elytra at all.)
+      if (!carried && !this._wearingElytra()) return { ok: false, why: 'no_elytra' }
 
       // Need downward velocity before elytraFly() will deploy.
       if (this.bot.entity.onGround) {

@@ -13,6 +13,11 @@
  *   2. assertVanillaAction(action) rejects action objects that smell like
  *      commands (a "command"/"cmd" field, a slash payload, RCON-ish fields)
  *      while letting every real tool call through untouched.
+ *   3. ONE exception, because every player can do it: a private message. The
+ *      guard exposes whisper(player, text), which builds "/msg <player> <text>"
+ *      itself from a validated online username. The model supplies the name
+ *      and the words, never the command, so it cannot be bent into anything
+ *      else.
  *
  * Movement, survival, building and combat are all performed through ordinary
  * client packets: setControlState, attack, placeBlock/dig, activateItem,
@@ -56,7 +61,23 @@ function installVanillaGuard (bot, { logger = null, onBlocked = null } = {}) {
   if (bot.__zincaiVanillaGuard) return bot.__zincaiVanillaGuard
 
   const originalChat = bot.chat.bind(bot)
-  const state = { blocked: 0, uninstall: () => { bot.chat = originalChat; delete bot.__zincaiVanillaGuard } }
+  const state = { blocked: 0, whispers: 0, uninstall: () => { bot.chat = originalChat; delete bot.__zincaiVanillaGuard } }
+
+  /**
+   * Private message to one online player. Returns false (and sends nothing)
+   * when the name is not a plain username of someone online or the text is
+   * empty.
+   */
+  state.whisper = (player, text) => {
+    const name = String(player || '').trim()
+    const body = String(text || '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200)
+    if (!/^[A-Za-z0-9_]{1,16}$/.test(name) || !body) return false
+    const players = bot.players ? Object.keys(bot.players) : null
+    if (players && !players.some((p) => p.toLowerCase() === name.toLowerCase())) return false
+    state.whispers++
+    originalChat(`/msg ${name} ${body}`)
+    return true
+  }
 
   bot.chat = (message, ...rest) => {
     if (isCommandLine(message)) {

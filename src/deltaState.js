@@ -26,7 +26,7 @@ const MAX_STRING = 64
 
 /** Whitelist of event keys we are willing to forward. Anything else is dropped. */
 const ALLOWED_KEYS = {
-  chat: ['user', 'msg'],
+  chat: ['user', 'msg', 'at'], // at = "x,y,z" of the speaker, when visible
   inv_delta: ['d'],
   hp: ['v'],
   food: ['v'],
@@ -37,7 +37,10 @@ const ALLOWED_KEYS = {
   equip: ['s', 'i'],
   attack: ['n'],
   combat: ['msg'],
-  move: ['x', 'y', 'z', 'ok'],
+  move: ['x', 'y', 'z', 'ok', 'why'],
+  threat: ['msg'], // the reflex layer started fleeing (wakes the model)
+  safe: ['msg'],
+  hurt: ['msg', 'hp'],
   elytra: ['ok'],
   unstuck: ['ok'],
   action_err: ['a', 'why'],
@@ -90,6 +93,7 @@ function toMemoryPhrase (e) {
       if (msg.startsWith('engaged')) return `fighting ${msg.split(' ')[1] || 'mob'}`
       if (msg.startsWith('disengaged')) return 'retreating'
       if (msg.includes('down') || msg.includes('dead')) return 'won fight'
+      if (msg.startsWith('lost')) return 'lost target'
       return 'fighting'
     }
     case 'attack': return `fighting ${e.n}`
@@ -101,6 +105,8 @@ function toMemoryPhrase (e) {
     case 'action_err': return `err ${e.a}`
     case 'equip': return `slot ${e.s}`
     case 'move': return e.ok ? 'moved' : 'move fail'
+    case 'threat': return 'fled danger'
+    case 'hurt': return Number(e.hp) <= 6 ? 'low hp' : 'got hurt'
     case 'self': return null // self-chatter carries no memory value
     default: return null
   }
@@ -133,8 +139,12 @@ class DeltaBuffer {
     this.pending.push({ event: clean, trigger: Boolean(trigger) })
     this.totalPushed += 1
     // Fold whatever overflows the 5-event window into the 10-word memory.
+    // The two most recent chat lines are spared: five "hit zombie" events used
+    // to push a friend's request out and leave only "chat Gabriel" behind.
     while (this.pending.length > this.maxEvents) {
-      const oldest = this.pending.shift()
+      const chats = this.pending.filter((p) => p.event.type === 'chat').slice(-2)
+      const victim = this.pending.findIndex((p) => !chats.includes(p))
+      const oldest = this.pending.splice(victim < 0 ? 0 : victim, 1)[0]
       this.totalEvicted += 1
       const phrase = toMemoryPhrase(oldest.event)
       if (phrase) this.absorbMemory(phrase)
@@ -168,12 +178,19 @@ class DeltaBuffer {
     const lines = [vitalsLine]
     if (this.memory) lines.push(this.memory)
     for (const { event } of this.pending) lines.push(JSON.stringify(event))
+    this._shown = this.pending.slice()
     return lines.join('\n')
   }
 
-  /** Called after a successful inference: pending events have been consumed. */
+  /**
+   * Called after a successful inference: the events that were IN THE PROMPT
+   * have been consumed. Anything that arrived while the call was in flight
+   * stays pending (it used to be wiped unseen).
+   */
   commit () {
-    this.pending = []
+    const shown = this._shown
+    this._shown = null
+    this.pending = shown ? this.pending.filter((p) => !shown.includes(p)) : []
   }
 
   stats () {

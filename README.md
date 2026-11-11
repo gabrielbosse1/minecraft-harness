@@ -1,146 +1,168 @@
-# mineflayer-zinc
+# Minecraft Harness — Zinc and ZincAI
 
-Autonomous **Minecraft Java** agent built on [Mineflayer](https://github.com/PrismarineJS/mineflayer),
-driven by the **AMD Radeon Cloud Token Factory API** (free tier — DeepSeek-V4-Flash-0731 by default).
-The bot plays as **Zinc** on a single whitelist-only server: it chats, moves, fights, flies,
-and stays silent unless the world changes.
+Two Mineflayer-based Minecraft Java agents share a survival/combat body, but
+have different model interfaces:
 
-Design goals, in order:
+| Harness | Entry point | Minecraft name | Model interface |
+| --- | --- | --- | --- |
+| **Zinc** | `src/index.js` (`npm start`) | `Zinc` by default | One compact JSON action per call; addressed chat and important game events wake the model. |
+| **ZincAI** | `zincai/index.js` (`npm run start:zincai`) | Always `ZincAI` | Separate chat and action lanes; OpenAI-compatible function tools for actions. |
 
-1. **Minimal token burn.** A short, *static* system prompt (≤150 words) plus *delta-only*
-   user messages (vitals/inventory/chat/events that actually changed). The static prefix
-   keeps KV-cache hit rates high on the AMD side; the session summary printed at shutdown
-   reports calls, cached tokens, and KV hit-rate.
-2. **Never blow up, never impersonate.** The bot always joins as `Zinc`. **Any** join
-   failure (kick, error, disconnect before spawn) is fatal — the process exits with code 1
-   instead of retrying or renaming. One whitelist, one identity.
-3. **No block chewing.** Pathfinder navigation with `canDig=false` by default; the bot
-   detours or jumps rather than mining your world.
+The agents do not decide to attack on their own. A local reflex layer flees
+from real danger; the model decides whether to keep fleeing, move, or start a
+fight (ZincAI also has a `hold` action). A player is attacked only after the model names that exact
+username. There is no friend list, no “attack nearby player” reflex, and no
+server-side control. Both bots use normal client actions; the only deliberate
+command exception is a guarded private `/msg` for ZincAI when the model asks to
+send a whisper.
 
 ## Quick start
 
-```bash
-npm ci                 # installs deps AND applies the Java 26.3 support patch (postinstall)
-cp .env.example .env   # then fill in your values (see below)
-npm run dry-run        # validates config + prompt budget, touches no network
-npm start              # joins the server
+Requirements: Node.js 18 or newer, a Minecraft Java server, and an AMD Radeon
+Cloud Token Factory API key (or a compatible OpenAI-style endpoint).
+
+```sh
+npm ci                         # also installs the repository's 26.3 data patch
+cp .env.example .env           # fill in API_KEY and your server address
+npm start                      # Zinc
+npm run start:zincai            # or ZincAI
 ```
 
-Node.js ≥ 18 required. Java itself is **not** required — the protocol stack is pure JS.
+Set `MC_HOST`, `MC_PORT`, and `MC_AUTH` in `.env` or the process environment.
+Leave `MC_VERSION` empty for protocol auto-detection, or pin a tested version.
+With `MC_AUTH=offline`, the Minecraft server must also be in offline mode and
+whitelist the corresponding name. Zinc defaults to `MC_USERNAME=Zinc`; ZincAI
+ignores `MC_USERNAME` and always logs in as `ZincAI`.
 
-## Configuration (`.env`)
+The AMD key can be supplied as `API_KEY`, `AMD_API_KEY`, or
+`RADEON_API_KEY`. `AMD_API_BASE_URL` defaults to
+`https://developer.amd.com.cn/radeon/api/v1`. The default model differs by
+harness (`DeepSeek-V4-Flash-0731` for Zinc, `Qwen3.8-Flash-Next` for ZincAI);
+set `AMD_MODEL` to an endpoint-supported model. Do not put real credentials in
+`zincai/config.json` or commit a `.env` file.
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `API_KEY` | — (**required**) | Radeon Cloud Token Factory key, `rc-...`. Also accepted: `AMD_API_KEY`, `RADEON_API_KEY`. Never logged. |
-| `AMD_API_BASE_URL` | `https://developer.amd.com.cn/radeon/api/v1` | Chat-completions endpoint (OpenAI-compatible). Override for other regions/proxies. |
-| `AMD_MODEL` | `DeepSeek-V4-Flash-0731` | Any model your Token Factory key can call (e.g. `Qwen3.8-Flash-Next`). |
-| `AMD_API_TIMEOUT_MS` | `20000` | Per-request timeout. |
-| `AMD_API_MAX_RETRIES` | `2` | Retries on 5xx/network/429 (with backoff). |
-| `AMD_MAX_TOKENS` | `96` | Action output is one line of JSON (<40 tok). 96 is headroom, not permission to ramble. |
-| `AMD_TEMPERATURE` | `0.25` | This is control flow, not creative writing. |
-| `MC_HOST` | `127.0.0.1` | Server host. |
-| `MC_PORT` | `25565` | Server port. |
-| `MC_USERNAME` | `Zinc` | **Keep `Zinc`.** Overriding logs a loud warning; join failures are still fatal. |
-| `MC_VERSION` | *(empty = auto-detect)* | Recommended: leave empty — the client pings the server for its version. Set explicitly (e.g. `26.3`) to skip auto-detect. |
-| `MC_AUTH` | `offline` | `offline` for cracked/private (whitelist) servers; `microsoft` with a real account. |
-| `MC_CAN_DIG` | `false` | Allow pathfinder to break blocks for navigation. |
-| `INFERENCE_MIN_INTERVAL_MS` | `3000` | Minimum spacing between AMD calls (stays under the ~20 RPM free tier). |
-| `INFERENCE_IDLE_INTERVAL_MS` | `15000` | Backoff after an idle answer. |
-| `MAX_SELF_CHAIN` | `12` | Cap on back-to-back non-idle actions before a forced breather. |
-| `CHAT_COOLDOWN_MS` | `3000` | Bot won't spam chat faster than this. |
-| `ENGAGE_RADIUS` | `24` | Mob/player engagement scan radius (combat). |
-| `ATTACK_COOLDOWN_MS` | `600` | Min ms between swings. |
-| `DISENGAGE_COOLDOWN_MS` | `10000` | After fleeing (≤30% HP), won't re-engage for this long. |
-| `ELYTRA_MIN_FALL` / `ELYTRA_GAP_BLOCKS` | `4` / `24` | Elytra deployment heuristics. |
+> **Credential warning:** this repository previously tracked a real `.env`.
+> The current change removes it from Git tracking, but the key may remain in
+> repository history. Treat it as exposed and rotate/revoke it in the AMD
+> dashboard. Keep your local `.env`; it is ignored by Git.
 
-The bot expects the server to whitelist **`Zinc`**. If `MC_AUTH=offline`, the server must be
-in offline mode as well (whitelist names are compared, not UUIDs).
+## Behavior and safety
 
-### What you'll see at runtime
+- **Flee first.** The survival body recognizes hostile mobs that can see or
+  reach the bot, immediate hazards such as lit creepers, and entities that
+  recently hurt it. Pets, named mobs, decorative entities, and peaceful players
+  merely nearby are not treated as active threats. A player who hits the bot
+  triggers a flee and a named wake-up, not retaliation.
+- **The model owns the fight decision.** `idle` keeps the bot fleeing. `attack`
+  is the only way a fight starts. Mob attacks require the exact type or
+  `any` (hostiles only), line of sight, and a non-protected target. PvP requires
+  an explicit exact player name; `player` and `any` never select a player.
+- **One owner for movement.** Survival, combat, and task lanes arbitrate
+  movement goals and keys (`survival > combat > task`) so concurrent behavior
+  does not leave controls held or cancel a more urgent flee.
+- **Vanilla-only operation.** No RCON, console commands, teleportation, or
+  server cheats. Slash-prefixed chat is blocked; the guarded ZincAI whisper
+  helper constructs `/msg` itself for an online player.
+- **Reconnects.** A failed first join (including a whitelist rejection) is
+  fatal. After a successful spawn, both harnesses can retry a dropped
+  connection/server restart with backoff and the same username.
 
-- Every AMD call logs its prompt size; `/shutdown` (SIGINT/SIGTERM) prints a session summary:
-  `requests`, `failures`, `avg prompt tokens/call`, `cached tokens`, `kv-hit-rate`.
-- If the AMD key is missing or the server rejects the join, the process exits **before**
-  wasting tokens: config is validated first, then the join is attempted exactly once.
-- If the LLM returns unusable output, the bot idles — it never crashes on a bad completion.
+## How the two harnesses differ
 
-## Java Edition 26.3 support (unofficial data)
+### Zinc (`src/`)
 
-**There is no npm release of `minecraft-data` containing pc/26.3** (latest at time of
-writing: `minecraft-data@3.119.0`, latest official version 26.1). This repo therefore ships
-**unmerged PR data**, pinned and integrity-checked:
+A small, low-token harness. A quiet server does not trigger model requests;
+only addressed chat and important deltas do. The prompt contains vitals, a
+short event buffer, and the nearby-threat line rather than ZincAI's fuller
+inventory/place observation. Chat replies are constrained to 10 words and
+100 characters while preserving accents. The action response is one JSON
+object such as `{"a":"move","x":12,"y":64,"z":-4}`. Walks run in the
+background through the task lane, so the agent can still process a new threat
+or chat while moving. Zinc shares control, threat sensing, and flee-reflex
+modules from `zincai/`.
 
-- Source: https://github.com/PrismarineJS/minecraft-data/pull/1345
-  (commit `312f3cada17a7d9e2e1a1834fe26f17296163096` of `suisarbre/minecraft-data@port-26.3`,
-  the tail of the stacked series #1300 → #1301 → #1345, `mergeable: clean`)
-- Vendored files: `vendor/minecraft-data-26.3/pc-26.3/` with a SHA-256 manifest
-  (`vendor/minecraft-data-26.3/VENDORED.md` — `sha256sum -c` verifies them)
-- `npm ci` / `npm install` runs `scripts/apply-26.3-data.js`, which copies the data into
-  `node_modules/minecraft-data` and patches *installed dependencies only* (never repo source):
-  the lazy loader entry, `dataPaths.json`, mineflayer's `testedVersions`,
-  minecraft-protocol's `supportedVersions`, the `prismarine-chunk` version map, and
-  `prismarine-physics`'s feature table. All patches extend 26.1 behavior lists to 26.3 and
-  **fail loudly** if an upstream anchor disappears after a dependency upgrade.
+Relevant environment settings include `MC_USERNAME` (default `Zinc`),
+`MC_CAN_DIG` (default `false`), `INFERENCE_MIN_INTERVAL_MS`,
+`INFERENCE_IDLE_INTERVAL_MS`, `INFERENCE_TICK_MS`, `REFLEX_TICK_MS`,
+`CHAT_COOLDOWN_MS`, and `RECONNECT` (default `true`). See `src/config.js` for
+bounds and defaults.
 
-**Caveats**
+### ZincAI (`zincai/`)
 
-- This is generated, unreviewed output. It works for login/play in theory but has not been
-  smoke-tested against a live 26.3 server from this environment.
-- `MC_VERSION` empty (auto-detect) is the safest setting; the client then negotiates
-  whatever the server speaks.
-- When the PR series merges and a new `minecraft-data` lands on npm, do:
-  ```bash
-  npm install minecraft-data@latest   # or first release containing pc/26.3
-  git rm -r vendor scripts/apply-26.3-data.js
-  # drop the "postinstall" line from package.json
-  ```
-  and verify with `npm ci && npm run dry-run && npm test`.
+A fuller agent with an independent chat-reply lane and an action-planning lane.
+Its action schemas are in `zincai/api_wrapper.js`; it sends
+`tool_choice: "required"` and falls back to `"auto"` if the endpoint rejects
+that setting. If a compatible endpoint ignores tools and returns JSON text, the
+client has a compatibility fallback. ZincAI uses `zincai/config.json` plus
+these environment overrides: `MC_HOST`, `MC_PORT`, `MC_VERSION`, `MC_AUTH`,
+`AMD_API_BASE_URL`, `AMD_MODEL`, `AMD_API_KEY`/`API_KEY`, `ZINC_DATA_DIR`, and
+`LOG_LEVEL`. The bot name is fixed to `ZincAI`.
 
-## Security
+Its action tools are `say`, `go_to`, `follow`, `stop`, `attack`, `hold`,
+`look_in`, `take`, `put`, `smelt`, `sleep`, `give`, `eat`, `equip`,
+`use_block`, `find`, `remember_here`, `craft`, `build`, `build_shape`,
+`run_script`, `set_mode`, and `idle`. The chat lane has one `reply` tool with
+optional task hand-off. There is no `behavior.friends` list or `pvpEnabled`
+switch.
 
-- **Never commit `.env`.** It carries your Radeon Cloud key. This repository currently has a
-  committed `.env` — the key in it must be considered compromised: **rotate it** in the AMD
-  Token Factory dashboard, and remove the file from tracking with `git rm --cached .env`
-  (plus add `.env` to `.gitignore`). History rewriting is optional; rotation is mandatory.
-- The key is never logged or sent anywhere except `AMD_API_BASE_URL`
-  (`redactSecrets` scrubs `rc-…` values from logs and errors).
-- No telemetry. The only outbound connections are `AMD_API_BASE_URL` and your Minecraft server.
+For ZincAI configuration, feature details, persistence, tool semantics, and
+known limits, see [`zincai/README.md`](zincai/README.md).
 
-## Development
+## Checks and tests
 
-```bash
-npm test          # node:test suite (85 tests) — no network, loopback mocks only
-npm run dry-run   # config + prompt validation
-npm run check     # syntax-check every src module
-npm run ping      # reachability + version check of the configured server (no join, no LLM call)
+```sh
+npm test
+npm run check
+node zincai/index.js --check
+API_KEY=rc-dummy node src/index.js --dry-run
+API_KEY=rc-dummy node zincai/index.js --dry-run
 ```
 
-`npm run ping` exits 0 and prints the server's reported version, player count and MOTD
-when the status handshake succeeds — run it before `npm start` if you are unsure whether
-the tunnel is up or which version it speaks.
+The unit/session suites use mocked Mineflayer bots and a scripted local model;
+they do not call the real AMD API or join a production server.
 
-Agent loop, subsystems (combat AI, elytra controller, anti-stuck watchdog, chat guard,
-action parser) are documented in the module headers under `src/`. The end-to-end harness
-used for local verification runs Mineflayer against a loopback
-[flying-squid](https://github.com/PrismarineJS/flying-squid) server — it lives outside the
-repo (`/tmp/e2e/`) and is not required to run the bot.
+### Local Minecraft loopback E2E
 
-## ZincAI (dual-process harness)
+A separate, opt-in loopback rig starts a local `flying-squid` server, a local
+mock model endpoint, and the real Zinc and/or ZincAI process. Gabriel is a
+plain Mineflayer client. It exercises login, player visibility, Portuguese
+chat, real pathfinding, a player-hit/flee scene, explicit player combat, and a
+zombie scene with “no attack before the model decides.” It is deliberately not
+part of `npm test` and never sends a real API key to the mock endpoint.
 
-A second, self-contained harness lives in [`zincai/`](zincai/README.md):
-a Pufferpanel-ready, Qwen 3.8 27B–tuned bot with System 1/System 2 dual-process
-architecture, native OpenAI-compatible tool calling, FOV-frustum perception
-plus 2D ASCII "vision", predictive threat mapping (`PredictiveThreatMap`) and
-semantic structure/material clustering, 3-tier memory with
-ephemeral action buffer and grep-first recall, mathematical shape primitives
-(`build_shape`), scaffold-aware phased + idempotent building with automatic
-scaffold removal, elite weapon-aware combat (85 % cooldown gate, crit timing,
-mace panic, elytra dodge, perpendicular arrow strafing), wind-charge gap/wall
-traversal, a vanilla-only Scout & Relocate startup (no commands, ever), and an
-opt-in instant-PvP reflex.
-It joins as **ZincAI** (the name mandated for it). See `zincai/README.md`.
+```sh
+npm ci
+cd test/e2e
+npm install
+node loopback.js                 # both harnesses (1.16.5; takes a few minutes)
+node loopback.js --only=zinc     # Zinc only
+node loopback.js --only=zincai  # ZincAI only
+```
 
-## License
+The rig's logs go to `test/e2e/logs/` (ignored by Git). Its `flying-squid`
+server includes small compatibility patches for the tab list and knockback.
+Its mobs do not provide normal mob AI, so the run is not evidence of survival
+against a live hostile mob. It does not verify the real AMD endpoint, `/msg`,
+Java 26.3, or production-server behavior. See the E2E script header for the
+exact scope.
 
-MIT
+## Java 26.3 data patch
+
+`npm ci` runs `scripts/apply-26.3-data.js`, which installs vendored,
+unmerged `minecraft-data` files into `node_modules` and adjusts dependency
+version maps. It does not change repo source or the server. The data is
+unofficial and has not been verified against a live 26.3 server from this
+sandbox. Prefer version auto-detection or a server version verified in your
+environment; treat 26.3 protocol/data behavior as unconfirmed.
+
+## Development notes
+
+- `npm run ping` checks server status/version without joining or calling the
+  model.
+- Runtime memory and place data go under `zincai-data/` by default (ignored by
+  Git); set `ZINC_DATA_DIR` to a persistent writable directory for ZincAI.
+- `zincai/README.md` documents the ZincAI tool/action and survival policies.
+- All local edits are branch-scoped; no deployment or live-server changes are
+  performed by the test commands.
+
+MIT License.

@@ -17,7 +17,7 @@
 'use strict'
 
 class ChatGuard {
-  constructor (bot, { cooldownMs = 3000, maxWords = 6, maxChars = 60 } = {}) {
+  constructor (bot, { cooldownMs = 3000, maxWords = 10, maxChars = 100 } = {}) {
     this.bot = bot
     this.cooldownMs = cooldownMs
     this.maxWords = maxWords
@@ -40,14 +40,15 @@ class ChatGuard {
     // Strip markdown / formatting control characters.
     t = t.replace(/[*_~`#>\[\](){}<>|\\]/g, '')
 
-    // Whitelist: lowercase ascii letters, digits, basic punctuation, spaces.
-    t = t.replace(/[^a-z0-9 .,!?'-]/g, ' ')
+    // Whitelist: letters of ANY alphabet, digits, basic punctuation, spaces.
+    // (The old ASCII-only rule turned "Não, eu já comi pão" into "n o, eu j comi p".)
+    t = t.replace(/[^\p{L}\p{N} .,!?'-]/gu, ' ')
 
     // Collapse whitespace.
     t = t.replace(/\s+/g, ' ').trim()
     if (!t) return null
 
-    // Hard cap the length the way a lazy human would: 6 words, 60 chars.
+    // Hard cap the length the way a lazy human would: 10 words, 100 chars.
     const words = t.split(' ')
     t = words.slice(0, this.maxWords).join(' ').slice(0, this.maxChars).trim()
     return t.length > 0 ? t : null

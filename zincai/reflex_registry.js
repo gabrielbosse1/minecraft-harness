@@ -3,34 +3,33 @@
  *
  * No behavior is hardcoded: every reflex is a registered entry with a
  * trigger, an action, an optional cooldown, and (for run_script) a script.
- * Users and the LLM may extend it at runtime:
+ * Operators may extend it at runtime:
  *
  *   const { ReflexRegistry } = require('./reflex_registry')
  *   registry.register({ name: 'say_gm', trigger: 'player_gave_item', action: 'call_system2' })
- *   registry.register({ name: 'flee',   trigger: 'hostile_near', action: 'run_script', script: 'flee.js' })
+ *   registry.register({ name: 'tower', trigger: 'chat', regex: 'torre', action: 'run_script', script: 'build_tower' })
  *
  * Triggers (event.type matched against):
- *   food_low · health_low · hostile_near · player_near · falling · in_water
- *   entity_hurt · item_gained · player_gave_item · chat · any (catch-all)
+ *   threat_near · food_low · health_low · falling · in_water
+ *   hostile_near · player_near · entity_hurt · item_gained · player_gave_item
+ *   chat · any (catch-all)
  * Optional event filters: { radius } on *_near triggers, { regex } on chat,
  * { item } on item_gained / player_gave_item.
  *
  * Actions:
- *   eat            — equip+consume best food
- *   drink_water    — use held water bucket (fall mitigation)
- *   back_jump      — 500ms back+jump pulse
- *   flee           — invert pathfinder goal away from the source entity
+ *   flee           — run from the live threats (System 1 owns the route)
+ *   eat            — eat from the food whitelist, hand restored afterwards
+ *   drink_water    — water-bucket clutch on a fall that would hurt
+ *   elytra         — open the elytra on a long fall
+ *   swim           — hold jump while submerged and idle
+ *   back_jump      — short back+jump hop (keys auto-released)
  *   jump           — single jump pulse
  *   say            — bot.chat(event.text or reflex.text)
  *   run_script     — execute zincai/scripts/<script> with { bot, ctx }
  *   call_system2   — escalate: ask the LLM what to do about this event
- *   engage_pvp     — hand the fight to System 1's PvP loop (mineflayer-pvp); LLM notified after
  *
- * v3 tactical actions (no LLM, no latency — these are the elite-combat reflexes):
- *   panic_retreat  — mace panic: sprint back + LOS block / water bucket
- *   evade_lateral  — elytra/spear lunge: lateral sprint strafe + jump
- *   strafe_ranged  — perpendicular arrow-dodge strafe
- *   combat_tick    — force one combat mechanics tick (cooldown/crit aware)
+ * There is deliberately NO attack action: reflexes never start a fight and
+ * never touch a player. Fighting is the model's explicit decision.
  */
 'use strict'
 
@@ -40,20 +39,18 @@ const fs = require('fs')
 const SCRIPTS_DIR = path.join(__dirname, 'scripts')
 
 const VALID_TRIGGERS = new Set([
-  'food_low', 'health_low', 'hostile_near', 'player_near', 'falling', 'in_water',
-  'entity_hurt', 'item_gained', 'player_gave_item', 'chat', 'any',
-  // v3 tactical triggers — emitted by System1's zero-latency threat scan.
-  'mace_threat', 'elytra_lunge', 'ranged_threat', 'melee_window'
+  'threat_near', 'food_low', 'health_low', 'falling', 'in_water',
+  'hostile_near', 'player_near', 'entity_hurt', 'item_gained', 'player_gave_item', 'chat', 'any'
 ])
 const VALID_ACTIONS = new Set([
-  'eat', 'drink_water', 'back_jump', 'flee', 'jump', 'say', 'run_script', 'call_system2', 'engage_pvp',
-  // v3 tactical actions — implemented by AdvancedCombat / System1, never an LLM call.
-  'panic_retreat', 'evade_lateral', 'strafe_ranged', 'combat_tick'
+  'flee', 'eat', 'drink_water', 'elytra', 'swim', 'back_jump', 'jump', 'say', 'run_script', 'call_system2'
 ])
 
 /** Load and execute a user script with the reflex context. Trusted local code. */
 async function runScript (scriptName, event, ctx) {
-  const safe = String(scriptName || '').replace(/[^a-z0-9_-]/gi, '').replace(/\.js$/, '')
+  // Strip the extension BEFORE sanitising: the old order turned "flee.js" into
+  // "fleejs" and reported the documented name as "not found".
+  const safe = String(scriptName || '').trim().replace(/\.js$/i, '').replace(/[^a-z0-9_-]/gi, '')
   if (!safe) throw new Error('run_script: empty script name')
   const file = path.join(SCRIPTS_DIR, `${safe}.js`)
   if (!fs.existsSync(file)) throw new Error(`run_script: "${safe}" not found in zincai/scripts/`)
@@ -154,10 +151,12 @@ class ReflexRegistry {
   async _runAction (r, event, ctx) {
     const { bot } = ctx
     switch (r.action) {
-      case 'eat': return (ctx.system1?.eat?.(), 'eat')
-      case 'drink_water': return (ctx.system1?.useWaterBucket?.(), 'drink_water')
-      case 'back_jump': return (ctx.system1?.backJump?.(), 'back_jump')
-      case 'flee': return ctx.pathfinder ? ctx.pathfinder._fleeTick?.() : 'no_pathfinder'
+      case 'flee': return ctx.system1?.flee?.(event) ?? 'no_system1'
+      case 'eat': return ctx.system1?.eat?.(event) ?? 'no_system1'
+      case 'drink_water': return ctx.system1?.useWaterBucket?.(event) ?? 'no_system1'
+      case 'elytra': return ctx.system1?.deployElytra?.(event) ?? 'no_system1'
+      case 'swim': return ctx.system1?.swim?.(event) ?? 'no_system1'
+      case 'back_jump': return ctx.system1?.backJump?.(event) ?? 'no_system1'
       case 'jump':
         bot?.setControlState?.('jump', true)
         setTimeout(() => { try { bot.setControlState('jump', false) } catch { /* gone */ } }, 250)
@@ -171,11 +170,6 @@ class ReflexRegistry {
       }
       case 'run_script': return runScript(r.script, event, ctx)
       case 'call_system2': return ctx.escalate ? ctx.escalate(event) : 'no_escalation_channel'
-      case 'engage_pvp': return ctx.system1?.engageNearestPlayer?.(event) ?? 'pvp_unavailable'
-      case 'panic_retreat': return ctx.system1?.panicRetreat?.(event) ?? 'no_system1'
-      case 'evade_lateral': return ctx.system1?.evadeLateral?.(event) ?? 'no_system1'
-      case 'strafe_ranged': return ctx.system1?.strafeRanged?.(event) ?? 'no_system1'
-      case 'combat_tick': return ctx.system1?.combatTick?.(event) ?? 'no_system1'
       default: return 'unknown_action'
     }
   }

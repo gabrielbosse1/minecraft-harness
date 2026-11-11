@@ -44,6 +44,27 @@ test('delta buffer caps at 5 events and folds the rest into <=10-word memory', (
   assert.ok(buf.memory.includes('chat Steve') || buf.memory.includes('hp change'), `memory keeps salient facts: ${buf.memory}`)
 })
 
+test('delta buffer: a chat line survives a burst of other events; commit only consumes what was shown', () => {
+  const buf = new DeltaBuffer()
+  buf.push({ type: 'chat', user: 'Gabriel', msg: 'zinc, pega 3 diamantes pra mim' })
+  for (let i = 0; i < 5; i++) buf.push({ type: 'combat', msg: 'hit zombie (sword)' })
+  const body = buf.buildBody('vitals')
+  assert.ok(body.includes('pega 3 diamantes'), 'the request is still in the prompt after five hits')
+  // An event that arrives while the model call is in flight was not shown…
+  buf.push({ type: 'chat', user: 'Pedro', msg: 'zinc?' })
+  buf.commit()
+  // …so it must still be there for the next call.
+  assert.equal(buf.pending.length, 1)
+  assert.equal(buf.pending[0].event.user, 'Pedro')
+})
+
+test('system prompt: one honest identity and the players\' language', () => {
+  assert.ok(/admit you are a bot/i.test(SYSTEM_PROMPT))
+  assert.ok(!/not an AI/i.test(SYSTEM_PROMPT), 'the "never reveal it" instruction is gone')
+  assert.ok(/Brazilian Portuguese/.test(SYSTEM_PROMPT))
+  assert.ok(/Never attack a player unless/.test(SYSTEM_PROMPT))
+})
+
 test('delta buffer body contains vitals + memory + events, commit() clears', () => {
   const buf = new DeltaBuffer()
   buf.push({ type: 'chat', user: 'Alex', msg: 'gg' })
@@ -79,10 +100,13 @@ test('memory phrase mapping is short and deterministic', () => {
 })
 
 // ---------------------------------------------------------------- chat guard
-test('chat sanitizer enforces lowercase, 6 words, md/emoji/url stripping', () => {
+test('chat sanitizer enforces lowercase, 10 words, md/emoji/url stripping — and keeps accents', () => {
   const bot = { chat () {} }
   const guard = new ChatGuard(bot, { cooldownMs: 3000 })
-  assert.equal(guard.sanitize('HELLO THERE STEVE THIS IS WAY TOO MANY WORDS OK'), 'hello there steve this is way')
+  assert.equal(guard.sanitize('HELLO THERE STEVE THIS IS WAY TOO MANY WORDS OK FOR ONE LINE'), 'hello there steve this is way too many words ok')
+  // Accents survive: the players here write Portuguese.
+  assert.equal(guard.sanitize('Não, eu já comi pão hoje. Você está bem?'), 'não, eu já comi pão hoje. você está bem?')
+  assert.equal(guard.sanitize('tô indo, peraí'), 'tô indo, peraí')
   assert.equal(guard.sanitize('**bold** _italic_ `code`'), 'bold italic code')
   assert.equal(guard.sanitize('gg 🎉🔥 wp'), 'gg wp')
   assert.equal(guard.sanitize('check https://example.com/x out'), 'check out')

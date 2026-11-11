@@ -19,9 +19,13 @@
     "maxRetries": 2
   },
   "inference": {
+    "_note": "Two lanes: chat (answers people) and action (drives the body). Wake-ups are queued, never dropped. rpm is the shared calls-per-minute budget; heartbeatMs is the self-prompt when nothing happens (0 = off).",
     "minIntervalMs": 3000,
-    "idleIntervalMs": 15000,
-    "maxSelfChain": 12
+    "chatMinIntervalMs": 1200,
+    "rpm": 18,
+    "heartbeatMs": 90000,
+    "maxSelfChain": 12,
+    "chatMaxTokens": 120
   },
   "memory": {
     "file": "zincai-data/memories.json",
@@ -32,18 +36,19 @@
     "preferencesFile": "zincai-data/preferences.json"
   },
   "behavior": {
+    "_note": "No friend list and no PvP switch: the bot never attacks a player unless the model names that player in the attack tool. Its reflex toward every real threat is to flee until the model decides.",
+    "aliases": [
+      "zinc"
+    ],
     "allowDigging": false,
+    "allowScaffolding": false,
     "engageRadius": 24,
     "fovDegrees": 90,
     "perceptionRange": 10,
-    "friends": [],
-    "chatCooldownMs": 3000,
+    "chatCooldownMs": 1500,
     "useArmorManager": true,
     "mode": "explorer",
-    "fleeRadius": 8,
     "perception3D": false,
-    "pvpEnabled": false,
-    "pvpRange": 15,
     "autoElytra": true
   },
   "build": {
@@ -56,29 +61,35 @@
     "autoRemoveScaffold": true
   },
   "system1": {
+    "_note": "Survival reflexes. eatBelowFood: eat under this hunger (never wasting food). lowHealth: eat a golden apple if carried. fleeBelowHealth: too hurt to honour earlier decisions - flee from everything. mlgFallBlocks: shortest fall worth a water-bucket clutch. fleeDistance: how far to run.",
     "eatBelowFood": 18,
-    "drinkWaterItems": [
-      "water_bucket"
-    ],
-    "fallVelocityThreshold": -0.35,
+    "lowHealth": 10,
+    "fleeBelowHealth": 6,
+    "mlgFallBlocks": 5,
+    "fleeDistance": 14,
     "tickMs": 200
   },
   "combat": {
-    "_note": "Elite System-1 combat. critThreshold gates every swing on the vanilla attack indicator (0.85 = >=85% charged, max-damage window).",
-    "critThreshold": 0.85,
+    "_note": "Only ever started by the attack tool. critThreshold is the fraction of the attack indicator required before a swing; vanilla cannot crit below 0.9, so values under 0.9 are raised to 0.9.",
+    "critThreshold": 1.0,
     "recoveryMs": 220,
     "attackCooldownMs": 600,
-    "disengageHealthFraction": 0.3
+    "disengageHealthFraction": 0.3,
+    "maxChainKills": 6
   },
   "threat": {
-    "_note": "PredictiveThreatMap: project hostile velocity 40 ticks (~2s) ahead and inject node penalties into A*.",
+    "_note": "What counts as a threat (threats.js) and how A* avoids it (PredictiveThreatMap). radius/rangedRadius: how far hostile mobs matter (melee / ranged). attackerMemoryMs: how long something that hit the bot stays a threat. Players are never threats unless they hit the bot.",
     "horizonTicks": 40,
     "sampleMs": 200,
     "maxRadius": 24,
     "penaltyScale": 26,
     "maxPenalty": 60,
-    "includePlayers": false,
-    "maxSpeed": 1.0
+    "maxSpeed": 1.0,
+    "radius": 12,
+    "rangedRadius": 18,
+    "attackerMemoryMs": 15000,
+    "maxThreats": 48,
+    "corridorClear": 3
   },
   "traversal": {
     "_note": "Wind-charge traversal. Used only when A* reports noPath across a 3-5 wide gap or <=4 high wall.",
@@ -89,7 +100,8 @@
     "maxWall": 4
   },
   "scout": {
-    "_note": "Startup/respawn Scout & Relocate. Evaluates a 30x30 area and WALKS to the safest anchor; never /tp or /setworldspawn.",
+    "_note": "Optional startup Scout & Relocate (walks to the safest nearby anchor). OFF by default: the bot now stays where it spawns (its bed) and the flee reflex handles danger.",
+    "enabled": false,
     "radius": 15,
     "step": 3,
     "minRadius": 5,
@@ -98,5 +110,17 @@
     "waitForWorldMs": 6000,
     "relocateTimeoutMs": 25000,
     "deathAvoidRadius": 12
+  },
+  "reconnect": {
+    "_note": "After a session that had spawned successfully, reconnect with back-off when the server restarts or the link drops. A rejection on the FIRST join (whitelist, name) is still fatal: no retries, no renames.",
+    "enabled": true,
+    "baseDelayMs": 5000,
+    "maxDelayMs": 120000,
+    "maxAttempts": 40
+  },
+  "places": {
+    "_note": "Place memory: chests, furnaces, beds, signs seen while walking, plus named places. Stored in zincai-data/places.json.",
+    "file": "zincai-data/places.json",
+    "scanRadius": 16
   }
 }

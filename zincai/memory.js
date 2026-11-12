@@ -182,7 +182,8 @@ class LongTermMemory {
     const vector = embed(clean)
     for (const e of this.entries) {
       if (e.text === clean && JSON.stringify(e.provenance || null) === JSON.stringify(provenance)) return e // preserve distinct sources
-      if (!provenance && !e.provenance && e._vec && cosine(e._vec, vector) > 0.92 && Math.abs(e.importance - importance) <= 1) {
+      const ev = e._vec || (e._vec = embed(e.text))
+      if (!provenance && !e.provenance && cosine(ev, vector) > 0.92 && Math.abs(e.importance - importance) <= 1) {
         e.ts = Date.now()
         return e
       }
@@ -197,6 +198,25 @@ class LongTermMemory {
     }
     this.save()
     return entry
+  }
+
+  /** Replace an existing non-provenanced entry sharing a tag (e.g. "container:chest1") or add fresh. */
+  upsertByTag (tag, text, tags = [], importance = 1) {
+    const clean = String(text).trim()
+    if (!clean || !tag) return this.add(text, tags, importance)
+    const idx = this.entries.findIndex((e) => !e.provenance && Array.isArray(e.tags) && e.tags.includes(tag))
+    if (idx >= 0) {
+      const existing = this.entries[idx]
+      if (existing.text === clean) { existing.ts = Date.now(); return existing }
+      existing.text = clean
+      existing.tags = tags.includes(tag) ? tags : [tag, ...tags]
+      existing.importance = importance
+      existing.ts = Date.now()
+      existing._vec = embed(clean)
+      this.save()
+      return existing
+    }
+    return this.add(clean, tags.includes(tag) ? tags : [tag, ...tags], importance)
   }
 
   /**

@@ -44,115 +44,115 @@ const backoffMs = (attempt) => Math.min(8_000, 500 * 2 ** attempt) + Math.floor(
 // ---------------------------------------------------------------------------
 const STR = (description) => ({ type: 'string', description })
 const INT = (description) => ({ type: 'integer', description })
-const STAGE = STR('Build phase: foundation | walls_with_windows | roof | interior_details. One phase per call; re-runs are idempotent.')
-const AT = { type: 'array', description: 'Absolute [x,y,z] origin; default: bot feet.', items: { type: 'integer' }, minItems: 3, maxItems: 3 }
+const STAGE = STR('Phase: foundation | walls_with_windows | roof | interior_details.')
+const AT = { type: 'array', description: 'Origin [x,y,z]; default: feet.', items: { type: 'integer' }, minItems: 3, maxItems: 3 }
 const tool = (name, description, properties = {}, required = []) => ({ name, description, parameters: { type: 'object', properties, ...(required.length ? { required } : {}) } })
 
 const ACTION_TOOLS = [
-  tool('say', 'Say one short chat line. Set `to` for a private message to one player.', {
-    text: STR('Plain text, max 200 chars, always in Brazilian Portuguese.'),
-    to: STR('Player name for a private message (optional).')
+  tool('say', 'Send one short PT-BR chat line (`to` = private).', {
+    text: STR('PT-BR text, max 200 chars.'),
+    to: STR('Recipient player (optional).')
   }, ['text']),
-  tool('go_to', 'Walk somewhere: a player, a remembered place or a listed id (chest2, bed1), or coordinates. You are told when you arrive or fail.', {
+  tool('go_to', 'Walk to a player, saved place, nearby id (chest2, bed1), or [x,y,z].', {
     player: STR('Player name.'),
-    place: STR('Remembered place name or an id from "nearby".'),
-    x: INT('X coordinate.'),
-    y: INT('Y coordinate (optional).'),
-    z: INT('Z coordinate.')
+    place: STR('Saved place or nearby id.'),
+    x: INT('X.'),
+    y: INT('Y (optional).'),
+    z: INT('Z.')
   }),
-  tool('follow', 'Follow a player until you call stop or another movement.', { player: STR('Player name.') }, ['player']),
-  tool('stop', 'Request cancellation of the current task, follow or fight and paused tasks. Survival may keep moving; an in-progress operation may still place or clean up blocks after stop.'),
-  tool('attack', 'Fight. The ONLY way a fight ever starts. `target` = exact mob type ("zombie") or "any" hostile mob. `player` = exact player name — PvP on your explicit decision.', {
-    target: STR('Mob type, or "any".'),
+  tool('follow', 'Follow a player until stopped.', { player: STR('Player name.') }, ['player']),
+  tool('stop', 'Cancel current task, follow, fight and paused tasks.'),
+  tool('attack', 'Fight. The ONLY way a fight ever starts. `target` = mob id or "any"; `player` = exact PvP target.', {
+    target: STR('Mob type or "any".'),
     player: STR('Exact player name (PvP).'),
-    count: INT('How many to kill. Default: ONE animal; hostile mobs: keep going while more of them come.')
+    count: INT('Kill limit (default 1 animal; chain hostiles).')
   }),
-  tool('hold', 'Stop fleeing from the threats listed now: they are harmless or you accept the risk. Your task carries on. A hit from one of them, a lit fuse or a new threat makes you flee again.'),
-  tool('look_in', 'Open a container and read its contents. Empty `where` = nearest.', { where: STR('Id from "nearby" (chest2), a label, or empty.') }),
-  tool('take', 'Take items from a container, or the output of a furnace (name the furnace in `where`).', {
-    item: STR('Item id, e.g. "diamond".'),
-    count: INT('How many (default: all).'),
-    where: STR('Container id or label. Default: a container already known to hold it.')
+  tool('hold', 'Accept currently listed threats and continue task unless hit/new threat/lit fuse.'),
+  tool('look_in', 'Open container and list contents (empty = nearest).', { where: STR('Id, label, or empty.') }),
+  tool('take', 'Take items from a container or furnace output.', {
+    item: STR('Item id.'),
+    count: INT('Amount (default all).'),
+    where: STR('Id, label, or known source.')
   }, ['item']),
   tool('put', 'Put carried items into a container.', {
     item: STR('Item id.'),
-    count: INT('How many (default: all).'),
-    where: STR('Container id or label (default: nearest).')
+    count: INT('Amount (default all).'),
+    where: STR('Id or label (default nearest).')
   }, ['item']),
-  tool('smelt', 'Load the nearest furnace with an item (fuel is added from your inventory) and walk away. Collect later with take.', {
+  tool('smelt', 'Load furnace with item + carried fuel; collect output with take.', {
     item: STR('Item id to smelt.'),
-    count: INT('How many (default: all).'),
-    where: STR('Furnace id (default: nearest).')
+    count: INT('Amount (default all).'),
+    where: STR('Furnace id (default nearest).')
   }, ['item']),
-  tool('sleep', 'Sleep in the nearest bed (night or thunderstorm only).'),
-  tool('give', 'Walk to a player and toss them an item.', {
+  tool('sleep', 'Sleep in nearest bed (night/thunderstorm).'),
+  tool('give', 'Walk to player and toss item.', {
     player: STR('Player name.'),
     item: STR('Item id.'),
-    count: INT('How many (default 1).')
+    count: INT('Amount (default 1).')
   }, ['player', 'item']),
-  tool('eat', 'Eat now. Empty `item` = best safe food carried. (Hunger is normally handled by reflex.)', { item: STR('Item id (optional).') }),
-  tool('equip', 'Equip a carried item by name.', {
+  tool('eat', 'Eat safe food now (empty = best carried).', { item: STR('Food id (optional).') }),
+  tool('equip', 'Equip carried item by name.', {
     item: STR('Item id.'),
     where: { type: 'string', enum: ['hand', 'off-hand', 'head', 'torso', 'legs', 'feet'] }
   }, ['item']),
-  tool('use_block', 'Walk to the nearest block of this name and right-click it (door, gate, lever, button, bell).', { what: STR('Block id.') }, ['what']),
-  tool('inspect_block', 'Read one nearby loaded block and its reported state; no redstone behavior is inferred.', { x: INT('Block X.'), y: INT('Block Y.'), z: INT('Block Z.') }, ['x', 'y', 'z']),
-  tool('inspect_region', 'Page through a small nearby 3D region as read-only block snapshots; unknown cells and omitted details are labeled. No circuit trace.', { x: INT('Center X.'), y: INT('Center Y.'), z: INT('Center Z.'), radius: INT('Radius 0–2; default 1.'), page: INT('Page, default 1; four cells per page.') }, ['x', 'y', 'z']),
-  tool('redstone_scan', 'Read-only local circuit snapshot and relationship summary; no power inferred. Scan with coordinates, then page using snapshot id.', { x: INT('Center X for new scan.'), y: INT('Center Y for new scan.'), z: INT('Center Z for new scan.'), radius: INT('Radius 0–2, default 1.'), snapshot: STR('Existing snapshot id (omit coordinates and radius).'), page: INT('Component page, default 1.') }),
-  tool('redstone_component', 'Inspect a captured component state and paginated evidence-labeled neighbors. Neither connectivity nor power is guaranteed.', { snapshot: STR('Snapshot id from redstone_scan.'), x: INT('Component X.'), y: INT('Component Y.'), z: INT('Component Z.'), page: INT('Neighbor page, default 1.') }, ['snapshot', 'x', 'y', 'z']),
-  tool('find', 'Where is it? A block type, an item (searches the containers you opened), a chest label, or "storage" to list every container around.', {
-    what: STR('Block or item id, a label, or "storage".'),
-    page: INT('Page of the storage list (default 1).')
+  tool('use_block', 'Walk to nearest matching block and right-click it.', { what: STR('Block id.') }, ['what']),
+  tool('inspect_block', 'Read one loaded block and state; no power inferred.', { x: INT('X.'), y: INT('Y.'), z: INT('Z.') }, ['x', 'y', 'z']),
+  tool('inspect_region', 'Read-only paginated 3D block snapshot around [x,y,z]; no circuit trace.', { x: INT('X.'), y: INT('Y.'), z: INT('Z.'), radius: INT('0–2, default 1.'), page: INT('Page, default 1.') }, ['x', 'y', 'z']),
+  tool('redstone_scan', 'Read-only local redstone snapshot (start with x,y,z; page with snapshot id).', { x: INT('X.'), y: INT('Y.'), z: INT('Z.'), radius: INT('0–2, default 1.'), snapshot: STR('Existing snapshot id.'), page: INT('Page, default 1.') }),
+  tool('redstone_component', 'Inspect captured redstone component state and neighbors.', { snapshot: STR('Snapshot id.'), x: INT('X.'), y: INT('Y.'), z: INT('Z.'), page: INT('Page, default 1.') }, ['snapshot', 'x', 'y', 'z']),
+  tool('find', 'Find block type, item in opened containers, chest label, or "storage".', {
+    what: STR('Id, label, or "storage".'),
+    page: INT('Storage page (default 1).')
   }, ['what']),
-  tool('remember_here', 'Save the current position under a name (home, mina, casa do Gabriel).', {
+  tool('remember_here', 'Save current position under a place name.', {
     name: STR('Place name.'),
     note: STR('Optional note.')
   }, ['name']),
-  tool('craft', 'Craft an item from the 2x2/3x3 grid if materials are available. Walks to the table itself if needed.', { item: STR('Item id, e.g. "crafting_table".') }, ['item']),
-  tool('gather', 'Dig a raw resource nearby: logs, ores, soils. Only named resource types are dug. They may be part of player builds; do not gather near structures without authorization. Ores need a good enough pickaxe carried.', {
-    item: STR('Resource id or alias, e.g. "oak_log", "coal", "iron", "diamond", "stone", "sand".'),
-    count: INT('How many to dig (default 1, max 64).'),
-    radius: INT('Search radius in blocks (default 32).')
+  tool('craft', 'Craft item (walks to nearby table if needed).', { item: STR('Item id.') }, ['item']),
+  tool('gather', 'Dig named raw logs/ores/soils nearby (avoid unauthorized builds; ores need pickaxe).', {
+    item: STR('Resource id/alias (oak_log, iron, stone…).'),
+    count: INT('Count 1–64 (default 1).'),
+    radius: INT('Radius (default 32).')
   }, ['item']),
-  tool('light_up', 'Place torches from the inventory onto dark walkable floor around you. Needs torches carried.', {
-    radius: INT('How far around to look for dark spots (default 8, max 16).')
+  tool('light_up', 'Place carried torches on dark walkable floors nearby.', {
+    radius: INT('Radius 2–16 (default 8).')
   }),
-  tool('shelter', 'Attempt to pillar up using scaffold from your inventory; this is not guaranteed cover from melee or arrows. Stop attempts scaffold cleanup.'),
-  tool('corpse_run', 'Walk near the remembered "last death" place and report nearby observed item stacks. Pickup is not verified; fails if no death was recorded or it is in another dimension.'),
-  tool('logic_test', 'Test an ABSTRACT combinational Boolean graph, NOT Minecraft redstone. Gates are topologically ordered; no cycles or timing. Results cannot locate physical faults.', {
-    inputs: { type: 'array', description: '1–9 unique signal ids. Bit strings use this order.', items: STR('Signal id'), minItems: 1, maxItems: 9 },
-    gates: { type: 'array', description: 'Up to 128 gates in topological order.', maxItems: 128, items: { type: 'object', properties: { id: STR('New signal id'), op: { type: 'string', enum: ['AND', 'OR', 'XOR', 'NOT', 'BUF', 'NAND', 'NOR', 'FULL_SUM', 'FULL_CARRY'] }, inputs: { type: 'array', description: 'NOT/BUF: one input; FULL_SUM/FULL_CARRY: A,B,carry; others: two. Reference earlier signals.', items: STR('Signal id'), minItems: 1, maxItems: 3 } }, required: ['id', 'op', 'inputs'], additionalProperties: false } },
-    outputs: { type: 'array', description: '1–9 output signal ids; output bits use this order.', items: STR('Signal id'), minItems: 1, maxItems: 9 },
-    tests: { type: 'array', description: '1–512 explicit test vectors, or omit for adder_width.', minItems: 1, maxItems: 512, items: { type: 'object', properties: { in_bits: STR('0/1 input bits in declared order'), out_bits: STR('Expected 0/1 output bits in declared order') }, required: ['in_bits', 'out_bits'], additionalProperties: false } },
-    adder_width: INT('Instead of tests, exhaustively check unsigned adder width 1–4. Input order: A LSB first, B LSB first, carry-in; output: sum LSB first, carry-out.'),
-    project: STR('Optional project name to save this validated graph and test result.')
+  tool('shelter', 'Pillar up with carried scaffold blocks (stop cleans up).'),
+  tool('corpse_run', 'Walk near "last death" and report observed item stacks.'),
+  tool('logic_test', 'Test ABSTRACT combinational Boolean graph (not MC redstone; acyclic gates).', {
+    inputs: { type: 'array', description: '1–9 input signal ids.', items: STR('Signal id'), minItems: 1, maxItems: 9 },
+    gates: { type: 'array', description: 'Up to 128 topological gates.', maxItems: 128, items: { type: 'object', properties: { id: STR('Signal id'), op: { type: 'string', enum: ['AND', 'OR', 'XOR', 'NOT', 'BUF', 'NAND', 'NOR', 'FULL_SUM', 'FULL_CARRY'] }, inputs: { type: 'array', description: '1–3 earlier signal ids.', items: STR('Signal id'), minItems: 1, maxItems: 3 } }, required: ['id', 'op', 'inputs'], additionalProperties: false } },
+    outputs: { type: 'array', description: '1–9 output signal ids.', items: STR('Signal id'), minItems: 1, maxItems: 9 },
+    tests: { type: 'array', description: '1–512 test vectors (or use adder_width).', minItems: 1, maxItems: 512, items: { type: 'object', properties: { in_bits: STR('Input bits'), out_bits: STR('Expected bits') }, required: ['in_bits', 'out_bits'], additionalProperties: false } },
+    adder_width: INT('Exhaustive unsigned adder width 1–4 (A, B, Cin -> S, Cout).'),
+    project: STR('Optional project name to save.')
   }, ['inputs', 'gates', 'outputs']),
-  tool('circuit_project', 'Save an observed snapshot summary, inspect a named investigation, or rerun its saved ABSTRACT logic test. Nothing is built or physically simulated.', {
+  tool('circuit_project', 'Bind snapshot, show project/graph, or rerun saved ABSTRACT logic test.', {
     operation: { type: 'string', enum: ['bind', 'show', 'graph', 'test', 'list'] },
-    name: STR('Project name: letters, digits, underscores or hyphens, max 32.'),
-    snapshot: STR('For bind: snapshot id from redstone_scan.'),
-    page: INT('For graph: gate page, default 1.'),
-    note: STR('For bind: optional hypothesis, max 240 characters; not an observed fact.')
+    name: STR('Project name (max 32).'),
+    snapshot: STR('For bind: snapshot id.'),
+    page: INT('For graph: page, default 1.'),
+    note: STR('For bind: note (max 240 chars).')
   }, ['operation']),
-  tool('build', 'Build a stored blueprint or an inline grid. Prefer build_shape for large/simple geometry.', {
-    blueprint: STR('Name of a file in zincai/blueprints/ (without .json).'),
-    grid: { type: 'array', description: 'Inline 3D layers (bottom-to-top); each layer is rows of palette chars; "." or " " is air. MUST come with "palette".', items: { type: 'array', items: { type: 'string' } } },
-    palette: { type: 'object', description: 'Required with grid: maps each char to a block id, e.g. {"#":"stone_bricks","G":"glass"}.', additionalProperties: { type: 'string' } },
+  tool('build', 'Build blueprint or inline grid+palette.', {
+    blueprint: STR('Blueprint name in zincai/blueprints/.'),
+    grid: { type: 'array', description: '3D bottom-up layers of palette strings ("."/" " = air).', items: { type: 'array', items: { type: 'string' } } },
+    palette: { type: 'object', description: 'Char -> block id map.', additionalProperties: { type: 'string' } },
     at: AT,
     stage: STAGE
   }),
-  tool('build_shape', 'Mathematically generate and build a geometric primitive — never place big builds by hand.', {
+  tool('build_shape', 'Generate and build a geometric shape.', {
     shape: { type: 'string', enum: ['cylinder', 'dome', 'arch', 'wall', 'box', 'floor', 'ring'] },
-    params: { type: 'object', description: 'Shape params: cylinder {r,h}; dome {r}; arch {w,h}; wall {l,h,axis}; box {w,d,h}; floor {w,d}; ring {r}. Optional th on cylinder/dome/arch/wall/box/ring; filled boolean on cylinder/box. Dimensions are integers 1–128 (dome/ring r >= 2, arch w/h >= 3); oversized plans are refused.' },
-    block: STR('Block id, e.g. "stone_bricks".'),
+    params: { type: 'object', description: 'cylinder {r,h}; dome {r}; arch {w,h}; wall {l,h,axis}; box {w,d,h}; floor {w,d}; ring {r}. Optional th, filled; ints 1–128 (dome/ring r>=2, arch w/h>=3).' },
+    block: STR('Block id.'),
     at: AT,
     stage: STAGE
   }, ['shape', 'block']),
-  tool('run_script', 'Run a saved automation script from zincai/scripts/ (e.g. build_tower).', { name: STR('Script name.') }, ['name']),
-  tool('set_mode', 'Switch movement mode: builder (no sprint, no drops), hunter (sprint + jump-run), explorer (default).', {
+  tool('run_script', 'Run saved script in zincai/scripts/.', { name: STR('Script name.') }, ['name']),
+  tool('set_mode', 'Switch movement mode: builder | hunter | explorer.', {
     mode: { type: 'string', enum: ['builder', 'hunter', 'explorer'] }
   }, ['mode']),
-  tool('idle', 'Do nothing this turn. While you are FLEEING this means: keep fleeing.')
+  tool('idle', 'Wait this turn (while fleeing: keep fleeing).')
 ]
 
 /** The chat lane has exactly one tool: answer, and optionally hand over a task. */
@@ -246,8 +246,24 @@ function coerceAction (message, strict = true) {
   }
 
   // Fallback: endpoint ignored `tools` and answered with plain content —
-  // recover the legacy single-line JSON contract rather than crash.
-  const content = typeof message?.content === 'string' ? message.content : ''
+  // strip <think> blocks, recover leaked <tool_call> XML tags, or recover
+  // the legacy single-line JSON contract rather than failing.
+  const rawContent = typeof message?.content === 'string' ? message.content : ''
+  const stripped = rawContent.replace(/<think>[\s\S]*?<\/think>/gi, '').trim()
+  const toolTag = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/i.exec(stripped)
+  if (toolTag) {
+    try {
+      const tc = JSON.parse(toolTag[1].trim())
+      if (tc && typeof tc === 'object' && typeof tc.name === 'string') {
+        const parsed = parseToolCall({ function: { name: tc.name, arguments: tc.arguments ?? {} } }, ACTION_TOOLS)
+        if (parsed.error === 'unknown') return strict ? { a: 'idle', _unknownTool: parsed.name } : null
+        if (parsed.error === 'args') return strict ? { a: 'idle', _badArgs: parsed.name } : null
+        const mapped = ARG_LEGACY[parsed.name] ? ARG_LEGACY[parsed.name](parsed.args) : { ...parsed.args }
+        return { ...mapped, a: parsed.name, _via: 'tool' }
+      }
+    } catch { /* fall through to JSON/prose */ }
+  }
+  const content = stripped
   const fence = /```(?:json)?\s*([\s\S]*?)```/.exec(content)
   const s = (fence ? fence[1] : content).trim()
   const line = s.split('\n').find((l) => l.trim().startsWith('{')) || s
@@ -269,9 +285,10 @@ function coerceAction (message, strict = true) {
       return { ...mapped, a: name, _via: 'json-fallback' }
     }
   } catch { /* fall through */ }
-  if (content) logger.warn(TAG, `model answered in prose without a tool call: ${content.slice(0, 120)}`)
+  const prose = content || rawContent.trim()
+  if (prose) logger.warn(TAG, `model answered in prose without a tool call: ${prose.slice(0, 120)}`)
   // Prose used to vanish silently. Keep it so the caller can report it back.
-  return strict ? { a: 'idle', _fallback: true, ...(content.trim() ? { _prose: content.trim().slice(0, 300) } : {}) } : null
+  return strict ? { a: 'idle', _fallback: true, ...(prose ? { _prose: prose.slice(0, 300) } : {}) } : null
 }
 
 /**
@@ -333,7 +350,7 @@ class AmdToolsClient {
    * Drop-in replacement for AmdClient at the call site, with the same
    * constructor contract and the same getStats() shape (plus tool metrics).
    */
-  constructor ({ apiKey, baseUrl, model, timeoutMs = 20_000, maxRetries = 2, temperature = 0.25, maxTokens = 256, toolChoice = 'required', maxConcurrent = 2, chatTimeoutMs = null, chatMaxRetries = 1 }) {
+  constructor ({ apiKey, baseUrl, model, timeoutMs = 20_000, maxRetries = 2, temperature = 0.25, maxTokens = 512, toolChoice = 'required', maxConcurrent = 2, chatTimeoutMs = null, chatMaxRetries = 1 }) {
     if (!apiKey) {
       // Never include the (missing) key in the error — only the variable name.
       throw new Error('AMD API key missing: set AMD_API_KEY (or API_KEY) in .env')
@@ -363,11 +380,26 @@ class AmdToolsClient {
     // 2 = one call per lane at a time. 1 = strictly one call at a time (for an
     // endpoint that refuses parallel requests); chat still jumps the queue.
     this.maxConcurrent = Math.max(1, Math.trunc(Number(maxConcurrent)) || 1)
-    // A chat reply that arrives a minute late is worth nothing: shorter leash.
-    this.chatTimeoutMs = Number.isFinite(chatTimeoutMs) && chatTimeoutMs > 0 ? chatTimeoutMs : Math.min(timeoutMs, 12_000)
+    // Chat gets a slightly tighter budget than action, without starving slow endpoints.
+    this.chatTimeoutMs = Number.isFinite(chatTimeoutMs) && chatTimeoutMs > 0 ? chatTimeoutMs : Math.min(timeoutMs, 90_000)
     this.chatMaxRetries = Math.max(0, Math.min(maxRetries, Math.trunc(Number(chatMaxRetries)) || 0))
     this._queue = [] // { lane, run, resolve, reject }
     this._running = new Set() // lanes with a call in flight
+    this._latencies = [] // recent successful call durations (ms) for adaptive timeout scaling
+  }
+
+  _recordLatency (ms) {
+    if (!Number.isFinite(ms) || ms <= 0) return
+    this._latencies.push(ms)
+    if (this._latencies.length > 16) this._latencies.shift()
+  }
+
+  _effectiveTimeoutMs (baseMs, maxCapMs = 180_000) {
+    // Preserve explicit short timeouts used in unit tests and low-timeout configs.
+    if (!Number.isFinite(baseMs) || baseMs < 10_000 || this._latencies.length < 2) return baseMs
+    const sorted = [...this._latencies].sort((a, b) => a - b)
+    const p90 = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.9))]
+    return Math.min(maxCapMs, Math.max(baseMs, Math.round(p90 * 1.5)))
   }
 
   async _fetchWithTimeout (url, options, timeoutMs) {
@@ -426,6 +458,7 @@ class AmdToolsClient {
       attempt += 1
       this.stats.requests += 1
       const payload = buildToolsPayload({ model: this.model, messages, temperature, maxTokens, tools, toolChoice: this.toolChoice })
+      const startedAt = Date.now()
       try {
         const res = await this._fetchWithTimeout(url, { method: 'POST', headers, body: JSON.stringify(payload) }, timeoutMs)
 
@@ -456,6 +489,7 @@ class AmdToolsClient {
           this.stats.failures += 1
           throw new Error('Malformed response: choices[0].message has neither content nor tool_calls')
         }
+        this._recordLatency(Date.now() - startedAt)
         const usage = parseUsage(data?.usage)
         if (usage.promptTokens !== null) {
           this.stats.promptTokens += usage.promptTokens
@@ -491,44 +525,66 @@ class AmdToolsClient {
    * @returns {Promise<{action:object, content:string, usage:object, raw:object}>}
    */
   async chatWithTools (messages, tools = createZincTools()) {
-    const first = await this._complete({ messages, tools, lane: 'action' })
+    const first = await this._complete({ messages, tools, lane: 'action', timeoutMs: this._effectiveTimeoutMs(this.timeoutMs, 180_000) })
     let action = coerceAction(first.message)
     const offered = new Set(tools.map((t) => t.function?.name))
     if (action._via && !offered.has(action.a)) action = { a: 'idle', _unknownTool: action.a }
-    // audit2 I: an answer that executed NOTHING in a broken way — an invented
-    // tool name, broken JSON arguments, an empty message, or finish_reason
-    // 'length' truncating the call — gets exactly one do-over with an explicit
-    // instruction. PROSE is not retried here: the executor already reports
-    // "you answered in prose without calling a tool" and re-wakes the model
-    // (a tested contract); retrying it would double every prose turn's cost.
-    const empty = !action._via && action._fallback && !action._prose
-    const broke = action._unknownTool || action._badArgs || empty || first.finishReason === 'length'
-    if (broke) {
-      const truncated = first.finishReason === 'length'
-      const nudge = truncated
-        ? 'Your answer was cut off. Call exactly ONE tool now, with short arguments — nothing else.'
-        : 'That answer did nothing: no valid tool was called. Call exactly ONE of the listed tools now (use say to just talk, idle to wait) — plain text, markdown fences and other names are not accepted.'
-      try {
-        const second = await this._complete({
-          messages: [...messages, { role: 'user', content: nudge }],
-          tools, lane: 'action',
-          maxTokens: truncated ? Math.min(512, (this.maxTokens || 256) * 2) : undefined
-        })
-        const retry = coerceAction(second.message)
-        if (retry._via === 'tool' && offered.has(retry.a)) {
-          this.stats.rescuedToolCalls = (this.stats.rescuedToolCalls || 0) + 1
+    // An answer that executed NOTHING in a broken way — an invented tool
+    // name, broken JSON arguments, an empty message, or finish_reason 'length'
+    // truncating the call — gets up to 2 rescue retries with explicit feedback.
+    // Plain prose with a non-length finish_reason is NOT retried here so the
+    // executor's prose feedback test contract stays intact.
+    const describeFailure = (a, finish) => finish === 'length'
+      ? 'truncated (length)'
+      : a._unknownTool ? `unknown "${a._unknownTool}"` : a._badArgs ? `bad args (${a._badArgs})` : a._prose ? 'prose' : 'empty'
+    const isBroke = (a, finish) => Boolean(a._unknownTool || a._badArgs || (!a._via && a._fallback && !a._prose) || finish === 'length')
+
+    let current = first
+    let totalUsage = first.usage
+    if (isBroke(action, current.finishReason)) {
+      let rescueMessages = [...messages]
+      for (let attempt = 1; attempt <= 2 && isBroke(action, current.finishReason); attempt++) {
+        const truncated = current.finishReason === 'length'
+        const nudge = truncated
+          ? 'Your previous answer was cut off before finishing a valid tool call. Reply ONLY with one compact tool call — no reasoning or extra text.'
+          : 'That answer did nothing: no valid tool was called. Call exactly ONE of the listed tools now (use say to just talk, idle to wait) — plain text, markdown fences and other names are not accepted.'
+        const badText = typeof current.message?.content === 'string' && current.message.content.trim()
+          ? current.message.content.trim().slice(0, 300)
+          : null
+        rescueMessages = [
+          ...rescueMessages,
+          ...(badText ? [{ role: 'assistant', content: badText }] : []),
+          { role: 'user', content: nudge }
+        ]
+        try {
+          const next = await this._complete({
+            messages: rescueMessages,
+            tools, lane: 'action',
+            timeoutMs: this._effectiveTimeoutMs(this.timeoutMs, 180_000),
+            maxTokens: truncated ? Math.min(1024, (this.maxTokens || 512) * 2) : undefined
+          })
+          totalUsage = mergeUsage(totalUsage, next.usage)
+          current = next
+          let retry = coerceAction(next.message)
+          if (retry._via && !offered.has(retry.a)) retry = { a: 'idle', _unknownTool: retry.a }
           action = retry
-          return { action, content: typeof second.message.content === 'string' ? second.message.content.trim() : '', usage: mergeUsage(first.usage, second.usage), raw: second.raw }
+          if (retry._via && offered.has(retry.a)) {
+            this.stats.rescuedToolCalls = (this.stats.rescuedToolCalls || 0) + 1
+            if (retry._via === 'tool') this.stats.toolCalls += 1
+            else this.stats.jsonFallbacks += 1
+            return { action, content: typeof next.message.content === 'string' ? next.message.content.trim() : '', usage: totalUsage, raw: next.raw }
+          }
+        } catch (err) {
+          logger.debug(TAG, `action retry ${attempt} failed: ${err.message || err}`)
+          break
         }
-        logger.warn(TAG, `model retry still produced no valid tool call (${action._unknownTool ? `unknown "${action._unknownTool}"` : action._badArgs ? 'bad args' : 'prose'})`)
-      } catch (err) {
-        logger.debug(TAG, `action retry failed: ${err.message || err}`)
       }
+      logger.warn(TAG, `model retry still produced no valid tool call (${describeFailure(action, current.finishReason)})`)
     }
     if (action._via === 'tool') this.stats.toolCalls += 1
     else if (action._fallback || action._badArgs) this.stats.jsonFallbacks += 1
     if (action._unknownTool) this.stats.unknownToolCalls += 1
-    return { action, content: typeof first.message.content === 'string' ? first.message.content.trim() : '', usage: first.usage, raw: first.raw }
+    return { action, content: typeof current.message.content === 'string' ? current.message.content.trim() : '', usage: totalUsage, raw: current.raw }
   }
 
   /**
@@ -539,7 +595,7 @@ class AmdToolsClient {
   async chatReply (messages, { maxTokens = 120 } = {}) {
     const { message, usage } = await this._complete({
       messages, tools: createChatTools(), maxTokens, temperature: Math.max(this.temperature, 0.5),
-      lane: 'chat', timeoutMs: this.chatTimeoutMs, maxRetries: this.chatMaxRetries
+      lane: 'chat', timeoutMs: this._effectiveTimeoutMs(this.chatTimeoutMs, 120_000), maxRetries: this.chatMaxRetries
     })
     this.stats.chatReplies += 1
     return { reply: coerceReply(message), usage }

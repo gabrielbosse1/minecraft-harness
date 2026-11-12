@@ -207,34 +207,58 @@ class Skills {
    * (fleeing) does not count against the timeout.
    * @returns {Promise<{ok:boolean, why:string, interrupted:boolean}>}
    */
-  async _walk (token, goal, { dynamic = false, timeoutMs = this.moveTimeoutMs, done = null } = {}) {
+  async _walk (token, goal, { dynamic = false, timeoutMs = this.moveTimeoutMs, done = null, retryNoPath = true } = {}) {
     const bot = this.bot
     const lane = this.lane
+    if (bot.pathfinder && Number.isFinite(bot.pathfinder.thinkTimeout)) {
+      bot.pathfinder.thinkTimeout = Math.max(bot.pathfinder.thinkTimeout, 8000)
+    }
     lane.acquire({ reason: token.label })
-    lane.setGoal(goal, dynamic)
     this._noPathAt = 0
+    lane.setGoal(goal, dynamic)
     let budget = timeoutMs
     let retried = false
     let interrupted = false
     let last = Date.now()
+    let segmentAnchor = bot.entity?.position?.clone?.() || null
+    let idleSince = 0
+    let segmentReplans = 0
     try {
       for (;;) {
         await sleep(150)
         const now = Date.now()
         if (token.cancelled) return { ok: false, why: token.cancelled, interrupted }
         if (!bot.entity?.position) return { ok: false, why: 'no position', interrupted }
-        if (!lane.isTop) { interrupted = true; last = now; continue } // a reflex is driving
+        if (!lane.isTop) { interrupted = true; last = now; idleSince = 0; continue } // a reflex is driving
         budget -= now - last
         last = now
         const here = bot.entity.position.floored()
         if (done ? done() : goal.isEnd(here)) return { ok: true, why: 'arrived', interrupted }
         if (this._noPathAt) {
-          if (retried) return { ok: false, why: 'no path', interrupted }
+          if (!retryNoPath || retried) return { ok: false, why: 'no path', interrupted }
           retried = true
           this._noPathAt = 0
           await sleep(1200) // threats move; one more try
           lane.setGoal(null)
           lane.setGoal(goal, dynamic)
+          idleSince = 0
+        } else if (typeof bot.pathfinder?.isMoving === 'function' && !bot.pathfinder.isMoving() && !bot.pathfinder.isMining?.() && !bot.pathfinder.isBuilding?.()) {
+          // A* thinkTimeout on long paths stops at a partial waypoint without emitting noPath;
+          // if progress was made toward the goal, chain up to 4 continuation segments.
+          if (!idleSince) idleSince = now
+          else if (now - idleSince >= 1500 && segmentReplans < 4) {
+            const cur = bot.entity.position
+            const moved = !segmentAnchor || cur.distanceTo(segmentAnchor) >= 2.0
+            if (moved) {
+              segmentAnchor = cur.clone()
+              segmentReplans++
+              idleSince = 0
+              lane.setGoal(null)
+              lane.setGoal(goal, dynamic)
+            }
+          }
+        } else {
+          idleSince = 0
         }
         if (budget <= 0) return { ok: false, why: 'timeout', interrupted }
       }
@@ -304,19 +328,44 @@ class Skills {
         }
         const label = named ? named.name : block.id
         token.label = `going to ${label}`
-        const r = await this._walk(token, new GoalNear(dest.x, dest.y, dest.z, named ? 1 : 2))
-        return r.ok ? ok(`arrived at ${label} (${dest.x},${dest.y},${dest.z})`) : fail(`could not reach ${label}: ${r.why}${r.interrupted ? ' (interrupted by fleeing)' : ''}`)
+        let r = await this._walk(token, new GoalNear(dest.x, dest.y, dest.z, named ? 1 : 2))
+        if (named && !r.ok && r.why === 'no path' && !token.cancelled) {
+          r = await this._walk(token, new GoalNear(dest.x, dest.y, dest.z, 2), { retryNoPath: false })
+        }
+        const jam = !r.ok && r.why === 'no path' ? this._recentJamHint() : ''
+        return r.ok ? ok(`arrived at ${label} (${dest.x},${dest.y},${dest.z})`) : fail(`could not reach ${label}: ${r.why}${jam}${r.interrupted ? ' (interrupted by fleeing)' : ''}`)
       }
       const x = Number(target.x); const y = Number(target.y); const z = Number(target.z)
       if (!Number.isFinite(x) || !Number.isFinite(z)) return fail('go_to needs a player, a place, or x and z')
       token.label = `going to ${Math.round(x)},${Number.isFinite(y) ? Math.round(y) : '~'},${Math.round(z)}`
-      const goal = Number.isFinite(y) ? new GoalNear(x, y, z, 1) : new GoalNearXZ(x, z, 1)
-      const r = await this._walk(token, goal)
+      let r = await this._walk(token, Number.isFinite(y) ? new GoalNear(x, y, z, 1) : new GoalNearXZ(x, z, 1))
+      if (Number.isFinite(y) && !r.ok && r.why === 'no path' && !token.cancelled) {
+        // When (x, y, z) is occupied by a solid block/slab/device or only diagonally
+        // reachable, range=1 has no standable cell within 1.0 block; retry once at range=2.
+        r = await this._walk(token, new GoalNear(x, y, z, 2), { retryNoPath: false })
+      }
       const p = bot.entity.position
+      const jam = !r.ok && r.why === 'no path' ? this._recentJamHint() : ''
       return r.ok
         ? ok(`arrived at ${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}`)
-        : fail(`did not arrive: ${r.why}${r.interrupted ? ' (interrupted by fleeing)' : ''}; now at ${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}`)
+        : fail(`did not arrive: ${r.why}${jam}${r.interrupted ? ' (interrupted by fleeing)' : ''}; now at ${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}`)
     })
+  }
+
+  _isTargetCellOccupied (x, y, z) {
+    try {
+      const { Vec3 } = require('vec3')
+      const fx = Math.floor(x); const fy = Math.floor(y); const fz = Math.floor(z)
+      const b0 = this.bot.blockAt(new Vec3(fx, fy, fz), false)
+      const b1 = this.bot.blockAt(new Vec3(fx, fy + 1, fz), false)
+      return Boolean((b0 && b0.boundingBox === 'block') || (b1 && b1.boundingBox === 'block'))
+    } catch { return false }
+  }
+
+  _recentJamHint () {
+    const j = this.pathfinder?.lastJam
+    if (!j || Date.now() - j.at > 15_000) return ''
+    return ` (${j.name} at ${j.x},${j.y},${j.z} would not open)`
   }
 
   /** Keep following a player until told otherwise (or `maxMs`). */

@@ -13,15 +13,15 @@
     "baseUrl": "https://developer.amd.com.cn/radeon/api/v1",
     "model": "Qwen3.8-Flash-Next",
     "_modelNote": "Radeon Cloud Token Factory alias for the Qwen 3.8 27B free standing model. DeepSeek-V4-Flash-0731 also works.",
-    "maxTokens": 256,
+    "maxTokens": 512,
     "temperature": 0.25,
     "timeoutMs": 120000,
-    "_timeoutNote": "26.1 live test (2026-11-12): Qwen3.8-27B measured 47-99s per action-lane call (9.7k-token prompts) vs the 20s default, so the action lane was aborting 2 of 3 attempts. Raised for this campaign; see .zinc-test-run/reports/FINAL_REPORT.md.",
+    "_timeoutNote": "26.1 live test (2026-11-12): Qwen3.8-27B measured 47-99s per action-lane call (9.7k-token prompts) and hit 256-token cutoffs. Raised maxTokens to 512 and chatTimeoutMs to 90000; see .zinc-test-run/reports/FINAL_REPORT.md.",
     "maxRetries": 2,
     "maxConcurrent": 2,
-    "chatTimeoutMs": 12000,
+    "chatTimeoutMs": 90000,
     "chatMaxRetries": 1,
-    "_lanesNote": "maxConcurrent 2 = the chat lane and the action lane each have one call in flight, so a slow action call never holds a chat reply (set 1 if the endpoint refuses parallel requests; chat still goes first). chatTimeoutMs / chatMaxRetries: a shorter leash for chat replies."
+    "_lanesNote": "maxConcurrent 2 = the chat lane and the action lane each have one call in flight, so a slow action call never holds a chat reply (set 1 if the endpoint refuses parallel requests; chat still goes first). chatTimeoutMs 90000 accommodates Qwen3.8-27B latency (~47s p50) while remaining shorter than action timeoutMs (120000); adaptive p90 scaling lifts slow calls automatically."
   },
   "inference": {
     "_note": "Two lanes: chat (answers people) and action (drives the body). Wake-ups are queued, never dropped. rpm is the shared calls-per-minute budget; chatReserve of those are for the chat lane alone (a mob chase used to spend all of them). urgentMinIntervalMs: the start of an escape or being cornered may be thought about this soon after the last call instead of minIntervalMs. heartbeatMs is the self-prompt when nothing happens (0 = off).",

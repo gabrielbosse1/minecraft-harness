@@ -143,17 +143,21 @@ function buildAreaA () {
   // interior partition walls (1F): x=0 wall (z -7..-1), z=0 wall (x 1..9)
   cmds.push(fillCmd(box(0, f1y + 1, z0 + 1, 0, f2y - 1, -1), 'cherry_planks'))
   cmds.push(fillCmd(box(1, f1y + 1, 0, x1 - 1, f2y - 1, 0), 'cherry_planks'))
-  // 2F rooms
+  // 2F rooms (with doorway x=0, z=2 connecting west bedroom and east study)
   cmds.push(air(box(x0 + 1, f2y + 1, z0 + 1, x1 - 1, f3y - 1, z1 - 1)))
   cmds.push(fillCmd(box(0, f2y + 1, z0 + 1, 0, f3y - 1, z1 - 1), 'cherry_planks'))
+  cmds.push(air(box(0, f2y + 1, 2, 0, f2y + 2, 2)))
   // 3F rooms
   cmds.push(air(box(x0 + 1, f3y + 1, z0 + 1, x1 - 1, roofY - 1, z1 - 1)))
-  // doors (1F south wall entrance at x=0,z=8; stair up at x=2)
+  // doors (1F south wall entrance at x=0,z=8)
   cmds.push(setBlock(0, f1y + 1, z1, 'cherry_door'))
   cmds.push(setBlock(0, f1y + 2, z1, 'cherry_door[facing=south,hinge=left,open=false]'))
-  // stairs up to 2F at x=9,z=7 ; 2F->3F at x=9,z=7
-  for (let i = 0; i < 4; i++) cmds.push(setBlock(9, f1y + 1 + i, 7, `cherry_stairs[facing=east,shape=straight,half=${i < 2 ? 'bottom' : 'top'}]`))
-  for (let i = 0; i < 4; i++) cmds.push(setBlock(-9, f2y + 1 + i, -7, `cherry_stairs[facing=west,shape=straight,half=${i < 2 ? 'bottom' : 'top'}]`))
+  // real ascending stairs 1F->2F along z=7 (x=5..8) + stairwell opening in f2y slab
+  for (let i = 0; i < 4; i++) cmds.push(setBlock(5 + i, f1y + 1 + i, 7, 'cherry_stairs[facing=east,shape=straight,half=bottom]'))
+  cmds.push(air(box(5, f2y, 7, 8, f2y, 7)))
+  // real ascending stairs 2F->3F along z=-7 (x=-5..-8) + stairwell opening in f3y slab
+  for (let i = 0; i < 4; i++) cmds.push(setBlock(-5 - i, f2y + 1 + i, -7, 'cherry_stairs[facing=west,shape=straight,half=bottom]'))
+  cmds.push(air(box(-8, f3y, -7, -5, f3y, -7)))
   // torches for light
   for (const [tx, ty, tz] of [[-9, f1y + 2, -7], [9, f1y + 2, -7], [-9, f2y + 2, 7], [9, f2y + 2, 7], [-9, f3y + 2, 7], [9, f3y + 2, -7]]) cmds.push(setBlock(tx, ty, tz, 'torch'))
 
@@ -234,6 +238,14 @@ function buildAreaA () {
     signs: ['Ferramentas', 'Minerios', 'Comida', 'Construcao', 'Valioso', 'Cultura', 'Cozinha', 'Quarto', 'Estudo', 'Reserva', 'Mobs (caixa)', 'Mobs (chao)', 'Curral', 'Cofre']
   }
   groundTruth.areas.A = areaGt
+  // clear walkways connecting Area A to Area E (north), Area D (south), and Area C (west)
+  cmds.push(fillCmd(box(-1, FLOOR, -40, 1, FLOOR, -11), 'smooth_stone'))
+  cmds.push(fillCmd(box(-1, FLOOR + 1, -40, 1, FLOOR + 3, -11), 'air'))
+  cmds.push(fillCmd(box(-1, FLOOR, 11, 1, FLOOR, 60), 'dirt_path'))
+  cmds.push(fillCmd(box(-1, FLOOR + 1, 11, 1, FLOOR + 3, 60), 'air'))
+  cmds.push(fillCmd(box(-60, FLOOR, -1, -13, FLOOR, 1), 'stone_bricks'))
+  cmds.push(fillCmd(box(-60, FLOOR + 1, -1, -13, FLOOR + 3, 1), 'air'))
+
   // forceload takes CHUNK coords: house blocks x -16..16, z -12..14 -> chunks -1..0, -1..0
   return { cmds, areaGt, forceload: [-1, -1, 0, 0], keep: true, label: 'AreaA_base' }
 }

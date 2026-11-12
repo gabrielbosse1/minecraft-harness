@@ -10,8 +10,9 @@
  *   - is cancellable (a new instruction or `stop` ends it);
  *   - resolves to { ok, msg } — one short sentence the model reads next turn.
  *
- * There is no "attack" here: fighting is combat.js, started only by the
- * model's explicit attack tool. There is no digging either.
+ * Fighting is combat.js, started by the model's attack tool. Gather and
+ * scaffold cleanup can dig directly; pathfinder digging being disabled does
+ * not disable those skills or establish block ownership.
  */
 'use strict'
 
@@ -297,6 +298,10 @@ class Skills {
         const block = named ? null : this._resolveBlock(target.place, new Set(['chest', 'barrel', 'shulker', 'ender_chest', 'furnace', 'bed', 'crafting_table', 'enchanting_table', 'brewing_stand', 'anvil', 'station']))
         const dest = named || block
         if (!dest) return fail(`I know no place called "${target.place}"`)
+        if (named) {
+          const targetDim = String(named.dim || 'overworld').replace(/^minecraft:/, '')
+          if (targetDim !== this._dim()) return fail(`"${named.name}" is in ${targetDim}, but I am in ${this._dim()}; no portal route is available`)
+        }
         const label = named ? named.name : block.id
         token.label = `going to ${label}`
         const r = await this._walk(token, new GoalNear(dest.x, dest.y, dest.z, named ? 1 : 2))
@@ -640,7 +645,8 @@ class Skills {
   // ------------------------------------------------- resource chores -----
   // audit2 B4/C: deterministic acquisition. The model names WHAT; the body
   // digs only blocks that ARE the requested resource (never arbitrary cells),
-  // from an explicit allowlist, and never touches anything player-built.
+  // from an explicit allowlist. This is not an ownership check: player-built
+  // structures can contain the same resource blocks.
 
   /** Equip the best hand tool for a block family, if carried. Never throws. */
   async _equipToolFor (name) {
@@ -702,8 +708,15 @@ class Skills {
           try {
             await bot.lookAt(block.position.offset(0.5, 0.5, 0.5), true)
           } catch { /* cosmetic */ }
+          // Equip/look are async: stop, replacement or survival preemption can
+          // happen during either await. Do not start a new dig with stale task
+          // ownership, and re-read the target after those awaits.
+          if (token.cancelled) break
+          if (!this.lane.isTop) continue
+          const current = bot.blockAt(p)
+          if (!current || !targets.names.includes(current.name)) continue
           try {
-            await bot.dig(block)
+            await bot.dig(current)
             dug++
             await sleep(450) // let the drop pop so the pickup delta lands
           } catch (err) {
@@ -818,9 +831,10 @@ class Skills {
   corpseRun () {
     const bot = this.bot
     return this._run('corpse_run', async (token) => {
-      const pos = bot.entity?.position
-      const entry = pos ? this.places.resolve('last death', pos, { dim: this._dim() }) : null
+      const entry = this.places.getPlace('last death')
       if (!entry) return fail('no "last death" place is remembered (only deaths since this feature existed are recorded)')
+      const deathDim = String(entry.dim || 'overworld').replace(/^minecraft:/, '')
+      if (deathDim !== this._dim()) return fail(`last death was in ${deathDim}, but I am in ${this._dim()}; no portal route is available`)
       token.label = 'walking back to last death'
       const r = await this._walk(token, new (this._goals().GoalNear)(entry.x, entry.y, entry.z, 2), { timeoutMs: Math.max(this.moveTimeoutMs, 180_000) })
       if (!r.ok) return fail(`could not get back to ${entry.x},${entry.y},${entry.z}: ${r.why}`)
@@ -832,7 +846,7 @@ class Skills {
           if ((e.name === 'item' || e.objectType === 'Item') && e.position.distanceTo(bot.entity.position) <= 10) stacks++
         }
       } catch { /* cosmetic */ }
-      return ok(`at the death spot${stacks ? `; ${stacks} item stack${stacks === 1 ? '' : 's'} still on the ground — standing on them picks them up` : '; nothing on the ground any more (items despawn after ~5 min)'}`)
+      return ok(`near the death spot; ${stacks ? `${stacks} item stack${stacks === 1 ? '' : 's'} observed` : 'no item stacks observed'} within 10m; pickup and despawn are not verified`)
     })
   }
 
@@ -883,7 +897,10 @@ class Skills {
       } catch { /* partial mock */ }
     }
     const place = this.places.getPlace(what)
-    if (place) parts.push(`place "${place.name}" at ${place.x},${place.y},${place.z} (${whereIs(pos, place)})`)
+    if (place) {
+      const placeDim = String(place.dim || 'overworld').replace(/^minecraft:/, '')
+      parts.push(`place "${place.name}" in ${placeDim} at ${place.x},${place.y},${place.z}${placeDim === dim ? ` (${whereIs(pos, place)})` : ' (different dimension)'}`)
+    }
     return parts.length ? ok(parts.join('; ')) : fail(`nothing known about "${what}" (no block within 48, no opened container holds it, no label matches)`)
   }
 }

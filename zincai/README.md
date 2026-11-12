@@ -196,10 +196,12 @@ release controls.
   trapdoors or anything it did not open, and reports a door that would not
   open instead of a bare "no path". Iron doors are walls unless they stand open.
 - **Building:** the action tools can build a saved blueprint, an inline grid,
-  or generated shapes. Building is inventory-checked, staged
-  (foundation → walls/windows → roof → details), and idempotent where the
-  target block is already present. `set_mode` supports `explorer`, `hunter`,
-  and `builder`. Pathfinding does not mine blocks by default.
+  or bounded generated shapes. Building is inventory-checked and staged
+  (foundation → walls/windows → roof → details); a rerun compares block names,
+  not orientation or context. `set_mode` supports `explorer`, `hunter`, and
+  `builder`. Pathfinder digging is disabled by default, but `gather` digs
+  directly and cannot distinguish natural resources from the same blocks in a
+  structure.
 - **Survival:** the body eats from a food whitelist, uses a water bucket only
   for a fall that warrants a clutch (default threshold 5 blocks), swims when
   submerged, and can deploy an elytra through Mineflayer's `bot.elytraFly()`
@@ -211,11 +213,17 @@ release controls.
 
 ## Action and chat tools
 
-The current action tool list is:
+The complete action tool list is:
 
 `say`, `go_to`, `follow`, `stop`, `attack`, `hold`, `look_in`, `take`, `put`,
-`smelt`, `sleep`, `give`, `eat`, `equip`, `use_block`, `find`, `remember_here`,
-`craft`, `build`, `build_shape`, `run_script`, `set_mode`, `idle`.
+`smelt`, `sleep`, `give`, `eat`, `equip`, `use_block`, `inspect_block`,
+`inspect_region`, `redstone_scan`, `redstone_component`, `find`, `remember_here`,
+`craft`, `gather`, `light_up`, `shelter`, `corpse_run`, `logic_test`,
+`circuit_project`, `build`, `build_shape`, `run_script`, `set_mode`, `idle`.
+Explorer mode omits the four builder/logic/project tools from the offered set,
+not all mutators; the model can also select `set_mode`. Modes are not a
+property-permission boundary. Shape floors use `{w,d}` and boxes `{w,d,h}`;
+unsupported parameters and oversized plans are refused rather than guessed.
 
 The separate chat lane has one `reply(text, task, remember)` tool. `task` is
 optional and is used only when the player asks ZincAI to do something in the
@@ -288,6 +296,14 @@ hostile AI. The runner header records the exact checks and known limitations.
 
 ## Known limits / unverified assumptions
 
+- Use only a supervised disposable world with enforced server-side boundaries.
+  In a synthetic session, an equip already in progress allowed build/shelter to
+  invoke placement after `stop`; shelter also attempted cleanup. Other actions
+  may cross awaited operations. A stop response is not proof all mutations have
+  ceased, and direct gathering cannot distinguish natural resources from the
+  same blocks in a structure. This does not require tracking an owner for every
+  item or block; use appropriate world/region safeguards for tests. No live
+  mutation was tested. See [`audit/PRE_SESSION_READINESS.md`](../audit/PRE_SESSION_READINESS.md).
 - Neither the AMD live endpoint nor `tool_choice: "required"` has been tested
   from this environment. Its fallback to `"auto"` is implemented, not an
   assertion that AMD accepts either payload.

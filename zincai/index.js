@@ -1084,7 +1084,7 @@ function startSession (shared, onEnded) {
         // A duel the model agreed to and then called off: the hits were part
         // of it, so the opponent is not somebody to run from afterwards.
         if (duel) sense.forgive(duel.id)
-        return report('stop', { ok: true, msg: 'stopped' }, { wake: false })
+        return report('stop', { ok: true, msg: 'stop requested; in-progress actions or survival movement may continue' }, { wake: false })
       }
       case 'hold': {
         // "They are harmless or accepted": the body stops running from them. It

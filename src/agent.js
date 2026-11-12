@@ -494,6 +494,9 @@ class ZincAgent {
     const bot = this.bot
     if (bot.health === undefined) return
     const hp = Math.round(bot.health)
+    // audit2 B13: absorption/health-boost raise real hp past the vanilla 20;
+    // the observed maximum becomes the combat base (odds + disengage).
+    try { this.combat?.noteHealth?.(hp) } catch { /* cosmetic */ }
     const food = Math.round(bot.food ?? 20)
     const prevHp = this._prevHp
     const prevFood = this._prevFood
@@ -629,7 +632,14 @@ class ZincAgent {
     const pos = p ? `${Math.trunc(p.x)},${Math.trunc(p.y)},${Math.trunc(p.z)}` : '?,?,?'
     const tod = bot?.time?.isDay === false ? 'night' : 'day'
     // Deliberately O(1) size — this is the ONLY state we always send.
-    const vitals = `vitals hp=${hp} food=${food} pos=${pos} tod=${tod}`
+    // audit2 B6: plus one short inventory line, so "equip" and "craft" name
+    // real items instead of guessing invisible hotbar slots. Capped.
+    let inv = ''
+    try {
+      const kinds = [...this._countInventory().entries()].slice(0, 12)
+      inv = ` inv ${kinds.length ? kinds.map(([n, c]) => (c > 1 ? `${n} x${c}` : n)).join(', ') : 'empty'}`
+    } catch { inv = '' }
+    const vitals = `vitals hp=${hp} food=${food} pos=${pos} tod=${tod}${inv}`
     // …plus one line while something dangerous is around, so the model knows
     // what its answer is deciding about — and what its body did by itself.
     // One count: everything hostile that has a line on the bot, near or still
@@ -751,7 +761,7 @@ class ZincAgent {
         break
       }
       case 'craft': {
-        const r = await craftItem(this.bot, action.i)
+        const r = await craftItem(this.bot, action.i, { approach: (table) => this._approachForCraft(table) })
         if (r.ok) {
           push({ type: 'craft', i: action.i, ok: true })
           logger.info(TAG, `crafted ${action.i}`)
@@ -762,8 +772,32 @@ class ZincAgent {
         break
       }
       case 'equip': {
-        const held = this._equipSlot(action.s)
-        push({ type: 'equip', s: action.s, i: held ?? 'empty' })
+        // audit2 B6: by item name (from the inv line) — the old slot number
+        // stayed as a fallback. Names equip from ANYWHERE in the inventory.
+        if (action.i) {
+          const q = String(action.i).toLowerCase()
+          const found = this.bot.inventory.items().find((it) => it.name === q) ||
+            this.bot.inventory.items().find((it) => it.name.endsWith('_' + q))
+          if (found) {
+            try {
+              await this.bot.equip(found, 'hand')
+              push({ type: 'equip', i: found.name, ok: true })
+            } catch (err) {
+              push({ type: 'action_err', a: 'equip', why: String(err?.message || err).slice(0, 60) })
+            }
+          } else push({ type: 'action_err', a: 'equip', why: `not carrying ${q} (see inv line)` })
+        } else {
+          const held = this._equipSlot(action.s)
+          push({ type: 'equip', s: action.s, i: held ?? 'empty' })
+        }
+        break
+      }
+      case 'hold': {
+        // audit2 B14: the missing decision — accept the threats shown (penned
+        // mobs, a guarded friend) instead of only flee/attack/move.
+        this.reflex?.acknowledge(shown, { label: 'hold', ttlMs: 30 * 60_000 })
+        push({ type: 'self', d: `hold: not running from ${shown.length} shown threat${shown.length === 1 ? '' : 's'} (until one hits me or something new shows up)` })
+        logger.info(TAG, `hold acknowledged for ${shown.length} threat(s)`)
         break
       }
       case 'attack': {
@@ -809,6 +843,33 @@ class ZincAgent {
         logger.warn(TAG, `unhandled action (parser should have caught): ${action.a}`)
     }
     this._afterAction(action)
+  }
+
+  /**
+   * audit2 E/B3: walk next to a crafting table before bot.craft — the finder
+   * sees 8 m but craft needs ~4.5 m. Refuses to run while the survival lane
+   * owns the body; replaces an in-flight plain walk (the model's newest
+   * decision wins — the minimal harness has no agenda to resume one).
+   */
+  async _approachForCraft (table) {
+    const p = table?.position
+    if (!p || !this.bot?.pathfinder?.setGoal) return { ok: false, why: 'no pathfinder' }
+    if (this.arbiter?.owner?.() === 'survival') return { ok: false, why: 'body is busy fleeing' }
+    const goal = new goals.GoalGetToBlock(p.x, p.y, p.z)
+    try {
+      this.bot.pathfinder.setGoal(goal)
+      const deadline = Date.now() + 12_000
+      while (Date.now() < deadline) {
+        if (this.arbiter?.owner?.() === 'survival') return { ok: false, why: 'fleeing took over' }
+        const d = this.bot.entity?.position?.distanceTo(p)
+        if (d === undefined || d === null) return { ok: false, why: 'no position' }
+        if (d <= 4) return { ok: true }
+        await new Promise((r) => setTimeout(r, 200))
+      }
+      return { ok: false, why: 'timeout walking to the table' }
+    } finally {
+      try { if (this.bot?.pathfinder?.goal === goal) this.bot.pathfinder.setGoal(null) } catch { /* gone */ }
+    }
   }
 
   /** Equip hotbar slot 0-8 (player window slots 36-44). */

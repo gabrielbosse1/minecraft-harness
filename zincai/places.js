@@ -209,7 +209,7 @@ class PlaceIndex {
     const last = this._lastScan
     const moved = Math.hypot(pos.x - last.x, pos.y - last.y, pos.z - last.z)
     if (!force && dim === last.dim && moved < 4 && this.now() - last.at < 15_000) return 0
-    this._lastScan = { at: this.now(), x: pos.x, y: pos.y, z: pos.z, dim }
+    this._lastScan = { at: this.now(), x: pos.x, y: pos.y, z: pos.z, dim, radius }
 
     let found = []
     try { found = bot.findBlocks({ matching: this._searchIds(bot), maxDistance: radius, count: max }) } catch { return 0 }
@@ -453,6 +453,17 @@ class PlaceIndex {
 
   // ------------------------------------------------------------ rendering --
 
+  /**
+   * audit2 B10: contents are a MEMORY ("as of last look"), not a live view —
+   * another player can move stock between scans. Older than a minute, say so.
+   */
+  _ageSuffix (e) {
+    const age = e?.lookedAt ? this.now() - e.lookedAt : 0
+    if (!age || age < 60_000) return ''
+    const m = Math.floor(age / 60_000)
+    return m >= 1 ? ` (as of ${m}m ago)` : ` (as of ${Math.round(age / 1000)}s ago)`
+  }
+
   _render (e) {
     let s = e.id
     if (e.kind === 'sign') return e.text ? `sign "${e.text}"` : null
@@ -463,6 +474,7 @@ class PlaceIndex {
     if (e.contents) {
       const top = Object.entries(e.contents).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([n, c]) => `${n} x${c}`)
       s += top.length ? ` [${top.join(', ')}${Object.keys(e.contents).length > 5 ? ', …' : ''}]` : ' [empty]'
+      s += this._ageSuffix(e)
     } else if (CONTAINER_KINDS.has(e.kind)) {
       s += ' [not opened yet]'
     }
@@ -547,6 +559,7 @@ class PlaceIndex {
       if (e.contents) {
         const top = Object.entries(e.contents).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([name, c]) => `${name} x${c}`)
         s += top.length ? ` [${top.join(', ')}${Object.keys(e.contents).length > 3 ? ', …' : ''}]` : ' [empty]'
+        s += this._ageSuffix(e)
       }
       return s
     })
@@ -567,3 +580,56 @@ class PlaceIndex {
 }
 
 module.exports = { PlaceIndex, kindOf, signTextOf, chestPartner, signSupport, CONTAINER_KINDS, STATION_KINDS }
+
+// ---------------------------------------------------------------------------
+// audit2 B15 — instant invalidation/adoption (method lives on
+// PlaceIndex.prototype so the class body above stays untouched):
+
+/**
+ * A blockUpdate at an indexed position: container broken or changed kind?
+ * The 3 s scan would catch it on the next pass; this makes it zero-cost and
+ * immediate, so a chest that vanished never keeps phantom contents.
+ * The other half: a blockUpdate for a NOT-yet-indexed container inside the
+ * last scanned box adopts it straight away, so a chest placed right next to
+ * the bot (by anyone, including the bot itself) does not sit invisible until
+ * the next scan wave. The bbox check against the last scan keeps this O(1)-ish
+ * and prevents phantom adoptions from other dimensions or far-away edits.
+ */
+PlaceIndex.prototype.onBlockChange = function (oldBlock, newBlock, { dim = null } = {}) {
+  const p = newBlock?.position || oldBlock?.position
+  if (!p || !Number.isFinite(p.x)) return
+  const x = Math.floor(p.x); const y = Math.floor(p.y); const z = Math.floor(p.z)
+  const kind = newBlock ? kindOf(newBlock.name || '') : null
+  let matched = false
+  for (const [key, e] of this.blocks) {
+    if (e.x !== x || e.y !== y || e.z !== z) continue
+    if (dim && e.dim !== dim) continue
+    matched = true
+    if (kind === e.kind && String(newBlock?.name) === e.block) continue // nothing structural changed
+    if (!kind) {
+      this.blocks.delete(key) // broken or replaced by air — gone from the index
+      this._dirty = true
+    } else {
+      // Same spot, changed identity (e.g. chest → trapped chest): re-index clean.
+      e.kind = kind
+      e.block = newBlock.name
+      e.contents = null
+      e.lookedAt = 0
+      this._dirty = true
+    }
+  }
+  if (matched || !kind || kind === 'sign') { if (this._dirty) this.save(); return }
+  // Not indexed yet: adopt only if it sits inside the last scanned box.
+  const last = this._lastScan
+  const r = (last.radius ?? 16) + 2
+  if (!last.at || this.now() - last.at > 30_000) return // no recent scan: nothing to extend
+  if (dim && last.dim && dim !== last.dim) return
+  if (Math.abs(x - last.x) > r || Math.abs(y - last.y) > r || Math.abs(z - last.z) > r) return
+  const useDim = dim || last.dim || 'overworld'
+  const pos = { x, y, z }
+  if (kind === 'chest' && this._twinOf(useDim, pos, newBlock)) return // other half indexed
+  const entry = { id: this._nextId(kind), kind, block: String(newBlock.name), x, y, z, dim: useDim, label: '', contents: null, seenAt: this.now(), lookedAt: 0 }
+  this.blocks.set(`${useDim}:${x},${y},${z}`, entry)
+  this._dirty = true
+  this.save()
+}

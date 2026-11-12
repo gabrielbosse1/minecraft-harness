@@ -54,13 +54,69 @@ const FUELS = { coal: 8, charcoal: 8, coal_block: 80, blaze_rod: 12, dried_kelp_
 const WOOD_FUEL = /(_planks|_log|_wood|_stem|_hyphae)$/ // 1.5 items each
 const EQUIP_SLOTS = { hand: 'hand', mainhand: 'hand', main: 'hand', offhand: 'off-hand', 'off-hand': 'off-hand', off: 'off-hand', head: 'head', helmet: 'head', chest: 'torso', torso: 'torso', legs: 'legs', feet: 'feet', boots: 'feet' }
 
+// --- gather allowlist (audit2 B4/C): what the body is ever allowed to dig --
+const TOOL_TIERS = { golden: 0, wooden: 0, stone: 1, copper: 1, iron: 2, diamond: 3, netherite: 4 }
+const TOOL_NAMES = ['wooden', 'stone', 'iron', 'diamond', 'netherite']
+/** Minimum pickaxe tier per ore-family block (soils/logs need none: -1). */
+const HARVEST_NEED = {
+  coal_ore: 0, deepslate_coal_ore: 0,
+  iron_ore: 1, deepslate_iron_ore: 1, copper_ore: 1, deepslate_copper_ore: 1, lapis_ore: 1, deepslate_lapis_ore: 1, nether_gold_ore: 0, nether_quartz_ore: 0,
+  gold_ore: 2, deepslate_gold_ore: 2, diamond_ore: 2, deepslate_diamond_ore: 2, emerald_ore: 2, deepslate_emerald_ore: 2, redstone_ore: 2, deepslate_redstone_ore: 2,
+  obsidian: 3, ancient_debris: 3
+}
+/** Loose blocks that need no pickaxe (shovel families + stone-family with any pick handled by tier 0). */
+const GATHER_SOILS = new Set(['dirt', 'grass_block', 'sand', 'red_sand', 'gravel', 'clay', 'snow_block', 'snow', 'mud', 'soul_sand', 'soul_soil', 'netherrack'])
+const GATHER_STONE = new Set(['stone', 'cobblestone', 'deepslate', 'cobbled_deepslate', 'andesite', 'diorite', 'granite', 'tuff', 'sandstone', 'blackstone'])
+/** Friendly aliases the model (or a player) actually says → block ids. */
+const GATHER_ALIASES = {
+  wood: null, // resolved per-registry: any *_log present
+  log: null,
+  logs: null,
+  coal: ['coal_ore', 'deepslate_coal_ore'],
+  iron: ['iron_ore', 'deepslate_iron_ore'],
+  raw_iron: ['iron_ore', 'deepslate_iron_ore'],
+  gold: ['gold_ore', 'deepslate_gold_ore', 'nether_gold_ore'],
+  raw_gold: ['gold_ore', 'deepslate_gold_ore', 'nether_gold_ore'],
+  diamond: ['diamond_ore', 'deepslate_diamond_ore'],
+  emerald: ['emerald_ore', 'deepslate_emerald_ore'],
+  redstone: ['redstone_ore', 'deepslate_redstone_ore'],
+  lapis: ['lapis_ore', 'deepslate_lapis_ore'],
+  quartz: ['nether_quartz_ore'],
+  snowball: ['snow']
+}
+
+/**
+ * Which blocks may be dug for a requested resource name.
+ * @returns {null | { names: string[], ids: number[] }} null = NOT allowed to dig for this.
+ */
+function resolveGatherTargets (registry, want) {
+  if (!want || !registry?.blocksByName) return null
+  const byName = registry.blocksByName
+  let names = null
+  if (GATHER_ALIASES[want] === null) { // log families
+    names = Object.keys(byName).filter((n) => /_log$|_stem$/.test(n))
+  } else if (Array.isArray(GATHER_ALIASES[want])) names = GATHER_ALIASES[want]
+  else if (/^copper(_ore)?$/.test(want)) names = ['copper_ore', 'deepslate_copper_ore']
+  else if (/_log$|_stem$|_hyphae$/.test(want) && byName[want]) names = [want]
+  else if (/^([a-z]+)_wood$/.test(want)) names = [want.replace(/_wood$/, '_log')].filter((n) => byName[n])
+  else if (GATHER_SOILS.has(want) || GATHER_STONE.has(want)) names = [want]
+  else if (Object.prototype.hasOwnProperty.call(HARVEST_NEED, want)) names = [want]
+  if (!names || !names.length) return null
+  const ids = names.map((n) => byName[n]?.id).filter((id) => id !== undefined)
+  if (!ids.length) return null
+  return { names: names.filter((n) => byName[n]), ids }
+}
+
 class Skills {
   /**
    * @param {object} bot
    * @param {{ arbiter: object, places: PlaceIndex, logger?: (level:string,msg:string)=>void,
-   *           whisper?: (player:string,text:string)=>boolean, moveTimeoutMs?: number }} deps
+   *           whisper?: (player:string,text:string)=>boolean, moveTimeoutMs?: number,
+   *           executor?: object|(()=>object), choreTimeoutMs?: number }} deps
+   *   executor — BuilderExecutor (for shelter scaffolding); a thunk is fine to
+   *   break the construction-order cycle.
    */
-  constructor (bot, { arbiter, places, logger = () => {}, whisper = null, moveTimeoutMs = 60_000 } = {}) {
+  constructor (bot, { arbiter, places, logger = () => {}, whisper = null, moveTimeoutMs = 60_000, executor = null, choreTimeoutMs = 240_000 } = {}) {
     this.bot = bot
     this.arbiter = arbiter
     this.lane = arbiter.lane('task', PRIORITY.task)
@@ -68,6 +124,8 @@ class Skills {
     this.log = logger
     this.whisper = whisper
     this.moveTimeoutMs = moveTimeoutMs
+    this._executor = typeof executor === 'function' ? executor : () => executor
+    this.choreTimeoutMs = choreTimeoutMs
     this._token = null
     this._noPathAt = 0
     this._onPathUpdate = (result) => {
@@ -546,6 +604,234 @@ class Skills {
     })
   }
 
+  // ---------------------------------------------------------------- craft --
+
+  /**
+   * Craft with a reachable table (audit2 B3/E): craftItem finds a table up
+   * to 8 m away but can only use it from ~4.5 m — walk there through the
+   * task lane first, then craft. Runs as one skill so `stop` and the flee
+   * reflex treat the whole thing as one job.
+   */
+  craft ({ item } = {}) {
+    const { craftItem } = require('../src/recipes')
+    return this._run('craft', async (token) => {
+      const want = fold(item).replace(/\s+/g, '_')
+      if (!want) return fail('craft needs an item id (e.g. "crafting_table")')
+      token.label = `crafting ${want}`
+      const r = await craftItem(this.bot, want, {
+        approach: async (table) => {
+          const pos = table.position
+          const ap = await this._approachBlock(token, pos)
+          return ap.ok ? { ok: true } : { ok: false, why: ap.why }
+        }
+      })
+      if (r.ok) return ok(`crafted ${r.item} x${r.count}`)
+      const why = String(r.why)
+      const msg = why === 'missing_materials' ? `missing materials for ${want}`
+        : why === 'need_crafting_table' ? `${want} needs a crafting table and none is within 8 blocks`
+          : why === 'no_recipe' ? `no recipe for ${want}`
+            : why === 'unknown_item' ? `unknown item "${want}"`
+              : why.startsWith('table_unreachable') ? `the crafting table is out of reach (${why.split(':')[1]}) — put one down close or walk me there with go_to`
+                : `craft ${want} failed: ${why}`
+      return fail(msg)
+    })
+  }
+
+  // ------------------------------------------------- resource chores -----
+  // audit2 B4/C: deterministic acquisition. The model names WHAT; the body
+  // digs only blocks that ARE the requested resource (never arbitrary cells),
+  // from an explicit allowlist, and never touches anything player-built.
+
+  /** Equip the best hand tool for a block family, if carried. Never throws. */
+  async _equipToolFor (name) {
+    try {
+      const want = /(_log|_stem|_hyphae|planks)/.test(name) ? /_axe$/ : /(ore|stone|cobblestone|deepslate|obsidian|ancient_debris|andesite|diorite|granite|tuff|netherrack|sandstone)/.test(name) ? /_pickaxe$/ : /(dirt|sand|gravel|clay|snow|mud)/.test(name) ? /_shovel$/ : null
+      if (!want) return false
+      const items = this.bot.inventory.items().filter((i) => want.test(i.name))
+      if (!items.length) return false
+      const tier = (i) => TOOL_TIERS[i.name.split('_')[0]] ?? 0
+      items.sort((a, b) => tier(b) - tier(a))
+      if (this.bot.heldItem?.name === items[0].name) return true
+      await this.bot.equip(items[0], 'hand')
+      return true
+    } catch { return false }
+  }
+
+  /**
+   * Gather a raw resource by digging it: logs, ores, soils. The ONLY blocks
+   * ever dug are blocks whose identity IS the requested resource (or the
+   * whitelisted alias for it); if none is in `radius`, the answer is "walk
+   * closer / go_to a place first", never free-form digging.
+   */
+  gather ({ item, count = 1, radius = 32 } = {}) {
+    const bot = this.bot
+    return this._run('gather', async (token) => {
+      const want = fold(item).replace(/\s+/g, '_')
+      const targets = resolveGatherTargets(bot.registry, want)
+      if (!targets) return fail(`"${item || ''}" is not gatherable — name a raw resource block like oak_log, coal_ore, iron_ore, stone, sand, dirt. (Never dug: anything else, by rule.)`)
+      token.label = `gathering ${want}`
+      // Harvest-level honesty: an ore whose tier exceeds every pickaxe in the
+      // inventory cannot be mined — say so BEFORE walking anywhere.
+      const need = Math.max(...targets.names.map((n) => HARVEST_NEED[n] ?? -1))
+      if (need >= 0) {
+        const picks = bot.inventory.items().filter((i) => /_pickaxe$/.test(i.name))
+        const best = picks.reduce((m, p) => Math.max(m, TOOL_TIERS[p.name.split('_')[0]] ?? 0), -1)
+        if (best < need) return fail(`need at least a ${TOOL_NAMES[need]} pickaxe in the inventory to mine ${targets.names[0]} (carrying: ${picks.map((p) => p.name).join(', ') || 'no pickaxe'})`)
+      }
+      const wanted = Math.max(1, Math.min(64, Math.trunc(Number(count)) || 1))
+      let dug = 0
+      let misses = 0
+      const deadline = Date.now() + (this.choreTimeoutMs || 240_000)
+      while (dug < wanted && misses < 4 && Date.now() < deadline) {
+        if (token.cancelled) break
+        let positions = []
+        try { positions = bot.findBlocks({ matching: targets.ids, maxDistance: radius, count: 8 }) } catch (err) { return fail(`search failed: ${err.message || err}`) }
+        if (!positions.length) return dug > 0 ? ok(`gathered ${want} x${dug} (no more within ${radius} blocks)`) : fail(`no ${targets.names.join(' or ')} within ${radius} blocks — go_to a place first, then gather again`)
+        for (const p of positions) {
+          if (dug >= wanted || token.cancelled || Date.now() >= deadline) break
+          const near = await this._walk(token, new (this._goals().GoalGetToBlock)(p.x, p.y, p.z))
+          if (!near.ok) { misses++; continue }
+          const block = bot.blockAt(p)
+          if (!block || !targets.names.includes(block.name)) continue // changed since the scan — never dig the wrong block
+          if (!this.lane.isTop) { /* a reflex owns the body right now */ await sleep(400); continue }
+          await this._equipToolFor(block.name)
+          try {
+            await bot.lookAt(block.position.offset(0.5, 0.5, 0.5), true)
+          } catch { /* cosmetic */ }
+          try {
+            await bot.dig(block)
+            dug++
+            await sleep(450) // let the drop pop so the pickup delta lands
+          } catch (err) {
+            if (token.cancelled || !this.lane.isTop) break // interrupted by a reflex — handled by pause/resume
+            misses++
+            this.log('debug', `dig failed at ${p.x},${p.y},${p.z}: ${err.message || err}`)
+          }
+        }
+      }
+      if (dug > 0) return ok(`gathered ${want} x${dug}${dug < wanted ? ` (asked ${wanted}; the rest was not reachable here)` : ''}`)
+      return fail(`could not gather ${want}: targets nearby were unreachable or kept breaking (try a smaller count or get closer first)`)
+    })
+  }
+
+  /**
+   * Place torches from the inventory on dark floors nearby. Dark = the
+   * block's light is under 8 (or unknown: the synthetic rig reports none).
+   * Never places on another torch, keeps 5 blocks between torches.
+   */
+  lightUp ({ radius = 8, max = 12 } = {}) {
+    const bot = this.bot
+    return this._run('light_up', async (token) => {
+      const torch = this._item('torch')
+      if (!torch) return fail('no torches in the inventory — craft or take torches first')
+      let placed = 0
+      const usedSpots = []
+      const r = Math.max(2, Math.min(16, Math.trunc(Number(radius)) || 8))
+      const cap = Math.max(1, Math.min(24, Math.trunc(Number(max)) || 12))
+      const existing = new Set()
+      try {
+        const tid = bot.registry.blocksByName?.torch?.id
+        if (tid !== undefined) for (const p of bot.findBlocks({ matching: tid, maxDistance: r * 2, count: 64 })) existing.add(`${p.x},${p.z}`)
+      } catch { /* partial world */ }
+      const me = bot.entity.position.floored()
+      const spots = []
+      for (let dx = -r; dx <= r; dx += 2) {
+        for (let dz = -r; dz <= r; dz += 2) {
+          const x = me.x + dx; const z = me.z + dz
+          if (Math.hypot(x + 0.5 - bot.entity.position.x, z + 0.5 - bot.entity.position.z) > r) continue
+          for (let y = me.y + 2; y >= me.y - 5; y--) {
+            const { Vec3 } = require('vec3')
+            const floor = bot.blockAt(new Vec3(x, y, z))
+            const above = bot.blockAt(new Vec3(x, y + 1, z))
+            const above2 = bot.blockAt(new Vec3(x, y + 2, z))
+            if (!floor || floor.boundingBox !== 'block' || !above || above.boundingBox !== 'empty' || !above2 || above2.boundingBox !== 'empty') continue
+            if (/torch|lava|water|cactus|magma/.test(floor.name)) continue
+            const light = typeof above.light === 'number' ? above.light : 0
+            if (light >= 8) break // bright enough here; scan lower floors only below
+            const key = `${x},${z}`
+            if (existing.has(key)) break
+            if (usedSpots.some((s) => Math.abs(s.x - x) + Math.abs(s.z - z) < 5)) break
+            spots.push({ x, y, z })
+            break
+          }
+        }
+      }
+      if (!spots.length) return ok('nothing dark to light here — no dark walkable floor in range')
+      for (const s of spots) {
+        if (placed >= cap || token.cancelled) break
+        if (this._countOf('torch') <= 0) break
+        const near = await this._walk(token, new (this._goals().GoalNear)(s.x, s.y, s.z, 3))
+        if (!near.ok) continue
+        if (!this.lane.isTop) { await sleep(400); continue }
+        try {
+          const { Vec3 } = require('vec3')
+          const floor = bot.blockAt(new Vec3(s.x, s.y, s.z))
+          if (!floor || floor.boundingBox !== 'block') continue
+          const t = this._item('torch')
+          if (!t) break
+          await this.bot.equip(t, 'hand')
+          await this.bot.placeBlock(floor, new Vec3(0, 1, 0))
+          placed++
+          usedSpots.push(s)
+          await sleep(200)
+        } catch { continue }
+      }
+      return placed > 0 ? ok(`placed ${placed} torch${placed === 1 ? '' : 'es'} (dark floors lit)`) : fail('found dark spots but could not place (reach or pathing) — get closer or clear the area first')
+    })
+  }
+
+  /**
+   * Emergency night cover WITH only owned blocks: pillar up 3 on scaffolding
+   * the builder tracks, so `stop` (or a cancelled task) digs the same blocks
+   * back down — nothing pre-existing is ever touched. Honest about limits:
+   * melee cannot reach, arrows still can.
+   */
+  shelter () {
+    const bot = this.bot
+    return this._run('shelter', async (token) => {
+      const exec = this._executor?.()
+      if (!exec) return fail('no builder available for scaffolding')
+      const carried = (exec.scaffoldBlocks || []).find((n) => this._countOf(n) >= 4)
+      if (!carried) return fail(`no blocks to shelter with — need ~4 of ${(exec.scaffoldBlocks || ['dirt', 'cobblestone']).join('/')}`)
+      token.label = 'sheltering on a pillar'
+      const feet = bot.entity.position.floored()
+      const done = await exec.pillarUpTo(feet.y + 3)
+      if (!done) return fail('could not pillar up (blocked above?)')
+      try {
+        // Stay until cancelled/stopped, re-prioritizing survival implicitly
+        // (this skill runs in the task lane; a flee reflex still preempts).
+        while (!token.cancelled) await sleep(500)
+        return ok('stayed on the shelter pillar until stopped')
+      } finally {
+        if (token.cancelled) {
+          try { await exec.removeScaffolds() } catch { /* best effort descent */ }
+        }
+      }
+    })
+  }
+
+  /** Walk back to where the bot died ("last death" place) and report what's left. */
+  corpseRun () {
+    const bot = this.bot
+    return this._run('corpse_run', async (token) => {
+      const pos = bot.entity?.position
+      const entry = pos ? this.places.resolve('last death', pos, { dim: this._dim() }) : null
+      if (!entry) return fail('no "last death" place is remembered (only deaths since this feature existed are recorded)')
+      token.label = 'walking back to last death'
+      const r = await this._walk(token, new (this._goals().GoalNear)(entry.x, entry.y, entry.z, 2), { timeoutMs: Math.max(this.moveTimeoutMs, 180_000) })
+      if (!r.ok) return fail(`could not get back to ${entry.x},${entry.y},${entry.z}: ${r.why}`)
+      // Item entities still lying around (they despawn after 5 minutes).
+      let stacks = 0
+      try {
+        for (const e of Object.values(bot.entities || {})) {
+          if (e === bot.entity || !e.position) continue
+          if ((e.name === 'item' || e.objectType === 'Item') && e.position.distanceTo(bot.entity.position) <= 10) stacks++
+        }
+      } catch { /* cosmetic */ }
+      return ok(`at the death spot${stacks ? `; ${stacks} item stack${stacks === 1 ? '' : 's'} still on the ground — standing on them picks them up` : '; nothing on the ground any more (items despawn after ~5 min)'}`)
+    })
+  }
+
   // -------------------------------------------------------------- memory --
 
   rememberHere ({ name, note = '', by = '' } = {}) {
@@ -598,4 +884,4 @@ class Skills {
   }
 }
 
-module.exports = { Skills, FUELS, matchItem, nearMisses }
+module.exports = { Skills, FUELS, matchItem, nearMisses, resolveGatherTargets, HARVEST_NEED, TOOL_TIERS }

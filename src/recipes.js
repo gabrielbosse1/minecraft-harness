@@ -90,12 +90,28 @@ function resolveRecipe (bot, itemName) {
 
 /**
  * Craft one `itemName`. Never throws.
+ *
+ * audit2 B3/E: the table finder looks 8 m out but bot.craft needs the table
+ * within interaction reach (~4.5 m), so a table 4.5-8 m away failed with a
+ * window error and the model just retried forever. `approach` (optional)
+ * walks the bot next to the table first; callers own HOW (ZincAI routes it
+ * through the task control lane, Zinc through a guarded plain walk).
+ *
+ * @param {(table:object)=>Promise<{ok:boolean, why?:string}>} [opts.approach]
  * @returns {Promise<{ok:true, item:string, count:number} | {ok:false, why:string}>}
  */
-async function craftItem (bot, itemName) {
+async function craftItem (bot, itemName, { approach = null } = {}) {
   const resolved = resolveRecipe(bot, itemName)
   if (!resolved.ok) return resolved
   try {
+    if (resolved.table && approach) {
+      const me = bot.entity?.position
+      const tp = resolved.table.position
+      if (me && tp && me.distanceTo(tp) > 3.5) {
+        const a = await approach(resolved.table)
+        if (!a?.ok) return { ok: false, why: `table_unreachable:${a?.why || 'no path'}` }
+      }
+    }
     await bot.craft(resolved.recipe, 1, resolved.table || null)
     return { ok: true, item: itemName, count: resolved.recipe.result?.count || 1 }
   } catch (err) {

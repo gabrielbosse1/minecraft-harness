@@ -389,6 +389,13 @@ test('G9: a decision generated for an old situation is refused before it acts', 
     assert.equal(it.results.at(-1).ok, false)
     assert.match(it.results.at(-1).msg, /active task changed while you were deciding/)
     assert.equal(it.agenda.main?.label, 'follow Gabriel', 'the running task was not replaced by the stale answer')
+
+    // The explicit debugging opt-out disables the guard, not the controls arbiter.
+    const action = { a: 'take', item: 'bread', where: 'chest' }
+    s.shared.cfg.goals.staleGuard = false
+    assert.equal(it.staleActionReason(action, staleSnap), null)
+    s.shared.cfg.goals.staleGuard = true
+    assert.match(it.staleActionReason(action, staleSnap), /active task changed/)
   } finally { s.stop() }
 })
 

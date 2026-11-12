@@ -830,6 +830,7 @@ function startSession (shared, onEnded) {
   // or resurrect a task that another controller already replaced.
   const QUIET_TASKS = new Set(['build', 'build_shape', 'gather', 'take', 'put', 'smelt', 'sleep', 'use_block', 'craft', 'look_in', 'light_up', 'shelter', 'follow', 'go_to', 'run_script'])
   function staleActionReason (action, snap) {
+    if (GOALS.staleGuard === false) return null // opt out from config (debugging)
     if (!snap || !QUIET_TASKS.has(action.a)) return null
     const known = new Set(snap.threatIds || [])
     const fresh = [...(sense.last?.dangerIds || [])].filter((id) => !known.has(id))

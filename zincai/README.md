@@ -172,9 +172,11 @@ What happens when the work is interrupted:
 
 Resuming is not replaying: the origin is the one captured when the build
 started, a gather continues from the remaining count, and short jobs re-run
-from their arguments. **The world is the only ground truth for completion** —
-`verifyGoalAgainstWorld` checks blocks, inventory, places and players; a task
-that returned success without the world agreeing stays open. Verification is
+from their arguments. Task completion requires a successful result that does
+not explicitly report incomplete work. On restart, explicit verification, and
+resume, `verifyGoalAgainstWorld` checks supported objectives against blocks,
+inventory, places and players; unsupported or unavailable evidence produces
+an unknown verdict, not proof of completion. Build verification is
 dimension-aware, so the same x/z in the nether is not evidence about an
 overworld build.
 

@@ -48,9 +48,19 @@ const VALIDATORS = {
     return { ok: true, action: { a: 'craft', i: o.i } }
   },
   equip (o) {
+    // audit2 B6: by NAME first (the model now sees an inventory line); the
+    // legacy slot form keeps working for prompts cached in old sessions.
+    if (o.i !== undefined) {
+      if (!isValidItemName(o.i)) return fail('equip: bad item id')
+      return { ok: true, action: { a: 'equip', i: String(o.i).toLowerCase() } }
+    }
     const s = toFiniteNumber(o.s)
-    if (s === null || !Number.isInteger(s) || s < 0 || s > 8) return fail('equip: s must be int 0..8')
+    if (s === null || !Number.isInteger(s) || s < 0 || s > 8) return fail('equip: needs i (item id) or s (slot int 0..8)')
     return { ok: true, action: { a: 'equip', s } }
+  },
+  hold () {
+    // "Accept the threats shown": the body stops running from them (30 min or until one hurts the bot/new danger).
+    return { ok: true, action: { a: 'hold' } }
   },
   attack (o) {
     if (typeof o.n !== 'string') return fail('attack: missing n')

@@ -58,6 +58,7 @@ const SYSTEM_PROMPT = fs.readFileSync(path.join(ZINC_DIR, 'system_prompt.txt'), 
 const CHAT_PROMPT = fs.readFileSync(path.join(ZINC_DIR, 'chat_prompt.txt'), 'utf8').trim()
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const { AmdToolsClient, createZincTools } = require('./api_wrapper')
+const { FailGate } = require('./failgate')
 const ZINC_TOOLS = createZincTools()
 
 // logger.js is plain text with ISO timestamps — Pufferpanel-safe by design.
@@ -382,6 +383,23 @@ function startSession (shared, onEnded) {
     if (shared.chatLog.length > 12) shared.chatLog.splice(0, shared.chatLog.length - 12)
   }
   /** The bot and this player exchanged lines within the last minute. */
+  // A sender may wake the chat lane at most this often (sliding minute).
+  const chatRate = {
+    hits: new Map(),
+    allow (sender) {
+      const max = cfg.behavior.chatPerPlayerPerMinute ?? 8
+      if (!(max > 0)) return true
+      const now = Date.now()
+      const key = String(sender).toLowerCase()
+      const list = (this.hits.get(key) || []).filter((t) => now - t < 60_000)
+      if (list.length >= max) { this.hits.set(key, list); return false }
+      list.push(now)
+      this.hits.set(key, list)
+      return true
+    },
+    prune () { const now = Date.now(); for (const [k, v] of this.hits) { const l = v.filter((t) => now - t < 60_000); if (!l.length) this.hits.delete(k); else this.hits.set(k, l) } }
+  }
+
   const inConversation = (name) => {
     const list = shared.convo.get(name)
     const last = list && list[list.length - 1]
@@ -415,6 +433,13 @@ function startSession (shared, onEnded) {
 
   // ------------------------------------------------------ action results --
   const INFORMATIONAL = new Set(['find', 'look_in'])
+  // audit2 B1: stop the model re-issuing a call the body keeps refusing.
+  const failGate = new FailGate({
+    windowMs: cfg.inference?.failWindowMs ?? 120_000,
+    maxFails: cfg.inference?.failGateAfter ?? 2
+  })
+  /** The action whose turn is executing right now, for failure attribution. */
+  let gateCtx = null
   /**
    * Record what an action did and, when the model needs to know right away
    * (a failure, a finished task, information it asked for), wake it.
@@ -424,12 +449,45 @@ function startSession (shared, onEnded) {
     // What the model asked to be told (a chest's contents, a storage list) is
     // not cut to a headline: at 220 characters a full chest lost its second half.
     const msg = String(r.msg || (r.ok ? 'done' : 'failed')).slice(0, INFORMATIONAL.has(label) ? 900 : 260)
+    if (gateCtx && String(gateCtx.a) === label) {
+      if (!r.ok) failGate.recordFailure(gateCtx, msg, here())
+      else failGate.recordSuccess(gateCtx)
+    }
     results.push({ label, ok: Boolean(r.ok), msg, ts: Date.now() })
     if (results.length > 5) results.splice(0, results.length - 5)
     logger.info(TAG, `${label}: ${r.ok ? 'ok' : 'FAILED'} — ${msg}`)
     note({ type: 'result', msg: `${label}: ${msg}` })
     const shouldWake = wake === null ? (!r.ok || INFORMATIONAL.has(label)) : wake
     if (shouldWake) brain?.wake(`${label} ${r.ok ? 'done' : 'failed'}: ${msg}`, { external: false })
+  }
+
+  // ------------------------------------------------------------ trust ----
+  /**
+   * audit2 B11/D: optional trust gate. The default has NO lists configured
+   * and behaves exactly as before (everyone equal). Once trust.owners or
+   * trust.trusted name players, a guest whose chat request reached the body
+   * may not: take/give valuables, run scripts. The bot's own initiative
+   * (askedBy null) is never gated. Matching is offline-safe best effort —
+   * username spoofing is a server-config matter (documented in README).
+   */
+  const trustCfg = cfg.trust || {}
+  const trustLists = { owners: (trustCfg.owners || []).map((n) => String(n).toLowerCase()), trusted: (trustCfg.trusted || []).map((n) => String(n).toLowerCase()) }
+  const trustConfigured = trustLists.owners.length > 0 || trustLists.trusted.length > 0
+  const TRUST_VALUABLE = /(diamond|diamante|netherite|esmeralda|emerald|ancient_debris|elytra|beacon|tesouro|valioso|enchanted_golden)/i
+  function trustLevel (name) {
+    if (!name) return 'self'
+    const n = String(name).toLowerCase()
+    if (trustLists.owners.includes(n)) return 'owner'
+    if (trustLists.trusted.includes(n)) return 'trusted'
+    return 'guest'
+  }
+  function trustCheck (a, action, askedBy) {
+    if (!trustConfigured || !askedBy || trustLevel(askedBy) !== 'guest') return null
+    const who = `${askedBy} is not in the trust list (config trust.owners/trusted) — an owner can ask this. Tell the player that`
+    if (a === 'run_script') return `refused for ${askedBy}: ${who}`
+    if (a === 'give' && TRUST_VALUABLE.test(String(action.item || ''))) return `refused for ${askedBy}: ${who}`
+    if (a === 'take' && (TRUST_VALUABLE.test(String(action.item || '')) || TRUST_VALUABLE.test(String(action.where || '')))) return `refused for ${askedBy}: ${who}`
+    return null
   }
 
   // ------------------------------------------------------------ agenda ---
@@ -684,7 +742,13 @@ function startSession (shared, onEnded) {
     const mode = wrapper.mode || 'explorer'
     const nearby = pos ? places.describeNearby(pos, { dim: dim() }) : ''
     const named = pos ? places.describeNamed(pos, { dim: dim() }) : ''
-    const request = [...reasons].reverse().find((r) => /^chat request/.test(r)) || shared.chatLog.filter((l) => l.who !== 'me').slice(-1)[0]?.text || ''
+    // audit2 B5: the memory-recall query for a non-chat wake must be RECENT
+    // chat — otherwise a question asked hours ago keeps steering recall into
+    // unrelated threat/task prompts (measured in audit/repro/13).
+    const lastChat = shared.chatLog.filter((l) => l.who !== 'me').slice(-1)[0]
+    const chatRecallAgeMs = cfg.memory.chatRecallMaxAgeMs ?? 120_000
+    const request = [...reasons].reverse().find((r) => /^chat request/.test(r)) ||
+      (lastChat && Date.now() - lastChat.ts <= chatRecallAgeMs ? lastChat.text : '')
     const recalled = memory.recallBlock(request, cfg.memory.topK ?? 3)
     const prefs = memory.preferencesLine()
     const chat = chatLines()
@@ -692,6 +756,14 @@ function startSession (shared, onEnded) {
     const events = memory.working.last(6)
       .filter((e) => !OWN_SECTION.has(e.type))
       .map((e) => `  - ${e.type}: ${e.text || e.msg || ''}${e.count > 1 ? ` (x${e.count})` : ''}`).join('\n')
+    // audit2 B9/K: wire the (previously write-only) ephemeral buffer as a
+    // "just now" line: the last ~4 things inside a 30 s window that no other
+    // section already shows (chat, said, results, threat events have their own).
+    const ephItems = (memory.ephemeral?.snapshot?.() || [])
+      .filter((e) => !OWN_SECTION.has(e.type) && (e.text || e.msg))
+      .slice(-4)
+      .map((e) => String(e.text || e.msg))
+    const justNow = ephItems.length ? `just now: ${ephItems.join('; ').slice(0, 220)}` : null
     const lines = [
       observe.selfLine(bot, { mode }),
       observe.inventoryLine(bot),
@@ -707,6 +779,8 @@ function startSession (shared, onEnded) {
       chat ? `chat (recent):\n${chat}` : null,
       res ? `results (your last actions):\n${res}` : null,
       events ? `events:\n${events}` : null,
+      failGate.advisoryLine(pos) || null,
+      justNow,
       `why now: ${reasons.join('; ')}`
     ]
     if (mode === 'builder') {
@@ -748,13 +822,47 @@ function startSession (shared, onEnded) {
   /** Tools that start or change something in the world: after one of them a request counts as taken up. */
   const PASSIVE = new Set(['idle', 'say', 'hold', 'find', 'equip', 'eat', 'set_mode', 'remember_here'])
 
+  // audit2 G.4: one metrics JSONL line per model call — the usage numbers in
+  // this repo's cost tables stop being estimates the first time this runs
+  // against a live endpoint that reports them.
+  let metricsWarned = false
+  function logUsage (lane, why, usage, ms, tool) {
+    try {
+      if (!usage) return
+      const row = {
+        ts: new Date().toISOString(), lane, tool: tool || null,
+        why: String(why || '').slice(0, 80),
+        in: usage.prompt_tokens ?? usage.promptTokens ?? null,
+        out: usage.completion_tokens ?? usage.completionTokens ?? null,
+        cached: usage.cached_tokens ?? usage.cachedTokens ?? usage.prompt_tokens_details?.cached_tokens ?? null,
+        ms: Number.isFinite(ms) ? ms : null
+      }
+      fs.appendFileSync(path.join(DATA_DIR, 'metrics.jsonl'), JSON.stringify(row) + '\n')
+    } catch (err) {
+      if (!metricsWarned) { metricsWarned = true; logger.warn(TAG, `metrics log unavailable: ${err.message || err}`) }
+    }
+  }
+  // audit2 G.3: per-mode tool schemas (cached; one JSON per mode so prefix
+  // caching still sees a stable schema block within a mode).
+  const modeToolsCache = new Map()
+  function modeTools (mode) {
+    const m = ['explorer', 'hunter', 'builder'].includes(mode) ? mode : 'explorer'
+    if (!modeToolsCache.has(m)) modeToolsCache.set(m, createZincTools({ mode: m }))
+    return modeToolsCache.get(m)
+  }
+
   async function act (reasons) {
     const snap = buildActionPrompt(reasons)
     logger.debug(TAG, `action turn (${reasons.join(' | ')})`)
-    const { action } = await amd.chatWithTools([
+    // audit2 G: the action lane ships only the tools the current mode can
+    // use (build tools only in builder mode) — a smaller schema block per call.
+    const tools = modeTools(wrapper.mode || 'explorer')
+    const t0 = Date.now()
+    const { action, usage } = await amd.chatWithTools([
       { role: 'system', content: SYSTEM_PROMPT },
       { role: 'user', content: snap.text }
-    ], ZINC_TOOLS)
+    ], tools)
+    logUsage('action', reasons.join(' | '), usage, Date.now() - t0, action?.a)
     await executeAction(action, snap)
     // The body took something up: what was asked is no longer "not started".
     // The request this turn was woken for, or — when the turn was about
@@ -775,7 +883,9 @@ function startSession (shared, onEnded) {
       { role: 'user', content: text }
     ]
     const maxTokens = cfg.inference.chatMaxTokens ?? 120
-    let { reply } = await amd.chatReply(messages, { maxTokens })
+    const tChat0 = Date.now()
+    let { reply, usage: chatUsage } = await amd.chatReply(messages, { maxTokens })
+    logUsage('chat', `${sender}: ${lines.map((l) => l.text).join(' / ').slice(0, 60)}`, chatUsage, Date.now() - tChat0, 'reply')
     // Language guard: one more try with a plain instruction, then a fixed line.
     if (reply.text && !inLanguage(reply.text)) {
       logger.warn(TAG, `chat reply was not ${LANGUAGE} ("${reply.text.slice(0, 80)}") — asking once more`)
@@ -846,12 +956,15 @@ function startSession (shared, onEnded) {
     } else {
       origin = bot.entity.position.floored()
     }
-    const preflight = parser.checkInventory(blocks, bot.inventory.items())
+    // audit2 F: plan FIRST so a staged build checks only ITS phase's
+    // materials — "roof" must not fail because detailing blocks are missing.
+    const plan = parser.plan({ name: label, blocks }, origin, bot.entity.position)
+    const phaseBlocks = stage && plan.steps ? plan.steps.filter((s) => (s.phase || 'walls') === stage).map((s) => ({ name: s.name })) : blocks
+    const preflight = parser.checkInventory(phaseBlocks, bot.inventory.items())
     if (!preflight.ok) {
       const missing = preflight.missing.map((m) => `${m.name} x${m.need - m.have}`).join(', ')
-      return { ok: false, msg: `cannot build ${label}${stage ? ' (' + stage + ')' : ''}: missing ${missing}` }
+      return { ok: false, msg: `cannot build ${label}${stage ? ' (' + stage + ')' : ''}: missing ${missing}. Gather them (gather) or ask a player, then call the same stage again — phases already placed do not redo.` }
     }
-    const plan = parser.plan({ name: label, blocks }, origin, bot.entity.position)
     logger.info(TAG, `${label} — ${plan.steps.length} blocks${stage ? ` (stage ${stage})` : ''}${plan.towerNeeded ? `, tower ${plan.towerHeight} high` : ''}`)
     const result = await executor.build(plan, { stage })
     let scaffoldNote = ''
@@ -875,7 +988,20 @@ function startSession (shared, onEnded) {
       return report(action.a || 'action', { ok: false, msg: `refused: ${vanilla.why} — you cannot run commands` })
     }
     const a = action.a
+    // audit2 D-min: a guest (chat-asker outside the trust lists) may not
+    // reach valuables or automation. Off when no lists are configured.
+    const trustRefusal = trustCheck(a, action, snap?.askedBy)
+    if (trustRefusal) return report(a, { ok: false, msg: trustRefusal })
+    // audit2 B1: the exact same call failed repeatedly seconds ago — refuse
+    // it locally instead of running the world mutation again. No wake: the
+    // quiet refusal shows up in the next natural prompt's results.
+    if (a !== 'idle') {
+      const blocked = failGate.check(action, here())
+      if (blocked) return report(a, { ok: false, msg: blocked }, { wake: false })
+    }
     if (a !== 'idle') logger.info(TAG, `action: ${a} ${JSON.stringify(Object.fromEntries(Object.entries(action).filter(([k]) => !k.startsWith('_') && k !== 'a')))}`)
+    gateCtx = action
+    try {
     switch (a) {
       case 'idle':
         // Prose without a tool call used to vanish silently; say so once.
@@ -975,11 +1101,30 @@ function startSession (shared, onEnded) {
         return report('find', skills.find({ what: action.what, page: action.page }))
       case 'remember_here':
         return report('remember_here', skills.rememberHere({ name: action.name, note: action.note }), { wake: null })
+      case 'gather': {
+        decided(snap, { label: 'gather' })
+        const n = Math.max(1, Math.min(64, Math.trunc(Number(action.count)) || 1))
+        return startMain({ tool: 'gather', label: `gather ${action.item}${n > 1 ? ` x${n}` : ''}`, askedBy: snap.askedBy, decision: decided(snap, { label: 'gather' }), run: () => skills.gather({ item: action.item, count: n, radius: action.radius }) })
+      }
+      case 'light_up': {
+        decided(snap, { label: 'light_up' })
+        return startMain({ tool: 'light_up', label: 'lighting the area', askedBy: snap.askedBy, decision: decided(snap, { label: 'light_up' }), run: () => skills.lightUp({ radius: action.radius }) })
+      }
+      case 'shelter': {
+        decided(snap, { label: 'shelter' })
+        return startMain({ tool: 'shelter', label: 'sheltering', askedBy: snap.askedBy, decision: decided(snap, { label: 'shelter' }), run: () => skills.shelter() })
+      }
+      case 'corpse_run': {
+        decided(snap, { label: 'corpse_run' })
+        return startMain({ tool: 'corpse_run', label: 'going back to last death', askedBy: snap.askedBy, decision: decided(snap, { label: 'corpse_run' }), run: () => skills.corpseRun() })
+      }
       case 'craft': {
+        // audit2 B3/E: runs as a side job through skills.craft, which WALKS
+        // to the table (task lane) before crafting. A main task pauses for it.
         const item = String(action.i ?? action.item ?? '')
         if (!item) return report('craft', { ok: false, msg: 'craft needs an item' })
-        const r = await craftItem(bot, item)
-        return report('craft', { ok: Boolean(r.ok), msg: r.ok ? `crafted ${item}` : `could not craft ${item}: ${r.why || 'unknown'}` }, { wake: !r.ok })
+        decided(snap, { label: 'craft' })
+        return startSide('craft', () => skills.craft({ item }))
       }
       case 'build': {
         if (!executor) return report('build', { ok: false, msg: 'not ready yet' })
@@ -1023,6 +1168,7 @@ function startSession (shared, onEnded) {
       default:
         return report(String(a), { ok: false, msg: `unknown action "${a}"` })
     }
+    } finally { gateCtx = null }
   }
 
   // ------------------------------------------ optional Scout & Relocate --
@@ -1111,7 +1257,7 @@ function startSession (shared, onEnded) {
 
     const taskLane = arbiter.lane('task', PRIORITY.task)
     executor = new BuilderExecutor(bot, { scaffoldBlocks: cfg.build.scaffoldBlocks, logger: wrapperLog, hands: taskLane })
-    skills = new Skills(bot, { arbiter, places, logger: wrapperLog, whisper: guard.whisper })
+    skills = new Skills(bot, { arbiter, places, logger: wrapperLog, whisper: guard.whisper, executor: () => executor })
     wrapper.setMode(cfg.behavior.mode || 'explorer')
 
     brain = new Brain({
@@ -1153,6 +1299,9 @@ function startSession (shared, onEnded) {
       onEvent: (evt) => {
         note({ type: evt.type, msg: evt.text })
         if (evt.wake) brain.wake(evt.text, { external: true, urgent: evt.urgent === true })
+        // A new danger on screen changes the world: what failed a moment ago
+        // (run away, fight back) may now be the right call.
+        if (evt.type === 'threat') failGate.clearContext()
         // An escape that cost health or dragged on says something about that
         // place. Written in a fixed form (kinds, 16-block cell, day or night)
         // so the tenth escape from the same spot is the same memory, not a tenth one.
@@ -1191,12 +1340,28 @@ function startSession (shared, onEnded) {
     isReady: () => systemsReady && !ended,
     onHurt: (cause, { hp }) => {
       note({ type: 'hurt', msg: cause.text })
+      // audit2 B1: do NOT clear the fail gate here — being hit is exactly the
+      // state in which "too hurt to fight" keeps failing; clearing re-armed
+      // the churn loop (repro 05). Death and new threats still clear it.
       const now = Date.now()
       if (hp > 0 && (cause.text !== lastHurt.text || now - lastHurt.at > 4000)) brain.wake(`hurt: ${cause.text} (hp ${hp})`, { external: true })
       lastHurt = { at: now, text: cause.text }
     }
   }).start()
   bot.on('entityHurt', (entity) => { if (entity !== bot.entity) system1?.onEntityHurt(entity) })
+
+  // audit2 B10/B15: a container block changing under the bot (opened or
+  // broken by someone else, a new chest placed) invalidates what the index
+  // thought was inside — at zero cost, no waiting for the next 3 s scan.
+  bot.on('blockUpdate', (oldBlock, newBlock) => {
+    if (!systemsReady) return
+    try { places.onBlockChange(oldBlock, newBlock, { dim: dim() }) } catch { /* cosmetic */ }
+  })
+
+  // audit2 B13: absorption/health-boost show up as hp above the vanilla 20 —
+  // that observed value is the only honest base for fight odds and the
+  // low-hp disengage threshold.
+  bot.on('health', () => { try { combat?.noteHealth?.(bot.health) } catch { /* cosmetic */ } })
 
   bot.on('playerCollect', (collector, item) => {
     if (!systemsReady || collector !== bot.entity) return
@@ -1210,6 +1375,7 @@ function startSession (shared, onEnded) {
     logger.warn(TAG, `died at ${where}${lastHurt.text ? ` (${lastHurt.text})` : ''}`)
     note({ type: 'death', msg: `I died at ${where}${lastHurt.text ? ` — ${lastHurt.text}` : ''}` }, { promote: true })
     if (p) places.remember('last death', p, { dim: dim(), note: lastHurt.text })
+    failGate.clearContext()
     fight = null
     agenda.main = null // a new life: the model is told and decides what to pick up again
     try { skills?.cancel('died') } catch { /* noop */ }
@@ -1255,6 +1421,13 @@ function startSession (shared, onEnded) {
     memory.rememberChat(sender, text, { addressed: Boolean(why) })
     logger.debug(TAG, `chat from ${sender}: ${text} (${why ? `for me: ${why}` : 'not for me'})`)
     if (!why) return
+    // audit2 scenario 32: one spamming player may not monopolize the chat
+    // lane's reserved budget — over the per-player limit the line is dropped
+    // (still logged/remembered above, just never answered).
+    if (!chatRate.allow(sender)) {
+      logger.warn(TAG, `chat rate limit: dropping extra line from ${sender}`)
+      return
+    }
     pushConvo(sender, 'them', text)
     brain.hear(sender, text, { whisper })
   })

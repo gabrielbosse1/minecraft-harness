@@ -16,6 +16,15 @@ const world = require('./world')
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
+/**
+ * Real A* from an ARBITRARY start over the synthetic world — backs the
+ * threat-reachability probe and the escape planner, which call
+ * bot.pathfinder.getPathFromTo(start, goal) and previously got nothing in
+ * session rig (the stub lacked it, so reachability always read "unknown").
+ */
+const AStarSim = require('mineflayer-pathfinder/lib/astar')
+const MoveSim = require('mineflayer-pathfinder/lib/move')
+
 /** A bot whose pathfinder stub actually walks it toward the goal. */
 function simulatedBot ({ items = [], held = null, solid = world.flat, blocks = {}, containers = {} } = {}) {
   // `blocks`: { 'x,y,z': 'chest' } — placed in the world and found by findBlocks.
@@ -35,7 +44,7 @@ function simulatedBot ({ items = [], held = null, solid = world.flat, blocks = {
   bot.players = { ZincAI: { entity: bot.entity } }
   bot.heldItem = held ? { name: held } : null
   const inv = items.map(([name, count = 1]) => ({ name, count, type: world.registry.itemsByName[name]?.id ?? 1 }))
-  bot.inventory = { items: () => inv, slots: [], on: () => {} }
+  bot.inventory = { items: () => inv, slots: [], on: () => {}, count: (type) => inv.filter((i) => i.type === type).reduce((n, i) => n + i.count, 0) }
   bot.setQuickBarSlot = (slot) => { log.equip.push(`slot${slot}`) }
   bot.loadPlugin = () => {}
   bot.chat = (t) => { log.chat.push(t) }
@@ -54,6 +63,10 @@ function simulatedBot ({ items = [], held = null, solid = world.flat, blocks = {
   bot.respawn = () => {}
   bot.quit = () => {}
   bot.end = () => {}
+  bot.findBlock = ({ matching, maxDistance = 16 }) => {
+    const ps = bot.findBlocks({ matching, maxDistance, count: 1 })
+    return ps.length ? bot.blockAt(ps[0]) : null // mineflayer: Block or null
+  }
   bot.findBlocks = ({ matching, maxDistance = 16, count = 64 }) => {
     const ids = new Set(Array.isArray(matching) ? matching : [matching])
     const out = []
@@ -118,7 +131,23 @@ function simulatedBot ({ items = [], held = null, solid = world.flat, blocks = {
         pending = { goal: g, resolve, reject }
       })
     },
-    isMoving: () => goal !== null
+    isMoving: () => goal !== null,
+    // Mirrors upstream: a sync-iterated generator of progress events,
+    // final one carrying { result: { status, path } }.
+    getPathFromTo (movements, startPos, g, opts = {}) {
+      return (function* () {
+        const timeout = opts.timeout ?? 5000
+        const tickTimeout = opts.tickTimeout ?? 40
+        const p = startPos.floored()
+        const start = new MoveSim(p.x, p.y, p.z, movements.countScaffoldingItems(), 0)
+        movements.clearCollisionIndex()
+        movements.updateCollisionIndex()
+        const ctx = new AStarSim(start, movements, g, timeout, tickTimeout, -1)
+        let result = ctx.compute()
+        while (result.status === 'partial') result = ctx.compute()
+        yield { result: { status: result.status, path: result.path, cost: result.cost } }
+      })()
+    }
   }
   // 20 Hz: walk toward the goal (0.28 b/t ≈ sprint) or along held keys.
   const tick = setInterval(() => {

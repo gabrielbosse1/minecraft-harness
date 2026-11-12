@@ -348,7 +348,13 @@ class ThreatSense {
    * @param {object} bot
    * @param {{ radius?: number, rangedRadius?: number, closeRadius?: number,
    *           attackerMemoryMs?: number, reachable?: (e:object)=>boolean|null,
-   *           now?: () => number }} [opts]
+   *           now?: () => number,
+   *           containedDemotion?: boolean }} [opts]
+   *   containedDemotion (default true): a visible hostile inside the trigger
+   *   ring that a walking mob could NOT reach (a fence pen, a sealed cage) is
+   *   classified hidden/caged instead of a live threat — a base's zoo must
+   *   not start escapes. Recent attackers, lit creepers and ranged mobs are
+   *   never demoted (a shooter shoots over the fence).
    */
   constructor (bot, opts = {}) {
     this.bot = bot
@@ -360,6 +366,7 @@ class ThreatSense {
     this.watchRadius = Number.isFinite(opts.watchRadius) ? opts.watchRadius : 32
     this.blastRadius = Number.isFinite(opts.blastRadius) ? opts.blastRadius : 8
     this.attackerMemoryMs = Number.isFinite(opts.attackerMemoryMs) ? opts.attackerMemoryMs : 15_000
+    this.containedDemotion = opts.containedDemotion !== false
     this.reachable = typeof opts.reachable === 'function' ? opts.reachable : () => null
     this.now = typeof opts.now === 'function' ? opts.now : () => Date.now()
     /** id -> { at, name, player } for things that actually hurt the bot */
@@ -460,6 +467,7 @@ class ThreatSense {
     if (!me) { this.last = { threats: out, watch, hidden, ids: new Set(), dangerIds: new Set(), at: now }; return this.last }
     const gold = wearsGold(bot)
     const seen = new Set()
+    let probes = 0 // A* containment probes this pass — capped so a horde stays cheap
     for (const id of Object.keys(bot.entities || {})) {
       const e = bot.entities[id]
       if (!e || !e.position || e === bot.entity) continue
@@ -515,6 +523,22 @@ class ThreatSense {
       if (!real) {
         hidden.push(this._entry(e, name, distance, { kind: 'mob', ranged, los, lit, charged, closing, caged: route === false }))
         continue
+      }
+      // Contained but VISIBLE: the fence pen / zoo case. Line of sight sees
+      // over a fence, so `los` alone made it "real" and the base's exhibits
+      // kept starting escapes. Demote to hidden/caged when a walking mob
+      // provably cannot reach the bot — but only a MELEE one: a skeleton
+      // shoots over the fence, a recent attacker has already proven contact,
+      // and anything lit/charged stays a hard threat. Probing is the real
+      // A*, so it is capped per tick and skipped for mobs that are visibly
+      // closing — a horde chasing the bot is never gated on this.
+      if (this.containedDemotion && real && !attacker && !ranged && !lit && !charged && probes < 3) {
+        probes++
+        const r2 = route === null ? this.reachable(e) : route
+        if (r2 === false) {
+          hidden.push(this._entry(e, name, distance, { kind: 'mob', ranged, los, lit, charged, closing, caged: true }))
+          continue
+        }
       }
       out.push(this._entry(e, name, distance, { kind: 'mob', ranged, los, attacker, lit, charged, closing }))
     }

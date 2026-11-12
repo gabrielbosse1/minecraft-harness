@@ -55,5 +55,13 @@ const N = Number(process.argv[2] || 12)
   console.log(`${N} zombies, model says "attack zombie": ${kills} killed, ${hits} hits taken, hp ${bot.health}/20 after 15 s\n`)
   for (const l of trace) console.log('  ' + l)
   console.log('\nmodel calls:'); for (const c of calls) console.log(`  +${((c.t - t0) / 1000).toFixed(0).padStart(2)}s ${c.text}`)
+  // audit2 B1 proof: after the FailGate fix the doomed loop is cut locally.
+  // Before the fix this scene showed 6 attack calls / 14 s, each ~3.7k tokens;
+  // after it, the 3rd identical attempt is refused with "skipped:" and no wake.
+  const attacks = calls.filter((c) => /→ attack/.test(c.text)).length
+  const skipped = s.internals().results.filter((r) => /skipped: the exact same/.test(r.msg)).length
+  console.log(`\nFailGate evidence: ${attacks} attack calls total (was 6 pre-fix), ${skipped} local "skipped:" refusal(s)`)
+  if (!skipped) console.log('  !! gate did NOT fire — regression')
+  else console.log('  OK — the churn loop is cut without spending a model call')
   s.stop(); process.exit(0)
 })().catch((e) => { console.error(e); process.exit(1) })

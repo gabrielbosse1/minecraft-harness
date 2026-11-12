@@ -31,7 +31,10 @@
     "chatReserve": 4,
     "heartbeatMs": 90000,
     "maxSelfChain": 12,
-    "chatMaxTokens": 120
+    "chatMaxTokens": 120,
+    "failGateAfter": 2,
+    "failWindowMs": 120000,
+    "_failGateNote": "audit2 B1: the same tool call with the same arguments failing failGateAfter times inside failWindowMs is refused locally (no wake) until the world changes (success, movement, hurt, new threat, timeout)."
   },
   "memory": {
     "file": "zincai-data/memories.json",
@@ -40,7 +43,14 @@
     "topK": 3,
     "ephemeralMs": 30000,
     "preferencesFile": "zincai-data/preferences.json",
-    "factsPerPlayer": 6
+    "factsPerPlayer": 6,
+    "chatRecallMaxAgeMs": 120000,
+    "_chatRecallNote": "Memory recall on non-chat wakes uses the last chat line only while it is this fresh (audit2 B5): hours-old chat stopped steering recall into flee/task prompts."
+  },
+  "trust": {
+    "_note": "audit2 B11/D: EMPTY lists = old behavior (everyone equal, gate off). Once owners or trusted names are set, a guest whose chat request reaches the action lane may NOT take/give valuables (diamond/netherite/emerald-tier items or labels) or run_script; the bot's own initiative is never gated. CAUTION: offline-mode usernames are not proof of identity - run online-mode or a whitelist if that matters.",
+    "owners": [],
+    "trusted": []
   },
   "behavior": {
     "_note": "No friend list and no PvP switch: the bot never attacks a player unless the model names that player in the attack tool. Its reflex toward every real threat is to flee until the model decides.",
@@ -55,6 +65,8 @@
     "fovDegrees": 90,
     "perceptionRange": 10,
     "chatCooldownMs": 1500,
+    "chatPerPlayerPerMinute": 8,
+    "_chatRateNote": "audit2 scenario 32: one player spamming the bot may use at most this many chat-lane wakes per minute; extra lines are still logged and remembered, just not answered.",
     "useArmorManager": true,
     "mode": "explorer",
     "perception3D": false,

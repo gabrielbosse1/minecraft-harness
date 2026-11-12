@@ -104,10 +104,21 @@ const ACTION_TOOLS = [
     name: STR('Place name.'),
     note: STR('Optional note.')
   }, ['name']),
-  tool('craft', 'Craft an item from the 2x2/3x3 grid if materials are available.', { item: STR('Item id, e.g. "crafting_table".') }, ['item']),
+  tool('craft', 'Craft an item from the 2x2/3x3 grid if materials are available. Walks to the table itself if needed.', { item: STR('Item id, e.g. "crafting_table".') }, ['item']),
+  tool('gather', 'Dig a raw resource nearby: logs, ores, soils. Only blocks that ARE the named resource are ever dug (strict allowlist — player buildings are never touched). Ores need a good enough pickaxe carried.', {
+    item: STR('Resource id or alias, e.g. "oak_log", "coal", "iron", "diamond", "stone", "sand".'),
+    count: INT('How many to dig (default 1, max 64).'),
+    radius: INT('Search radius in blocks (default 32).')
+  }, ['item']),
+  tool('light_up', 'Place torches from the inventory onto dark walkable floor around you. Needs torches carried.', {
+    radius: INT('How far around to look for dark spots (default 8, max 16).')
+  }),
+  tool('shelter', 'Emergency cover where you stand: pillar up 3 blocks on owned scaffold. Melee cannot reach, arrows still can. stop digs the pillar back down. Use at night with no bed.'),
+  tool('corpse_run', 'Walk back to the remembered "last death" place and pick up the dropped items. Fails if no death was recorded since the feature existed.'),
   tool('build', 'Build a stored blueprint or an inline grid. Prefer build_shape for large/simple geometry.', {
     blueprint: STR('Name of a file in zincai/blueprints/ (without .json).'),
-    grid: { type: 'array', description: 'Inline 3D layers (bottom-to-top), each layer an array of rows of chars; "." is air.', items: { type: 'array', items: { type: 'string' } } },
+    grid: { type: 'array', description: 'Inline 3D layers (bottom-to-top); each layer is rows of palette chars; "." or " " is air. MUST come with "palette".', items: { type: 'array', items: { type: 'string' } } },
+    palette: { type: 'object', description: 'Required with grid: maps each char to a block id, e.g. {"#":"stone_bricks","G":"glass"}.', additionalProperties: { type: 'string' } },
     at: AT,
     stage: STAGE
   }),
@@ -136,8 +147,25 @@ const CHAT_TOOLS = [
 
 const toOpenAi = (list) => list.map((t) => ({ type: 'function', function: JSON.parse(JSON.stringify(t)) }))
 
+/**
+ * audit2 G: tools a mode cannot meaningfully use are not shipped to the
+ * model in that mode — the schema block is ~63% of every action call, and a
+ * builder never needs `smelt`/`sleep` mid-build. Movement, survival and
+ * social tools (say/idle/stop/hold/find/remember_here/set_mode…) are always
+ * present, so a mode switch never strands the model without a way out.
+ */
+const MODE_DROP_TOOLS = {
+  explorer: ['build', 'build_shape'],
+  hunter: ['build', 'build_shape', 'smelt', 'sleep', 'use_block'],
+  builder: ['smelt', 'sleep']
+}
+
 /** OpenAI-format tools array. Cloned so callers may not mutate the source. */
-function createZincTools () { return toOpenAi(ACTION_TOOLS) }
+function createZincTools ({ mode = null } = {}) {
+  const drop = MODE_DROP_TOOLS[mode] || []
+  const list = drop.length ? ACTION_TOOLS.filter((t) => !drop.includes(t.name)) : ACTION_TOOLS
+  return toOpenAi(list)
+}
 function createChatTools () { return toOpenAi(CHAT_TOOLS) }
 
 /**
@@ -239,6 +267,22 @@ function buildToolsPayload ({ model, messages, temperature, maxTokens, tools, to
     tools,
     tool_choice: toolChoice,
     parallel_tool_calls: false
+  }
+}
+
+/** Sum two usage reports (a call and its rescue retry), preserving nulls. */
+function mergeUsage (a, b) {
+  if (!a) return b
+  if (!b) return a
+  const sum = (x, y) => (x === null || x === undefined ? (y ?? null) : (y == null ? x : x + y))
+  return {
+    ...a,
+    promptTokens: sum(a.promptTokens, b.promptTokens),
+    completionTokens: sum(a.completionTokens, b.completionTokens),
+    cachedTokens: sum(a.cachedTokens, b.cachedTokens),
+    // index.js logs the wire names too; keep both spellings when present
+    prompt_tokens: sum(a.prompt_tokens, b.prompt_tokens),
+    completion_tokens: sum(a.completion_tokens, b.completion_tokens)
   }
 }
 
@@ -379,7 +423,8 @@ class AmdToolsClient {
             this.stats.callsWithCacheInfo += 1
           }
         }
-        return { message, usage, raw: data }
+        const finishReason = data?.choices?.[0]?.finish_reason ?? null
+        return { message, usage, raw: data, finishReason }
       } catch (err) {
         const isAbort = err && (err.name === 'AbortError' || /abort/i.test(String(err.message)))
         const isNetwork = err instanceof TypeError
@@ -396,19 +441,50 @@ class AmdToolsClient {
     throw lastError || new Error('AMD request failed after retries')
   }
 
-  /**
-   * One tool-enabled completion for the ACTION lane.
+
+/**
+ * One tool-enabled completion for the ACTION lane.
    * @param {{role:string, content:string}[]} messages
    * @param {object[]} tools OpenAI-format tools (see createZincTools)
    * @returns {Promise<{action:object, content:string, usage:object, raw:object}>}
    */
   async chatWithTools (messages, tools = createZincTools()) {
-    const { message, usage, raw } = await this._complete({ messages, tools, lane: 'action' })
-    const action = coerceAction(message)
+    const first = await this._complete({ messages, tools, lane: 'action' })
+    let action = coerceAction(first.message)
+    // audit2 I: an answer that executed NOTHING in a broken way — an invented
+    // tool name, broken JSON arguments, an empty message, or finish_reason
+    // 'length' truncating the call — gets exactly one do-over with an explicit
+    // instruction. PROSE is not retried here: the executor already reports
+    // "you answered in prose without calling a tool" and re-wakes the model
+    // (a tested contract); retrying it would double every prose turn's cost.
+    const empty = !action._via && action._fallback && !action._prose
+    const broke = action._unknownTool || action._badArgs || empty || first.finishReason === 'length'
+    if (broke) {
+      const truncated = first.finishReason === 'length'
+      const nudge = truncated
+        ? 'Your answer was cut off. Call exactly ONE tool now, with short arguments — nothing else.'
+        : 'That answer did nothing: no valid tool was called. Call exactly ONE of the listed tools now (use say to just talk, idle to wait) — plain text, markdown fences and other names are not accepted.'
+      try {
+        const second = await this._complete({
+          messages: [...messages, { role: 'user', content: nudge }],
+          tools, lane: 'action',
+          maxTokens: truncated ? Math.min(512, (this.maxTokens || 256) * 2) : undefined
+        })
+        const retry = coerceAction(second.message)
+        if (retry._via === 'tool') {
+          this.stats.rescuedToolCalls = (this.stats.rescuedToolCalls || 0) + 1
+          action = retry
+          return { action, content: typeof second.message.content === 'string' ? second.message.content.trim() : '', usage: mergeUsage(first.usage, second.usage), raw: second.raw }
+        }
+        logger.warn(TAG, `model retry still produced no valid tool call (${action._unknownTool ? `unknown "${action._unknownTool}"` : action._badArgs ? 'bad args' : 'prose'})`)
+      } catch (err) {
+        logger.debug(TAG, `action retry failed: ${err.message || err}`)
+      }
+    }
     if (action._via === 'tool') this.stats.toolCalls += 1
     else if (action._fallback || action._badArgs) this.stats.jsonFallbacks += 1
     if (action._unknownTool) this.stats.unknownToolCalls += 1
-    return { action, content: typeof message.content === 'string' ? message.content.trim() : '', usage, raw }
+    return { action, content: typeof first.message.content === 'string' ? first.message.content.trim() : '', usage: first.usage, raw: first.raw }
   }
 
   /**

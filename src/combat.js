@@ -402,6 +402,7 @@ class AdvancedCombat {
   } = {}) {
     this.bot = bot
     this.maxHealth = maxHealth
+    this._disengageFrac = disengageHealthFraction
     this.disengageAt = Math.max(1, Math.floor(maxHealth * disengageHealthFraction))
     this.attackCooldownMs = attackCooldownMs
     this.disengageCooldownMs = disengageCooldownMs
@@ -416,6 +417,18 @@ class AdvancedCombat {
     this.hands = hands || directHands(bot)
     this.fleeOnDisengage = fleeOnDisengage !== false
     this.lineOfSight = typeof lineOfSight === 'function' ? lineOfSight : (e) => hasLineOfSight(this.bot, e)
+    /**
+     * audit2 B13: Absorption / health-boost raise REAL hp past the vanilla 20,
+     * and we can only know by seeing it. The largest observed hp is the best
+     * available base for the disengage threshold and fight-cost estimates, so
+     * call this on every health event; vanilla bots never move from 20.
+     */
+    this.noteHealth = (hp) => {
+      const h = Math.ceil(Number(hp) || 0)
+      if (h <= this.maxHealth) return
+      this.maxHealth = h
+      this.disengageAt = Math.max(1, Math.floor(h * this._disengageFrac))
+    }
     this.motion = new MotionTracker({ now: this.now })
     this.watch = typeof watch === 'function' ? watch : () => []
     this._evadeDir = null
@@ -681,20 +694,36 @@ class AdvancedCombat {
     return new GoalNear(botPos.x + dx * 14, Math.floor(botPos.y), botPos.z + dz * 14, 2)
   }
 
+  /**
+   * Base score for auto-equip. audit2 B7: mace/trident/spear were invisible
+   * to it — the bot could carry a netherite-grade arsenal and swing with a
+   * fist. Trident melee (9) sits just under netherite sword; mace without a
+   * fall is a weak club (its smash needs height — the dodge handles being on
+   * the receiving end); spear is a charge weapon, poor in a straight brawl.
+   */
+  _weaponScore (name) {
+    const m = /^(netherite|diamond|iron|copper|stone|golden|wooden)_(sword|axe)$/.exec(name)
+    if (m) {
+      const tier = WEAPON_TIERS.indexOf(m[1])
+      const kindBonus = m[2] === 'sword' ? 2 : 1
+      return (WEAPON_TIERS.length - tier) * 10 + kindBonus
+    }
+    if (name === 'trident') return (WEAPON_TIERS.length - 0) * 10 + 1 // netherite axe tier
+    if (name === 'mace') return 13 // ≈ stone sword; smash fallback only
+    if (name === 'spear') return 9
+    return -1
+  }
+
   async _equipBestWeapon () {
     try {
       const items = this.bot.inventory.items()
       let best = null
       let bestScore = -1
       for (const item of items) {
-        const m = /^(netherite|diamond|iron|copper|stone|golden|wooden)_(sword|axe)$/.exec(item.name)
-        if (!m) continue
-        const tier = WEAPON_TIERS.indexOf(m[1])
-        const kindBonus = m[2] === 'sword' ? 2 : 1
-        const score = (WEAPON_TIERS.length - tier) * 10 + kindBonus
+        const score = this._weaponScore(item.name)
         if (score > bestScore) { bestScore = score; best = item }
       }
-      if (best && this.bot.heldItem?.name !== best.name) await this.bot.equip(best, 'hand')
+      if (best && bestScore >= 0 && this.bot.heldItem?.name !== best.name) await this.bot.equip(best, 'hand')
     } catch (err) {
       logger.debug(TAG, `weapon equip skipped: ${err.message || err}`)
     }

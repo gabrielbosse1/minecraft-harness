@@ -73,6 +73,17 @@ const EN_WORDS = new Set((
 ).split(' '))
 // Words both languages use ("a", "as", "do", "no", "me", "so", "to", "come", "ok"…) are in neither list.
 const STRONG_EN = new Set(['hello', 'thanks', 'sorry', 'yes', 'sure', 'please', 'done', 'wait', 'coming', 'here', 'there', 'nothing', 'what', 'why', 'where', 'how', 'okay'])
+// audit2 I: the guard used to know only PT vs EN. A smaller model may drift
+// into Spanish/French/German instead; these function words count AGAINST the
+// line exactly like English does (they never collide with the PT function set,
+// after accent folding).
+const FOREIGN_WORDS = new Set((
+  'hola gracias estoy estas quiero quieres puedes tambien ahora donde porque siempre hermano tengo buenos buenas senior senor amigo ' +
+  'bonjour merci oui pourquoi comment avec vous tres bienvenue salut ' +
+  'hallo danke bitte ich nicht und du bist guten morgen freund warum'
+).split(' '))
+// A single one of these words is already enough to reject a one-word line.
+const STRONG_FOREIGN = new Set(['hola', 'gracias', 'bonjour', 'merci', 'oui', 'hallo', 'danke', 'bitte', 'salut'])
 
 /**
  * Is this outgoing chat line in the server's language?
@@ -86,13 +97,17 @@ function checkPortuguese (text, { names = [] } = {}) {
   const words = fold(raw).split(/[^a-z_0-9]+/).filter((w) => w && !/[_0-9]/.test(w) && !skip.has(w))
   let pt = 0
   let en = 0
+  let foreign = false
   for (const w of words) {
     if (PT_WORDS.has(w)) pt++
     else if (EN_WORDS.has(w)) en++
+    else if (FOREIGN_WORDS.has(w)) { en++; foreign = true }
   }
-  if (/[ãõçáéíóúâêôà]/i.test(raw)) pt += 2
+  // Accents point to Portuguese — unless a known foreign function word is
+  // already in play ("bonjour, comment ça va?" must not read as PT).
+  if (!foreign && /[ãõçáéíóúâêôà]/i.test(raw)) pt += 2
   let ok = true
-  if (words.length === 1) ok = !STRONG_EN.has(words[0])
+  if (words.length === 1) ok = !STRONG_EN.has(words[0]) && !STRONG_FOREIGN.has(words[0])
   else if (en >= 2 && en > pt) ok = false
   else if (en >= 1 && pt === 0 && words.length >= 2) ok = false
   return { ok, pt, en, words: words.length }

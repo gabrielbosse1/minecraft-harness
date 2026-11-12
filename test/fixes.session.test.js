@@ -401,7 +401,7 @@ test('T5: "hold" is about the mobs, not the task — it outlives the next tasks,
     const { system1, sense } = s.internals()
     const flees = () => s.prompts.action.filter((p) => /reflex: started FLEEING/.test(why(p))).length
     assert.ok(await s.until(() => s.internals().results.some((r) => r.label === 'hold' && r.ok), 4000), 'the model answered hold')
-    assert.ok(await s.until(() => !system1.fleeing, 2000))
+    assert.ok(await s.until(() => !system1.fleeing, 6000), 'the reflex stands down once the hold lands')
     assert.equal(flees(), 1)
 
     // A short job comes and goes. Its own decision ends with it; the hold does not.

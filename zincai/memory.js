@@ -176,18 +176,18 @@ class LongTermMemory {
   }
 
   /** Add an important fact. Dedupes near-identical facts. */
-  add (text, tags = [], importance = 1) {
+  add (text, tags = [], importance = 1, provenance = null) {
     const clean = String(text).trim()
     if (!clean) return null
     const vector = embed(clean)
     for (const e of this.entries) {
-      if (e.text === clean) return e // exact dedupe
-      if (e._vec && cosine(e._vec, vector) > 0.92 && Math.abs(e.importance - importance) <= 1) {
+      if (e.text === clean && JSON.stringify(e.provenance || null) === JSON.stringify(provenance)) return e // preserve distinct sources
+      if (!provenance && !e.provenance && e._vec && cosine(e._vec, vector) > 0.92 && Math.abs(e.importance - importance) <= 1) {
         e.ts = Date.now()
         return e
       }
     }
-    const entry = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), ts: Date.now(), text: clean, tags, importance }
+    const entry = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), ts: Date.now(), text: clean, tags, importance, ...(provenance ? { provenance } : {}) }
     entry._vec = vector
     this.entries.push(entry)
     // Cap the store at 500 entries, evicting lowest importance then oldest.
@@ -213,12 +213,12 @@ class LongTermMemory {
     const literal = this.entries.filter((e) => fold(e.text).includes(q))
     const scored = []
     if (literal.length) {
-      for (const e of literal) scored.push({ text: e.text, score: 1 + (e.importance || 0) * 0.1 })
+      for (const e of literal) scored.push({ ...e, score: 1 + (e.importance || 0) * 0.1 })
     } else {
       for (const e of this.entries) {
         const low = fold(e.text)
         const hits = terms.filter((t) => low.includes(t)).length
-        if (hits > 0) scored.push({ text: e.text, score: hits / terms.length + (e.importance || 0) * 0.05 })
+        if (hits > 0) scored.push({ ...e, score: hits / terms.length + (e.importance || 0) * 0.05 })
       }
     }
     scored.sort((a, b) => b.score - a.score)
@@ -235,7 +235,7 @@ class LongTermMemory {
       const sim = cosine(q, v)
       if (sim <= 0.05) continue
       const score = sim * (1 + (e.importance || 0) * 0.35)
-      scored.push({ text: e.text, tags: e.tags || [], importance: e.importance || 0, score })
+      scored.push({ ...e, score })
     }
     scored.sort((a, b) => b.score - a.score)
     return scored.slice(0, k)
@@ -268,7 +268,7 @@ class MemorySystem {
     const importance = scoreImportance(evt)
     const shouldPromote = promote === null ? importance >= 2 : Boolean(promote)
     if (shouldPromote) {
-      this.longTerm.add(evt.msg || evt.text || JSON.stringify(evt), evt.tags || [evt.type || 'misc'], Math.max(1, importance))
+      this.longTerm.add(evt.msg || evt.text || JSON.stringify(evt), evt.tags || [evt.type || 'misc'], Math.max(1, importance), { kind: 'event', source: String(evt.type || 'unknown') })
     }
   }
 
@@ -296,23 +296,24 @@ class MemorySystem {
     const q = String(queryText || '').trim()
     if (!q) return ''
     const parts = []
+    const render = (h) => `${h.text} [${h.provenance?.kind || 'unknown source'}${h.provenance?.source ? `: ${h.provenance.source}` : ''}; ${h.ts ? new Date(h.ts).toISOString().slice(0, 10) : 'date unknown'}; verify before relying]`
     if (MemorySystem.isRecallQuery(q)) {
       const literal = this.longTerm.grep(q, topK)
       if (literal.length) {
-        parts.push('recalled:\n' + literal.map((h) => `- ${h.text}`).join('\n'))
+        parts.push('recalled:\n' + literal.map((h) => `- ${render(h)}`).join('\n'))
       } else {
         // no literal hit — try per-significant-token grep, merge unique hits
         const tokens = tokenize(q).slice(0, 4)
-        const seen = new Set()
+        const seen = new Map()
         for (const tok of tokens) {
-          for (const h of this.longTerm.grep(tok, 2)) seen.add(h.text)
+          for (const h of this.longTerm.grep(tok, 2)) seen.set(h.id || h.text, h)
           if (seen.size >= topK) break
         }
-        if (seen.size) parts.push('recalled:\n' + [...seen].slice(0, topK).map((t) => `- ${t}`).join('\n'))
+        if (seen.size) parts.push('recalled:\n' + [...seen.values()].slice(0, topK).map((h) => `- ${render(h)}`).join('\n'))
       }
     } else {
       const hits = this.longTerm.query(q, topK)
-      if (hits.length) parts.push('memories:\n' + hits.map((h) => `- (${h.importance}*) ${h.text}`).join('\n'))
+      if (hits.length) parts.push('memories:\n' + hits.map((h) => `- (${h.importance}*) ${render(h)}`).join('\n'))
     }
     return parts.join('\n')
   }
@@ -341,7 +342,7 @@ class MemorySystem {
     // never matched "guardei" — so three of them matched nothing at all.
     const factual = /\d|\b(base|casa|house|home|bau|baus|chest|farm|fazenda|mina|mine|portal|bed|cama|guard\w*|coloc\w*|coloqu\w*|deix\w*|escond\w*|fica|ficam|ficou|is at|are at|put|stored|keep|meu|minha|meus|minhas|my|nosso|nossa|our|amanha|hoje|ontem|semana|aniversario|irmao|irma|pai|mae|pais|amigo|amiga|alergic\w*|odeio|adoro|prefiro|vamos|vou|vai|combinad\w*)\b/.test(f)
     if (!factual || /\?\s*$/.test(t)) return null
-    return this.longTerm.add(`${sender} said: ${t.slice(0, 160)}`, ['chat', String(sender)], addressed ? 2 : 1)
+    return this.longTerm.add(`${sender} said: ${t.slice(0, 160)}`, ['chat', String(sender)], addressed ? 2 : 1, { kind: 'player statement', source: String(sender) })
   }
 
   /**
@@ -354,7 +355,7 @@ class MemorySystem {
     const t = String(text || '').replace(/\s+/g, ' ').trim().slice(0, 200)
     if (t.length < 6) return null
     const who = String(about || '').trim()
-    return this.longTerm.add(t, who ? ['fact', who] : ['fact'], 3)
+    return this.longTerm.add(t, who ? ['fact', who] : ['fact'], 3, { kind: 'model summary of player statement', source: who || 'unknown' })
   }
 
   /**

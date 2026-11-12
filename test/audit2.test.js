@@ -281,7 +281,7 @@ test('G: action tool schemas follow the mode (builder keeps build; explorer drop
   for (const keep of ['say', 'idle', 'stop', 'find', 'set_mode', 'hold']) {
     for (const mode of [builder, explorer, hunter]) assert.ok(mode.includes(keep), `${keep} survives every mode`)
   }
-  assert.equal(names(createZincTools()).length, 27, 'the full set is 27 tools after the chores')
+  assert.equal(names(createZincTools()).length, 33, 'the full set includes block inspection and abstract logic testing')
 })
 
 // --------------------------------------------------------------- C: gather

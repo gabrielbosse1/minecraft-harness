@@ -114,8 +114,7 @@ attack reflex and no `pvpEnabled` switch.
   player. `attack: "player"` and `attack: "any"` never match a player. If a
   named player is not visible, the model is told to `go_to` them first.
 - A hit by a player triggers fleeing and a wake-up; the reflex never retaliates.
-  The model is instructed to require an explicit duel request or continued
-  aggression before it chooses that exact player. The harness enforces exact
+  The model decides whether to choose that player; the harness enforces exact
   name selection, not a separate server-side consent/duel protocol.
 - A kill may chain to another **hostile** mob of the same requested type (up to
   six kills) without another model call. An animal is one animal per call
@@ -319,3 +318,29 @@ hostile AI. The runner header records the exact checks and known limitations.
   multimodal model.
 
 The root [`README.md`](../README.md) covers both Zinc and ZincAI.
+
+### Investigating a small redstone region
+
+`redstone_scan` reads a cube (radius 0–2, within eight blocks) and returns a
+session snapshot ID, component counts, unreadable/unloaded cells and a page of
+coordinates. For later pages use `redstone_scan` with `snapshot` and `page`.
+`redstone_component` takes that snapshot ID and a listed `x,y,z`; it returns
+reported block states and pages of nearby graph relationships. The snapshot is
+non-atomic, becomes stale and only the four most recent are kept in the session.
+Observed mutual dust-side state is geometry evidence, **not proof of power**;
+adjacencies, stepped dust, non-component blocks, chunk boundaries and
+quasi-connectivity remain uncertain. Comparator output strength can be unknown.
+Use `inspect_block` for additional states. None of these tools changes the world.
+
+In builder mode, `logic_test` can save its validated abstract graph and result
+by providing `project`; `circuit_project` with `operation: "bind"`, the same
+`name` and a `snapshot` saves a historical location/summary and optional
+unverified hypothesis. `show`, `graph` (paginated), `test` and `list` retrieve
+or rerun the saved investigation. The bounded store in
+`zincai-data/circuit-projects.json` persists up to 16 projects; physical graph
+details are not persisted and the region must be rescanned to refresh them.
+`FULL_SUM` and `FULL_CARRY` gates provide reusable three-input Boolean full
+adder outputs. Testing is abstract only: a counterexample identifies differing
+outputs and a declared dependency cone, **not a physical fault or its cause**.
+No timing, live signal propagation, layout verification or world mutation is
+performed by this workflow.

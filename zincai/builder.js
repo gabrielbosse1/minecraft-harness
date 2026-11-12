@@ -539,16 +539,47 @@ class BuilderExecutor {
  */
 function generateShape (shape, p = {}, block = 'stone') {
   if (!block || !/^[a-z0-9_]+$/.test(block)) throw new Error(`build_shape: bad block id "${block}"`)
+  const allowed = {
+    cylinder: ['r', 'h', 'th', 'filled'], dome: ['r', 'th'], arch: ['w', 'h', 'th'],
+    wall: ['l', 'h', 'th', 'axis'], box: ['w', 'd', 'h', 'th', 'filled'],
+    floor: ['w', 'd'], ring: ['r', 'th']
+  }
+  const kind = String(shape)
+  if (!Object.hasOwn(allowed, kind)) throw new Error(`build_shape: unknown shape "${kind}" (cylinder|dome|arch|wall|box|floor|ring)`)
+  if (!p || typeof p !== 'object' || Array.isArray(p)) throw new Error('build_shape: params must be an object')
+  // Model-provided dimensions used to enter unbounded synchronous loops before
+  // inventory preflight, potentially blocking the survival/reflex event loop.
+  for (const [key, value] of Object.entries(p)) {
+    if (!allowed[kind].includes(key)) throw new Error(`build_shape: unsupported parameter "${key.slice(0, 40)}" for ${kind}; use ${allowed[kind].join(', ')}`)
+    if (key === 'filled') {
+      if (typeof value !== 'boolean') throw new Error('build_shape: filled must be a boolean')
+    } else if (key === 'axis') {
+      if (value !== 'x' && value !== 'z') throw new Error('build_shape: axis must be x or z')
+    } else {
+      const n = Number(value)
+      const min = kind === 'arch' && (key === 'w' || key === 'h') ? 3 : ((kind === 'dome' || kind === 'ring') && key === 'r' ? 2 : 1)
+      if (!['number', 'string'].includes(typeof value) || !Number.isInteger(n) || n < min || n > 128) {
+        throw new Error(`build_shape: ${key} must be an integer from ${min} to 128`)
+      }
+    }
+  }
+  const checkWork = (iterations) => {
+    if (iterations > 250_000) throw new Error('build_shape: plan is too large to generate safely; split it into smaller shapes')
+  }
   const B = []
-  const push = (x, y, z) => B.push({ dx: x, dy: y, dz: z, name: block })
+  const push = (x, y, z) => {
+    if (B.length >= 32_768) throw new Error('build_shape: plan exceeds 32768 blocks; split it into smaller shapes')
+    B.push({ dx: x, dy: y, dz: z, name: block })
+  }
   const axis = (p.axis === 'z') ? 'z' : 'x'
 
-  switch (String(shape)) {
+  switch (kind) {
     case 'cylinder': {
       const r = Math.max(1, Math.trunc(Number(p.r) || 3))
       const h = Math.max(1, Math.trunc(Number(p.h) || 6))
       const filled = Boolean(p.filled)
       const th = Math.max(1, Math.trunc(Number(p.th) || 1)) // shell thickness
+      checkWork(h * (2 * r + 1) ** 2)
       for (let y = 0; y < h; y++) {
         for (let dx = -r; dx <= r; dx++) {
           for (let dz = -r; dz <= r; dz++) {
@@ -567,6 +598,7 @@ function generateShape (shape, p = {}, block = 'stone') {
     case 'dome': {
       const r = Math.max(2, Math.trunc(Number(p.r) || 5))
       const th = Math.max(1, Math.trunc(Number(p.th) || 1))
+      checkWork((2 * r + 1) ** 2 * th)
       for (let dx = -r; dx <= r; dx++) {
         for (let dz = -r; dz <= r; dz++) {
           const d = Math.hypot(dx, dz)
@@ -582,6 +614,7 @@ function generateShape (shape, p = {}, block = 'stone') {
       const w = Math.max(3, Math.trunc(Number(p.w) || 10))
       const h = Math.max(3, Math.trunc(Number(p.h) || 8))
       const th = Math.max(1, Math.trunc(Number(p.th) || 1))
+      checkWork(th * th * w * (h + 2))
       // Semicircle arc springing from y=S with apex exactly at h:
       //   r = w/2, cx = (w-1)/2, endOffset = sqrt(r^2 - cx^2), S = h - r + endOffset
       //   y(x) = S + sqrt(r^2 - (x-cx)^2) - endOffset   ->  y(0)=S, y(cx)=h
@@ -615,6 +648,7 @@ function generateShape (shape, p = {}, block = 'stone') {
       const l = Math.max(1, Math.trunc(Number(p.l) || 20))
       const h = Math.max(1, Math.trunc(Number(p.h) || 5))
       const th = Math.max(1, Math.trunc(Number(p.th) || 1))
+      checkWork(th * l * h)
       for (let t = 0; t < th; t++) {
         for (let i = 0; i < l; i++) {
           for (let y = 0; y < h; y++) {
@@ -631,6 +665,7 @@ function generateShape (shape, p = {}, block = 'stone') {
       const d = Math.max(1, Math.trunc(Number(p.d) || 6))
       const filled = Boolean(p.filled)
       const th = Math.max(1, Math.trunc(Number(p.th) || 1))
+      checkWork(w * h * d)
       for (let y = 0; y < h; y++) {
         for (let x = 0; x < w; x++) {
           for (let z = 0; z < d; z++) {
@@ -645,12 +680,14 @@ function generateShape (shape, p = {}, block = 'stone') {
     case 'floor': {
       const w = Math.max(1, Math.trunc(Number(p.w) || 10))
       const d = Math.max(1, Math.trunc(Number(p.d) || 10))
+      checkWork(w * d)
       for (let x = 0; x < w; x++) for (let z = 0; z < d; z++) push(x, 0, z)
       break
     }
     case 'ring': {
       const r = Math.max(2, Math.trunc(Number(p.r) || 6))
       const th = Math.max(1, Math.trunc(Number(p.th) || 1))
+      checkWork((2 * r + 1) ** 2)
       for (let dx = -r; dx <= r; dx++) {
         for (let dz = -r; dz <= r; dz++) {
           const d2 = dx * dx + dz * dz

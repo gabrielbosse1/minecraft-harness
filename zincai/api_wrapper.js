@@ -61,7 +61,7 @@ const ACTION_TOOLS = [
     z: INT('Z coordinate.')
   }),
   tool('follow', 'Follow a player until you call stop or another movement.', { player: STR('Player name.') }, ['player']),
-  tool('stop', 'Stop the current task, follow or fight (and anything paused behind it) and stand still.'),
+  tool('stop', 'Request cancellation of the current task, follow or fight and paused tasks. Survival may keep moving; an in-progress operation may still place or clean up blocks after stop.'),
   tool('attack', 'Fight. The ONLY way a fight ever starts. `target` = exact mob type ("zombie") or "any" hostile mob. `player` = exact player name — PvP on your explicit decision.', {
     target: STR('Mob type, or "any".'),
     player: STR('Exact player name (PvP).'),
@@ -117,8 +117,8 @@ const ACTION_TOOLS = [
   tool('light_up', 'Place torches from the inventory onto dark walkable floor around you. Needs torches carried.', {
     radius: INT('How far around to look for dark spots (default 8, max 16).')
   }),
-  tool('shelter', 'Emergency cover where you stand: pillar up 3 blocks on owned scaffold. Melee cannot reach, arrows still can. stop digs the pillar back down. Use at night with no bed.'),
-  tool('corpse_run', 'Walk back to the remembered "last death" place and pick up the dropped items. Fails if no death was recorded since the feature existed.'),
+  tool('shelter', 'Attempt to pillar up using scaffold from your inventory; this is not guaranteed cover from melee or arrows. Stop attempts scaffold cleanup.'),
+  tool('corpse_run', 'Walk near the remembered "last death" place and report nearby observed item stacks. Pickup is not verified; fails if no death was recorded or it is in another dimension.'),
   tool('logic_test', 'Test an ABSTRACT combinational Boolean graph, NOT Minecraft redstone. Gates are topologically ordered; no cycles or timing. Results cannot locate physical faults.', {
     inputs: { type: 'array', description: '1–9 unique signal ids. Bit strings use this order.', items: STR('Signal id'), minItems: 1, maxItems: 9 },
     gates: { type: 'array', description: 'Up to 128 gates in topological order.', maxItems: 128, items: { type: 'object', properties: { id: STR('New signal id'), op: { type: 'string', enum: ['AND', 'OR', 'XOR', 'NOT', 'BUF', 'NAND', 'NOR', 'FULL_SUM', 'FULL_CARRY'] }, inputs: { type: 'array', description: 'NOT/BUF: one input; FULL_SUM/FULL_CARRY: A,B,carry; others: two. Reference earlier signals.', items: STR('Signal id'), minItems: 1, maxItems: 3 } }, required: ['id', 'op', 'inputs'], additionalProperties: false } },
@@ -143,7 +143,7 @@ const ACTION_TOOLS = [
   }),
   tool('build_shape', 'Mathematically generate and build a geometric primitive — never place big builds by hand.', {
     shape: { type: 'string', enum: ['cylinder', 'dome', 'arch', 'wall', 'box', 'floor', 'ring'] },
-    params: { type: 'object', description: 'Shape params: cylinder {r,h}; dome {r}; arch {w,h}; wall {l,h,axis}; box {l,w,h}; floor {l,w}; ring {r}.' },
+    params: { type: 'object', description: 'Shape params: cylinder {r,h}; dome {r}; arch {w,h}; wall {l,h,axis}; box {w,d,h}; floor {w,d}; ring {r}. Optional th on cylinder/dome/arch/wall/box/ring; filled boolean on cylinder/box. Dimensions are integers 1–128 (dome/ring r >= 2, arch w/h >= 3); oversized plans are refused.' },
     block: STR('Block id, e.g. "stone_bricks".'),
     at: AT,
     stage: STAGE

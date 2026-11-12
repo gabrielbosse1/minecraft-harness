@@ -335,7 +335,13 @@ function makeReachabilityCheck (bot, { Movements, goals, budgetMs = 6, cacheMs =
         timeout: budgetMs, tickTimeout: budgetMs, searchRadius: 24, optimizePath: false, resetEntityIntersects: false
       })
       const first = gen.next().value
-      value = first?.result?.status === 'success'
+      const status = first?.result?.status
+      // An incomplete search is not evidence of containment. In particular,
+      // the pathfinder may yield a partial result or time out on its tiny
+      // budget. Only a completed noPath is a negative route result (and even
+      // that is limited by the loaded world and the search radius).
+      if (status === 'success') value = true
+      else if (status === 'noPath') value = false
     } catch { value = null }
     cache.set(entity.id, { at: t, value })
     if (cache.size > 128) for (const [id, v] of cache) if (t - v.at > cacheMs) cache.delete(id)
@@ -532,7 +538,7 @@ class ThreatSense {
       // and anything lit/charged stays a hard threat. Probing is the real
       // A*, so it is capped per tick and skipped for mobs that are visibly
       // closing — a horde chasing the bot is never gated on this.
-      if (this.containedDemotion && real && !attacker && !ranged && !lit && !charged && probes < 3) {
+      if (this.containedDemotion && real && !attacker && !ranged && !lit && !charged && !(closing > 0) && probes < 3) {
         probes++
         const r2 = route === null ? this.reachable(e) : route
         if (r2 === false) {

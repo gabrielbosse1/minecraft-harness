@@ -756,7 +756,11 @@ test('vanilla guard blocks slash-commands in chat and command-shaped actions', (
 // ============================================================== system prompt
 test('prompts: flee-first policy, phased building, vanilla-only, PT-BR voice', () => {
   const prompt = fs.readFileSync(path.join(__dirname, '..', 'zincai', 'system_prompt.txt'), 'utf8')
-  assert.ok(prompt.includes('The harness automatically equips the optimal tool and manages attack cooldowns.'))
+  assert.match(prompt, /equipment choice and attack timing, but these are heuristics, not guarantees/)
+  assert.doesNotMatch(prompt, /automatically equips the optimal tool/)
+  assert.match(prompt, /incoming projectile avoidance is not guaranteed/)
+  assert.match(prompt, /in-progress build or shelter may still place or clean up afterward/)
+  assert.match(prompt, /a dig call is not proof of collection/)
   for (const phase of ['foundation', 'walls_with_windows', 'roof', 'interior_details']) {
     assert.ok(prompt.includes(phase), `prompt missing phase ${phase}`)
   }
@@ -772,7 +776,7 @@ test('prompts: flee-first policy, phased building, vanilla-only, PT-BR voice', (
 
   // The body's own doing is something the model is told about, in both prompts.
   assert.ok(/reflex: what your body did BY ITSELF/.test(prompt), 'the model is told what the reflex line is')
-  assert.ok(/only PAUSE/.test(prompt), 'short jobs no longer cancel the long task')
+  assert.ok(/Short jobs can pause them/.test(prompt), 'short jobs may pause a same-session long task')
   assert.ok(/ALWAYS write in informal Brazilian Portuguese/.test(prompt))
 
   const chat = fs.readFileSync(path.join(__dirname, '..', 'zincai', 'chat_prompt.txt'), 'utf8')

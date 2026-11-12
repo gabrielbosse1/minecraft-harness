@@ -1,0 +1,2 @@
+1|OK|tp @a 5 106 5 => Teleported ZincAI to 5.500000, 106.000000, 5.500000
+2|OK|setworldspawn 5 106 5 => Set the world spawn point to 5, 106, 5 [0.0, 0.0] in minecraft:overworld

@@ -1,0 +1,77 @@
+{
+  "generated_at": "2026-11-12T15:03:54.363Z",
+  "campaign": "zinc-autonomous-test",
+  "stage": "shutdown",
+  "elapsed_min": "243.1",
+  "tests": {
+    "attempted": 34,
+    "passed": 22,
+    "failed": 8,
+    "skipped": 4,
+    "interrupted": 0,
+    "pass_rate": "73.3%"
+  },
+  "model": {
+    "calls_total": 28,
+    "in_tokens": 192598,
+    "out_tokens": 9524,
+    "cached_tokens": 150400,
+    "avg_in_per_call": 6879,
+    "avg_out_per_call": 340,
+    "latency_ms": {
+      "min": 10337,
+      "p50": 47186,
+      "p90": 99472,
+      "max": 113643
+    }
+  },
+  "bot": {
+    "log_lines": 23,
+    "deaths": 0,
+    "flee_episodes": 0,
+    "errors": 14,
+    "model_timeouts": 12,
+    "kicked": 0
+  },
+  "server": {
+    "recent_tps": [],
+    "warnings_count": 4,
+    "errors_count": 0
+  },
+  "resources": {
+    "samples": 61,
+    "server_rss_mib_max": 0,
+    "bot_rss_mib_max": 0,
+    "system_free_mib_min": 3669,
+    "last": {
+      "t": "2026-11-12T15:00:29.066Z",
+      "stage": "stage1_smoke",
+      "elapsed_s": 14382,
+      "server_rss_mib": null,
+      "bot_rss_mib": null,
+      "system_free_mib": 3857,
+      "server_alive": false,
+      "bot_alive": true,
+      "model_calls_total": 28,
+      "last_model": {
+        "at": "2026-11-12T14:59:25.222Z",
+        "in": 5085,
+        "out": 256,
+        "ms": 71039,
+        "cached": 4544
+      }
+    }
+  },
+  "incidents": [
+    {
+      "at": "2026-11-12T12:47:30.919Z",
+      "kind": "server_auto_pause",
+      "detail": "server paused while empty -> forceload generation stalled; fix: keeper client"
+    },
+    {
+      "at": "2026-11-12T13:25:21.824Z",
+      "kind": "critical",
+      "detail": "26.3_protocol_incompatible"
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "steps": [
+    { "at": 10, "cmd": "say oi Zinc, tudo bem?" },
+    { "at": 35, "cmd": "say voce e um robota?" },
+    { "at": 55, "cmd": "say Gabriel: fala comigo" },
+    { "at": 75, "cmd": "say zinc, quantas camadas tem a casa que voce conhece?" },
+    { "at": 105, "cmd": "say zinc, onde tem diamante guardado?" },
+    { "at": 140, "cmd": "say a casa tem uma cozinha no primeiro andar" },
+    { "at": 175, "cmd": "say zinc, vai ate o curral" },
+    { "at": 210, "cmd": "say cheguei perto do curral, confirma" }
+  ]
+}

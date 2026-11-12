@@ -1,0 +1,115 @@
+1|OK|forceload add -1 -1 0 0 => Marked 3 chunks in minecraft:overworld from [-1, -1] to [0, 0] to be force loaded
+3|OK|fill -12 60 -10 12 105 10 cherry_planks replace => Successfully filled 24150 block(s)
+4|OK|fill -10 109 -8 10 109 8 cherry_slab[half=bottom] replace => Block minecraft:cherry_slab does not have property 'half'...erry_slab[half=bottom] replace<--[HERE]
+5|OK|fill -10 113 -8 10 113 8 cherry_slab[half=bottom] replace => Block minecraft:cherry_slab does not have property 'half'...erry_slab[half=bottom] replace<--[HERE]
+6|OK|fill -10 106 -8 10 108 -8 cherry_planks replace => Successfully filled 63 block(s)
+7|OK|fill -10 106 8 10 108 8 cherry_planks replace => Successfully filled 63 block(s)
+8|OK|fill -10 106 -8 -10 108 8 cherry_planks replace => Successfully filled 45 block(s)
+9|OK|fill 10 106 -8 10 108 8 cherry_planks replace => Successfully filled 45 block(s)
+10|OK|fill -10 110 -8 10 112 -8 cherry_planks replace => Successfully filled 63 block(s)
+11|OK|fill -10 110 8 10 112 8 cherry_planks replace => Successfully filled 63 block(s)
+12|OK|fill -10 110 -8 -10 112 8 cherry_planks replace => Successfully filled 45 block(s)
+13|OK|fill 10 110 -8 10 112 8 cherry_planks replace => Successfully filled 45 block(s)
+14|OK|fill -10 114 -8 10 116 -8 cherry_planks replace => Successfully filled 63 block(s)
+15|OK|fill -10 114 8 10 116 8 cherry_planks replace => Successfully filled 63 block(s)
+16|OK|fill -10 114 -8 -10 116 8 cherry_planks replace => Successfully filled 45 block(s)
+17|OK|fill 10 114 -8 10 116 8 cherry_planks replace => Successfully filled 45 block(s)
+18|OK|fill -10 117 -8 10 117 8 cherry_slab[half=bottom] replace => Block minecraft:cherry_slab does not have property 'half'...erry_slab[half=bottom] replace<--[HERE]
+19|OK|fill -9 106 -7 9 108 7 air replace => No blocks were filled
+20|OK|fill 0 106 -7 0 108 -1 cherry_planks replace => Successfully filled 21 block(s)
+21|OK|fill 1 106 0 9 108 0 cherry_planks replace => Successfully filled 27 block(s)
+22|OK|fill -9 110 -7 9 112 7 air replace => No blocks were filled
+23|OK|fill 0 110 -7 0 112 7 cherry_planks replace => Successfully filled 45 block(s)
+24|OK|fill -9 114 -7 9 116 7 air replace => No blocks were filled
+25|OK|setblock 0 106 8 cherry_door => Changed the block at 0, 106, 8
+26|OK|setblock 0 107 8 cherry_door[facing=south,hinge=left,open=false] => Changed the block at 0, 107, 8
+27|OK|setblock 9 106 7 cherry_stairs[facing=east,shape=straight,half=bottom] => Changed the block at 9, 106, 7
+28|OK|setblock 9 107 7 cherry_stairs[facing=east,shape=straight,half=bottom] => Changed the block at 9, 107, 7
+29|OK|setblock 9 108 7 cherry_stairs[facing=east,shape=straight,half=top] => Changed the block at 9, 108, 7
+30|OK|setblock 9 109 7 cherry_stairs[facing=east,shape=straight,half=top] => Changed the block at 9, 109, 7
+31|OK|setblock -9 110 -7 cherry_stairs[facing=west,shape=straight,half=bottom] => Changed the block at -9, 110, -7
+32|OK|setblock -9 111 -7 cherry_stairs[facing=west,shape=straight,half=bottom] => Changed the block at -9, 111, -7
+33|OK|setblock -9 112 -7 cherry_stairs[facing=west,shape=straight,half=top] => Changed the block at -9, 112, -7
+34|OK|setblock -9 113 -7 cherry_stairs[facing=west,shape=straight,half=top] => Changed the block at -9, 113, -7
+35|OK|setblock -9 107 -7 torch => Changed the block at -9, 107, -7
+36|OK|setblock 9 107 -7 torch => Changed the block at 9, 107, -7
+37|OK|setblock -9 111 7 torch => Changed the block at -9, 111, 7
+38|OK|setblock 9 111 7 torch => Changed the block at 9, 111, 7
+39|OK|setblock -9 115 7 torch => Changed the block at -9, 115, 7
+40|OK|setblock 9 115 -7 torch => Changed the block at 9, 115, -7
+41|OK|setblock 3 105 3 chest => Changed the block at 3, 105, 3
+42|OK|data merge block 3 105 3 {Items:[{Slot:0b,id:"minecraft:wooden_pickaxe",count:1},{Slot:1b,id:"minecraft:stone_pickaxe",count:1},{Slot:2b,id:"minecraft:iron_pickaxe",count:1},{Slot:3b,id:"minecraft:iron_axe",count:1},{Slot:4b,id:"minecraft:iron_sword",count:1},{Slot:5b,id:"minecraft:shield",count:1},{Slot:6b,id:"minecraft:bow",count:1},{Slot:7b,id:"minecraft:arrow",count:32}]} => Modified block data of 3, 105, 3
+43|OK|setblock 3 106 2 cherry_sign{front_text:{messages:["Ferramentas","","",""],color:"black"}} => Changed the block at 3, 106, 2
+44|OK|setblock 5 105 3 chest => Changed the block at 5, 105, 3
+45|OK|data merge block 5 105 3 {Items:[{Slot:0b,id:"minecraft:coal",count:64},{Slot:1b,id:"minecraft:iron_ingot",count:32},{Slot:2b,id:"minecraft:gold_ingot",count:16},{Slot:3b,id:"minecraft:diamond",count:8},{Slot:4b,id:"minecraft:redstone",count:64}]} => Modified block data of 5, 105, 3
+46|OK|setblock 5 106 2 cherry_sign{front_text:{messages:["Minerios","","",""],color:"black"}} => Changed the block at 5, 106, 2
+47|OK|setblock 7 105 3 chest => Changed the block at 7, 105, 3
+48|OK|data merge block 7 105 3 {Items:[{Slot:0b,id:"minecraft:bread",count:16},{Slot:1b,id:"minecraft:apple",count:16},{Slot:2b,id:"minecraft:cooked_beef",count:16},{Slot:3b,id:"minecraft:cooked_porkchop",count:16},{Slot:4b,id:"minecraft:golden_apple",count:2},{Slot:5b,id:"minecraft:wheat",count:32}]} => Modified block data of 7, 105, 3
+49|OK|setblock 7 106 2 cherry_sign{front_text:{messages:["Comida","","",""],color:"black"}} => Changed the block at 7, 106, 2
+50|OK|setblock 3 105 5 chest => Changed the block at 3, 105, 5
+51|OK|data merge block 3 105 5 {Items:[{Slot:0b,id:"minecraft:cherry_planks",count:64},{Slot:1b,id:"minecraft:cherry_log",count:32},{Slot:2b,id:"minecraft:stone_bricks",count:64},{Slot:3b,id:"minecraft:glass",count:32},{Slot:4b,id:"minecraft:torch",count:64},{Slot:5b,id:"minecraft:stick",count:64}]} => Modified block data of 3, 105, 5
+52|OK|setblock 3 106 4 cherry_sign{front_text:{messages:["Construcao","","",""],color:"black"}} => Changed the block at 3, 106, 4
+53|OK|setblock 5 105 5 chest => Changed the block at 5, 105, 5
+54|OK|data merge block 5 105 5 {Items:[{Slot:0b,id:"minecraft:diamond",count:32},{Slot:1b,id:"minecraft:emerald",count:16},{Slot:2b,id:"minecraft:netherite_ingot",count:2},{Slot:3b,id:"minecraft:obsidian",count:8}]} => Modified block data of 5, 105, 5
+55|OK|setblock 5 106 4 cherry_sign{front_text:{messages:["Valioso","","",""],color:"black"}} => Changed the block at 5, 106, 4
+56|OK|setblock 7 105 5 chest => Changed the block at 7, 105, 5
+57|OK|data merge block 7 105 5 {Items:[{Slot:0b,id:"minecraft:wheat_seeds",count:64},{Slot:1b,id:"minecraft:carrot",count:32},{Slot:2b,id:"minecraft:potato",count:32},{Slot:3b,id:"minecraft:beetroot_seeds",count:16},{Slot:4b,id:"minecraft:oak_sapling",count:8}]} => Modified block data of 7, 105, 5
+58|OK|setblock 7 106 4 cherry_sign{front_text:{messages:["Cultura","","",""],color:"black"}} => Changed the block at 7, 106, 4
+59|OK|setblock -7 105 1 furnace => Changed the block at -7, 105, 1
+60|OK|setblock -5 105 1 furnace => Changed the block at -5, 105, 1
+61|OK|setblock -3 105 1 furnace => Changed the block at -3, 105, 1
+62|OK|setblock -3 105 5 crafting_table => Changed the block at -3, 105, 5
+63|OK|setblock -5 106 0 cherry_sign{front_text:{messages:["Cozinha","","",""],color:"black"}} => Changed the block at -5, 106, 0
+64|OK|setblock -7 109 -5 red_bed[facing=west] => Changed the block at -7, 109, -5
+65|OK|setblock -7 109 4 enchanting_table => Changed the block at -7, 109, 4
+66|OK|setblock -5 109 4 grindstone => Changed the block at -5, 109, 4
+67|OK|setblock 5 109 -5 brewing_stand => Changed the block at 5, 109, -5
+68|OK|setblock -5 110 0 cherry_sign{front_text:{messages:["Quarto","","",""],color:"black"}} => Changed the block at -5, 110, 0
+69|OK|setblock 5 110 0 cherry_sign{front_text:{messages:["Estudo","","",""],color:"black"}} => Changed the block at 5, 110, 0
+70|OK|setblock 8 109 7 chest => Changed the block at 8, 109, 7
+71|OK|data merge block 8 109 7 {Items:[{Slot:0b,id:"minecraft:emerald",count:8},{Slot:1b,id:"minecraft:gold_ingot",count:16}]} => Modified block data of 8, 109, 7
+72|OK|setblock 8 110 6 cherry_sign{front_text:{messages:["Reserva","","",""],color:"black"}} => Changed the block at 8, 110, 6
+73|OK|fill 1 114 4 5 114 7 iron_bars replace => Successfully filled 20 block(s)
+74|OK|fill 1 116 4 5 116 7 iron_bars replace => Successfully filled 20 block(s)
+75|OK|fill 1 114 4 5 116 4 iron_bars replace => Successfully filled 5 block(s)
+76|OK|fill 1 114 7 5 116 7 iron_bars replace => Successfully filled 5 block(s)
+77|OK|fill 1 114 4 1 116 7 iron_bars replace => Successfully filled 2 block(s)
+78|OK|fill 5 114 4 5 116 7 iron_bars replace => Successfully filled 2 block(s)
+79|OK|fill 2 114 5 4 116 6 air replace => Successfully filled 12 block(s)
+80|OK|setblock 3 114 3 cherry_sign{front_text:{messages:["Mobs (caixa)","","",""],color:"black"}} => Changed the block at 3, 114, 3
+81|OK|setblock -8 113 -7 chest => Changed the block at -8, 113, -7
+82|OK|data merge block -8 113 -7 {Items:[{Slot:0b,id:"minecraft:diamond",count:16},{Slot:1b,id:"minecraft:obsidian",count:16}]} => Modified block data of -8, 113, -7
+83|OK|setblock -8 114 -6 cherry_sign{front_text:{messages:["Cofre","","",""],color:"black"}} => Changed the block at -8, 114, -6
+84|OK|fill 11 60 -9 21 105 1 grass_block replace => Successfully filled 5467 block(s)
+85|OK|fill 12 106 -8 20 107 -8 oak_fence replace => Successfully filled 18 block(s)
+86|OK|fill 12 106 0 20 107 0 oak_fence replace => Successfully filled 18 block(s)
+87|OK|fill 12 106 -8 12 107 0 oak_fence replace => Successfully filled 14 block(s)
+88|OK|fill 20 106 -8 20 107 0 oak_fence replace => Successfully filled 14 block(s)
+89|OK|fill 12 106 -8 20 108 0 air replace => Successfully filled 64 block(s)
+90|OK|setblock 13 106 1 cherry_sign{front_text:{messages:["Curral","","",""],color:"black"}} => Changed the block at 13, 106, 1
+91|OK|fill 21 60 -9 26 105 -4 stone_bricks replace => Successfully filled 1656 block(s)
+92|OK|fill 22 107 -8 25 107 -5 iron_bars replace => Successfully filled 16 block(s)
+93|OK|fill 22 106 -8 25 107 -8 iron_bars replace => Successfully filled 4 block(s)
+94|OK|fill 22 106 -5 25 107 -5 iron_bars replace => Successfully filled 4 block(s)
+95|OK|fill 22 106 -8 22 107 -5 iron_bars replace => Successfully filled 2 block(s)
+96|OK|fill 25 106 -8 25 107 -5 iron_bars replace => Successfully filled 2 block(s)
+97|OK|fill 22 106 -8 25 107 -5 air replace => Successfully filled 28 block(s)
+98|OK|setblock 23 106 -4 cherry_sign{front_text:{messages:["Mobs (chao)","","",""],color:"black"}} => Changed the block at 23, 106, -4
+99|OK|setblock 12 105 6 grass_block => Changed the block at 12, 105, 6
+100|WARN|setblock 12 106 6 air => Could not set the block
+101|FAIL|place feature minecraft:cherry 12 106 6 => Failed to place feature
+102|WARN|setblock 12 105 -4 grass_block => Could not set the block
+103|WARN|setblock 12 106 -4 air => Could not set the block
+104|FAIL|place feature minecraft:cherry 12 106 -4 => Failed to place feature
+105|OK|setblock 11 105 2 grass_block => Changed the block at 11, 105, 2
+106|WARN|setblock 11 106 2 air => Could not set the block
+107|FAIL|place feature minecraft:cherry 11 106 2 => Failed to place feature
+108|OK|setblock -12 105 5 grass_block => Changed the block at -12, 105, 5
+109|WARN|setblock -12 106 5 air => Could not set the block
+110|FAIL|place feature minecraft:cherry -12 106 5 => Failed to place feature
+111|OK|setblock -12 105 -5 grass_block => Changed the block at -12, 105, -5
+112|WARN|setblock -12 106 -5 air => Could not set the block
+113|FAIL|place feature minecraft:cherry -12 106 -5 => Failed to place feature
+114|OK|setblock -11 105 3 grass_block => Changed the block at -11, 105, 3
+115|WARN|setblock -11 106 3 air => Could not set the block
+116|FAIL|place feature minecraft:cherry -11 106 3 => Failed to place feature

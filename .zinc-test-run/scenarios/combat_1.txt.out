@@ -1,0 +1,4 @@
+1|OK|forceload add -142 -32 -60 32 => Marked 30 chunks in minecraft:overworld from [-9, -2] to [-4, 2] to be force loaded
+2|OK|kill @e[type=monster,x=-142,y=74,z=-32,dx=84,dy=14,dz=64] => Invalid or unknown entity type 'minecraft:monster'...l @e[type=monster,x=-142,y=74,z=-32,dx=84,dy=14,dz=64]<--[HERE]
+3|OK|summon minecraft:zombie -100 106 0 {CustomName:'"Arena zombie"',NoAI:false} => Summoned new "Arena zombie"
+4|OK|forceload remove -142 -32 -60 32 => Unmarked 30 chunks in minecraft:overworld from [-9, -2] to [-4, 2] for force loading

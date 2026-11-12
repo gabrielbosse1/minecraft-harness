@@ -145,6 +145,22 @@
     "maxDelayMs": 120000,
     "maxAttempts": 40
   },
+  "goals": {
+    "_note": "Durable objectives (goals.js). Every long task becomes a record with an id, origin, priority, checkpoint and lifecycle; it survives deaths, restarts and context resets (goals.json in the data dir). stallMs: an ACTIVE goal whose checkpoint has not moved for this long wakes the model once (remindMs before a second nudge) — waiting on a furnace or the night is legitimate, so only the running goal is nudged and never failed automatically. maxFails: repeated failures plus no progress suspend it as blocked. starveMs/starveRemindMs: an open goal that waits this long while the body is idle is offered back to the model. maxResumes: a main task paused this many times is set aside (not deleted). verifyRadius: restored build/gather goals within this many blocks of the site are re-checked at startup.",
+    "file": "zincai-data/goals.json",
+    "maxGoals": 40,
+    "terminalKeep": 12,
+    "stallMs": 180000,
+    "remindMs": 300000,
+    "maxFails": 3,
+    "maxResumes": 8,
+    "starveMs": 300000,
+    "starveRemindMs": 600000,
+    "promptMax": 6,
+    "verifyRadius": 64,
+    "tickMs": 15000,
+    "staleGuard": true
+  },
   "places": {
     "_note": "Place memory: chests, furnaces, beds, signs seen while walking, plus named places. Stored in zincai-data/places.json. A storage room (more containers than fit on one prompt line) is shown as a summary with every label.",
     "file": "zincai-data/places.json",

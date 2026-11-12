@@ -193,8 +193,11 @@ function addPlayer (bot, id, username, x, z, held = null) {
  *   tool call). chat: `(prompt) => ({ text, task })`. Arrays are also accepted
  *   and consumed in order.
  */
-function startTestSession ({ chat = [], actions = [], bot = simulatedBot(), cfg: tweak = null } = {}) {
-  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zincai-session-'))
+function startTestSession ({ chat = [], actions = [], bot = simulatedBot(), cfg: tweak = null, dataDir: sharedDir = null } = {}) {
+  // A test that simulates a restart passes the same dataDir in for both
+  // sessions (and keeps it); otherwise each session gets its own temp dir.
+  const ownDir = !sharedDir
+  const dataDir = sharedDir || fs.mkdtempSync(path.join(os.tmpdir(), 'zincai-session-'))
   process.env.API_KEY = process.env.API_KEY || 'rc-test-key'
 
   // 1. mineflayer.createBot → our simulated bot.
@@ -246,6 +249,8 @@ function startTestSession ({ chat = [], actions = [], bot = simulatedBot(), cfg:
     session,
     prompts,
     ended,
+    dataDir,
+    ownDir,
     internals: () => session.internals(),
     spawn () { bot.emit('spawn') },
     say (line) { bot.emit('messagestr', line) },
@@ -260,7 +265,7 @@ function startTestSession ({ chat = [], actions = [], bot = simulatedBot(), cfg:
       globalThis.fetch = realFetch
       if (realMineflayer) require.cache[mfPath] = realMineflayer
       else delete require.cache[mfPath]
-      fs.rmSync(dataDir, { recursive: true, force: true })
+      if (ownDir) fs.rmSync(dataDir, { recursive: true, force: true })
     }
   }
 }

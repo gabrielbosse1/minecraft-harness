@@ -143,6 +143,56 @@ can resume. Main-hand use is serialized so eating or equipping does not fight
 combat over the same slot. Death, reconnect, task replacement, and shutdown
 release controls.
 
+### Objectives that survive interruptions
+
+`goals.js` is a small durable registry behind whatever the bot is doing. Every
+long task (`build`, `build_shape`, `gather`, `go_to`, `follow`, `light_up`,
+`shelter`, `corpse_run`) and every short job (`give`, `take`, `put`, `smelt`,
+`sleep`, `look_in`, `use_block`, `craft`) gets a record with an id (`g7`), an
+origin (`player:Gabriel` or `self`), a priority, a completion/failure/resume
+description, and a checkpoint in `detail` — a build's resolved origin and
+stage, a gather's item and count, a job's arguments.
+
+Statuses are `pending`, `active`, `suspended`, `resumable`, `completed`,
+`failed`, `cancelled`, and every change goes through one transition table;
+illegal transitions are refused with a reason. Terminal states stay terminal,
+but `completed` is reachable from every open state because verification can
+prove an interrupted objective already done.
+
+What happens when the work is interrupted:
+
+| Event | The objective becomes |
+| --- | --- |
+| a newer main task starts | `suspended` + on the agenda shelf ("set aside") |
+| a short job arrives | `suspended` ("paused for give"), resumes afterwards |
+| death | `resumable` with `needsVerify`; the respawn prompt lists it |
+| shutdown / link drop | saved as `resumable` before the sockets close |
+| a process killed without that | demoted to `resumable` when `goals.json` loads |
+| `stop` | `cancelled` — never revived |
+
+Resuming is not replaying: the origin is the one captured when the build
+started, a gather continues from the remaining count, and short jobs re-run
+from their arguments. **The world is the only ground truth for completion** —
+`verifyGoalAgainstWorld` checks blocks, inventory, places and players; a task
+that returned success without the world agreeing stays open. Verification is
+dimension-aware, so the same x/z in the nether is not evidence about an
+overworld build.
+
+The `goal` tool is the model's handle on this list: `list`, `show`, `add`,
+`resume`, `suspend`, `cancel`, `complete`, `update`, `verify`. Priorities are a
+guideline for ordering and reporting, not a scheduler; the model still decides
+what matters. A watchdog (`goals.tickMs`, 15 s) nudges the model when a running
+objective stops making checkpoints, suspends one that recorded three failures
+with no progress, and nudges a waiting objective that nothing picks up. Being
+slow is never treated as failure.
+
+Operational notes: `goals.json` lives under `ZINC_DATA_DIR` and is written
+atomically; run **one process per data directory** (there is no lock file), and
+keep the directory persistent or every restart forgets. Restart verification
+inspects the first six open objectives; the rest stay flagged `needsVerify` and
+are checked on `goal resume` or `goal verify`. Tunables are the `goals` block in
+`config.json`.
+
 ## Perception, memory, and execution
 
 - **Action prompt:** current HP/food/position/time/mode, inventory, what the
@@ -219,7 +269,8 @@ The complete action tool list is:
 `smelt`, `sleep`, `give`, `eat`, `equip`, `use_block`, `inspect_block`,
 `inspect_region`, `redstone_scan`, `redstone_component`, `find`, `remember_here`,
 `craft`, `gather`, `light_up`, `shelter`, `corpse_run`, `logic_test`,
-`circuit_project`, `build`, `build_shape`, `run_script`, `set_mode`, `idle`.
+`circuit_project`, `build`, `build_shape`, `run_script`, `goal`, `set_mode`,
+`idle`.
 Explorer mode omits the four builder/logic/project tools from the offered set,
 not all mutators; the model can also select `set_mode`. Modes are not a
 property-permission boundary. Shape floors use `{w,d}` and boxes `{w,d,h}`;

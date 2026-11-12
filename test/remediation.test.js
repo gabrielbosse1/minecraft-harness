@@ -474,8 +474,10 @@ test('F5: system prompt + tool schemas stay compact while preserving all modes a
   assert.ok(chatPrompt.length < 1600, `chat_prompt.txt should stay under 1600 chars (got ${chatPrompt.length})`)
 
   const totalToolChars = JSON.stringify(createZincTools()).length
-  assert.ok(totalToolChars < 12_500, `full tool schema should stay compact (< 12.5KB, got ${totalToolChars})`)
-  assert.equal(ACTION_TOOLS.length, 33)
+  // 12.9KB: the goal tool (goals.js / multi-objective continuity) adds ~0.7KB
+  // on top of the 12.1KB baseline, still ~16% below the 15.3KB pre-remediation size.
+  assert.ok(totalToolChars < 12_900, `full tool schema should stay compact (< 12.9KB, got ${totalToolChars})`)
+  assert.equal(ACTION_TOOLS.length, 34)
 })
 
 test('Memory: LongTermMemory deduplicates reloaded entries and upsertByTag keeps container updates single-entry', () => {

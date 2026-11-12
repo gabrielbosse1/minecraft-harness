@@ -775,7 +775,8 @@ class Skills {
           }
         }
       }
-      if (dug > 0) return ok(`${progress()}${token.cancelled ? '; interrupted' : dug < wanted ? '; stopped before requested number of calls' : ''}`)
+      const meta = { progress: { done: dug, total: wanted }, complete: dug >= wanted && !token.cancelled }
+      if (dug > 0) return ok(`${progress()}${token.cancelled ? '; interrupted' : dug < wanted ? '; stopped before requested number of calls' : ''}`, meta)
       return fail(`could not gather ${want}: targets nearby were unreachable or kept breaking (try a smaller count or get closer first)`)
     })
   }

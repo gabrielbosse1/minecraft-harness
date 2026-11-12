@@ -122,7 +122,8 @@ function loadConfig () {
     traversal: raw.traversal || {},
     scout: raw.scout || {},
     reconnect: raw.reconnect || {},
-    places: raw.places || {}
+    places: raw.places || {},
+    goals: raw.goals || {}
   }
 }
 
@@ -144,6 +145,7 @@ function makeShared (cfg, { dataDir = DATA_DIR } = {}) {
   const { MemorySystem } = require('./memory')
   const { PlaceIndex } = require('./places')
   const { BlueprintParser } = require('./builder')
+  const { GoalRegistry } = require('./goals')
   const at = (configured, fallback) => path.join(dataDir, String(configured || fallback).replace(/^zincai-data[/\\]/, ''))
   const memoryFile = at(cfg.memory.file, 'memories.json')
   const shared = {
@@ -158,6 +160,14 @@ function makeShared (cfg, { dataDir = DATA_DIR } = {}) {
       ephemeralMs: cfg.memory.ephemeralMs ?? 30_000
     }),
     places: new PlaceIndex({ file: at(cfg.places.file, 'places.json'), logger: (level, msg) => logger[level]?.(TAG, msg) }),
+    // Durable objectives: the agenda below is session RAM, this is the record
+    // that survives a context reset, a death and a restart (goals.js).
+    goals: new GoalRegistry({
+      file: at(cfg.goals?.file, 'goals.json'),
+      logger: (level, msg) => logger[level]?.(TAG, msg),
+      max: cfg.goals?.maxGoals ?? 40,
+      terminalKeep: cfg.goals?.terminalKeep ?? 12
+    }),
     amd: new AmdToolsClient({
       apiKey: cfg.amd.apiKey,
       baseUrl: cfg.amd.baseUrl,
@@ -449,7 +459,7 @@ function startSession (shared, onEnded) {
   }
 
   // ------------------------------------------------------ action results --
-  const INFORMATIONAL = new Set(['find', 'look_in', 'inspect_block', 'inspect_region', 'logic_test', 'redstone_scan', 'redstone_component', 'circuit_project'])
+  const INFORMATIONAL = new Set(['find', 'look_in', 'inspect_block', 'inspect_region', 'logic_test', 'redstone_scan', 'redstone_component', 'circuit_project', 'goal'])
   // audit2 B1: stop the model re-issuing a call the body keeps refusing.
   const failGate = new FailGate({
     windowMs: cfg.inference?.failWindowMs ?? 120_000,
@@ -538,10 +548,96 @@ function startSession (shared, onEnded) {
   const agenda = { main: null, shelved: [], asked: [] }
   const MAIN_MAX_AGE_MS = 30 * 60_000
 
+  // ------------------------------------------------ durable objectives ---
+  // `agenda` above is what runs in THIS process. `goals` (goals.js) is the
+  // durable record behind it: the problem was never "which task is running",
+  // it was that a death, a restart or a compaction erased what the bot was
+  // doing, with no checkpoint to resume from.
+  const goalReg = shared.goals
+  const GOALS = cfg.goals || {}
+  const GOAL_PRIORITY = { shelter: 80, corpse_run: 75, gather: 60, build: 55, build_shape: 55, craft: 50, go_to: 45, give: 45, follow: 40, take: 40, put: 40, light_up: 35, smelt: 35, sleep: 30, look_in: 25 }
+  const goalPriority = (tool) => Math.max(0, Math.min(100, Math.trunc(Number(GOAL_PRIORITY[String(tool)] ?? 45))))
+  const SIDE_KINDS = new Set(['take', 'put', 'smelt', 'craft', 'sleep', 'look_in', 'use_block', 'give'])
+  let goalToolSeq = 0
+
   function pruneAgenda () {
     const now = Date.now()
     agenda.shelved = agenda.shelved.filter((x) => now - x.at < MAIN_MAX_AGE_MS)
     agenda.asked = agenda.asked.filter((x) => now - x.at < 5 * 60_000)
+  }
+
+  /** The action's own arguments, minus the tool name and internal markers. */
+  function goalArgs (action) {
+    const out = {}
+    for (const [k, v] of Object.entries(action || {})) {
+      if (k === 'a' || k.startsWith('_') || v === undefined || v === null) continue
+      out[k] = v
+    }
+    return out
+  }
+
+  /**
+   * What is needed to run this task again later, in the same place, with the
+   * remaining work. A build's origin is resolved NOW: re-running `build` with
+   * no `at` used to anchor the structure at the bot's new feet position, i.e.
+   * a second house beside the first.
+   */
+  function goalDetailFor (tool, action) {
+    const detail = { args: goalArgs(action) }
+    if (String(tool).startsWith('build')) {
+      const p = here()
+      const at = Array.isArray(action.at) && action.at.length >= 3 && action.at.every((v) => Number.isFinite(Number(v)))
+        ? action.at.map((v) => Math.trunc(Number(v)))
+        : (p ? [Math.floor(p.x), Math.floor(p.y), Math.floor(p.z)] : null)
+      if (at) detail.at = at
+      // Which dimension the site is in: the same x,z means a different place
+      // in the nether, and re-reading "the house" there is not evidence.
+      try { detail.dim = dim() } catch { /* no world yet */ }
+      if (action.stage) detail.stage = String(action.stage)
+    }
+    return detail
+  }
+
+  /** The registry record behind a task the model just started. */
+  function openGoalForMain (spec) {
+    const declared = goalReg.list({ status: 'pending' })
+      .filter((g) => g.kind === 'declared' && Date.now() - g.createdAt < 10 * 60_000)
+      .sort((a, b) => b.createdAt - a.createdAt)[0] || null
+    // The kind is the tool family: it decides how the checkpoint is replayed.
+    const kind = String(spec.tool || 'task').split(' ')[0]
+    const goal = goalReg.add({
+      description: spec.label,
+      kind,
+      origin: spec.askedBy ? `player:${spec.askedBy}` : (spec.origin || 'self'),
+      priority: spec.priority ?? goalPriority(spec.tool),
+      parentId: declared ? declared.id : null,
+      completion: 'the task reports success and the world agrees (verified, not just "the call returned")',
+      failure: 'the task failed and no retry made progress',
+      interruption: 'safety reflex, fight, death, restart, a newer task or the model itself',
+      resume: 're-run the same task from this checkpoint (build: same origin and stage; gather: the remaining count)',
+      detail: spec.detail || {}
+    })
+    if (goal && declared) goalReg.update(declared.id, { detail: { activeChild: goal.id } })
+    return goal
+  }
+
+  /** The task finished: record what actually happened, never "the call returned". */
+  function finishGoal (goalId, r) {
+    if (!goalId) return
+    const goal = goalReg.get(goalId)
+    if (!goal) return
+    // A late result may not revive a cancelled objective nor overwrite a
+    // completion that was already recorded.
+    if (goal.status === 'cancelled' || goal.status === 'completed') return
+    const msg = String(r?.msg || (r?.ok ? 'done' : 'failed')).slice(0, 160)
+    if (r?.progress) goalReg.progress(goalId, r.progress)
+    if (/\b(replaced|paused|cancelled)\b/i.test(msg)) {
+      goalReg.suspend(goalId, { reason: msg.slice(0, 100), by: 'task' })
+      return
+    }
+    if (r && r.ok && r.complete !== false) goalReg.complete(goalId, { note: msg })
+    else if (r && r.ok) goalReg.suspend(goalId, { reason: `stopped before finishing: ${msg.slice(0, 90)}`, by: 'task' })
+    else goalReg.fail(goalId, { error: msg || 'failed' })
   }
 
   /** Start (or restart after a pause) the main task. */
@@ -554,20 +650,37 @@ function startSession (shared, onEnded) {
     background(main.tool, main.running, { showAs: main.showAs || null, main, seq: main.seq })
   }
 
+  /** Put the running objective aside without losing it. */
+  function shelfMain (main, reason) {
+    if (!main) return
+    if (main.goalId && goalReg.get(main.goalId)) goalReg.suspend(main.goalId, { reason, by: 'agenda' })
+    if (!agenda.shelved.some((x) => main.goalId && x.goalId === main.goalId)) {
+      agenda.shelved.push({ label: main.label, askedBy: main.askedBy || null, at: Date.now(), goalId: main.goalId || null })
+      if (agenda.shelved.length > 4) agenda.shelved.shift()
+    }
+  }
+
   /**
    * A long task begins. Whatever ran before ends (the newest decision wins);
-   * a build that was in progress is set aside, not forgotten.
-   * @param {{ tool:string, label:string, run:() => Promise<object>, askedBy?:string|null, showAs?:string, resumable?:boolean }} spec
+   * it is set aside with its checkpoint — whatever kind it was, not just a
+   * build, and never silently.
+   * @param {{ tool:string, label:string, run:() => Promise<object>, askedBy?:string|null, showAs?:string, resumable?:boolean, goalId?:string, detail?:object, priority?:number, origin?:string }} spec
    */
   function startMain (spec) {
     const prev = agenda.main
-    if (prev && /^build/.test(prev.tool) && !/^build/.test(spec.tool)) {
-      agenda.shelved.push({ label: prev.label, askedBy: prev.askedBy || null, at: Date.now() })
-      if (agenda.shelved.length > 3) agenda.shelved.shift()
-    }
-    agenda.shelved = agenda.shelved.filter((x) => x.label !== spec.label)
+    if (prev) shelfMain(prev, `set aside: ${spec.label} was started`)
+    agenda.shelved = agenda.shelved.filter((x) => !spec.goalId || x.goalId !== spec.goalId)
     replaceTask()
     const main = { ...spec, startedAt: Date.now(), paused: null, resumes: 0, seq: 0 }
+    let goal = main.goalId ? goalReg.get(main.goalId) : null
+    if (goal) {
+      goalReg.update(goal.id, { detail: { ...(goal.detail || {}), ...(spec.detail || {}) } })
+      goalReg.resume(goal.id, { reason: 'run again' })
+    } else {
+      goal = openGoalForMain(spec)
+      main.goalId = goal ? goal.id : null
+      if (goal) goalReg.resume(goal.id, { reason: spec.askedBy ? `asked by ${spec.askedBy}` : 'started' })
+    }
     agenda.main = main
     launch(main)
   }
@@ -576,8 +689,13 @@ function startSession (shared, onEnded) {
   function pauseMain (by, { until = null } = {}) {
     const main = agenda.main
     if (!main) return false
-    if (main.resumable === false) { agenda.main = null; return false }
+    if (main.resumable === false) {
+      agenda.main = null
+      if (main.goalId) goalReg.cancel(main.goalId, { reason: `cancelled to make room for ${by}` })
+      return false
+    }
     main.paused = { by, at: Date.now(), until }
+    if (main.goalId) goalReg.suspend(main.goalId, { reason: `paused for ${by}`, by })
     return true
   }
 
@@ -592,7 +710,23 @@ function startSession (shared, onEnded) {
       try { executor?.cancel() } catch { /* noop */ }
       leaveFight('new task')
     } else replaceTask()
-    return background(label, run(), { side: true })
+    // A short job is an objective too (a player is owed a loaf).
+    let goal = opts.goalId ? goalReg.get(opts.goalId) : null
+    if (goal) {
+      goalReg.resume(goal.id, { reason: 'resumed as a side job' })
+    } else {
+      goal = goalReg.add({
+        description: opts.describe || String(label),
+        kind: String(label).split(' ')[0],
+        origin: opts.askedBy ? `player:${opts.askedBy}` : 'self',
+        priority: goalPriority(label),
+        completion: 'this one job reports success',
+        resume: 're-run the same short job (checkpoint kept in detail)',
+        detail: opts.detail || {}
+      })
+      if (goal) goalReg.resume(goal.id, { reason: 'side job started' })
+    }
+    return background(label, run(), { side: true, goalId: goal ? goal.id : null })
   }
 
   /** The side job is over: back to the main task, if one is waiting and nothing else runs. */
@@ -601,13 +735,20 @@ function startSession (shared, onEnded) {
     if (!main || !main.paused || ended) return false
     if (main.paused.until === 'wake' && bot.isSleeping) return false // the wake event resumes it
     if (skills?.current() || combat?.isEngaged) return false // whatever is running calls this again when it ends
-    if (Date.now() - main.startedAt > MAIN_MAX_AGE_MS || main.resumes >= 8) {
+    if (Date.now() - main.startedAt > MAIN_MAX_AGE_MS || main.resumes >= (GOALS.maxResumes ?? 8)) {
+      // It used to be deleted here. An objective interrupted eight times is
+      // exactly the one a player still wants finished: it is set aside, with
+      // its checkpoint and a reason, and the model is told.
       agenda.main = null
-      note({ type: 'dropped', msg: `gave up on ${main.label} (interrupted too often or too old)` })
+      shelfMain(main, `set aside after ${main.resumes} interruptions or ${Math.round((Date.now() - main.startedAt) / 60000)} min`)
+      note({ type: 'dropped', msg: `set aside ${main.label} (interrupted too often or too old); it is still on the goal list` })
+      supersede(`gave up on ${main.label}`)
+      brain?.wake(`${main.label} was set aside after ${main.resumes} interruptions; it is still open (goal resume or goal cancel)`, { external: true })
       return false
     }
     main.paused = null
     main.resumes++
+    if (main.goalId) goalReg.resume(main.goalId, { reason: `resumed after ${after}` })
     // The decision that came with the task comes back with it (the side job
     // replaced it) — except about anything that hit the bot in the meantime.
     const d = main.decision
@@ -617,6 +758,7 @@ function startSession (shared, onEnded) {
     }
     note({ type: 'resumed', msg: `back to ${main.label} after ${after}` })
     logger.info(TAG, `resuming ${main.label} after ${after}`)
+    supersede(`resumed ${main.label}`)
     launch(main)
     return true
   }
@@ -632,12 +774,400 @@ function startSession (shared, onEnded) {
     return parts.length ? `agenda: ${parts.join(' | ')}` : null
   }
 
+  // ------------------------------------------- goals: prompt & watchdog --
+
+  /** Invalidate an in-flight model decision: the situation it answered has changed. */
+  function supersede (reason) {
+    if (!brain || !brain.busyAction) return false
+    decisionEpoch++
+    logger.debug(TAG, `in-flight decision superseded (${reason})`)
+    return true
+  }
+
+  /** The durable objective list as prompt lines, or null when there is nothing. */
+  function goalLines () {
+    const open = goalReg.openGoals()
+    if (!open.length) return null
+    const now = Date.now()
+    const limit = Math.max(1, Math.min(8, GOALS.promptMax ?? 6))
+    const waiting = goalReg.waiting({ now })
+    const head = `goals (${open.length} open${waiting.length ? `; longest waiting: ${waiting[0].id} ${waiting[0].description.slice(0, 40)}` : ''}): a goal is not lost when a task pauses, dies or restarts — inspect with goal show <id>, continue with goal resume <id>, drop with goal cancel <id>`
+    return [head, ...goalReg.brief({ limit, now }).map((l) => `  - ${l}`)].join('\n')
+  }
+
+  /** One compact line for the chat lane: what the body owes someone right now. */
+  function goalBriefLine () {
+    const open = goalReg.openGoals()
+    if (!open.length) return null
+    const bits = open.slice(0, 3).map((g) => `${g.id} ${g.status} ${g.description}`)
+    const more = open.length > 3 ? ` (+${open.length - 3} more)` : ''
+    return `goals: ${bits.join(' | ')}${more}`
+  }
+
+  /** Origin + checkpoint for a short job, so it is not anonymous in the registry. */
+  function sideOpts (label, action, snap) {
+    return {
+      askedBy: snap?.askedBy || null,
+      describe: describeSide(label, action),
+      detail: goalDetailFor(label, action)
+    }
+  }
+
+  /** "take diamond x5 from chest2" — the readable form of a short job. */
+  function describeSide (label, action) {
+    const bits = []
+    if (action.item) bits.push(String(action.item))
+    if (action.count) bits.push(`x${action.count}`)
+    if (action.where) bits.push(`${label === 'put' ? 'into' : 'from'} ${action.where}`)
+    if (action.player) bits.push(`to ${action.player}`)
+    if (action.what) bits.push(String(action.what))
+    if (action.i && !action.item) bits.push(String(action.i))
+    return bits.length ? `${label} ${bits.join(' ')}` : label
+  }
+
+  // Actions that are worth refusing when the world moved while the model was
+  // thinking: a delayed answer must not start quiet work beside a new creeper
+  // or resurrect a task that another controller already replaced.
+  const QUIET_TASKS = new Set(['build', 'build_shape', 'gather', 'take', 'put', 'smelt', 'sleep', 'use_block', 'craft', 'look_in', 'light_up', 'shelter', 'follow', 'go_to', 'run_script'])
+  function staleActionReason (action, snap) {
+    if (!snap || !QUIET_TASKS.has(action.a)) return null
+    const known = new Set(snap.threatIds || [])
+    const fresh = [...(sense.last?.dangerIds || [])].filter((id) => !known.has(id))
+    if (fresh.length) {
+      return `refused: ${fresh.length} new threat${fresh.length === 1 ? '' : 's'} came close while you were deciding (not in the snapshot you answered). Decide again — fight, hold or flee.`
+    }
+    const then = snap.goalId || null
+    const now = agenda.main && !agenda.main.paused ? agenda.main.goalId : null
+    if (then !== now) {
+      return `refused: the active task changed while you were deciding${then ? ` (${then} was running then)` : ''}${now ? `; ${now} is running now` : ''}. Read goals/doing and decide again.`
+    }
+    return null
+  }
+
+  /**
+   * Is a stored objective still true? The world is the only ground truth:
+   * a saved plan is not evidence that the chest still holds the diamonds or
+   * that the wall was not finished before the process died.
+   * @returns {{ state:'complete'|'partial'|'unknown'|'invalid', note:string, done?:number, total?:number }}
+   */
+  function verifyGoalAgainstWorld (goal) {
+    const d = (goal && goal.detail) || {}
+    const args = (d && d.args) || {}
+    try {
+      if (goal.kind === 'build' || goal.kind === 'build_shape') {
+        if (!Array.isArray(d.at) || d.at.length < 3) return { state: 'unknown', note: 'no build origin recorded, so the site cannot be checked' }
+        if (d.dim && dim() && d.dim !== dim()) return { state: 'unknown', note: `the site is in the ${d.dim} and this is the ${dim()} — go there to check it` }
+        let parsed
+        if (args.blueprint) parsed = parser.load(String(args.blueprint))
+        else if (Array.isArray(args.grid)) parsed = parser.parseInline({ grid: args.grid, palette: args.palette || {} })
+        else if (args.shape) parsed = { blocks: generateShape(String(args.shape), args.params || {}, String(args.block)) }
+        else return { state: 'unknown', note: 'no plan recorded for this build' }
+        const origin = new Vec3(Math.trunc(d.at[0]), Math.trunc(d.at[1]), Math.trunc(d.at[2]))
+        const plan = parser.plan(parsed, origin, bot.entity.position)
+        const stage = d.stage ? normalizeStage(d.stage) : null
+        const steps = stage ? plan.steps.filter((st) => st.phase === stage) : plan.steps
+        if (!steps.length) return { state: 'unknown', note: 'the plan has no blocks for that stage' }
+        let present = 0
+        let missing = 0
+        let unreadable = 0
+        for (const st of steps) {
+          let block = null
+          try { block = bot.blockAt(new Vec3(st.x, st.y, st.z)) } catch { block = null }
+          if (!block) unreadable++
+          else if (block.name === st.name) present++
+          else missing++
+        }
+        const total = steps.length
+        if (present === total) return { state: 'complete', done: present, total, note: `all ${total} blocks of this ${stage || 'build'} are already in place at ${d.at.join(',')}` }
+        if (unreadable > total / 2) return { state: 'unknown', done: present, total, note: `the site is not loaded (${unreadable}/${total} cells unreadable)` }
+        return { state: 'partial', done: present, total, note: `${present}/${total} blocks in place, ${missing} still missing` }
+      }
+      if (goal.kind === 'gather') {
+        const want = String(args.item || '').toLowerCase().trim()
+        const total = Math.max(1, Math.trunc(Number(args.count) || 1))
+        const have = bot.inventory.items().filter((i) => i.name === want).reduce((n, i) => n + (Number(i.count) || 0), 0)
+        if (!want) return { state: 'unknown', note: 'no item recorded for this gather' }
+        if (have >= total) return { state: 'complete', done: have, total, note: `carrying ${have} ${want} (asked for ${total})` }
+        return { state: 'partial', done: have, total, note: `carrying ${have} of ${total} ${want}` }
+      }
+      if (goal.kind === 'go_to') {
+        if (args.place) {
+          const place = places.getPlace(args.place)
+          if (!place) return { state: 'invalid', note: `the place "${args.place}" is no longer known` }
+          return { state: 'unknown', note: `the place "${args.place}" still exists at ${place.x},${place.y},${place.z}` }
+        }
+        if (Number.isFinite(Number(args.x)) && Number.isFinite(Number(args.z)) && here()) {
+          const p = here()
+          const dx = Number(args.x) - p.x
+          const dz = Number(args.z) - p.z
+          if (Math.hypot(dx, dz) <= 2) return { state: 'complete', note: `already standing at ${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}` }
+        }
+        return { state: 'unknown', note: 'walking there again is the only way to know' }
+      }
+      if (goal.kind === 'follow') {
+        const who = String(args.player || '')
+        if (who && !bot.players?.[who]) return { state: 'invalid', note: `${who} is not on the server any more` }
+        return { state: 'unknown', note: `${who || 'the player'} must be seen again before following` }
+      }
+      if (goal.kind === 'take' || goal.kind === 'put') {
+        const where = String(args.where || '')
+        const entry = where ? places.resolve(where, here(), { dim: dim() }) : null
+        const want = String(args.item || '')
+        if (entry && entry.contents && want) {
+          const inside = Number(entry.contents[want] || 0)
+          if (goal.kind === 'take' && inside === 0) return { state: 'invalid', note: `the container no longer holds ${want} (someone may have emptied it)` }
+        }
+        return { state: 'unknown', note: 'the container must be opened again to be sure' }
+      }
+      if (goal.kind === 'declared') return { state: 'unknown', note: 'a declared objective has no world state of its own; judge it from what you see' }
+      return { state: 'unknown', note: 'nothing verifiable is recorded for this kind of goal' }
+    } catch (err) {
+      return { state: 'invalid', note: `cannot be verified: ${String(err?.message || err).slice(0, 100)}` }
+    }
+  }
+
+  /** Apply a verification verdict to the record (never to a terminal goal). */
+  function applyVerdict (goal, verdict) {
+    if (!goal) return verdict
+    goal.verifiedAt = Date.now()
+    if (!['pending', 'active', 'suspended', 'resumable', 'failed'].includes(goal.status)) return verdict
+    if (verdict.state === 'complete') {
+      goalReg.complete(goal.id, { note: `verified in the world: ${verdict.note}` })
+      note({ type: 'goal', msg: `${goal.id} ${goal.description}: ${verdict.note} — marked completed` }, { promote: true })
+    } else if (verdict.state === 'invalid') {
+      goalReg.fail(goal.id, { error: verdict.note })
+      note({ type: 'goal', msg: `${goal.id} ${goal.description} is no longer valid: ${verdict.note}` }, { promote: true })
+    } else if (verdict.state === 'partial') {
+      goalReg.update(goal.id, { needsVerify: false })
+      goalReg.progress(goal.id, { done: verdict.done, total: verdict.total, note: verdict.note })
+    }
+    return verdict
+  }
+
+  function reconcileGoal (goal) { return applyVerdict(goal, verifyGoalAgainstWorld(goal)) }
+
+  /**
+   * Rebuild a runnable from the checkpoint: what the goal needs to continue,
+   * with the remaining work — not the whole task from the start.
+   */
+  function runFromDetail (goal) {
+    const d = (goal && goal.detail) || {}
+    const args = d.args || {}
+    const kind = String(goal.kind || '')
+    try {
+      if (kind === 'build') {
+        let planned
+        if (args.blueprint) planned = parser.load(String(args.blueprint))
+        else if (Array.isArray(args.grid)) planned = parser.parseInline({ grid: args.grid, palette: args.palette || {} })
+        else return { ok: false, why: 'no blueprint or grid was recorded, so the build cannot be continued' }
+        const name = String(args.blueprint || 'inline')
+        return { ok: true, tool: 'build', label: goal.description, run: () => buildBlocks(planned.blocks, name, d.stage || args.stage, d.at || args.at) }
+      }
+      if (kind === 'build_shape') {
+        if (!args.shape || !args.block) return { ok: false, why: 'the shape and block were not recorded' }
+        const blocks = generateShape(String(args.shape), args.params || {}, String(args.block))
+        return { ok: true, tool: 'build_shape', label: goal.description, run: () => buildBlocks(blocks, `shape:${args.shape}`, d.stage || args.stage, d.at || args.at) }
+      }
+      if (kind === 'gather') {
+        const want = String(args.item || '')
+        const total = Math.max(1, Math.trunc(Number(args.count) || 1))
+        const done = Math.max(0, Math.trunc(Number(goal.progress?.done) || 0))
+        const remaining = Math.max(1, total - done)
+        return { ok: true, tool: 'gather', label: goal.description, run: () => skills.gather({ item: want, count: remaining, radius: args.radius }) }
+      }
+      if (kind === 'go_to') {
+        const target = args.player ? { player: args.player } : args.place ? { place: args.place } : { x: args.x, y: args.y, z: args.z }
+        return { ok: true, tool: 'go_to', label: goal.description, run: () => skills.goTo(target) }
+      }
+      if (kind === 'follow') return { ok: true, tool: 'follow', label: goal.description, run: () => skills.follow({ player: args.player }) }
+      if (kind === 'light_up') return { ok: true, tool: 'light_up', label: goal.description, run: () => skills.lightUp({ radius: args.radius }) }
+      if (kind === 'shelter') return { ok: true, tool: 'shelter', label: goal.description, run: () => skills.shelter() }
+      if (kind === 'corpse_run') return { ok: true, tool: 'corpse_run', label: goal.description, run: () => skills.corpseRun() }
+      if (SIDE_KINDS.has(kind)) {
+        if (typeof skills[kind] !== 'function') return { ok: false, why: `no way to re-run ${kind}` }
+        return { ok: true, tool: kind, side: true, label: goal.description, run: () => skills[kind]({ ...args }) }
+      }
+      return { ok: false, why: 'this goal has no executable checkpoint; start it with the normal tools' }
+    } catch (err) {
+      return { ok: false, why: `its checkpoint no longer loads: ${String(err?.message || err).slice(0, 100)}` }
+    }
+  }
+
+  /** The `goal` tool: the model's handle on its own objective list. */
+  async function runGoalOp (action) {
+    const op = String(action.operation || 'list').toLowerCase()
+    const wanted = String(action.id || action.description || '').trim()
+    const goal = action.id ? goalReg.get(action.id) : (op === 'resume' || op === 'show' || op === 'cancel' || op === 'suspend' || op === 'complete' || op === 'verify' ? goalReg.find(wanted) : null)
+    switch (op) {
+      case 'list': {
+        const open = goalReg.openGoals()
+        const closed = goalReg.list({}).filter((g) => !['pending', 'active', 'suspended', 'resumable'].includes(g.status)).slice(0, 3)
+        if (!open.length && !closed.length) return { ok: true, msg: 'no goals recorded yet — main tasks create them automatically; goal add records one that is not started yet' }
+        const fmt = (g) => goalReg.describe(g)
+        return { ok: true, msg: `goals (${open.length} open): ${open.map(fmt).join(' | ') || 'none open'}${closed.length ? ` || recently finished: ${closed.map(fmt).join(' | ')}` : ''}` }
+      }
+      case 'show': {
+        if (!goal) return { ok: false, msg: `no goal matches "${wanted || '?'}"` }
+        const view = goalReg.show(goal.id)
+        return { ok: true, msg: view.line }
+      }
+      case 'add': {
+        const desc = String(action.description || '').trim()
+        if (!desc) return { ok: false, msg: 'goal add needs a description of the objective' }
+        const g = goalReg.add({
+          description: desc,
+          kind: 'declared',
+          origin: 'self',
+          priority: action.priority ?? 50,
+          completion: 'the whole objective is done, not one step of it',
+          resume: 'start it with the normal tools; the next main task is linked to it as its step',
+          detail: { declaredAt: Date.now() }
+        })
+        return { ok: true, msg: `goal ${g.id} recorded: ${g.description}. The next main task you start is linked to it as its step; mark the whole objective complete with goal complete ${g.id}.` }
+      }
+      case 'update': {
+        if (!goal) return { ok: false, msg: `no goal matches "${wanted || '?'}"` }
+        if (action.note) goalReg.update(goal.id, { detail: { lastNote: String(action.note).slice(0, 140) } })
+        goalReg.progress(goal.id, { percent: action.percent, note: action.note })
+        return { ok: true, msg: `updated: ${goalReg.describe(goalReg.get(goal.id))}` }
+      }
+      case 'verify': {
+        if (!goal) return { ok: false, msg: `no goal matches "${wanted || '?'}"` }
+        const before = goal.status
+        const verdict = reconcileGoal(goalReg.get(goal.id))
+        const after = goalReg.get(goal.id)
+        return { ok: verdict.state !== 'invalid', msg: `${after.id} (was ${before}, now ${after.status}): ${verdict.note}` }
+      }
+      case 'suspend': {
+        if (!goal) return { ok: false, msg: `no goal matches "${wanted || '?'}"` }
+        stopGoalIfRunning(goal.id)
+        const r = goalReg.suspend(goal.id, { reason: action.note ? String(action.note).slice(0, 100) : 'suspended by the model', by: 'model' })
+        return r.ok ? { ok: true, msg: `${goal.id} suspended: ${goal.description}` } : { ok: false, msg: r.why }
+      }
+      case 'cancel': {
+        if (!goal) return { ok: false, msg: `no goal matches "${wanted || '?'}"` }
+        stopGoalIfRunning(goal.id)
+        const r = goalReg.cancel(goal.id, { reason: action.note ? String(action.note).slice(0, 100) : 'cancelled by the model' })
+        return r.ok ? { ok: true, msg: `${goal.id} cancelled; it will not come back on its own: ${goal.description}` } : { ok: false, msg: r.why }
+      }
+      case 'complete': {
+        if (!goal) return { ok: false, msg: `no goal matches "${wanted || '?'}"` }
+        stopGoalIfRunning(goal.id)
+        const r = goalReg.complete(goal.id, { note: action.note ? String(action.note).slice(0, 100) : 'marked complete by the model' })
+        return r.ok ? { ok: true, msg: `${goal.id} completed: ${goal.description}` } : { ok: false, msg: r.why }
+      }
+      case 'resume': {
+        if (!goal) return { ok: false, msg: `no goal matches "${wanted || '?'}"` }
+        if (!['pending', 'active', 'suspended', 'resumable', 'failed'].includes(goal.status)) {
+          return { ok: false, msg: `${goal.id} is ${goal.status}; it cannot be resumed` }
+        }
+        if (goal.status === 'active' && agenda.main?.goalId === goal.id) return { ok: true, msg: `${goal.id} is already running: ${goalReg.describe(goal)}` }
+        // Always look at the world before continuing an old plan.
+        const verdict = reconcileGoal(goalReg.get(goal.id))
+        const fresh = goalReg.get(goal.id)
+        if (!fresh) return { ok: false, msg: `goal ${goal.id} disappeared` }
+        if (fresh.status === 'completed') return { ok: true, msg: `${fresh.id} needed no work: ${verdict.note}` }
+        if (fresh.status === 'cancelled') return { ok: false, msg: `${fresh.id} was cancelled` }
+        if (verdict.state === 'invalid') return { ok: false, msg: `${fresh.id} cannot be resumed: ${verdict.note}. Replan it (a new goal) or cancel it.` }
+        if (verdict.state === 'unknown' && fresh.status === 'failed') {
+          return { ok: false, msg: `${fresh.id} failed and cannot be checked from here (${verdict.note}); look at it first (goal show ${fresh.id}) and decide whether to retry` }
+        }
+        const spec = runFromDetail(fresh)
+        if (!spec.ok) {
+          const r = goalReg.resume(fresh.id, { reason: 'resume requested' })
+          return r.ok
+            ? { ok: true, msg: `${fresh.id} is active again: ${fresh.description}. ${spec.why}; start it with the normal tools.` }
+            : { ok: false, msg: r.why }
+        }
+        if (spec.side && agenda.main) {
+          startSide(spec.tool, spec.run, { describe: spec.label, detail: fresh.detail, goalId: fresh.id })
+          return { ok: true, msg: `resuming ${fresh.id} as a side job (the current task waits): ${spec.label}` }
+        }
+        startMain({ tool: spec.tool, label: spec.label, goalId: fresh.id, detail: fresh.detail, askedBy: fresh.origin.startsWith('player:') ? fresh.origin.slice(7) : null, run: spec.run, priority: fresh.priority })
+        return { ok: true, msg: `resuming ${fresh.id}: ${spec.label}${verdict.state === 'partial' ? ` (${verdict.note})` : ''}` }
+      }
+      default:
+        return { ok: false, msg: `unknown goal operation "${op}" (list|show|add|resume|suspend|cancel|complete|update|verify)` }
+    }
+  }
+
+  /** Stop the body if this goal is the one running: a cancelled goal must not keep working. */
+  function stopGoalIfRunning (goalId) {
+    if (agenda.main?.goalId === goalId) {
+      agenda.main = null
+      try { skills?.cancel('goal changed') } catch { /* noop */ }
+      try { executor?.cancel() } catch { /* noop */ }
+    } else if (agenda.main?.paused && agenda.main.goalId === goalId) {
+      agenda.main = null
+    }
+  }
+
+  /**
+   * Periodic goal upkeep: no-progress detection, blocked tasks, starvation of
+   * waiting objectives, and a throttled save. Runs locally — the model is only
+   * woken when a decision is actually needed.
+   */
+  function goalTick () {
+    const now = Date.now()
+    try { goalReg.maybeSave() } catch { /* best effort */ }
+    for (const goal of goalReg.stalled({ stallMs: GOALS.stallMs ?? 180_000, remindMs: GOALS.remindMs ?? 300_000, now })) {
+      if (goal.id !== agenda.main?.goalId) continue // only the objective that is actually running
+      goalReg.noteStall(goal.id, now)
+      const secs = Math.round((now - goal.progressAt) / 1000)
+      note({ type: 'goal', msg: `no progress on ${goal.description} for ${secs}s` })
+      brain?.wake(`no progress on ${goal.id} ${goal.description} for ${secs}s${goal.progress?.note ? ` (last checkpoint: ${goal.progress.note})` : ''} — check it with goal verify ${goal.id}, then keep it, replan or cancel it`, { external: true })
+    }
+    const running = agenda.main?.goalId ? goalReg.get(agenda.main.goalId) : null
+    if (running && running.status === 'active' && running.fails >= (GOALS.maxFails ?? 3) && now - running.progressAt > (GOALS.stallMs ?? 180_000)) {
+      goalReg.suspend(running.id, { reason: `blocked after ${running.fails} failed attempts (${running.lastError || 'no progress'})`, by: 'monitor' })
+      goalReg.update(running.id, { needsVerify: true })
+      agenda.main = null
+      try { skills?.cancel('blocked') } catch { /* noop */ }
+      try { executor?.cancel() } catch { /* noop */ }
+      note({ type: 'goal', msg: `${running.id} suspended: blocked after repeated failures` })
+      brain?.wake(`${running.id} looks blocked (${running.fails} failures, no progress: ${running.lastError || 'unknown'}); it is suspended. Check the world before resuming, or cancel it`, { external: true })
+    }
+    // A waiting objective must not starve silently when nothing is running.
+    if (!agenda.main && !combat?.isEngaged && !skills?.current()) {
+      const waiting = goalReg.waiting({ now, minAgeMs: GOALS.starveMs ?? 300_000 })[0]
+      const lastNudge = Number(waiting?.detail?.starveNudgedAt) || 0
+      if (waiting && now - lastNudge > (GOALS.starveRemindMs ?? 600_000)) {
+        goalReg.update(waiting.id, { detail: { starveNudgedAt: now } })
+        brain?.wake(`unfinished goal ${waiting.id} "${waiting.description}" has been waiting ${Math.round((now - (waiting.suspendedAt || waiting.updatedAt || waiting.createdAt)) / 60000)} min; resume it (goal resume ${waiting.id}) or cancel it`, { external: true })
+      }
+    }
+  }
+
+  /**
+   * Re-check restored objectives against the world once the chunks are there.
+   * A completion event that never got saved, or a chest emptied overnight,
+   * becomes visible here instead of being rediscovered mid-task.
+   */
+  function reconcileRestored () {
+    if (!goalReg.openGoals().length) return 0
+    let checked = 0
+    let completed = 0
+    let invalid = 0
+    for (const goal of goalReg.openGoals().slice(0, 6)) {
+      if (!['build', 'build_shape', 'gather', 'go_to', 'follow', 'take', 'put'].includes(goal.kind)) continue
+      const d = goal.detail || {}
+      if (d.dim && d.dim !== dim()) continue // a nether trip must not "complete" an overworld build
+      if (d.at && here() && Math.hypot(d.at[0] - here().x, d.at[2] - here().z) > (GOALS.verifyRadius ?? 64)) continue
+      const verdict = reconcileGoal(goalReg.get(goal.id))
+      checked++
+      if (verdict.state === 'complete') completed++
+      if (verdict.state === 'invalid') invalid++
+    }
+    if (checked) logger.info(TAG, `goals: re-checked ${checked} restored objective(s) against the world — ${completed} already done, ${invalid} no longer valid`)
+    return checked
+  }
+
   /**
    * Run long work in the background; the model is told how it ended.
    * `showAs` labels work that is not a Skill (builds, scripts) in "doing:".
    * `main` / `seq` mark the agenda's main task; `side` a job it is paused for.
    */
-  function background (label, promise, { showAs = null, main = null, seq = 0, side = false } = {}) {
+  function background (label, promise, { showAs = null, main = null, seq = 0, side = false, goalId = null } = {}) {
     const id = ++taskSeq
     if (showAs) task = { id, label: showAs, startedAt: Date.now() }
     Promise.resolve(promise)
@@ -650,6 +1180,9 @@ function startSession (shared, onEnded) {
           // Cancelled to make room for a side job: it will be launched again.
           if (main.paused) return
           agenda.main = null
+          finishGoal(main.goalId, r)
+        } else if (goalId) {
+          finishGoal(goalId, r)
         }
         if (!combat?.isEngaged) system1?.clearDecision()
         // Replaced by the model's own next instruction: not news.
@@ -812,6 +1345,7 @@ function startSession (shared, onEnded) {
       observe.inventoryLine(bot),
       doingLine(),
       agendaLine(),
+      goalLines(),
       ...threatLines(),
       observe.playersLine(bot),
       observe.mobsLine(bot, { threatIds: sense.last.dangerIds, notes: hostileNotes() }),
@@ -831,7 +1365,15 @@ function startSession (shared, onEnded) {
     }
     // Who asked for what this turn is about (the newest chat request among the reasons).
     const asked = /^chat request from (\S+?):/.exec([...reasons].reverse().find((r) => /^chat request from /.test(r)) || '')
-    return { text: lines.filter(Boolean).join('\n'), threatIds, askedBy: asked ? asked[1] : null, reasons }
+    return {
+      text: lines.filter(Boolean).join('\n'),
+      threatIds,
+      askedBy: asked ? asked[1] : null,
+      reasons,
+      // Which objective this snapshot was taken for: a delayed answer about
+      // one objective must not act on another (see staleActionReason).
+      goalId: agenda.main && !agenda.main.paused ? (agenda.main.goalId || null) : null
+    }
   }
 
   function buildChatPrompt (sender, incoming) {
@@ -850,6 +1392,7 @@ function startSession (shared, onEnded) {
       observe.inventoryLine(bot, { max: 16 }),
       doingLine(),
       agendaLine(),
+      goalBriefLine(),
       ...threatBrief(),
       observe.playersLine(bot),
       named ? `places: ${named}` : null,
@@ -864,7 +1407,7 @@ function startSession (shared, onEnded) {
 
   // ------------------------------------------------------- model turns ---
   /** Tools that start or change something in the world: after one of them a request counts as taken up. */
-  const PASSIVE = new Set(['idle', 'say', 'hold', 'find', 'equip', 'eat', 'set_mode', 'remember_here'])
+  const PASSIVE = new Set(['idle', 'say', 'hold', 'find', 'equip', 'eat', 'set_mode', 'remember_here', 'goal'])
 
   // audit2 G.4: one metrics JSONL line per model call — the usage numbers in
   // this repo's cost tables stop being estimates the first time this runs
@@ -1034,7 +1577,14 @@ function startSession (shared, onEnded) {
     const phaseTotal = stage && plan.phaseCounts ? plan.phaseCounts[stage] : plan.steps.length
     const text = `build ${label}${stage ? ' (' + stage + ')' : ''}: completed ${result.placed}/${phaseTotal} (${result.placed - (result.alreadyPresent || 0)} newly placed${result.alreadyPresent ? `, ${result.alreadyPresent} already present` : ''})${result.skipped.length ? `, skipped ${result.skipped.length}` : ''}${result.reason === 'cancelled' ? ', cancelled' : ''}${scaffoldNote}`
     if (result.placed > 0) note({ type: 'build_complete', msg: text }, { promote: true })
-    return { ok: result.ok, msg: text }
+    // The objective is complete only when every block of the phase is in
+    // place — a loop that returned is not the same thing.
+    return {
+      ok: result.ok,
+      msg: text,
+      progress: { done: result.placed, total: phaseTotal, note: `${result.placed}/${phaseTotal} blocks` },
+      complete: result.ok && Boolean(phaseTotal) && result.placed >= phaseTotal
+    }
   }
 
   // ----------------------------------------------------------- executor --
@@ -1055,6 +1605,13 @@ function startSession (shared, onEnded) {
     if (a !== 'idle') {
       const blocked = failGate.check(action, here())
       if (blocked) return report(a, { ok: false, msg: blocked }, { wake: false })
+    }
+    // A decision generated for a situation that no longer exists must not act:
+    // the model may have been thinking for a minute and a half.
+    const stale = staleActionReason(action, snap)
+    if (stale) {
+      logger.info(TAG, `stale ${a} refused: ${stale.slice(0, 120)}`)
+      return report(a, { ok: false, msg: stale }, { wake: false })
     }
     if (a !== 'idle') logger.info(TAG, `action: ${a} ${JSON.stringify(Object.fromEntries(Object.entries(action).filter(([k]) => !k.startsWith('_') && k !== 'a')))}`)
     gateCtx = action
@@ -1085,15 +1642,17 @@ function startSession (shared, onEnded) {
       case 'go_to': {
         const target = { player: action.player, place: action.place, x: action.x, y: action.y, z: action.z }
         const where = action.player || action.place || (Number.isFinite(Number(action.x)) ? `${Math.round(Number(action.x))},${Math.round(Number(action.z))}` : 'somewhere')
-        return startMain({ tool: 'go_to', label: `go to ${where}`, askedBy: snap.askedBy, decision: decided(snap, { label: 'go_to' }), run: () => skills.goTo(target) })
+        return startMain({ tool: 'go_to', label: `go to ${where}`, askedBy: snap.askedBy, detail: goalDetailFor('go_to', target), decision: decided(snap, { label: 'go_to' }), run: () => skills.goTo(target) })
       }
       case 'follow': {
-        return startMain({ tool: 'follow', label: `follow ${action.player}`, askedBy: snap.askedBy, decision: decided(snap, { label: 'follow', ttlMs: 30 * 60_000 }), run: () => skills.follow({ player: action.player }) })
+        return startMain({ tool: 'follow', label: `follow ${action.player}`, askedBy: snap.askedBy, detail: goalDetailFor('follow', { player: action.player }), decision: decided(snap, { label: 'follow', ttlMs: 30 * 60_000 }), run: () => skills.follow({ player: action.player }) })
       }
       case 'stop': {
         const duel = fight?.player ? combat?.target : null
         agenda.main = null
         agenda.asked = []
+        // Cancelled is terminal: a late tool result cannot bring it back.
+        try { goalReg.cancelAll({ reason: 'stop' }) } catch { /* best effort */ }
         replaceTask()
         system1.clearDecision()
         // A duel the model agreed to and then called off: the hits were part
@@ -1132,25 +1691,25 @@ function startSession (shared, onEnded) {
       // Short jobs: a main task (follow, go_to, a build) waits for them and resumes.
       case 'look_in':
         decided(snap, { label: 'look_in' })
-        return startSide('look_in', () => skills.lookIn({ where: action.where }))
+        return startSide('look_in', () => skills.lookIn({ where: action.where }), sideOpts('look_in', action, snap))
       case 'take':
         decided(snap, { label: 'take' })
-        return startSide('take', () => skills.take({ item: action.item, count: action.count, where: action.where }))
+        return startSide('take', () => skills.take({ item: action.item, count: action.count, where: action.where }), sideOpts('take', action, snap))
       case 'put':
         decided(snap, { label: 'put' })
-        return startSide('put', () => skills.put({ item: action.item, count: action.count, where: action.where }))
+        return startSide('put', () => skills.put({ item: action.item, count: action.count, where: action.where }), sideOpts('put', action, snap))
       case 'smelt':
         decided(snap, { label: 'smelt' })
-        return startSide('smelt', () => skills.smelt({ item: action.item, count: action.count, where: action.where }))
+        return startSide('smelt', () => skills.smelt({ item: action.item, count: action.count, where: action.where }), sideOpts('smelt', action, snap))
       case 'sleep':
         decided(snap, { label: 'sleep' })
-        return startSide('sleep', () => skills.sleep(), { until: 'wake' })
+        return startSide('sleep', () => skills.sleep(), { ...sideOpts('sleep', action, snap), until: 'wake' })
       case 'give':
         decided(snap, { label: 'give' })
-        return startSide('give', () => skills.give({ player: action.player, item: action.item, count: action.count }))
+        return startSide('give', () => skills.give({ player: action.player, item: action.item, count: action.count }), sideOpts('give', action, snap))
       case 'use_block':
         decided(snap, { label: 'use_block' })
-        return startSide('use_block', () => skills.useBlock({ what: action.what }))
+        return startSide('use_block', () => skills.useBlock({ what: action.what }), sideOpts('use_block', action, snap))
       case 'eat':
         return background('eat', skills.eat({ item: action.item }))
       case 'equip':
@@ -1191,7 +1750,7 @@ function startSession (shared, onEnded) {
       case 'gather': {
         decided(snap, { label: 'gather' })
         const n = Math.max(1, Math.min(64, Math.trunc(Number(action.count)) || 1))
-        return startMain({ tool: 'gather', label: `gather ${action.item}${n > 1 ? ` x${n}` : ''}`, askedBy: snap.askedBy, decision: decided(snap, { label: 'gather' }), run: () => skills.gather({ item: action.item, count: n, radius: action.radius }) })
+        return startMain({ tool: 'gather', label: `gather ${action.item}${n > 1 ? ` x${n}` : ''}`, askedBy: snap.askedBy, detail: goalDetailFor('gather', { item: action.item, count: n, radius: action.radius }), decision: decided(snap, { label: 'gather' }), run: () => skills.gather({ item: action.item, count: n, radius: action.radius }) })
       }
       case 'light_up': {
         decided(snap, { label: 'light_up' })
@@ -1211,7 +1770,7 @@ function startSession (shared, onEnded) {
         const item = String(action.i ?? action.item ?? '')
         if (!item) return report('craft', { ok: false, msg: 'craft needs an item' })
         decided(snap, { label: 'craft' })
-        return startSide('craft', () => skills.craft({ item }))
+        return startSide('craft', () => skills.craft({ item }), sideOpts('craft', action, snap))
       }
       case 'build': {
         if (!executor) return report('build', { ok: false, msg: 'not ready yet' })
@@ -1223,8 +1782,11 @@ function startSession (shared, onEnded) {
           else return report('build', { ok: false, msg: `need a blueprint name (${parser.listAvailable().join(', ')}) or an inline grid` })
         } catch (err) { return report('build', { ok: false, msg: String(err.message || err) }) }
         const what = `${action.blueprint || 'inline grid'}${stage ? ` (${stage})` : ''}`
-        // Re-running a phase is idempotent, so a paused build simply runs again.
-        return startMain({ tool: 'build', label: `build ${what}`, askedBy: snap.askedBy, showAs: `building ${what}`, decision: decided(snap, { label: 'build', ttlMs: 30 * 60_000 }), run: () => buildBlocks(planned.blocks, String(action.blueprint || 'inline'), stage, action.at) })
+        // Re-running a phase is idempotent, so a paused build simply runs again
+        // — at the SAME origin, which is resolved now and kept in the goal
+        // checkpoint (re-running without `at` used to build a second house).
+        const detail = goalDetailFor('build', action)
+        return startMain({ tool: 'build', label: `build ${what}`, askedBy: snap.askedBy, showAs: `building ${what}`, detail, decision: decided(snap, { label: 'build', ttlMs: 30 * 60_000 }), run: () => buildBlocks(planned.blocks, String(action.blueprint || 'inline'), stage, detail.at) })
       }
       case 'build_shape': {
         if (!executor) return report('build_shape', { ok: false, msg: 'not ready yet' })
@@ -1234,7 +1796,8 @@ function startSession (shared, onEnded) {
         if (!shape || !block) return report('build_shape', { ok: false, msg: 'need shape and block' })
         let blocks
         try { blocks = generateShape(shape, params, block) } catch (err) { return report('build_shape', { ok: false, msg: String(err.message || err) }) }
-        return startMain({ tool: 'build_shape', label: `build ${shape} of ${block}`, askedBy: snap.askedBy, showAs: `building ${shape} of ${block}`, decision: decided(snap, { label: 'build', ttlMs: 30 * 60_000 }), run: () => buildBlocks(blocks, `shape:${shape}`, normalizeStage(action.stage), action.at) })
+        const detail = goalDetailFor('build_shape', action)
+        return startMain({ tool: 'build_shape', label: `build ${shape} of ${block}`, askedBy: snap.askedBy, showAs: `building ${shape} of ${block}`, detail, decision: decided(snap, { label: 'build', ttlMs: 30 * 60_000 }), run: () => buildBlocks(blocks, `shape:${shape}`, normalizeStage(action.stage), detail.at) })
       }
       case 'run_script': {
         const name = String(action.name || '')
@@ -1246,6 +1809,9 @@ function startSession (shared, onEnded) {
         }
         // A script is not safe to run twice, so a side job ends it instead of pausing it.
         return startMain({ tool: `run_script ${name}`, label: `script ${name}`, askedBy: snap.askedBy, showAs: `running script ${name}`, resumable: false, run: () => runScript(name, {}, ctx).then((out) => ({ ok: true, msg: typeof out === 'string' ? out : 'done' })) })
+      }
+      case 'goal': {
+        return report('goal', await runGoalOp(action))
       }
       case 'set_mode': {
         const applied = wrapper.setMode(String(action.mode || ''))
@@ -1307,7 +1873,13 @@ function startSession (shared, onEnded) {
       const p = here()
       logger.info(TAG, 'respawned')
       wrapper.setMode(cfg.behavior.mode || 'explorer')
-      brain.wake(`respawned at ${p ? `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}` : 'spawn'}; items were dropped at place "last death"`)
+      // A death does not erase the plan: the objectives went back to the
+      // registry as resumable, and are re-checked against the world.
+      let rechecked = 0
+      try { rechecked = reconcileRestored() } catch (err) { logger.debug(TAG, `goal reconcile: ${err.message || err}`) }
+      const open = goalReg.openGoals()
+      const pending = open.length ? `; unfinished: ${open.slice(0, 4).map((g) => goalReg.describe(g)).join(' | ')}` : ''
+      brain.wake(`respawned at ${p ? `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}` : 'spawn'}; items were dropped at place "last death"${pending}${rechecked ? ` (re-checked ${rechecked} goal(s) against the world)` : ''}`)
       return
     }
     systemsReady = true
@@ -1413,11 +1985,19 @@ function startSession (shared, onEnded) {
 
     every(3000, () => { try { places.scan(bot, { radius: cfg.places.scanRadius ?? 16 }) } catch { /* partial world */ } })
     every(60_000, () => { try { memory.save(); places.save(); shared.saveConvo?.() } catch { /* best effort */ } })
+    every(GOALS.tickMs ?? 15_000, () => { try { goalTick() } catch (err) { logger.debug(TAG, `goal tick: ${err.message || err}`) } })
 
     try { bot.armorManager?.equipAll?.() } catch { /* cosmetic */ }
     logger.info(TAG, 'ZincAI ready — reflexes flee, the model decides; chat lane + action lane on demand')
     if (first) {
-      brain.wake('just joined the server — look around; idle is fine')
+      let restored = 0
+      try { restored = reconcileRestored() } catch (err) { logger.debug(TAG, `goal reconcile: ${err.message || err}`) }
+      const open = goalReg.openGoals()
+      const carried = open.length
+        ? `; objectives restored from the last session (${open.length}): ${open.slice(0, 4).map((g) => goalReg.describe(g)).join(' | ')}${open.length > 4 ? ` +${open.length - 4} more` : ''} — check them (goal show/verify <id>) before resuming`
+        : ''
+      brain.wake(`just joined the server — look around; idle is fine${carried}`)
+      if (restored) logger.info(TAG, `goals: re-checked ${restored} restored objective(s) at startup`)
       scoutAndRelocate().catch((err) => logger.warn(TAG, `scout failed: ${err.message || err}`))
     }
   })
@@ -1469,6 +2049,13 @@ function startSession (shared, onEnded) {
     if (p) places.remember('last death', p, { dim: dim(), note: lastHurt.text })
     failGate.clearContext()
     fight = null
+    // A new life, not a new plan: the main task stops running but goes back to
+    // the registry as resumable, with its checkpoint. (It used to be deleted.)
+    try {
+      if (agenda.main?.goalId) goalReg.suspend(agenda.main.goalId, { reason: `died at ${where}`, by: 'death' })
+      goalReg.suspendAll({ reason: `died at ${where}` })
+      goalReg.save({ force: true })
+    } catch (err) { logger.debug(TAG, `goal death handling: ${err.message || err}`) }
     agenda.main = null // a new life: the model is told and decides what to pick up again
     try { skills?.cancel('died') } catch { /* noop */ }
     try { executor?.cancel() } catch { /* noop */ }
@@ -1530,6 +2117,9 @@ function startSession (shared, onEnded) {
     ended = true
     decisionEpoch++
     lifeEpoch++
+    // What was running when the link dropped is not finished: resumable, and
+    // on disk before the sockets close.
+    try { goalReg.suspendAll({ reason: quit ? 'shutdown' : 'connection ended' }); goalReg.save({ force: true }) } catch { /* best effort */ }
     for (const t of timers) { clearInterval(t); clearTimeout(t) }
     timers.clear()
     try { brain?.stop() } catch { /* noop */ }
@@ -1562,7 +2152,17 @@ function startSession (shared, onEnded) {
   })
 
   // `internals` exists for the session test; nothing in the harness uses it.
-  return { dispose, bot, internals: () => ({ arbiter, sense, wrapper, combat, system1, skills, brain, results, agenda, executeAction, buildActionPrompt, buildChatPrompt }) }
+  return {
+    dispose,
+    bot,
+    internals: () => ({
+      arbiter, sense, wrapper, combat, system1, skills, brain, results, agenda,
+      goals: goalReg, executeAction, buildActionPrompt, buildChatPrompt,
+      // Goal orchestration surface (tests and the session's own monitor):
+      startMain, resumeMain, finishGoal, runGoalOp, goalLines, goalTick,
+      reconcileRestored, reconcileGoal, verifyGoalAgainstWorld, staleActionReason
+    })
+  }
 }
 
 if (require.main === module) main()

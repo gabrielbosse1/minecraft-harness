@@ -535,7 +535,7 @@ class AdvancedCombat {
    *   "Gabriel"           → same, when an online player has exactly that name
    * @returns {{ target: object|null, why?: string }}
    */
-  resolveTarget (request) {
+  resolveTarget (request, { explicitPlayersOnly = false } = {}) {
     const botPos = this.bot.entity?.position
     if (!botPos) return { target: null, why: 'no_target' }
     const asPlayer = request && typeof request === 'object' ? String(request.player || '').trim() : ''
@@ -554,6 +554,7 @@ class AdvancedCombat {
       if (e.name === undefined || e.name === null) continue
       const dist = e.position.distanceTo(botPos)
       if (isPlayer(e)) {
+        if (explicitPlayersOnly && !asPlayer) continue
         // A player is only ever matched by exact username — and then at any
         // distance they are visible from: the model named them on purpose
         // (a duel is often called from across the field).
@@ -584,7 +585,7 @@ class AdvancedCombat {
   }
 
   /** Entry point for {"a":"attack","n":"zombie"}. Never throws. */
-  async engage (request) {
+  async engage (request, { explicitPlayersOnly = false } = {}) {
     if (this.bot.health !== undefined && this.bot.health <= 0) {
       return { ok: false, why: 'dead' }
     }
@@ -597,7 +598,7 @@ class AdvancedCombat {
     if (this.now() < this.cooldownUntil) {
       return { ok: false, why: 'disengage_cooldown' }
     }
-    const { target, why } = this.resolveTarget(request)
+    const { target, why } = this.resolveTarget(request, { explicitPlayersOnly })
     if (!target) return { ok: false, why: why || 'no_target' }
 
     const label = isPlayer(target) ? String(target.username || 'player') : String(target.name).toLowerCase()

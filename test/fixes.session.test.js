@@ -394,6 +394,10 @@ test('T5: "hold" is about the mobs, not the task — it outlives the next tasks,
   bot.toss = async () => { bot.log.tossed = (bot.log.tossed || 0) + 1 }
   const s = startTestSession({ bot, actions: (p) => (/^doing: .*FLEEING by reflex/m.test(p) ? { a: 'hold' } : null) })
   try {
+    // This test covers hold across jobs, not pathfinder containment inference.
+    // Probe classification can change as this synthetic bot walks, turning a
+    // previously unlisted zombie into a NEW threat (a legitimate re-flee).
+    s.internals().sense.containedDemotion = false
     s.spawn()
     await sleep(200)
     // An exhibit with a view: three zombies that never move.

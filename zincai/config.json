@@ -148,5 +148,12 @@
     "_note": "Place memory: chests, furnaces, beds, signs seen while walking, plus named places. Stored in zincai-data/places.json. A storage room (more containers than fit on one prompt line) is shown as a summary with every label.",
     "file": "zincai-data/places.json",
     "scanRadius": 16
+  },
+  "identity": {
+    "_note": "Optional operator-supplied creator identity. A UUID match alone is not proof of authentication on offline-mode or proxy servers. Never use a name or appearance as proof.",
+    "creator": {
+      "name": "",
+      "uuid": ""
+    }
   }
 }

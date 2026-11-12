@@ -62,7 +62,8 @@ test('system prompt: one honest identity and the players\' language', () => {
   assert.ok(/admit you are a bot/i.test(SYSTEM_PROMPT))
   assert.ok(!/not an AI/i.test(SYSTEM_PROMPT), 'the "never reveal it" instruction is gone')
   assert.ok(/Brazilian Portuguese/.test(SYSTEM_PROMPT))
-  assert.ok(/Never attack a player unless/.test(SYSTEM_PROMPT))
+  assert.ok(/Decide social actions yourself/.test(SYSTEM_PROMPT))
+  assert.ok(!/Never attack a player unless/.test(SYSTEM_PROMPT))
 })
 
 test('delta buffer body contains vitals + memory + events, commit() clears', () => {

@@ -245,7 +245,7 @@ test('createZincTools emits OpenAI-format schemas with the full action set', () 
     assert.equal(t.type, 'function')
     assert.ok(t.function.description.length > 10, `${t.function.name} needs a description`)
     assert.equal(t.function.parameters.type, 'object')
-    assert.ok(!Array.isArray(t.function.parameters.required) || t.function.parameters.required.length <= 3)
+    assert.ok(!Array.isArray(t.function.parameters.required) || t.function.parameters.required.length <= 4)
   }
   const shape = tools.find((t) => t.function.name === 'build_shape')
   assert.deepEqual(shape.function.parameters.properties.shape.enum, ['cylinder', 'dome', 'arch', 'wall', 'box', 'floor', 'ring'])

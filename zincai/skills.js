@@ -679,6 +679,10 @@ class Skills {
         if (best < need) return fail(`need at least a ${TOOL_NAMES[need]} pickaxe in the inventory to mine ${targets.names[0]} (carrying: ${picks.map((p) => p.name).join(', ') || 'no pickaxe'})`)
       }
       const wanted = Math.max(1, Math.min(64, Math.trunc(Number(count)) || 1))
+      radius = Math.max(1, Math.min(32, Math.trunc(Number(radius)) || 32))
+      const countExact = () => bot.inventory.items().filter((i) => i.name === want).reduce((n, i) => n + (Number(i.count) || 0), 0)
+      const before = countExact()
+      const progress = () => `dig calls completed: ${dug}/${wanted}; exact inventory ${want} net change: ${countExact() - before} (not attributable; other drops or later pickup not counted)`
       let dug = 0
       let misses = 0
       const deadline = Date.now() + (this.choreTimeoutMs || 240_000)
@@ -686,7 +690,7 @@ class Skills {
         if (token.cancelled) break
         let positions = []
         try { positions = bot.findBlocks({ matching: targets.ids, maxDistance: radius, count: 8 }) } catch (err) { return fail(`search failed: ${err.message || err}`) }
-        if (!positions.length) return dug > 0 ? ok(`gathered ${want} x${dug} (no more within ${radius} blocks)`) : fail(`no ${targets.names.join(' or ')} within ${radius} blocks — go_to a place first, then gather again`)
+        if (!positions.length) return dug > 0 ? ok(`${progress()}; no more targets within ${radius} blocks`) : fail(`no ${targets.names.join(' or ')} within ${radius} blocks — go_to a place first, then gather again`)
         for (const p of positions) {
           if (dug >= wanted || token.cancelled || Date.now() >= deadline) break
           const near = await this._walk(token, new (this._goals().GoalGetToBlock)(p.x, p.y, p.z))
@@ -709,7 +713,7 @@ class Skills {
           }
         }
       }
-      if (dug > 0) return ok(`gathered ${want} x${dug}${dug < wanted ? ` (asked ${wanted}; the rest was not reachable here)` : ''}`)
+      if (dug > 0) return ok(`${progress()}${token.cancelled ? '; interrupted' : dug < wanted ? '; stopped before requested number of calls' : ''}`)
       return fail(`could not gather ${want}: targets nearby were unreachable or kept breaking (try a smaller count or get closer first)`)
     })
   }

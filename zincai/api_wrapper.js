@@ -62,7 +62,7 @@ const ACTION_TOOLS = [
   }),
   tool('follow', 'Follow a player until you call stop or another movement.', { player: STR('Player name.') }, ['player']),
   tool('stop', 'Stop the current task, follow or fight (and anything paused behind it) and stand still.'),
-  tool('attack', 'Fight. The ONLY way a fight ever starts. `target` = exact mob type ("zombie") or "any" hostile mob. `player` = exact player name — PvP only on your explicit decision (a duel they asked for, or someone who keeps hitting you).', {
+  tool('attack', 'Fight. The ONLY way a fight ever starts. `target` = exact mob type ("zombie") or "any" hostile mob. `player` = exact player name — PvP on your explicit decision.', {
     target: STR('Mob type, or "any".'),
     player: STR('Exact player name (PvP).'),
     count: INT('How many to kill. Default: ONE animal; hostile mobs: keep going while more of them come.')
@@ -96,6 +96,10 @@ const ACTION_TOOLS = [
     where: { type: 'string', enum: ['hand', 'off-hand', 'head', 'torso', 'legs', 'feet'] }
   }, ['item']),
   tool('use_block', 'Walk to the nearest block of this name and right-click it (door, gate, lever, button, bell).', { what: STR('Block id.') }, ['what']),
+  tool('inspect_block', 'Read one nearby loaded block and its reported state; no redstone behavior is inferred.', { x: INT('Block X.'), y: INT('Block Y.'), z: INT('Block Z.') }, ['x', 'y', 'z']),
+  tool('inspect_region', 'Page through a small nearby 3D region as read-only block snapshots; unknown cells and omitted details are labeled. No circuit trace.', { x: INT('Center X.'), y: INT('Center Y.'), z: INT('Center Z.'), radius: INT('Radius 0–2; default 1.'), page: INT('Page, default 1; four cells per page.') }, ['x', 'y', 'z']),
+  tool('redstone_scan', 'Read-only local circuit snapshot and relationship summary; no power inferred. Scan with coordinates, then page using snapshot id.', { x: INT('Center X for new scan.'), y: INT('Center Y for new scan.'), z: INT('Center Z for new scan.'), radius: INT('Radius 0–2, default 1.'), snapshot: STR('Existing snapshot id (omit coordinates and radius).'), page: INT('Component page, default 1.') }),
+  tool('redstone_component', 'Inspect a captured component state and paginated evidence-labeled neighbors. Neither connectivity nor power is guaranteed.', { snapshot: STR('Snapshot id from redstone_scan.'), x: INT('Component X.'), y: INT('Component Y.'), z: INT('Component Z.'), page: INT('Neighbor page, default 1.') }, ['snapshot', 'x', 'y', 'z']),
   tool('find', 'Where is it? A block type, an item (searches the containers you opened), a chest label, or "storage" to list every container around.', {
     what: STR('Block or item id, a label, or "storage".'),
     page: INT('Page of the storage list (default 1).')
@@ -105,7 +109,7 @@ const ACTION_TOOLS = [
     note: STR('Optional note.')
   }, ['name']),
   tool('craft', 'Craft an item from the 2x2/3x3 grid if materials are available. Walks to the table itself if needed.', { item: STR('Item id, e.g. "crafting_table".') }, ['item']),
-  tool('gather', 'Dig a raw resource nearby: logs, ores, soils. Only blocks that ARE the named resource are ever dug (strict allowlist — player buildings are never touched). Ores need a good enough pickaxe carried.', {
+  tool('gather', 'Dig a raw resource nearby: logs, ores, soils. Only named resource types are dug. They may be part of player builds; do not gather near structures without authorization. Ores need a good enough pickaxe carried.', {
     item: STR('Resource id or alias, e.g. "oak_log", "coal", "iron", "diamond", "stone", "sand".'),
     count: INT('How many to dig (default 1, max 64).'),
     radius: INT('Search radius in blocks (default 32).')
@@ -115,6 +119,21 @@ const ACTION_TOOLS = [
   }),
   tool('shelter', 'Emergency cover where you stand: pillar up 3 blocks on owned scaffold. Melee cannot reach, arrows still can. stop digs the pillar back down. Use at night with no bed.'),
   tool('corpse_run', 'Walk back to the remembered "last death" place and pick up the dropped items. Fails if no death was recorded since the feature existed.'),
+  tool('logic_test', 'Test an ABSTRACT combinational Boolean graph, NOT Minecraft redstone. Gates are topologically ordered; no cycles or timing. Results cannot locate physical faults.', {
+    inputs: { type: 'array', description: '1–9 unique signal ids. Bit strings use this order.', items: STR('Signal id'), minItems: 1, maxItems: 9 },
+    gates: { type: 'array', description: 'Up to 128 gates in topological order.', maxItems: 128, items: { type: 'object', properties: { id: STR('New signal id'), op: { type: 'string', enum: ['AND', 'OR', 'XOR', 'NOT', 'BUF', 'NAND', 'NOR', 'FULL_SUM', 'FULL_CARRY'] }, inputs: { type: 'array', description: 'NOT/BUF: one input; FULL_SUM/FULL_CARRY: A,B,carry; others: two. Reference earlier signals.', items: STR('Signal id'), minItems: 1, maxItems: 3 } }, required: ['id', 'op', 'inputs'], additionalProperties: false } },
+    outputs: { type: 'array', description: '1–9 output signal ids; output bits use this order.', items: STR('Signal id'), minItems: 1, maxItems: 9 },
+    tests: { type: 'array', description: '1–512 explicit test vectors, or omit for adder_width.', minItems: 1, maxItems: 512, items: { type: 'object', properties: { in_bits: STR('0/1 input bits in declared order'), out_bits: STR('Expected 0/1 output bits in declared order') }, required: ['in_bits', 'out_bits'], additionalProperties: false } },
+    adder_width: INT('Instead of tests, exhaustively check unsigned adder width 1–4. Input order: A LSB first, B LSB first, carry-in; output: sum LSB first, carry-out.'),
+    project: STR('Optional project name to save this validated graph and test result.')
+  }, ['inputs', 'gates', 'outputs']),
+  tool('circuit_project', 'Save an observed snapshot summary, inspect a named investigation, or rerun its saved ABSTRACT logic test. Nothing is built or physically simulated.', {
+    operation: { type: 'string', enum: ['bind', 'show', 'graph', 'test', 'list'] },
+    name: STR('Project name: letters, digits, underscores or hyphens, max 32.'),
+    snapshot: STR('For bind: snapshot id from redstone_scan.'),
+    page: INT('For graph: gate page, default 1.'),
+    note: STR('For bind: optional hypothesis, max 240 characters; not an observed fact.')
+  }, ['operation']),
   tool('build', 'Build a stored blueprint or an inline grid. Prefer build_shape for large/simple geometry.', {
     blueprint: STR('Name of a file in zincai/blueprints/ (without .json).'),
     grid: { type: 'array', description: 'Inline 3D layers (bottom-to-top); each layer is rows of palette chars; "." or " " is air. MUST come with "palette".', items: { type: 'array', items: { type: 'string' } } },
@@ -155,8 +174,8 @@ const toOpenAi = (list) => list.map((t) => ({ type: 'function', function: JSON.p
  * present, so a mode switch never strands the model without a way out.
  */
 const MODE_DROP_TOOLS = {
-  explorer: ['build', 'build_shape'],
-  hunter: ['build', 'build_shape', 'smelt', 'sleep', 'use_block'],
+  explorer: ['build', 'build_shape', 'logic_test', 'circuit_project'],
+  hunter: ['build', 'build_shape', 'logic_test', 'circuit_project', 'smelt', 'sleep', 'use_block'],
   builder: ['smelt', 'sleep']
 }
 
@@ -187,7 +206,20 @@ function parseToolCall (call, known) {
   try {
     const rawArgs = call?.function?.arguments
     let args = typeof rawArgs === 'string' ? JSON.parse(rawArgs || '{}') : (rawArgs || {})
-    if (!args || typeof args !== 'object' || Array.isArray(args)) args = {}
+    if (!args || typeof args !== 'object' || Array.isArray(args)) return { error: 'args', name }
+    const schema = known.find((t) => t.name === name).parameters
+    // Reject undeclared fields: in particular, an injected `a` must never
+    // override the chosen tool name in the executor.
+    if (Object.keys(args).some((key) => !Object.hasOwn(schema.properties, key))) return { error: 'args', name }
+    if ((schema.required || []).some((key) => !Object.hasOwn(args, key))) return { error: 'args', name }
+    for (const [key, value] of Object.entries(args)) {
+      const spec = schema.properties[key]
+      if (spec.type === 'string' && typeof value !== 'string') return { error: 'args', name }
+      if (spec.type === 'integer' && !Number.isInteger(value)) return { error: 'args', name }
+      if (spec.type === 'array' && (!Array.isArray(value) || (spec.minItems != null && value.length < spec.minItems) || (spec.maxItems != null && value.length > spec.maxItems))) return { error: 'args', name }
+      if (spec.type === 'object' && (!value || typeof value !== 'object' || Array.isArray(value))) return { error: 'args', name }
+      if (spec.enum && !spec.enum.includes(value)) return { error: 'args', name }
+    }
     return { name, args }
   } catch (err) {
     logger.warn(TAG, `malformed tool arguments for ${name}: ${err.message}`)
@@ -210,7 +242,7 @@ function coerceAction (message, strict = true) {
     if (parsed.error === 'args') return strict ? { a: 'idle', _badArgs: parsed.name } : null
     const { name, args } = parsed
     const mapped = ARG_LEGACY[name] ? ARG_LEGACY[name](args) : { ...args }
-    return { a: name, ...mapped, _via: 'tool' }
+    return { ...mapped, a: name, _via: 'tool' }
   }
 
   // Fallback: endpoint ignored `tools` and answered with plain content —
@@ -224,7 +256,17 @@ function coerceAction (message, strict = true) {
     if (obj && typeof obj === 'object' && typeof obj.a === 'string') {
       // Legacy {"a":"move"} is today's go_to.
       if (obj.a === 'move') obj.a = 'go_to'
-      return { ...obj, _via: 'json-fallback' }
+      if (!ACTION_TOOLS.some((t) => t.name === obj.a)) return { a: 'idle', _unknownTool: obj.a }
+      const name = obj.a
+      const args = { ...obj }
+      delete args.a
+      if (name === 'say' && args.text === undefined && args.t !== undefined) { args.text = args.t; delete args.t }
+      if (name === 'craft' && args.item === undefined && args.i !== undefined) { args.item = args.i; delete args.i }
+      if (name === 'attack' && args.target === undefined && args.n !== undefined) { args.target = args.n; delete args.n }
+      const parsed = parseToolCall({ function: { name, arguments: args } }, ACTION_TOOLS)
+      if (parsed.error) return { a: 'idle', _badArgs: name }
+      const mapped = ARG_LEGACY[name] ? ARG_LEGACY[name](parsed.args) : parsed.args
+      return { ...mapped, a: name, _via: 'json-fallback' }
     }
   } catch { /* fall through */ }
   if (content) logger.warn(TAG, `model answered in prose without a tool call: ${content.slice(0, 120)}`)
@@ -451,6 +493,8 @@ class AmdToolsClient {
   async chatWithTools (messages, tools = createZincTools()) {
     const first = await this._complete({ messages, tools, lane: 'action' })
     let action = coerceAction(first.message)
+    const offered = new Set(tools.map((t) => t.function?.name))
+    if (action._via && !offered.has(action.a)) action = { a: 'idle', _unknownTool: action.a }
     // audit2 I: an answer that executed NOTHING in a broken way — an invented
     // tool name, broken JSON arguments, an empty message, or finish_reason
     // 'length' truncating the call — gets exactly one do-over with an explicit
@@ -471,7 +515,7 @@ class AmdToolsClient {
           maxTokens: truncated ? Math.min(512, (this.maxTokens || 256) * 2) : undefined
         })
         const retry = coerceAction(second.message)
-        if (retry._via === 'tool') {
+        if (retry._via === 'tool' && offered.has(retry.a)) {
           this.stats.rescuedToolCalls = (this.stats.rescuedToolCalls || 0) + 1
           action = retry
           return { action, content: typeof second.message.content === 'string' ? second.message.content.trim() : '', usage: mergeUsage(first.usage, second.usage), raw: second.raw }

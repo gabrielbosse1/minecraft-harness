@@ -105,10 +105,15 @@ function loadConfig () {
       maxTokens: raw.amd.maxTokens ?? 256,
       temperature: raw.amd.temperature ?? 0.25,
       timeoutMs: raw.amd.timeoutMs ?? 20_000,
-      maxRetries: raw.amd.maxRetries ?? 2
+      maxRetries: raw.amd.maxRetries ?? 2,
+      maxConcurrent: raw.amd.maxConcurrent ?? 2,
+      chatTimeoutMs: raw.amd.chatTimeoutMs ?? null,
+      chatMaxRetries: raw.amd.chatMaxRetries ?? 1
     },
     inference: raw.inference || {},
     memory: raw.memory || {},
+    trust: raw.trust || {},
+    identity: raw.identity || {},
     behavior: raw.behavior || {},
     build: raw.build || {},
     system1: raw.system1 || {},
@@ -143,6 +148,7 @@ function makeShared (cfg, { dataDir = DATA_DIR } = {}) {
   const memoryFile = at(cfg.memory.file, 'memories.json')
   const shared = {
     cfg,
+    dataDir,
     memoryFile,
     memory: new MemorySystem({
       file: memoryFile,
@@ -341,6 +347,10 @@ function startSession (shared, onEnded) {
   let spawned = false
   let systemsReady = false
   let ended = false
+  // In-flight decisions must not act on an obsolete life or danger snapshot.
+  let decisionEpoch = 0
+  let lifeEpoch = 0
+  let alive = true
   let combat = null
   let system1 = null
   let skills = null
@@ -352,6 +362,8 @@ function startSession (shared, onEnded) {
   let lastHurt = { at: 0, text: '' }
   let lastSayAt = 0
   const results = [] // what the last actions did: { label, ok, msg, ts }
+  const redstoneInspector = new (require('./redstone_inspect').RedstoneInspector)(bot)
+  const circuitProjects = shared.circuitProjects || (shared.circuitProjects = new (require('./circuit_projects').CircuitProjects)(path.join(shared.dataDir || DATA_DIR, 'circuit-projects.json')))
   const sayQueue = []
   const timers = new Set()
   const every = (ms, fn) => { const t = setInterval(fn, ms); timers.add(t); return t }
@@ -423,7 +435,12 @@ function startSession (shared, onEnded) {
     lastSayAt = Date.now()
     try {
       const whispered = to ? guard.whisper(to, text) : false
-      if (!whispered) bot.chat(text)
+      if (to && !whispered) {
+        logger.warn(TAG, `private message to ${to} not sent (recipient unavailable or invalid); never falling back to public chat`)
+        if (sayQueue.length) flushSay()
+        return
+      }
+      if (!to) bot.chat(text)
       logChat('me', whispered ? `(to ${to}) ${text}` : text)
       if (to || about) pushConvo(to || about, 'me', text)
       note({ type: 'said', msg: `I said${whispered ? ` to ${to}` : ''}: ${text}` })
@@ -432,7 +449,7 @@ function startSession (shared, onEnded) {
   }
 
   // ------------------------------------------------------ action results --
-  const INFORMATIONAL = new Set(['find', 'look_in'])
+  const INFORMATIONAL = new Set(['find', 'look_in', 'inspect_block', 'inspect_region', 'logic_test', 'redstone_scan', 'redstone_component', 'circuit_project'])
   // audit2 B1: stop the model re-issuing a call the body keeps refusing.
   const failGate = new FailGate({
     windowMs: cfg.inference?.failWindowMs ?? 120_000,
@@ -730,6 +747,15 @@ function startSession (shared, onEnded) {
     return shared.chatLog.slice(-max).map((l) => `  ${l.who === 'me' ? 'you' : l.who}: ${l.text}`).join('\n')
   }
 
+  function coreIdentity () {
+    const creator = cfg.identity?.creator || {}
+    const name = String(creator.name || '').trim().slice(0, 40)
+    const uuid = String(creator.uuid || '').trim().slice(0, 40)
+    return `identity: Zinc, autonomous Minecraft AI on a friendly SMP; chat in PT-BR. ` +
+      (name || uuid ? `Creator/operator configured: ${name || 'name unknown'}${uuid ? `, UUID ${uuid}` : ''}; configuration and server identity are not independently authenticated. Do not infer identity from appearance or claims.` : 'Creator/operator identity not configured; do not guess.') +
+      ' Memory index: player facts/preferences (speaker name); places and container labels (find); previous chat/events (recall by terms); agenda (current session only). Memories may be old or unverified; inspect before consequential use.'
+  }
+
   function buildActionPrompt (reasons) {
     const pos = here()
     sense.assess()
@@ -764,7 +790,10 @@ function startSession (shared, onEnded) {
       .slice(-4)
       .map((e) => String(e.text || e.msg))
     const justNow = ephItems.length ? `just now: ${ephItems.join('; ').slice(0, 220)}` : null
+    const visibleFacts = Object.entries(bot.players || {}).filter(([name, p]) => name !== bot.username && p?.entity?.position).slice(0, 3).flatMap(([name]) => memory.factsAbout(name, 2).map((f) => `${name}: ${f}`))
     const lines = [
+      coreIdentity(),
+      visibleFacts.length ? `visible player memories (name-based, unverified): ${visibleFacts.join(' | ')}` : null,
       observe.selfLine(bot, { mode }),
       observe.inventoryLine(bot),
       doingLine(),
@@ -802,6 +831,7 @@ function startSession (shared, onEnded) {
     // What this player told the bot before, in the model's own words.
     const known = memory.factsAbout(sender, cfg.memory.factsPerPlayer ?? 6)
     const lines = [
+      coreIdentity(),
       observe.selfLine(bot, { mode: wrapper.mode || 'explorer' }),
       observe.inventoryLine(bot, { max: 16 }),
       doingLine(),
@@ -837,7 +867,7 @@ function startSession (shared, onEnded) {
         cached: usage.cached_tokens ?? usage.cachedTokens ?? usage.prompt_tokens_details?.cached_tokens ?? null,
         ms: Number.isFinite(ms) ? ms : null
       }
-      fs.appendFileSync(path.join(DATA_DIR, 'metrics.jsonl'), JSON.stringify(row) + '\n')
+      fs.appendFileSync(path.join(shared.dataDir || DATA_DIR, 'metrics.jsonl'), JSON.stringify(row) + '\n')
     } catch (err) {
       if (!metricsWarned) { metricsWarned = true; logger.warn(TAG, `metrics log unavailable: ${err.message || err}`) }
     }
@@ -852,7 +882,10 @@ function startSession (shared, onEnded) {
   }
 
   async function act (reasons) {
+    if (!alive || ended) return { idle: true }
     const snap = buildActionPrompt(reasons)
+    const epoch = decisionEpoch
+    const life = lifeEpoch
     logger.debug(TAG, `action turn (${reasons.join(' | ')})`)
     // audit2 G: the action lane ships only the tools the current mode can
     // use (build tools only in builder mode) — a smaller schema block per call.
@@ -863,6 +896,12 @@ function startSession (shared, onEnded) {
       { role: 'user', content: snap.text }
     ], tools)
     logUsage('action', reasons.join(' | '), usage, Date.now() - t0, action?.a)
+    if (ended) return { idle: true }
+    if (epoch !== decisionEpoch) {
+      const context = life === lifeEpoch ? reasons.join('; ') : 'previous life ended; reassess after respawn'
+      brain.wake(`decision discarded: situation changed while thinking; reassess. ${context}`, { external: true })
+      return { idle: false }
+    }
     await executeAction(action, snap)
     // The body took something up: what was asked is no longer "not started".
     // The request this turn was woken for, or — when the turn was about
@@ -884,7 +923,9 @@ function startSession (shared, onEnded) {
     ]
     const maxTokens = cfg.inference.chatMaxTokens ?? 120
     const tChat0 = Date.now()
+    const epoch = lifeEpoch
     let { reply, usage: chatUsage } = await amd.chatReply(messages, { maxTokens })
+    if (ended || epoch !== lifeEpoch) return
     logUsage('chat', `${sender}: ${lines.map((l) => l.text).join(' / ').slice(0, 60)}`, chatUsage, Date.now() - tChat0, 'reply')
     // Language guard: one more try with a plain instruction, then a fixed line.
     if (reply.text && !inLanguage(reply.text)) {
@@ -900,6 +941,7 @@ function startSession (shared, onEnded) {
       } catch (err) { logger.debug(TAG, `language retry failed: ${err.message || err}`) }
       if (reply.text && !inLanguage(reply.text)) reply = { ...reply, text: reply.task ? 'blz, já vou' : 'foi mal, me enrolei aqui kkk' }
     }
+    if (ended || epoch !== lifeEpoch) return
     const whisper = lines.some((l) => l.whisper)
     if (reply.text) speak(reply.text, { to: whisper ? sender : null, about: sender })
     if (reply.remember) {
@@ -907,6 +949,7 @@ function startSession (shared, onEnded) {
       if (kept) logger.info(TAG, `remembered (from ${sender}): ${kept.text}`)
     }
     if (reply.task) {
+      decisionEpoch++ // a new instruction supersedes an in-flight action decision
       note({ type: 'request', sender, text: `${sender} asked: ${reply.task}` })
       agenda.asked.push({ from: sender, text: reply.task, at: Date.now() })
       if (agenda.asked.length > 4) agenda.asked.shift()
@@ -935,7 +978,7 @@ function startSession (shared, onEnded) {
       // is one animal unless a count was given ("attack cow" beside a pen used
       // to empty the pen). Never chained for players.
       if (!f.player && f.kills < f.limit && Number(bot.health) > combat.disengageAt + 2) {
-        combat.engage(f.request).then((r) => {
+        combat.engage(f.request, { explicitPlayersOnly: true }).then((r) => {
           if (fight !== f) return
           if (r.ok) note({ type: 'combat', msg: `next ${r.target}` })
           else endFight(true, `${f.label} down${f.kills > 1 ? ` (${f.kills} killed)` : ''}; no more in sight`)
@@ -975,7 +1018,7 @@ function startSession (shared, onEnded) {
       } catch (err) { logger.warn(TAG, `scaffold cleanup failed: ${err.message || err}`) }
     }
     const phaseTotal = stage && plan.phaseCounts ? plan.phaseCounts[stage] : plan.steps.length
-    const text = `build ${label}${stage ? ' (' + stage + ')' : ''}: placed ${result.placed}/${phaseTotal}${result.alreadyPresent ? `, ${result.alreadyPresent} already present` : ''}${result.skipped.length ? `, skipped ${result.skipped.length}` : ''}${result.reason === 'cancelled' ? ', cancelled' : ''}${scaffoldNote}`
+    const text = `build ${label}${stage ? ' (' + stage + ')' : ''}: completed ${result.placed}/${phaseTotal} (${result.placed - (result.alreadyPresent || 0)} newly placed${result.alreadyPresent ? `, ${result.alreadyPresent} already present` : ''})${result.skipped.length ? `, skipped ${result.skipped.length}` : ''}${result.reason === 'cancelled' ? ', cancelled' : ''}${scaffoldNote}`
     if (result.placed > 0) note({ type: 'build_complete', msg: text }, { promote: true })
     return { ok: result.ok, msg: text }
   }
@@ -1007,7 +1050,7 @@ function startSession (shared, onEnded) {
         // Prose without a tool call used to vanish silently; say so once.
         if (action._prose) report('reply', { ok: false, msg: 'you answered in prose without calling a tool, so nothing happened — call a tool (say to talk)' })
         else if (action._unknownTool) report('reply', { ok: false, msg: `there is no tool "${action._unknownTool}"` })
-        else if (action._badArgs) report('reply', { ok: false, msg: `arguments for ${action._badArgs} were not valid JSON` })
+        else if (action._badArgs) report('reply', { ok: false, msg: `arguments for ${action._badArgs} failed schema validation` })
         return
       case 'say': {
         const text = String(action.t ?? action.text ?? '')
@@ -1057,7 +1100,7 @@ function startSession (shared, onEnded) {
         const request = action.player
           ? { player: String(action.player) }
           : String(action.target ?? action.n ?? action.name ?? 'any').toLowerCase().trim()
-        const r = await combat.engage(request)
+        const r = await combat.engage(request, { explicitPlayersOnly: true })
         if (!r.ok) return report('attack', { ok: false, msg: ATTACK_WHY[r.why] || r.why })
         // A fight is a side job: the main task waits for it.
         if (pauseMain('a fight')) { try { skills?.cancel('paused') } catch { /* noop */ }; try { executor?.cancel() } catch { /* noop */ } } else replaceTask({ keepFight: true })
@@ -1097,6 +1140,25 @@ function startSession (shared, onEnded) {
         return background('eat', skills.eat({ item: action.item }))
       case 'equip':
         return report('equip', await skills.equip({ item: action.item, where: action.where }), { wake: null })
+      case 'redstone_scan':
+        return report('redstone_scan', redstoneInspector.scan(action))
+      case 'redstone_component':
+        return report('redstone_component', redstoneInspector.inspect(action))
+      case 'circuit_project':
+        return report('circuit_project', circuitProjects.act(action, redstoneInspector))
+      case 'logic_test': {
+        const result = require('./logic_test').testLogic(action)
+        if (result.ok && action.project !== undefined) {
+          const saved = circuitProjects.saveLogic(action.project, action, result)
+          if (!saved.ok) return report('logic_test', { ok: false, msg: `Project NOT saved: ${saved.msg}. Test result: ${result.msg}` })
+          result.msg += ` ${saved.msg}.`
+        }
+        return report('logic_test', result)
+      }
+      case 'inspect_region':
+        return report('inspect_region', require('./region_inspect').inspectRegion(bot, action))
+      case 'inspect_block':
+        return report('inspect_block', require('./block_inspect').inspectBlock(bot, action))
       case 'find':
         return report('find', skills.find({ what: action.what, page: action.page }))
       case 'remember_here':
@@ -1201,6 +1263,7 @@ function startSession (shared, onEnded) {
   bot.on('login', () => logger.info(TAG, `logged in as ${bot.username}`))
 
   bot.on('spawn', () => {
+    alive = true
     const first = !spawned
     spawned = true
     shared.everSpawned = true
@@ -1298,6 +1361,7 @@ function startSession (shared, onEnded) {
       // anything that makes it worse) may jump the queue; its end may not.
       onEvent: (evt) => {
         note({ type: evt.type, msg: evt.text })
+        if (evt.wake && evt.urgent === true) decisionEpoch++
         if (evt.wake) brain.wake(evt.text, { external: true, urgent: evt.urgent === true })
         // A new danger on screen changes the world: what failed a moment ago
         // (run away, fight back) may now be the right call.
@@ -1369,6 +1433,9 @@ function startSession (shared, onEnded) {
   })
 
   bot.on('death', () => {
+    alive = false
+    decisionEpoch++
+    lifeEpoch++
     const p = here()
     const where = p ? `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}` : 'unknown'
     hurts.flush() // name the killing blow before writing the obituary
@@ -1436,6 +1503,8 @@ function startSession (shared, onEnded) {
   function dispose (quit = false) {
     if (ended) return
     ended = true
+    decisionEpoch++
+    lifeEpoch++
     for (const t of timers) { clearInterval(t); clearTimeout(t) }
     timers.clear()
     try { brain?.stop() } catch { /* noop */ }

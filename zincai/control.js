@@ -264,8 +264,8 @@ class ControlArbiter extends EventEmitter {
 
   /**
    * Borrow the main hand: equip `item`, run `fn`, then put back whatever was
-   * held before. Serialised — a second borrower with lower or equal priority
-   * is refused (returns { ok:false, why:'hand_busy' }) instead of fighting.
+   * held before. A second borrower is refused while any operation is in
+   * flight (including higher priority); it can retry after release.
    *
    * @param {string} owner label for logs
    * @param {object} item inventory item to equip (null = keep current)
@@ -273,7 +273,10 @@ class ControlArbiter extends EventEmitter {
    * @param {{ priority?: number, dest?: string, restore?: boolean }} [opts]
    */
   async useHand (owner, item, fn, { priority = PRIORITY.task, dest = 'hand', restore = true } = {}) {
-    if (this._handBusy && this._handBusy.priority >= priority) return { ok: false, why: 'hand_busy' }
+    // An async equip/use cannot be safely preempted: allowing a higher
+    // priority borrower here overlaps both operations and the first restore
+    // can overwrite the second item. The caller may retry after release.
+    if (this._handBusy) return { ok: false, why: 'hand_busy' }
     const token = { owner, priority }
     this._handBusy = token
     const bot = this.bot

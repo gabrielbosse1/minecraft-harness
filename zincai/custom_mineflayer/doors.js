@@ -76,7 +76,16 @@ function passageAxis (bot, pos, d) {
   const room = (dx, dz) => {
     let b = null
     try { b = bot.blockAt(new Vec3(pos.x + dx, pos.y, pos.z + dz), false) } catch { return false }
-    return Boolean(b) && (b.boundingBox !== 'block' || isDoorLike(b))
+    if (!b) return false
+    if (b.boundingBox !== 'block' || isDoorLike(b)) return true
+    // A porch stair or slab step right outside a door still grants passage when head space above it is clear.
+    if (/_(stairs|slab)$/.test(String(b.name || ''))) {
+      try {
+        const head = bot.blockAt(new Vec3(pos.x + dx, pos.y + 1, pos.z + dz), false)
+        return Boolean(head) && (head.boundingBox !== 'block' || isDoorLike(head))
+      } catch { return false }
+    }
+    return false
   }
   const along = { x: () => room(1, 0) && room(-1, 0), z: () => room(0, 1) && room(0, -1) }
   if (along[d.axis]()) return d.axis

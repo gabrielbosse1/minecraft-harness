@@ -474,6 +474,20 @@ function startSession (shared, onEnded) {
     if (results.length > 5) results.splice(0, results.length - 5)
     logger.info(TAG, `${label}: ${r.ok ? 'ok' : 'FAILED'} — ${msg}`)
     note({ type: 'result', msg: `${label}: ${msg}` })
+    // Promote durable world/exploration findings (not ephemeral walk/eat failures) to long-term memory.
+    if (r.ok) {
+      try {
+        if (label === 'look_in' && !/is empty\b/i.test(msg)) {
+          const cid = (msg.match(/^([a-z_]+\d+)\b/i) || [])[1] || ''
+          const tag = cid ? `container:${cid.toLowerCase()}` : null
+          const summary = `container ${msg}`.slice(0, 220)
+          if (tag && typeof memory.longTerm?.upsertByTag === 'function') memory.longTerm.upsertByTag(tag, summary, ['container', cid.toLowerCase()], 2)
+          else memory.longTerm?.add(summary, ['container'], 2)
+        } else if (label === 'circuit_project' && /^(bound|saved)\b/i.test(msg)) {
+          memory.longTerm?.add(`circuit project: ${msg}`.slice(0, 220), ['redstone', 'circuit'], 2)
+        }
+      } catch { /* never let memory persistence break reporting */ }
+    }
     const shouldWake = wake === null ? (!r.ok || INFORMATIONAL.has(label)) : wake
     if (shouldWake) brain?.wake(`${label} ${r.ok ? 'done' : 'failed'}: ${msg}`, { external: false })
   }
@@ -1047,10 +1061,11 @@ function startSession (shared, onEnded) {
     try {
     switch (a) {
       case 'idle':
-        // Prose without a tool call used to vanish silently; say so once.
+        // Prose, invalid tool calls, or empty tool-less responses used to vanish silently; tell the model once.
         if (action._prose) report('reply', { ok: false, msg: 'you answered in prose without calling a tool, so nothing happened — call a tool (say to talk)' })
         else if (action._unknownTool) report('reply', { ok: false, msg: `there is no tool "${action._unknownTool}"` })
         else if (action._badArgs) report('reply', { ok: false, msg: `arguments for ${action._badArgs} failed schema validation` })
+        else if (action._fallback) report('reply', { ok: false, msg: 'you returned no tool call, so nothing happened — call exactly ONE listed tool (or idle to wait)' })
         return
       case 'say': {
         const text = String(action.t ?? action.text ?? '')
@@ -1152,6 +1167,7 @@ function startSession (shared, onEnded) {
           const saved = circuitProjects.saveLogic(action.project, action, result)
           if (!saved.ok) return report('logic_test', { ok: false, msg: `Project NOT saved: ${saved.msg}. Test result: ${result.msg}` })
           result.msg += ` ${saved.msg}.`
+          try { memory.longTerm?.add(`logic_test "${action.project}" passed: ${result.msg}`.slice(0, 220), ['redstone', 'logic'], 2) } catch { /* noop */ }
         }
         return report('logic_test', result)
       }
@@ -1161,8 +1177,17 @@ function startSession (shared, onEnded) {
         return report('inspect_block', require('./block_inspect').inspectBlock(bot, action))
       case 'find':
         return report('find', skills.find({ what: action.what, page: action.page }))
-      case 'remember_here':
-        return report('remember_here', skills.rememberHere({ name: action.name, note: action.note }), { wake: null })
+      case 'remember_here': {
+        const res = skills.rememberHere({ name: action.name, note: action.note })
+        if (res.ok) {
+          try {
+            const p = here()?.floored()
+            const loc = p ? `${p.x},${p.y},${p.z} (${dim()})` : ''
+            memory.longTerm?.upsertByTag(`place:${String(action.name).toLowerCase()}`, `saved place "${action.name}" at ${loc}${action.note ? `: ${action.note}` : ''}`, ['place', String(action.name).toLowerCase()], 2)
+          } catch { /* noop */ }
+        }
+        return report('remember_here', res, { wake: null })
+      }
       case 'gather': {
         decided(snap, { label: 'gather' })
         const n = Math.max(1, Math.min(64, Math.trunc(Number(action.count)) || 1))

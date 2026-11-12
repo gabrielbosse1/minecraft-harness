@@ -1074,6 +1074,7 @@ class PathfinderWrapper {
     this._configureDigging(movements)
     this._configureScaffolding(movements)
     this._configureDoors(movements)
+    this._configureWalkableSurfaces(movements)
     this._configureHazards(movements)
     this._applyMode(movements)
     this.threat.attachToMovements(movements)
@@ -1096,6 +1097,7 @@ class PathfinderWrapper {
     if (this._appliedOnce) return this._applied
     this._appliedOnce = true
     this._patchDigging()
+    this._patchStairClearance()
     this._onPathSeen = (result) => { if (result && Array.isArray(result.path)) this._path = result.path }
     this.bot.on('path_update', this._onPathSeen)
     this._onTick(this._doorTick.bind(this))
@@ -1256,6 +1258,20 @@ class PathfinderWrapper {
     movements.scafoldingBlocks = [] // (sic) upstream's spelling
   }
 
+  /**
+   * Upstream only treats shapes < 0.1 tall as walkable carpets; 1/8-block
+   * redstone components (repeater, comparator, 0.125 tall) are well under
+   * Minecraft's 0.6 auto-step height and should be walkable instead of walls.
+   */
+  _configureWalkableSurfaces (movements) {
+    const registry = this.bot?.registry
+    if (!registry?.blocksByName || !movements?.carpets) return
+    for (const name of ['repeater', 'comparator']) {
+      const b = registry.blocksByName[name]
+      if (b) movements.carpets.add(b.id)
+    }
+  }
+
   // ------------------------------------------------------------ hazards--
   /**
    * Upstream avoids fire, cobwebs and lava. These also hurt or trap a player
@@ -1263,6 +1279,37 @@ class PathfinderWrapper {
    */
   _configureHazards (movements) {
     configureHazards(this.bot, movements)
+  }
+
+  /**
+   * Allow stepping onto a stair or bottom slab when the overhead clearance
+   * block at (0, 2, 0) is a top-half block (e.g. upper slab/trapdoor with minY >= 0.5).
+   * Walking up a half-step raises the head to at most y + 2.3 (< y + 2.5).
+   */
+  _patchStairClearance () {
+    try {
+      const { Movements } = require('mineflayer-pathfinder')
+      this._patch(Movements.prototype, 'getMoveJumpUp', (orig) => function (node, dir, neighbors) {
+        const blockA = this.getBlock(node, 0, 2, 0)
+        const blockC = this.getBlock(node, dir.x, 0, dir.z)
+        const topHalfOverhead = blockA && !blockA.safe && !this.blocksToAvoid?.has(blockA.type) &&
+          Array.isArray(blockA.shapes) && blockA.shapes.length > 0 && blockA.shapes.every((s) => s[1] >= 0.5)
+        const stepUp = blockC && /_(stairs|slab)$/.test(String(blockC.name || ''))
+        if (!topHalfOverhead || !stepUp) return orig.call(this, node, dir, neighbors)
+        const origGetBlock = this.getBlock
+        this.getBlock = function (pos, dx, dy, dz) {
+          if (pos === node && dx === 0 && dy === 2 && dz === 0) return { ...blockA, safe: true, physical: false }
+          return origGetBlock.call(this, pos, dx, dy, dz)
+        }
+        try {
+          return orig.call(this, node, dir, neighbors)
+        } finally {
+          this.getBlock = origGetBlock
+        }
+      })
+    } catch (err) {
+      this.log('warn', `stair clearance patch skipped: ${err.message || err}`)
+    }
   }
 
   // -------------------------------------------------------------- doors--

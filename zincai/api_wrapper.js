@@ -62,6 +62,14 @@ const ACTION_TOOLS = [
   }),
   tool('follow', 'Follow a player until stopped.', { player: STR('Player name.') }, ['player']),
   tool('stop', 'Cancel current task, follow, fight and paused tasks.'),
+  tool('goal', 'Your objectives (survive death/restart/context loss): list|show|add|resume|suspend|cancel|complete|update|verify.', {
+    operation: { type: 'string', enum: ['list', 'show', 'add', 'resume', 'suspend', 'cancel', 'complete', 'update', 'verify'] },
+    id: STR('Goal id (g3).'),
+    description: STR('For add: one short sentence.'),
+    priority: INT('0–100, higher = more important.'),
+    note: STR('What changed / why.'),
+    percent: INT('For update: 0–100.')
+  }, ['operation']),
   tool('attack', 'Fight. The ONLY way a fight ever starts. `target` = mob id or "any"; `player` = exact PvP target.', {
     target: STR('Mob type or "any".'),
     player: STR('Exact player name (PvP).'),

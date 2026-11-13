@@ -155,10 +155,12 @@ class PlaceIndex {
 
   // -------------------------------------------------------- named places --
 
-  remember (name, pos, { dim = 'overworld', note = '', by = '' } = {}) {
+  remember (name, pos, { dim = 'overworld', note = '', by = '', ownership = '', owner = '' } = {}) {
     const clean = String(name || '').replace(/\s+/g, ' ').trim().slice(0, 40)
     if (!clean || !pos) return null
-    const entry = { name: clean, x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z), dim, note: String(note || '').slice(0, 80), by, ts: this.now() }
+    const entry = { name: clean, x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z), dim, note: String(note || '').slice(0, 100), by, ts: this.now() }
+    if (ownership && ['own', 'shared', 'player', 'unknown'].includes(ownership)) entry.ownership = ownership
+    if (owner) entry.owner = String(owner).slice(0, 32)
     this.named.set(fold(clean), entry)
     this._dirty = true
     this.save()
@@ -369,8 +371,20 @@ class PlaceIndex {
   noteContents (pos, counts, { dim = 'overworld', freeSlots = null } = {}) {
     const e = this.blocks.get(`${dim}:${Math.floor(pos.x)},${Math.floor(pos.y)},${Math.floor(pos.z)}`) || this._twinAt(dim, pos)
     if (!e) return null
+    let diff = null
+    if (e.contents && typeof e.contents === 'object') {
+      const deltas = []
+      const keys = new Set([...Object.keys(e.contents), ...Object.keys(counts || {})])
+      for (const k of keys) {
+        const delta = (Number(counts?.[k]) || 0) - (Number(e.contents[k]) || 0)
+        if (delta > 0) deltas.push(`+${k} x${delta}`)
+        else if (delta < 0) deltas.push(`-${k} x${Math.abs(delta)}`)
+      }
+      if (deltas.length) diff = deltas.slice(0, 4).join(', ')
+    }
     e.contents = counts
     e.freeSlots = freeSlots
+    e.lastDiff = diff
     e.lookedAt = this.now()
     this._dirty = true
     this.save()
@@ -574,7 +588,11 @@ class PlaceIndex {
       .map((p) => ({ p, d: Math.hypot(p.x - pos.x, p.y - pos.y, p.z - pos.z) }))
       .sort((a, b) => a.d - b.d)
       .slice(0, max)
-      .map(({ p }) => `${p.name} (${p.x},${p.y},${p.z} · ${whereIs(pos, p)})`)
+      .map(({ p }) => {
+        const ownTag = p.ownership === 'own' ? ' [yours]' : p.ownership === 'player' ? ` [${p.owner || 'player'}'s]` : p.ownership === 'shared' ? ' [shared]' : ''
+        const noteTag = p.note ? ` · "${p.note}"` : ''
+        return `${p.name}${ownTag} (${p.x},${p.y},${p.z} · ${whereIs(pos, p)}${noteTag})`
+      })
       .join(', ')
   }
 }

@@ -252,6 +252,7 @@ function startTestSession ({ chat = [], actions = [], bot = simulatedBot(), cfg:
     dataDir,
     ownDir,
     internals: () => session.internals(),
+    resetContext: (opts) => session.resetContext(opts),
     spawn () { bot.emit('spawn') },
     say (line) { bot.emit('messagestr', line) },
     async until (fn, ms = 4000) {

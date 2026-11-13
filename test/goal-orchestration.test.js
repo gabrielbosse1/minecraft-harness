@@ -154,6 +154,9 @@ test('G3: a build interrupted mid-way resumes at the SAME origin and from the ob
     assert.equal(goal.origin, 'player:Gabriel')
     assert.deepEqual(goal.detail.at, [3, 64, 2], 'the origin is captured when the build starts')
     assert.equal(goal.status, 'active')
+    const firstJobId = it.agenda.main.jobId
+    assert.ok(firstJobId, 'the active build is recorded in JobRegistry')
+    assert.equal(it.jobs.status(firstJobId).goalId, goal.id)
 
     // Interrupt it while it is still half-built: a new main task replaces it.
     await sleep(900)
@@ -175,6 +178,8 @@ test('G3: a build interrupted mid-way resumes at the SAME origin and from the ob
     assert.match(resume.msg, /\d+\/16 blocks in place/, `the checkpoint was reconciled with the world (${resume.msg})`)
     assert.deepEqual(it.agenda.main?.detail?.at, [3, 64, 2], 'resumed at the original site, not at the feet')
     assert.equal(s.shared.goals.get(goal.id).status, 'active')
+    assert.notEqual(it.agenda.main.jobId, firstJobId, 'resume starts a new job for the same durable goal')
+    assert.equal(it.jobs.status(it.agenda.main.jobId).goalId, goal.id)
 
     // Cancelling stops the body and is terminal.
     await it.executeAction({ a: 'goal', operation: 'cancel', id: goal.id }, snapNow(it))
@@ -610,4 +615,67 @@ test('G15: progress columns and stage labels stay consistent with the builder', 
     reg.progress(g.id, { done: 5, total: 4 })
     assert.equal(reg.get(g.id).progress.percent, 100, 'clamped')
   } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
+
+test('G17: reset keeps a live build job and its lock; cancellation stops the job', async () => {
+  const bot = simulatedBot({ items: [['dirt', 64]] })
+  const placed = buildable(bot)
+  const s = startTestSession({ bot, actions: () => ({ a: 'idle' }) })
+  try {
+    s.spawn()
+    await sleep(150)
+    const it = s.internals()
+    it.brain.stop()
+    await it.executeAction({ a: 'build_shape', shape: 'wall', params: { l: 8, h: 2 }, block: 'dirt', at: [3, 64, 2] }, snapNow(it))
+    const main = it.agenda.main
+    assert.ok(main?.jobId)
+    assert.ok(await s.until(() => placed.size > 0, 2500), 'real executor placed a block')
+    assert.equal(it.jobs.status(main.jobId).state, 'running')
+    assert.ok(it.jobs.status(main.jobId).progress.done > 0)
+    const holder = it.lanes.bodyHolder().holder
+    s.resetContext({ reason: 'test', wake: false })
+    assert.equal(it.agenda.main, main, 'reset does not restart or abandon the build')
+    assert.equal(it.lanes.bodyHolder()?.holder, holder, 'the live job retains its BODY lease')
+    assert.equal(it.jobs.status(main.jobId).state, 'running')
+    assert.equal(it.lanes.tryAcquire('inspect_block', { footprint: { x1: 3, z1: 2, x2: 3, z2: 2 } }), null)
+    const far = it.lanes.tryAcquire('inspect_block', { footprint: { x1: -5, z1: 2, x2: -5, z2: 2 } })
+    assert.ok(far, 'unrelated region is readable'); far.release()
+    await it.executeAction({ a: 'inspect_block', x: 3, y: 64, z: 2 }, snapNow(it))
+    assert.match(it.results.at(-1).msg, /resource busy/, 'real conflicting read is refused')
+    await it.executeAction({ a: 'inspect_block', x: -1, y: 63, z: 2 }, snapNow(it))
+    assert.equal(it.results.at(-1).ok, true, 'real distant read runs during the build')
+    await it.runGoalOp({ operation: 'cancel', id: main.goalId })
+    assert.ok(await s.until(() => it.jobs.status(main.jobId).state === 'cancelled', 3000))
+    assert.equal(it.lanes.bodyHolder(), null, 'lease released after worker actually exits')
+    assert.equal(it.goals.get(main.goalId).status, 'cancelled')
+  } finally { s.stop() }
+})
+
+test('G18: an interrupted job resumes with only the missing blocks in inventory', async () => {
+  const bot = simulatedBot({ items: [['dirt', 16]] })
+  const placed = buildable(bot)
+  const s = startTestSession({ bot, actions: () => ({ a: 'idle' }) })
+  try {
+    s.spawn()
+    await sleep(150)
+    const it = s.internals()
+    it.brain.stop()
+    await it.executeAction({ a: 'build_shape', shape: 'wall', params: { l: 8, h: 2 }, block: 'dirt', at: [3, 64, 2] }, snapNow(it))
+    const main = it.agenda.main
+    assert.ok(await s.until(() => placed.size >= 2, 2500))
+    assert.ok((await it.runGoalOp({ operation: 'suspend', id: main.goalId })).ok)
+    assert.ok(await s.until(() => it.jobs.status(main.jobId).state === 'cancelled', 3000))
+    const already = placed.size
+    assert.ok(already > 0 && already < 16)
+    bot.inventory.items()[0].count = 16 - already
+    const resumed = await it.runGoalOp({ operation: 'resume', id: main.goalId })
+    assert.equal(resumed.ok, true, resumed.msg)
+    const resumedJobId = it.agenda.main.jobId
+    assert.notEqual(resumedJobId, main.jobId)
+    assert.ok(await s.until(() => it.jobs.status(resumedJobId).state === 'done', 10000), 'resumed job should finish')
+    assert.equal(placed.size, 16)
+    assert.equal(it.goals.get(main.goalId).status, 'completed')
+    assert.deepEqual(it.goals.get(main.goalId).detail.at, [3, 64, 2])
+  } finally { s.stop() }
 })

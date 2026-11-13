@@ -207,6 +207,8 @@ class System1 {
     this._calmSince = 0
     this._fall = { startY: null, fallen: 0 }
     this._mlg = null
+    this._hazardEscape = null
+    this._lastDodgeAt = 0
     this._onPhysics = this._physicsTick.bind(this)
     this._onPathUpdate = (result) => {
       if (!this._flee || !this.hands.isTop) return
@@ -267,6 +269,7 @@ class System1 {
     this._episode = null
     this.lastEpisode = null
     this._mlg = null
+    this._hazardEscape = null
     this.live = []
     this.chasers = []
     this._fall = { startY: null, fallen: 0 }
@@ -334,7 +337,7 @@ class System1 {
     this._decision = null
   }
 
-  get fleeing () { return Boolean(this._flee) }
+  get fleeing () { return Boolean(this._flee || this._hazardEscape) }
 
   /** The model's standing decision about threats, if any: { label, at, until, count }. */
   get decision () { return this._decision }
@@ -404,6 +407,9 @@ class System1 {
     if (!bot?.entity) return
     const ctx = this._ctx()
     const now = this.now()
+
+    // 0. Immediate contact hazard (lava, fire, magma, cactus) → zero-LLM local escape.
+    if (this._tickHazardEscape(now)) return
 
     // 1. Real threats → flee (unless the model already decided about them).
     //    A threat inside the trigger ring STARTS an escape; once running, it
@@ -865,6 +871,7 @@ class System1 {
     const e = bot.entity
     if (!e?.position) return
     this.sense.trackMotion()
+    this._dodgeIncomingProjectile()
     const vy = Number(e.velocity?.y) || 0
     if (e.onGround || e.isInWater || e.elytraFlying) {
       this._fall = { startY: null, fallen: 0 }
@@ -995,6 +1002,193 @@ class System1 {
     this.buoyancy.acquire({ ttlMs: 600, reason: 'swimming up' })
     this.buoyancy.setControlState('jump', true)
     return 'swim'
+  }
+
+  // ------------------------------------------ hazard & projectile reflexes --
+
+  _detectContactHazard () {
+    const bot = this.bot
+    const e = bot?.entity
+    if (!e?.position || !bot.blockAt) return null
+    if (e.isInLava) return 'lava'
+    const p = e.position
+    const fx = Math.floor(p.x); const fy = Math.floor(p.y); const fz = Math.floor(p.z)
+    const DIRECT_RE = /^(lava|flowing_lava|fire|soul_fire|sweet_berry_bush|powder_snow|lava_cauldron)$/
+    const probes = [
+      [fx, fy, fz],
+      [fx, fy + 1, fz]
+    ]
+    for (const [x, y, z] of probes) {
+      let b = null
+      try { b = bot.blockAt({ x, y, z }, false) } catch { b = null }
+      if (b && DIRECT_RE.test(b.name || '')) return b.name
+    }
+    try {
+      const below = bot.blockAt({ x: fx, y: fy - 1, z: fz }, false)
+      if (below && /^(magma_block|campfire|soul_campfire|lava|flowing_lava)$/.test(below.name || '') && !e.isSneaking) {
+        return below.name
+      }
+    } catch { /* ignore */ }
+    for (const [dx, dz] of [[0.34, 0], [-0.34, 0], [0, 0.34], [0, -0.34]]) {
+      try {
+        const b = bot.blockAt({ x: Math.floor(p.x + dx), y: fy, z: Math.floor(p.z + dz) }, false)
+        if (b && /^(cactus|lava|flowing_lava|fire|soul_fire)$/.test(b.name || '')) return b.name
+      } catch { /* ignore */ }
+    }
+    // Lookahead along active horizontal motion: brake BEFORE stepping into lava/fire!
+    const vx = Number(e.velocity?.x) || 0
+    const vz = Number(e.velocity?.z) || 0
+    const hSpeed = Math.hypot(vx, vz)
+    if (hSpeed > 0.08) {
+      const ax = Math.floor(p.x + (vx / hSpeed) * 0.85)
+      const az = Math.floor(p.z + (vz / hSpeed) * 0.85)
+      if (ax !== fx || az !== fz) {
+        try {
+          const aheadFeet = bot.blockAt({ x: ax, y: fy, z: az }, false)
+          const aheadBelow = bot.blockAt({ x: ax, y: fy - 1, z: az }, false)
+          if (aheadFeet && /^(lava|flowing_lava|fire|soul_fire|cactus|powder_snow)$/.test(aheadFeet.name || '')) {
+            return `ahead_${aheadFeet.name}`
+          }
+          if (aheadBelow && /^(lava|flowing_lava)$/.test(aheadBelow.name || '') && (!aheadFeet || aheadFeet.name === 'air')) {
+            return `ahead_${aheadBelow.name}`
+          }
+        } catch { /* ignore */ }
+      }
+    }
+    return null
+  }
+
+  _findSafeHazardExit (preferWater = false) {
+    const bot = this.bot
+    const p = bot?.entity?.position
+    if (!p || !bot.blockAt) return null
+    const ox = Math.floor(p.x); const oy = Math.floor(p.y); const oz = Math.floor(p.z)
+    const BAD_RE = /(lava|fire|magma|cactus|sweet_berry_bush|powder_snow|campfire)/
+    const OPEN_RE = /^(air|cave_air|void_air|short_grass|grass|tall_grass|fern|snow|water)$/
+    let best = null
+    let bestScore = Infinity
+    for (let r = 1; r <= 5; r++) {
+      for (let dx = -r; dx <= r; dx++) {
+        for (let dz = -r; dz <= r; dz++) {
+          if (Math.max(Math.abs(dx), Math.abs(dz)) !== r) continue
+          for (let dy = 1; dy >= -2; dy--) {
+            const x = ox + dx; const y = oy + dy; const z = oz + dz
+            let ground = null; let feet = null; let head = null
+            try {
+              ground = bot.blockAt({ x, y: y - 1, z }, false)
+              feet = bot.blockAt({ x, y, z }, false)
+              head = bot.blockAt({ x, y: y + 1, z }, false)
+            } catch { continue }
+            if (!ground || !feet || !head) continue
+            if (preferWater && (feet.name === 'water' || ground.name === 'water') && !BAD_RE.test(head.name || '')) {
+              return { x, y, z, water: true }
+            }
+            const solid = ground.boundingBox === 'block' || (!OPEN_RE.test(ground.name || '') && ground.name !== 'water')
+            if (!solid || BAD_RE.test(ground.name || '')) continue
+            if (!OPEN_RE.test(feet.name || '') || feet.name === 'water' || BAD_RE.test(feet.name || '')) continue
+            if (!OPEN_RE.test(head.name || '') || head.name === 'water' || BAD_RE.test(head.name || '')) continue
+            const score = Math.hypot(dx, dz) + Math.abs(dy) * 0.6
+            if (score < bestScore) { bestScore = score; best = { x, y, z, water: false } }
+          }
+        }
+      }
+      if (best) return best
+    }
+    return best
+  }
+
+  _tickHazardEscape (now) {
+    const bot = this.bot
+    const hazard = this._detectContactHazard()
+    if (!hazard) {
+      if (this._hazardEscape) {
+        const prev = this._hazardEscape
+        this._hazardEscape = null
+        this.hands.setGoal(null)
+        this.hands.clearControlStates()
+        this.hands.release('hazard_cleared')
+        this.onEvent({ type: 'hazard', text: `reflex: stepped out of ${prev.hazard}`, wake: false })
+      }
+      return false
+    }
+    const burning = /lava|fire|magma|campfire/.test(hazard)
+    const exit = this._findSafeHazardExit(burning)
+    if (!this._hazardEscape) {
+      this._hazardEscape = { hazard, startedAt: now, warned: false, exit }
+      this.logger?.warn?.('reflex', `local hazard escape: ${hazard}`)
+      this.onEvent({ type: 'hazard', text: `reflex: escaping ${hazard} locally`, wake: false })
+    } else {
+      this._hazardEscape.hazard = hazard
+      if (exit) this._hazardEscape.exit = exit
+    }
+    this.hands.acquire({ ttlMs: 1500, reason: `escaping ${hazard}` })
+    const target = this._hazardEscape.exit
+    if (target) {
+      const tx = target.x + 0.5; const tz = target.z + 0.5
+      const yaw = Math.atan2(-(tx - bot.entity.position.x), -(tz - bot.entity.position.z))
+      try { Promise.resolve(bot.look(yaw, 0, true)).catch(() => {}) } catch { /* mock */ }
+      this.hands.setControlState('forward', true)
+      this.hands.setControlState('sprint', true)
+      this.hands.setControlState('jump', /lava|powder_snow/.test(hazard) || target.y > Math.floor(bot.entity.position.y))
+    } else {
+      this.hands.setControlState('back', true)
+      this.hands.setControlState('jump', true)
+    }
+    // Only escalate to the LLM if stuck in the hazard for >3s.
+    if (!this._hazardEscape.warned && now - this._hazardEscape.startedAt >= 3000) {
+      this._hazardEscape.warned = true
+      this.onEvent({ type: 'hazard', text: `reflex: trapped in ${hazard} for 3s — need another way out`, wake: true, urgent: true })
+    }
+    return true
+  }
+
+  _dodgeIncomingProjectile () {
+    const bot = this.bot
+    const e = bot?.entity
+    if (!e?.position || !bot.entities) return false
+    const now = this.now()
+    if (now - this._lastDodgeAt < 650) return false
+    const PROJ_RE = /^(arrow|spectral_arrow|trident|fireball|small_fireball|dragon_fireball|wind_charge|breeze_wind_charge|shulker_bullet|llama_spit)$/
+    const bx = e.position.x; const by = e.position.y + 0.9; const bz = e.position.z
+    for (const ent of Object.values(bot.entities)) {
+      if (!ent || ent === e || !ent.position || !ent.velocity) continue
+      const name = String(ent.name || ent.displayName || '').toLowerCase()
+      if (!PROJ_RE.test(name)) continue
+      const vx = Number(ent.velocity.x) || 0
+      const vy = Number(ent.velocity.y) || 0
+      const vz = Number(ent.velocity.z) || 0
+      const speedSq = vx * vx + vy * vy + vz * vz
+      if (speedSq < 0.08) continue
+      const dx = bx - ent.position.x
+      const dy = by - ent.position.y
+      const dz = bz - ent.position.z
+      const dist = Math.hypot(dx, dy, dz)
+      if (dist > 14 || dist < 0.4) continue
+      const dot = vx * dx + vy * dy + vz * dz
+      if (dot <= 0) continue // moving away
+      const t = dot / speedSq // ticks until closest approach
+      if (t > 20) continue
+      const cx = ent.position.x + vx * t - bx
+      const cy = ent.position.y + vy * t - by
+      const cz = ent.position.z + vz * t - bz
+      if (Math.hypot(cx, cy, cz) > 1.45) continue
+      // Choose horizontal perpendicular sidestep away from trajectory line.
+      const hLen = Math.hypot(vx, vz) || 1
+      let sx = -vz / hLen
+      let sz = vx / hLen
+      if (sx * (-cx) + sz * (-cz) < 0) { sx = -sx; sz = -sz }
+      const yaw = Number(e.yaw) || 0
+      // In Mineflayer yaw: forward = (-sin(yaw), -cos(yaw)), right = (-cos(yaw), sin(yaw))
+      const rightX = -Math.cos(yaw)
+      const rightZ = Math.sin(yaw)
+      const key = (sx * rightX + sz * rightZ) >= 0 ? 'right' : 'left'
+      this._lastDodgeAt = now
+      this.hands.acquire({ ttlMs: 300, reason: `sidestep ${name}` })
+      this.hands.pulse(key, 240)
+      this.onEvent({ type: 'projectile', text: `reflex: sidestepped incoming ${name}`, wake: false })
+      return true
+    }
+    return false
   }
 
   // ----------------------------------------------- operator reflex helpers

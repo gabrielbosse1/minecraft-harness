@@ -158,11 +158,21 @@ class GoalRegistry {
   _normalize (item) {
     const now = this.now()
     const progress = item.progress && typeof item.progress === 'object' ? item.progress : {}
+    const origin = clean(item.origin || 'self', 60)
+    const derivedOriginType = origin.startsWith('shared:') || item.originType === 'shared_project'
+      ? 'shared_project'
+      : (origin.startsWith('player:') || item.originType === 'player_requested' ? 'player_requested' : 'self_generated')
+    const derivedParticipants = Array.isArray(item.participants)
+      ? item.participants.map((p) => clean(p, 32)).filter(Boolean).slice(0, 6)
+      : (origin.startsWith('player:') ? [origin.slice(7)].filter(Boolean) : (origin.startsWith('shared:') ? origin.slice(7).split(',').map((p) => clean(p, 32)).filter(Boolean) : []))
     return {
       id: clean(item.id, 24),
       description: clean(item.description, 160),
       kind: clean(item.kind || 'declared', 24),
-      origin: clean(item.origin || 'self', 60),
+      origin,
+      originType: derivedOriginType,
+      participants: derivedParticipants,
+      reason: clean(item.reason || '', 160),
       priority: clampInt(item.priority, 0, 100, 50),
       parentId: item.parentId ? clean(item.parentId, 24) : null,
       relatedIds: Array.isArray(item.relatedIds) ? item.relatedIds.map((x) => clean(x, 24)).slice(0, 8) : [],
@@ -297,6 +307,9 @@ class GoalRegistry {
       description,
       kind: spec.kind || 'declared',
       origin: spec.origin || 'self',
+      originType: spec.originType,
+      participants: spec.participants,
+      reason: spec.reason || '',
       priority: spec.priority,
       parentId: spec.parentId || null,
       relatedIds: spec.relatedIds || [],
@@ -329,11 +342,22 @@ class GoalRegistry {
     if (!goal) return null
     if (!isOpen(goal) && (patch.detail || patch.progress || patch.resources)) return goal
     if (patch.description) goal.description = clean(patch.description, 160)
+    if (patch.reason !== undefined) goal.reason = clean(patch.reason, 160)
+    if (patch.origin) {
+      goal.origin = clean(patch.origin, 60)
+      goal.originType = goal.origin.startsWith('shared:') || patch.originType === 'shared_project'
+        ? 'shared_project'
+        : (goal.origin.startsWith('player:') || patch.originType === 'player_requested' ? 'player_requested' : 'self_generated')
+    } else if (patch.originType && ['self_generated', 'player_requested', 'shared_project'].includes(patch.originType)) {
+      goal.originType = patch.originType
+    }
+    if (Array.isArray(patch.participants)) goal.participants = patch.participants.map((p) => clean(p, 32)).filter(Boolean).slice(0, 6)
     if (patch.priority !== undefined) goal.priority = clampInt(patch.priority, 0, 100, goal.priority)
     if (patch.detail && typeof patch.detail === 'object') goal.detail = { ...goal.detail, ...patch.detail }
     if (Array.isArray(patch.resources)) goal.resources = patch.resources.slice(0, 12)
     if (Array.isArray(patch.preconditions)) goal.preconditions = patch.preconditions.map((x) => clean(x, 120)).slice(0, 6)
     if (Array.isArray(patch.dependencies)) goal.dependencies = patch.dependencies.map((x) => clean(x, 24)).slice(0, 6)
+    if (Array.isArray(patch.relatedIds)) goal.relatedIds = patch.relatedIds.map((x) => clean(x, 24)).slice(0, 8)
     if (patch.parentId !== undefined) goal.parentId = patch.parentId ? clean(patch.parentId, 24) : null
     if (patch.needsVerify !== undefined) goal.needsVerify = Boolean(patch.needsVerify)
     if (patch.completion) goal.completion = clean(patch.completion, 160)
@@ -341,6 +365,33 @@ class GoalRegistry {
     goal.updatedAt = this.now()
     this.save()
     return goal
+  }
+
+  /**
+   * Combine two or more open goals into a single unified goal, recording the
+   * merged goal IDs on `relatedIds` and cancelling superseded entries.
+   */
+  combine (ids = [], spec = {}) {
+    const sources = ids.map((id) => this.get(id)).filter((g) => g && isOpen(g))
+    if (sources.length < 2) return null
+    const maxPrio = Math.max(...sources.map((g) => g.priority || 50))
+    const mergedDesc = clean(spec.description, 160) || clean(sources.map((g) => g.description).join(' + '), 160)
+    const players = [...new Set(sources.flatMap((g) => g.participants || []))]
+    const hasSelf = sources.some((g) => g.originType === 'self_generated')
+    const origin = spec.origin || (players.length && hasSelf ? `shared:${players.join(',')}` : players.length ? `player:${players[0]}` : 'self')
+    const combined = this.add({
+      description: mergedDesc,
+      kind: spec.kind || 'declared',
+      origin,
+      participants: players,
+      reason: spec.reason || clean(sources.map((g) => g.reason).filter(Boolean).join('; '), 160),
+      priority: spec.priority ?? maxPrio,
+      relatedIds: sources.map((g) => g.id)
+    })
+    for (const src of sources) {
+      this.cancel(src.id, { reason: `combined into ${combined.id}` })
+    }
+    return combined
   }
 
   /**
@@ -540,15 +591,20 @@ class GoalRegistry {
       return min < 90 ? `${min}m ago` : `${Math.round(min / 60)}h ago`
     }
     const bits = [`${goal.id} ${LABEL[goal.status] || goal.status} ${goal.description}`]
+    if (goal.parentId) bits.push(`step of ${goal.parentId}`)
     const p = goal.progress
     if (Number.isFinite(p.total) && p.total > 0) bits.push(`${p.percent}% (${p.done}/${p.total})`)
     else if (p.note) bits.push(p.note)
-    if (goal.origin && goal.origin !== 'self') bits.push(`from ${goal.origin.replace(/^player:/, '')}`)
+    else if (goal.reason) bits.push(`why: ${goal.reason}`)
+    if (goal.originType === 'shared_project') bits.push(`shared(${goal.participants?.join(',') || goal.origin.replace(/^shared:/, '')})`)
+    else if (goal.origin && goal.origin !== 'self') bits.push(`from ${goal.origin.replace(/^player:/, '')}`)
+    else bits.push('self')
     if (goal.status === STATUS.active) bits.push(`started ${age(goal.startedAt || goal.progressAt)}`)
     else if (goal.suspendReason && isOpen(goal)) bits.push(goal.suspendReason)
     else if (goal.status === STATUS.failed && goal.lastError) bits.push(goal.lastError)
     else if (!isOpen(goal) && goal.endedAt) bits.push(age(goal.endedAt))
     if (verbose) {
+      if (goal.reason) bits.push(`reason: ${goal.reason}`)
       if (goal.detail && Object.keys(goal.detail).length) bits.push(`checkpoint ${JSON.stringify(goal.detail).slice(0, 160)}`)
       if (goal.resume) bits.push(`resume: ${goal.resume}`)
       if (goal.needsVerify) bits.push('verify against the world before resuming')

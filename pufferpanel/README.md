@@ -85,6 +85,74 @@ node pufferpanel/import.js          # checks the template, prints both paths
 - The branch name in **Add repo** does not exist on the remote.
 - The node has no network/git access to the URL: check the panel log for the
   clone error, and use an SSH URL plus a deploy key for a private repository.
+- The JSON parses but does not **decode** into PufferPanel's structs — the file
+  is skipped silently. See
+  [It does not show up at all](#it-does-not-show-up-at-all-nothing-listed-no-error).
+
+### One bad template does not break the others — one bad *repo* does
+
+These are two different failures and they look identical from the browser.
+
+**A bad file inside a repo is contained.** `GetAllFromRepo` reads each JSON
+independently and `continue`s past one it cannot decode, so the other templates
+in the same repo are still listed. A malformed template costs you that one
+entry, nothing else. (A JSON that does not *parse* is worse: it is still listed,
+as a nameless, permanently incompatible row — that is the "no name" section
+below.)
+
+**A repo that fails to list is not contained.** Look at what the frontend does
+with the per-repo answer (`client/api/src/templates.js`):
+
+```js
+try   { templates = await this.listRepoTemplates(repo.id) }
+catch (e) { error = e ... }            // templates stays undefined
+res.push({ ...repo, templates, error })
+```
+
+and then (`SelectTemplate.vue`, `load()`):
+
+```js
+if (repos[repo].templates.length === 0) return   // no guard for undefined
+```
+
+`undefined.length` throws. That happens **before** any repo is added to the
+list, so the create-server template step renders nothing — including templates
+from repos that are perfectly healthy. The *Templates* page itself shows the
+error per repo and keeps working; it is the **create-server** step that goes
+blank.
+
+`GET /api/templates/{repo}` returns 500 only when it cannot read the clone at
+all: `validateRepoOnDisk` failing to clone or pull (bad branch, unreachable URL,
+missing credentials), or `os.ReadDir` failing. A template that merely fails to
+decode never produces a 500, so this template could not cause it. Check
+**Templates** for a red error row, or run:
+
+```sh
+PUFFER_URL=... PUFFER_USER=... PUFFER_PASS=... node pufferpanel/doctor.js --refresh
+```
+
+It reports the clone error for the repo that is actually broken instead of
+leaving you guessing.
+
+### The panel scans the whole repository you point it at
+
+**Add repo** points the panel at a repository and it scans **everything** in it.
+If you add a repository that is not a template collection (this one, for
+example, if you point at the root), every `*.json` a level inside a folder
+becomes a candidate — some are templates, most are not. That is harmless in
+itself (the bad ones are skipped or shown as nameless rows), but it is noise,
+and it is why `pufferpanel/zincai.json` exists as a template-only subfolder.
+
+The tidy setup is a **dedicated template repository** containing just:
+
+```sh
+node pufferpanel/import.js --dir /srv/zincai-templates --apply
+# /srv/zincai-templates/zincai/zincai.json
+# /srv/zincai-templates/zincai/README.md
+```
+
+Point **Add repo** at that, and nothing else in this repository can ever affect
+the panel's template list.
 
 ### "Incompatible with environment 'host'" (Orange Pi, Raspberry Pi, any node)
 

@@ -403,6 +403,29 @@ async function refreshMain () {
       return 0
     }
 
+    // Before touching anything, find out whether any repo already fails to
+    // list. If one does, the create-server step is blank for EVERY repo, because
+    // SelectTemplate.vue reads `templates.length` on the undefined result — so
+    // say which repo it is instead of re-adding repos blindly.
+    const blanking = []
+    for (const repo of gitRepos) {
+      const listed = await call('GET', `/api/templates/${repo.id}`)
+      if (listed.status !== 200) blanking.push({ repo, status: listed.status, body: listed.body })
+    }
+    if (blanking.length) {
+      console.error('Before refresh: these repositories fail to list. While one of them')
+      console.error('does, the create-server template step shows NO templates at all —')
+      console.error('including those from repos that are fine (SelectTemplate.vue reads')
+      console.error('`templates.length` on the undefined result of the failed repo).')
+      for (const b of blanking) {
+        console.error(`  repo ${b.repo.id} "${b.repo.name}" ${b.repo.url} (branch ${b.repo.branch || 'main'})`)
+        console.error(`    GET /api/templates/${b.repo.id} -> ${b.status}: ${JSON.stringify(b.body)}`)
+      }
+      console.error('Re-cloning below; a stale clone is often all it was.')
+      console.error('')
+    }
+
+    // Only what is still broken AFTER the re-clone counts as a failure.
     let bad = 0
     for (const repo of gitRepos) {
       console.log(`repo ${repo.id} "${repo.name}" ${repo.url} (branch ${repo.branch || 'main'})`)
@@ -419,10 +442,12 @@ async function refreshMain () {
         bad++
         continue
       }
-      const newId = add.body && add.body.id !== undefined ? add.body.id : '?'
+      const newId = add.body && add.body.id !== undefined ? add.body.id : repo.id
       const fresh = await call('GET', `/api/templates/${newId}`)
       if (fresh.status !== 200) {
         console.error(`  GET /api/templates/${newId} -> ${fresh.status}: ${JSON.stringify(fresh.body)}`)
+        console.error('  Still failing after a fresh clone — this is the repo that blanks the')
+        console.error('  create-server template list. Fix its URL/branch/credentials, or remove it.')
         bad++
         continue
       }

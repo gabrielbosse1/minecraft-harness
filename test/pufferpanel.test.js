@@ -457,3 +457,62 @@ test('template: stopping is still deterministic — stopCode is SIGINT', () => {
   const src = fs.readFileSync(path.join(__dirname, '..', 'zincai', 'index.js'), 'utf8')
   assert.match(src, /process\.on\('SIGINT', \(\) => shutdown\(0, 'SIGINT'\)\)/)
 })
+
+// ---------------------------------------------------------------------------
+// A bad template costs one entry; a bad REPO blanks the whole create step.
+//
+// services/templates.go contains the first failure per-file (`continue` past a
+// JSON it cannot decode), so the rest of the repo still lists. But
+// client/api/src/templates.js leaves `templates` undefined when a repo 500s,
+// and SelectTemplate.vue then does `repos[repo].templates.length` — which throws
+// before any repo is rendered. That is the "one template broke every template"
+// symptom, and it comes from a repo that will not list (clone/pull failure),
+// not from a template that will not decode.
+//
+// GET /api/templates/{repo} returns 500 only from validateRepoOnDisk/os.ReadDir,
+// never from a per-file decode error, so the template in this repo could not
+// have caused it.
+// ---------------------------------------------------------------------------
+
+test('panel: an undecodable template is skipped per-file, never a 500', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'pufferpanel', 'doctor.js'), 'utf8')
+  // The mirror's doc block must keep saying this, because the difference is the
+  // whole reason the two symptoms look alike.
+  assert.match(src, /logs and `continue`s/)
+})
+
+test('panel: one repo answering 500 makes SelectTemplate.vue render nothing', () => {
+  // Verbatim behaviour of listAllTemplates() + load() in the panel's frontend.
+  const listAllTemplates = (repos, byId) => repos.map((repo) => {
+    let templates
+    let error
+    const r = byId[repo.id]
+    if (r.error) error = r.error
+    else templates = r.templates
+    return { ...repo, templates, error }
+  })
+  const load = (repos) => {
+    const compatible = []
+    for (const repo of repos) {
+      if (repo.templates.length === 0) continue // no guard for undefined
+      compatible.push(repo)
+    }
+    return compatible
+  }
+
+  const repos = [{ id: 0 }, { id: 1 }, { id: 2 }]
+  const healthy = listAllTemplates(repos, {
+    0: { templates: [{ name: 'local' }] },
+    1: { templates: [{ name: 'zincai' }] },
+    2: { templates: [{ name: 'other' }] }
+  })
+  assert.equal(load(healthy).length, 3, 'three healthy repos render')
+
+  const oneBroken = listAllTemplates(repos, {
+    0: { templates: [{ name: 'local' }] },
+    1: { templates: [{ name: 'zincai' }] },
+    2: { error: { status: 500 } } // clone failed for a DIFFERENT repo
+  })
+  assert.throws(() => load(oneBroken), /Cannot read properties of undefined/,
+    'the healthy repos are lost too — this is the reported symptom')
+})

@@ -255,6 +255,7 @@ the next start.
 | --- | --- |
 | Repo added, **no template listed** | The JSON sits at the clone root instead of a subfolder, or is named `data.json`. |
 | Repo shows a clone error | Wrong branch name, or the node can't reach the URL (private repo without a deploy key/PAT). |
+| Create-server step shows **no templates at all**, but some are fine | One repo in the list fails to list (500). `SelectTemplate.vue` reads `templates.length` on `undefined` and the step renders nothing. Check **Templates** for the red row, or run `doctor.js --refresh`. |
 | Template list looks stale after a push | The panel caches the clone for ~5 minutes. |
 | Template saves from the UI but is nameless | The pasted JSON had no `name` field — use `import.js --print`. |
 | Install fails at `npm ci` | Node too old on the node, or no network to the npm registry. |

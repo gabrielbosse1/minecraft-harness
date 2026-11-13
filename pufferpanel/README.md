@@ -4,28 +4,95 @@ Everything needed to run the bot as a PufferPanel 3 server.
 
 ```
 pufferpanel/
-  zincai.json   the template (import this)
-  import.js     validates it and copies it into the panel's template directory
+  zincai.json   the template itself
+  import.js     validates it, prints it for the web UI, or lays out a template repo
 ```
 
-## 1. Install the template
+Verified against PufferPanel **v3** (`services/templates.go`, `web/api/templates.go`,
+`client/frontend/src/views/TemplateCreate.vue`). Two things there are worth
+knowing before you go looking for them:
 
-From a checkout on the panel node:
+- **There is no `Templates → Import` button.** Templates arrive either through
+  **Templates → New** in the web UI (saved into the panel's database) or by
+  adding a **git repository** with **Add repo**.
+- **There is no template folder to drop a file into.** The panel clones a
+  repository into its own cache and reads `<repo-root>/<subfolder>/<name>.json`.
+  That is why `templates.x.json` must live under a folder, not at the root.
+
+## 1. Get the template into the panel
+
+Pick one of the two paths below. Both end with the template listed under
+**Templates**.
+
+### Path A — from the git repository (recommended, and it updates itself)
+
+The repository already has the layout the panel wants, in `pufferpanel/`:
+
+```
+minecraft-harness/
+└── pufferpanel/
+    ├── zincai.json     -> template name "zincai"
+    └── README.md       -> shown on the template page
+```
+
+1. Make sure the branch you want is pushed to a repository the panel node can
+   reach (public, or with a deploy key / PAT configured on the repo entry).
+2. In the panel: **Templates → Add repo**. Name `ZincAI`, Url
+   `https://github.com/gabrielbosse1/minecraft-harness.git`, Branch `main`.
+3. The panel clones it and lists the template. It refreshes the clone every few
+   minutes, so a push to the branch shows up without touching the panel.
+
+> The repository root is what the panel scans, so the JSON must be inside a
+> subfolder of the clone root. `pufferpanel/` is that subfolder; if you fork and
+> move things, keep one folder per template with the `.json` inside it.
+
+### Path B — paste it into the web UI (no git access needed)
 
 ```sh
-node pufferpanel/import.js                      # validate, print the target path
-node pufferpanel/import.js --dir /var/lib/pufferpanel/templates --apply
+node pufferpanel/import.js --print > zincai-template.json
 ```
 
-`--apply` needs write access to that directory — run it as the `pufferpanel`
-user, or use **Templates → Import** in the web UI and paste `zincai.json`
-instead. Restart PufferPanel so it loads the template.
+Open **Templates → New**, switch to the **Json** tab, paste the file, **Save**.
+The template name comes from the JSON's `name` field (`zincai`) — that field
+exists only for this path, because a repository template takes its name from the
+file name instead.
+
+This path is a one-off: the panel stores it in its database, so it does not
+follow the repository. Re-paste after a template change.
+
+### Making your own template repository
+
+If you want to host the template yourself instead of pointing at this repo:
+
+```sh
+node pufferpanel/import.js --dir /srv/zincai-templates --apply
+# writes /srv/zincai-templates/zincai/zincai.json
+#        /srv/zincai-templates/zincai/README.md
+```
+
+Commit that tree, push it, and add **that** repository in the panel.
+
+Validate without writing anything at any time:
+
+```sh
+node pufferpanel/import.js          # checks the template, prints both paths
+```
+
+### If the panel shows the repo but no template
+
+- The JSON is not in a subfolder — the panel ignores files at the clone root.
+- The file is named `data.json` — that name is skipped by the scanner.
+- The branch name in **Add repo** does not exist on the remote.
+- The node has no network/git access to the URL: check the panel log for the
+  clone error, and use an SSH URL plus a deploy key for a private repository.
 
 ## 2. Create the server
 
-Pick **Minecraft Agent (ZincAI)** on the create-server page. The variables are
-grouped as Endpoint, Minecraft Server, Behaviour, Limits, Operator Control and
-Installation.
+**Servers → New server**, then pick the template — it appears as **zincai**
+under the repository you added, or under **Local** if you pasted it. Its display
+name is **Minecraft Agent (ZincAI)**. Give the server a name and an id, choose
+**host** or **docker** as the environment, and fill in the variables: Endpoint,
+Minecraft Server, Behaviour, Limits, Operator Control and Installation.
 
 | Variable | Environment | Default | Notes |
 | --- | --- | --- | --- |
@@ -133,13 +200,29 @@ npm run check                   # syntax-check every module
 ```
 
 The panel's **Console** shows the same lines the preflight prints, so a
-variable that is wrong is visible there before the bot joins anything.
+variable that is wrong is visible there before the bot joins anything. Expect a
+`control:` line naming the command prefix, how many operator UUIDs are
+configured and whether the process joins on start — if it says
+`operators=NONE`, chat commands will be refused and only the console will work.
+
+Type an operator command straight into the console (no prefix, one line, press
+enter) to prove the control path end to end:
+
+```
+status
+```
 
 ## Updating the bot
 
-Change `branch` (or push to it) and press **Install** again: the template
-fetches the branch, checks it out and reinstalls dependencies. Runtime data in
-`datadir` is left alone.
+Push to the branch the server was installed from, then press **Install** in the
+panel: the template runs `git fetch`/`checkout` on that branch and
+`npm ci --omit=dev` again. Runtime data in `datadir` (memory, places, goals,
+`runtime-config.json`) is left alone, and **Start** runs the `--dry-run`
+preflight first, so a broken update is visible before the bot joins.
+
+Pressing **Install** is also how you pick up a changed *template* — but the
+panel caches the template repository for a few minutes, so a brand-new variable
+can take a moment to appear.
 
 ## Requirements
 

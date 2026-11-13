@@ -23,17 +23,22 @@ configure by hand.
 
 ## Quick start (PufferPanel)
 
-1. Install the template on the panel node:
+1. Get the template into the panel — PufferPanel 3 takes it either from a git
+   repository or pasted into the web UI; it has no template folder and no
+   "Import" button:
 
    ```sh
-   node pufferpanel/import.js                     # validate + show where it goes
-   node pufferpanel/import.js --dir /var/lib/pufferpanel/templates --apply
+   node pufferpanel/import.js            # validate + explain both paths
+   node pufferpanel/import.js --print    # the JSON to paste into Templates → New
    ```
 
-   (Or use **Templates → Import** in the panel and paste
-   `pufferpanel/zincai.json`.) Restart the panel afterwards.
+   **Easiest:** in the panel, **Templates → Add repo** with this repository's
+   URL and branch — the template in `pufferpanel/` is already laid out the way
+   the panel scans (`<subfolder>/<name>.json`). See
+   [`pufferpanel/README.md`](pufferpanel/README.md#1-get-the-template-into-the-panel).
 
-2. Create a server from **Minecraft Agent (ZincAI)** and fill in the variables:
+2. **Servers → New server**, pick the **zincai** template, and fill in the
+   variables:
 
    | Variable | What to put |
    | --- | --- |

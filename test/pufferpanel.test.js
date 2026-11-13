@@ -115,26 +115,50 @@ test('template: both supported environments are declared', () => {
   assert.match(docker.image, /^node:\$\{nodeversion\}/, 'the Docker image follows the nodeversion variable')
 })
 
-test('import.js: --dir and --apply are parsed, unknown flags are refused', () => {
-  assert.deepEqual(parseArgs([]), { apply: false, dir: null, help: false })
-  assert.deepEqual(parseArgs(['--dir', '/tmp/x', '--apply']), { apply: true, dir: '/tmp/x', help: false })
-  assert.deepEqual(parseArgs(['--dir=/tmp/x']), { apply: false, dir: '/tmp/x', help: false })
+test('import.js: --dir, --apply and --print are parsed, unknown flags are refused', () => {
+  assert.deepEqual(parseArgs([]), { apply: false, dir: null, help: false, print: false })
+  assert.deepEqual(parseArgs(['--dir', '/tmp/x', '--apply']), { apply: true, dir: '/tmp/x', help: false, print: false })
+  assert.deepEqual(parseArgs(['--dir=/tmp/x']), { apply: false, dir: '/tmp/x', help: false, print: false })
+  assert.deepEqual(parseArgs(['--print']), { apply: false, dir: null, help: false, print: true })
   assert.throws(() => parseArgs(['--nope']), /unknown argument/)
 })
 
-test('import.js: a dry run writes nothing, --apply copies the template', () => {
+test('import.js: a dry run writes nothing, --apply lays out a template REPOSITORY', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pp-tpl-'))
   const script = path.join(__dirname, '..', 'pufferpanel', 'import.js')
 
   const dry = execFileSync(process.execPath, [script, '--dir', dir], { encoding: 'utf8' })
   assert.match(dry, /template OK/)
+  assert.match(dry, /\/zincai\/zincai\.json/)
   assert.deepEqual(fs.readdirSync(dir), [], 'a dry run must not create files')
 
   const applied = execFileSync(process.execPath, [script, '--dir', dir, '--apply'], { encoding: 'utf8' })
-  assert.match(applied, /restart PufferPanel/)
-  const written = JSON.parse(fs.readFileSync(path.join(dir, 'zincai.json'), 'utf8'))
+  assert.match(applied, /add the repository in the panel/)
+  // PufferPanel 3 reads <repo-root>/<folder>/<name>.json — not a flat file.
+  const written = JSON.parse(fs.readFileSync(path.join(dir, 'zincai', 'zincai.json'), 'utf8'))
   assert.deepEqual(written, template)
+  assert.ok(fs.existsSync(path.join(dir, 'zincai', 'README.md')), 'the panel shows the folder README')
   fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('import.js: no --dir explains both real import paths instead of a fake directory', () => {
+  const script = path.join(__dirname, '..', 'pufferpanel', 'import.js')
+  const out = execFileSync(process.execPath, [script], { encoding: 'utf8' })
+  assert.match(out, /Templates -> New/, 'the web UI path')
+  assert.match(out, /Add repo/, 'the git repository path')
+  // PufferPanel 3 has no template folder and no Import button; claiming either
+  // sends the operator looking for something that does not exist.
+  assert.doesNotMatch(out, /no PufferPanel template directory found/)
+})
+
+test('import.js: --print emits the named JSON the web UI needs', () => {
+  const script = path.join(__dirname, '..', 'pufferpanel', 'import.js')
+  const out = execFileSync(process.execPath, [script, '--print'], { encoding: 'utf8' })
+  const parsed = JSON.parse(out.slice(out.indexOf('{')))
+  // TemplateCreate.vue takes the template name from the JSON body, not the file.
+  assert.equal(parsed.name, 'zincai')
+  assert.equal(parsed.display, template.display)
+  assert.deepEqual(parsed.data, template.data)
 })
 
 test('import.js: the committed template validates with no errors', () => {

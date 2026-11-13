@@ -255,9 +255,17 @@ function makeShared (cfg, { dataDir = DATA_DIR } = {}) {
 }
 
 // ============================================================ boot ====
+/**
+ * Process-level entry point.
+ *
+ * The shape is deliberate: ONE Host (configuration, boundary, connection
+ * state machine, command interface) owns the process, and it creates sessions
+ * on demand. Joining, leaving, restarting the link and pausing the body are
+ * therefore operations of a live process, not of `main()`.
+ */
 function main () {
   if (process.argv.includes('--check')) {
-    for (const m of ['./api_wrapper', './memory', './perception', './filter', './builder', './continuity', './custom_mineflayer/pathfinder_wrapper', './custom_mineflayer/doors', './custom_mineflayer/escape', './system1', './tactics', './reflex_registry', './vanilla_guard', './control', './threats', './places', './skills', './observe', './brain', './events', './redstone_engine']) require(m)
+    for (const m of ['./api_wrapper', './memory', './perception', './filter', './builder', './continuity', './custom_mineflayer/pathfinder_wrapper', './custom_mineflayer/doors', './custom_mineflayer/escape', './system1', './tactics', './reflex_registry', './vanilla_guard', './control', './threats', './places', './skills', './observe', './brain', './events', './redstone_engine', './runtime_config', './boundary', './connection', './death_recovery', './host', './control_commands']) require(m)
     require('minecraft-data')('26.3') // postinstall patch must be in place
     logger.info(TAG, '--check OK — all modules load, 26.3 data present')
     return
@@ -269,11 +277,18 @@ function main () {
     const errors = validateConfig(cfg)
     logger.info(TAG, `config: host=${cfg.server.host} port=${cfg.server.port} user=${cfg.server.username} auth=${cfg.server.auth} version=${cfg.server.version || 'auto'}`)
     logger.info(TAG, `amd: model=${cfg.amd.model} base=${cfg.amd.baseUrl} key=${cfg.amd.apiKey ? 'present' : 'MISSING'}`)
-    logger.info(TAG, `data dir: ${DATA_DIR} (memories, places, goals, metrics)`)
+    logger.info(TAG, `data dir: ${DATA_DIR} (memories, places, goals, metrics, runtime-config)`)
     logger.info(TAG, `behaviour: mode=${cfg.behavior.mode} aliases=${(cfg.behavior.aliases || []).join(',') || '-'} language=${cfg.behavior.language || 'off'} elytra=${cfg.behavior.autoElytra ? 'yes' : 'no'}`)
     logger.info(TAG, `limits: rpm=${cfg.inference.rpm} minInterval=${cfg.inference.minIntervalMs}ms heartbeat=${cfg.inference.heartbeatMs}ms reconnect=${cfg.reconnect.enabled ? `${cfg.reconnect.maxAttempts} attempts` : 'off'}`)
     logger.info(TAG, `prompts: action ${SYSTEM_PROMPT.split(/\s+/).length} words, chat ${CHAT_PROMPT.split(/\s+/).length} words (static), ${ZINC_TOOLS.length} tools`)
     logger.info(TAG, 'policy: flee from real threats until the model decides; no PvP unless the model names a player; no friend list')
+    // The control plane is part of the preflight: an empty operator list and a
+    // prefix nobody knows are configuration mistakes, not surprises at runtime.
+    try {
+      const rc = new (require('./runtime_config').RuntimeConfig)({ file: path.join(DATA_DIR, 'runtime-config.json') })
+      const ops = rc.get('control.operators') || []
+      logger.info(TAG, `control: prefix="${rc.get('control.prefix')}" operators=${ops.length ? ops.length : 'NONE (chat commands refused; console only)'} console=${rc.get('control.allowConsole') ? 'stdin' : 'off'} joinOnStart=${rc.get('connection.joinOnStart') ? 'yes' : 'no'}`)
+    } catch (err) { logger.warn(TAG, `control: could not read the runtime config: ${err?.message || err}`) }
     for (const e of errors) logger.error(TAG, e)
     process.exitCode = errors.length ? 1 : 0
     return
@@ -295,11 +310,16 @@ function main () {
     logger.info(TAG, `memory: long-term ${shared.memory.longTerm.entries.length} entries saved to ${memoryFile}; places ${shared.places.blocks.size} blocks, ${shared.places.named.size} named`)
   }
 
+  // One Host for the whole process: it owns the runtime configuration, the
+  // physical boundary, the link state machine and the command interface.
+  // A session is something the Host creates, not something main() is.
+  const host = shared.host || (shared.host = createHost(shared, cfg))
+
   function shutdown (code, reason) {
     if (shared.shuttingDown) return
     shared.shuttingDown = true
     logger.info(TAG, `shutting down (${reason})`)
-    try { shared.session?.dispose(true) } catch { /* noop */ }
+    try { host.shutdown({ reason, quit: true }) } catch { /* already gone */ }
     try { shared.memory.save() } catch { /* best effort */ }
     try { shared.places.save(true) } catch { /* best effort */ }
     try { shared.saveConvo() } catch { /* best effort */ }
@@ -308,42 +328,109 @@ function main () {
     // socket never closes (join failure before spawn, etc.).
     setTimeout(() => process.exit(code), 1_000)
   }
+  shared.shutdown = shutdown
 
-  /** Called by a session when its connection is over. */
-  function sessionEnded ({ kind, text, spawned }) {
-    if (shared.shuttingDown) return
-    shared.session = null
-    if (spawned) shared.attempts = 0
-    const verdict = decideReconnect({ kind, text, everSpawned: shared.everSpawned, attempts: shared.attempts, reconnect: cfg.reconnect })
-    if (verdict.action === 'exit') {
-      for (const line of verdict.log) logger.error(TAG, line)
-      return shutdown(verdict.code, verdict.reason)
-    }
-    shared.attempts = verdict.attempt
-    logger.warn(TAG, `connection over (${kind}: ${text || 'no reason'}) — reconnecting in ${Math.round(verdict.delayMs / 1000)}s (attempt ${verdict.attempt}/${verdict.maxAttempts})`)
-    try { shared.memory.save(); shared.places.save(true) } catch { /* best effort */ }
-    setTimeout(() => { if (!shared.shuttingDown) shared.session = startSession(shared, sessionEnded) }, verdict.delayMs)
-  }
+  // A link that cannot be retried (a rejected first join, a ban, an exhausted
+  // retry budget) ends the process — the same rule as before, now decided by
+  // the connection manager instead of a setTimeout chain.
+  host.on('fatal', (info) => {
+    for (const line of fatalLines(info)) logger.error(TAG, line)
+    shutdown(info?.reason === 'retries-exhausted' || info?.reason === 'fatal-error' || info?.reason === 'join-failed' ? 1 : 0, info?.reason || 'fatal')
+  })
+  host.on('ended' in host ? 'ended' : 'detach', () => { try { shared.memory.save(); shared.places.save(true) } catch { /* best effort */ } })
+  host.connection.on('ended', () => { try { shared.memory.save(); shared.places.save(true) } catch { /* best effort */ } })
 
   process.on('SIGINT', () => shutdown(0, 'SIGINT'))
   process.on('SIGTERM', () => shutdown(0, 'SIGTERM'))
   process.on('unhandledRejection', (err) => logger.error(TAG, `unhandled rejection: ${err?.message || err}`))
   process.on('exit', (code) => { try { shared.memory.save() } catch { /* best effort */ }; if (code !== 0) logger.error(TAG, `exit code ${code}`) })
 
-  shared.session = startSession(shared, sessionEnded)
+  // The control interface is up before the first join: status, config, help and
+  // even stop/resume work while the link is still CONNECTING.
+  host.attachStdin()
+  logger.info(TAG, `control: console commands ready${(host.config.get('control.operators') || []).length ? `, ${(host.config.get('control.operators') || []).length} operator UUID(s)` : '; no operator UUID configured, so chat commands are refused — set control.operators'}`)
+  host.boot()
+}
+
+/** The lines a terminal connection failure prints. */
+function fatalLines (info = {}) {
+  const reason = info.reason || 'fatal'
+  const text = info.text || 'no details'
+  if (reason === 'join-failed') {
+    return [
+      `FATAL: join rejected before the first spawn (${text})`,
+      `aborting. Check the host/port, the whitelist (name "${'ZincAI'}"), and MC_AUTH. A failed first join is never retried.`
+    ]
+  }
+  if (reason === 'retries-exhausted') return [`FATAL: gave up reconnecting (${text})`]
+  return [`FATAL: ${reason} — ${text}`]
+}
+
+/**
+ * Build the process-level Host around a shared context.
+ *
+ * `createSession` here is the session FACTORY: the Host calls it for every
+ * join, and each call produces a brand-new session with a brand-new bot, so a
+ * reconnect can never inherit a stale listener, a stale lease or a stale world
+ * snapshot.
+ */
+function createHost (shared, cfg, { dataDir = null } = {}) {
+  const { Host } = require('./host')
+  return new Host({
+    dataDir: dataDir || shared.dataDir || DATA_DIR,
+    logger,
+    tag: TAG,
+    createSession: (hooks) => startSession(shared, hooks && hooks.onEnded ? hooks.onEnded : null, { host: hooks?.host || shared.host || null, hooks })
+  })
 }
 
 // ========================================================= one session ==
 /**
  * One connection to the server: the bot and everything attached to it.
- * @returns {{ dispose: (quit?: boolean) => void }}
+ *
+ * Called once per join by the ConnectionManager (or directly by the test
+ * harness). Everything a session owns is created here and destroyed by
+ * `dispose()`, which is what makes "reconnect without duplicate listeners"
+ * checkable: a second call builds a second, independent set of listeners on a
+ * second bot.
+ *
+ * @param {object} shared process-level context (memory, places, goals, amd…)
+ * @param {(info:object) => void} [onEnded] called once when this session's link ends
+ * @param {{ host?: object, hooks?: object }} [opts]
+ * @returns {{ dispose: (quit?: boolean) => void, subsystems: object }}
  */
-function startSession (shared, onEnded) {
+function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   const { cfg, memory, places, amd, parser } = shared
+  // The host is the process-level shell. When a session is started directly
+  // (the test harness), a minimal one is created so the boundary, the control
+  // interface and the pause flag behave exactly as in production.
+  const owner = host || shared.host || null
+  // The shared enforcement boundary. It is consulted by the lane scheduler,
+  // by every lane's key/goal write, by each physical tool and by the bot-level
+  // guard below — one decision point, so no route can bypass it.
+  const config = owner?.config || (shared.config = shared.config || new (require('./runtime_config').RuntimeConfig)({
+    // One config per process: a directly-started session (the test harness)
+    // still reads and writes the same persistent store a Host would.
+    file: shared.dataDir ? path.join(shared.dataDir, 'runtime-config.json') : null,
+    logger: (level, msg) => logger[level]?.(TAG, msg)
+  }))
+  const boundary = owner?.boundary || new (require('./boundary').PhysicalBoundary)({
+    config,
+    logger: (level, msg) => logger[level]?.(TAG, msg),
+    getPosition: () => botRef()?.entity?.position || null,
+    getDimension: () => { try { return PlaceIndex.dimensionOf(botRef()) } catch { return 'overworld' } }
+  })
+  const gateFor = (resources = []) => {
+    // Only a physical lane is gated here: reads and reasoning are never
+    // blocked by a pause, an area limit or a permission.
+    if (!resources.some((r) => r === 'lane:BODY')) return null
+    const verdict = boundary.check('__lane__', { caps: ['move'] })
+    return verdict.ok ? null : verdict.why
+  }
   // Logical execution lanes: BODY is exclusive, COMPUTATION / INTERACTION /
   // WORLD INFO may overlap. Every tool call takes a lease, and the lease is
   // released on success, failure, cancellation and context reset.
-  const lanes = new LaneScheduler()
+  const lanes = new LaneScheduler({ gate: gateFor })
   const jobs = new JobRegistry({ lanes })
 
   const mineflayer = require('mineflayer')
@@ -359,6 +446,7 @@ function startSession (shared, onEnded) {
   const { System1 } = require('./system1')
   const { ReflexRegistry, runScript } = require('./reflex_registry')
   const { ControlArbiter, PRIORITY } = require('./control')
+  const { DeathRecovery } = require('./death_recovery')
   const { ThreatSense, HurtTracker, makeReachabilityCheck, useRegistry, isHostileMob } = require('./threats')
   const tactics = require('./tactics')
   const { clearToRun } = require('./custom_mineflayer/escape')
@@ -372,8 +460,21 @@ function startSession (shared, onEnded) {
 
   const wrapperLog = (level, msg) => logger[level === 'debug' ? 'debug' : level]?.(TAG, msg)
 
+  // `botRef` exists because the boundary is created before the bot: it asks for
+  // the CURRENT bot, which a reconnect replaces.
+  let bot = null
+  // Every listener this session installs on its bot is recorded, so `dispose()`
+  // can take all of them off again. A reconnect then builds ONE fresh set on a
+  // new bot instead of stacking a second copy on the old one.
+  const botListeners = []
+  const onBot = (event, fn) => {
+    bot.on(event, fn)
+    botListeners.push([event, fn])
+    return fn
+  }
+  const botRef = () => bot
   logger.info(TAG, `connecting to ${cfg.server.host}:${cfg.server.port} as "${cfg.server.username}" (auth=${cfg.server.auth}, version=${cfg.server.version || 'auto'})`)
-  const bot = mineflayer.createBot({
+  bot = mineflayer.createBot({
     host: cfg.server.host,
     port: cfg.server.port,
     username: cfg.server.username, // always ZincAI — enforced in loadConfig()
@@ -385,9 +486,19 @@ function startSession (shared, onEnded) {
   const guard = installVanillaGuard(bot, { logger })
   bot.loadPlugin(pathfinder)
   if (cfg.behavior.useArmorManager) bot.loadPlugin(armorManager)
+  // Network-level physical barrier: every primitive that could move the body or
+  // change the world is refused while the body is paused, disconnected, dead or
+  // outside its permissions. Installed BEFORE any subsystem gets the bot.
+  const physicalGuard = require('./boundary').installPhysicalGuard(bot, boundary, {
+    logger: (level, msg) => logger[level]?.(TAG, msg)
+  })
 
   // --- who owns what ------------------------------------------------------
   const arbiter = new ControlArbiter(bot, { logger: wrapperLog })
+  // Every lane write (keys and pathfinder goals) goes through the boundary, and
+  // a lane that would drive the body while it is paused or forbidden stays
+  // silent instead of pressing keys into a wall.
+  arbiter.setGate((cap) => boundary.check('__lane__', { caps: [cap] }))
   const sense = new ThreatSense(bot, {
     radius: cfg.threat.radius ?? 12,
     rangedRadius: cfg.threat.rangedRadius ?? 18,
@@ -422,7 +533,12 @@ function startSession (shared, onEnded) {
   let taskSeq = 0
   let lastHurt = { at: 0, text: '' }
   let lastSayAt = 0
+  const chatSaid = { recent: [] } // public lines in the last minute (limits.maxPublicChatPerMinute)
   const results = [] // what the last actions did: { label, ok, msg, ts }
+  /** The most recent boundary refusal inside this session: { at, what, why }. */
+  let lastRefusal = null
+  const onRefused = (entry) => { lastRefusal = entry }
+  boundary.on('refused', onRefused)
   const continuity = shared.continuity || (shared.continuity = new ContinuityStore({
     file: path.join(shared.dataDir || DATA_DIR, 'continuity.json'),
     botName: cfg.server?.username || 'ZincAI'
@@ -432,6 +548,10 @@ function startSession (shared, onEnded) {
     library: shared.redstoneLibrary,
     memory,
     executor: () => executor,
+    // The engineer right-clicks levers and can place components; it is granted
+    // those capabilities only for the duration of one engineering call (see
+    // executeAction), so the standing permission stays the operator's.
+    boundary,
     canWrite: (pos) => {
       try {
         const claim = continuity.claimAt(pos, dim())
@@ -442,6 +562,15 @@ function startSession (shared, onEnded) {
     logger
   })
   const circuitProjects = shared.circuitProjects || (shared.circuitProjects = new (require('./circuit_projects').CircuitProjects)(path.join(shared.dataDir || DATA_DIR, 'circuit-projects.json')))
+  const deathRecovery = new DeathRecovery({
+    config,
+    logger: (level, msg) => logger[level]?.(TAG, msg),
+    getPosition: () => here(),
+    getDimension: () => dim(),
+    getHealth: () => bot.health,
+    getInventory: () => bot.inventory?.items?.() || [],
+    checkRoute: (from, to) => checkRouteHome(from, to)
+  })
   const sayQueue = []
   const timers = new Set()
   const every = (ms, fn) => { const t = setInterval(fn, ms); timers.add(t); return t }
@@ -575,10 +704,30 @@ function startSession (shared, onEnded) {
     return Boolean(last) && Date.now() - last.ts < 60_000 && list.some((l) => l.who === 'me' && Date.now() - l.ts < 90_000)
   }
 
+  /**
+   * Communication permissions. These are permission checks, not instructions:
+   * they do not tell Zinc what to say or whom to trust — they decide only
+   * whether a line may leave the process.
+   */
+  function maySpeak ({ to = null } = {}) {
+    if (to) return config.get('communication.privateMessages') !== false
+    return config.get('communication.publicChat') !== false
+  }
+
+  /** May the bot answer a player who addressed it at all? */
+  function canReplyToChat () { return config.get('communication.replyToChat') !== false }
+
   /** Queue a chat line. Lines are spaced out, never dropped. */
   function speak (text, { to = null, about = null } = {}) {
     const t = String(text || '').replace(/\s+/g, ' ').trim().replace(/^\/+/, '').slice(0, 200)
     if (!t) return false
+    if (!maySpeak({ to })) {
+      logger.warn(TAG, `speech refused: ${to ? 'communication.privateMessages' : 'communication.publicChat'} is off`)
+      // Tell the model the line did not go out, so it does not believe a
+      // refusal is a delivery.
+      report('say', { ok: false, msg: `NOT SENT — ${to ? 'private messages' : 'public chat'} are switched off by the operator (${to ? 'communication.privateMessages' : 'communication.publicChat'})` }, { wake: false })
+      return false
+    }
     sayQueue.push({ text: t, to, about })
     if (sayQueue.length > 6) sayQueue.splice(0, sayQueue.length - 6)
     flushSay()
@@ -589,6 +738,21 @@ function startSession (shared, onEnded) {
     const wait = (cfg.behavior.chatCooldownMs ?? 1500) - (Date.now() - lastSayAt)
     if (wait > 0) { const t = setTimeout(() => { timers.delete(t); flushSay() }, wait + 20); timers.add(t); return }
     const { text, to, about } = sayQueue.shift()
+    // A sliding-window ceiling per minute, public chat only: a reply to one
+    // player must still be possible while the public channel is capped.
+    if (!to) {
+      const cap = Number(config.get('limits.maxPublicChatPerMinute'))
+      if (cap > 0) {
+        const now = Date.now()
+        chatSaid.recent = chatSaid.recent.filter((t) => now - t < 60_000)
+        if (chatSaid.recent.length >= cap) {
+          logger.warn(TAG, 'public chat rate limit reached — line dropped')
+          if (sayQueue.length) flushSay()
+          return
+        }
+      }
+    }
+    if (!to) chatSaid.recent.push(Date.now())
     lastSayAt = Date.now()
     try {
       const whispered = to ? guard.whisper(to, text) : false
@@ -1594,6 +1758,34 @@ function startSession (shared, onEnded) {
     return `doing: ${parts.length ? parts.join('; ') : 'nothing'}`
   }
 
+  /**
+   * Why the body is not acting, when the reason is not the model's decision.
+   * A paused body cannot do anything at all, so the model is told that in one
+   * line instead of being shown a snapshot that invites another call.
+   */
+  function boundaryLine () {
+    const paused = owner?.paused === true
+    const link = owner?.connection?.state
+    if (link && link !== 'CONNECTED') return `body: not connected (${link}) — no physical action can run right now; goals are safe, say something only if it was queued`
+    if (paused) return 'body: PAUSED by the operator — no physical action will run; goals stay suspended (not deleted) until resume; you may still reason, talk if permitted, and plan'
+    if (lastRefusal && Date.now() - lastRefusal.at < 20_000) return `body: last physical action refused — ${lastRefusal.what}: ${lastRefusal.why}`
+    return null
+  }
+
+  /** What the body is doing, in one short sentence, for `status`. */
+  function activityText () {
+    const parts = []
+    const cur = skills?.current()
+    if (cur) parts.push(`${cur.label} (${cur.seconds}s)`)
+    else if (task) parts.push(`${task.label} (${Math.round((Date.now() - task.startedAt) / 1000)}s)`)
+    if (combat?.isEngaged) parts.push(`fighting ${fight?.label || 'target'}`)
+    if (system1?.fleeing) parts.push('fleeing by reflex')
+    const main = agenda.main
+    if (main) parts.push(`${main.paused ? 'paused: ' : ''}${main.label}${main.goalId ? ` [${main.goalId}]` : ''}`)
+    if (!parts.length) parts.push('nothing')
+    return parts.join('; ')
+  }
+
   /** The escape route as the reflex sees it right now (wall-aware), or null. */
   function routeNow () {
     const plan = system1?.fleeing ? system1._flee?.plan : null
@@ -1731,6 +1923,7 @@ function startSession (shared, onEnded) {
       events ? `events:\n${events}` : null,
       perceived.text ? `perceived (timestamped; [NEW] = not yet delivered, "(scanned_diff)" = you discovered it late, exact time unknown):\n${perceived.text}` : null,
       failGate.advisoryLine(pos) || null,
+      boundaryLine(),
       justNow,
       `why now: ${reasons.join('; ')}`
     ]
@@ -1925,7 +2118,9 @@ function startSession (shared, onEnded) {
     }
     if (ended || epoch !== lifeEpoch) return
     const whisper = lines.some((l) => l.whisper)
-    if (reply.text) speak(reply.text, { to: whisper ? sender : null, about: sender })
+    if (reply.text && !canReplyToChat()) {
+      logger.warn(TAG, `chat reply to ${sender} not sent: communication.replyToChat is off`)
+    } else if (reply.text) speak(reply.text, { to: whisper ? sender : null, about: sender })
     if (reply.remember) {
       const kept = memory.rememberFact(reply.remember, { about: sender })
       if (kept) logger.info(TAG, `remembered (from ${sender}): ${kept.text}`)
@@ -1989,6 +2184,30 @@ function startSession (shared, onEnded) {
    * Only shapes whose extent we can compute cheaply are narrowed; anything
    * uncertain stays coarse, which is always safe — just less parallel.
    */
+  /**
+   * The coordinate an action is aimed at, when it has one: a walk, a dig, a
+   * build origin or a build_shape origin. Resolves a saved place name through
+   * the place index so "go_to place: shed" is checked like "go_to 400,400".
+   */
+  function destinationOf (action) {
+    const a = action?.a
+    if (!['go_to', 'move', 'dig', 'build', 'build_shape', 'place', 'gather', 'light_up', 'corpse_run'].includes(a)) return null
+    const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : null)
+    if (a === 'build_shape' && Array.isArray(action.at) && action.at.length >= 3) return { x: num(action.at[0]), z: num(action.at[2]) }
+    if (a === 'build' && Array.isArray(action.at) && action.at.length >= 3) return { x: num(action.at[0]), z: num(action.at[2]) }
+    const x = num(action.x)
+    const z = num(action.z)
+    if (x !== null && z !== null) return { x, y: num(action.y), z }
+    const placeName = action.place || (a === 'go_to' && action.where) || null
+    if (placeName) {
+      try {
+        const entry = places.resolve(String(placeName), here(), { dim: dim() })
+        if (entry && Number.isFinite(entry.x) && Number.isFinite(entry.z)) return { x: entry.x, y: entry.y, z: entry.z }
+      } catch { /* unknown place: the skill will report it */ }
+    }
+    return null
+  }
+
   function footprintOf (action) {
     const a = action?.a
     const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : null)
@@ -2111,6 +2330,20 @@ function startSession (shared, onEnded) {
       return report(action.a || 'action', { ok: false, msg: `refused: ${vanilla.why} — you cannot run commands` })
     }
     const a = action.a
+    // THE SHARED BOUNDARY, first refusal of the tool path. Read-only and
+    // reasoning tools are never gated here (the boundary returns ok for them);
+    // anything physical is checked against the pause flag, the permissions, the
+    // permitted area and the action rate before a lease is even requested.
+    const physical = boundary.check(a, { action })
+    if (!physical.ok) {
+      return report(a, { ok: false, msg: `refused: ${physical.why}` }, { wake: false })
+    }
+    // Where the action is AIMED matters as much as where the body stands: a walk
+    // or a build outside the permitted area must not start just because the
+    // body is still inside it.
+    const destination = destinationOf(action)
+    const awayTarget = destination ? boundary.destinationRefusal(destination) : null
+    if (awayTarget) return report(a, { ok: false, msg: `refused: ${awayTarget}` }, { wake: false })
     // min: a guest (chat-asker outside the trust lists) may not
     // reach valuables or automation. Off when no lists are configured.
     const trustRefusal = trustCheck(a, action, snap?.askedBy)
@@ -2155,7 +2388,11 @@ function startSession (shared, onEnded) {
     } catch { laneLease = null }
     if (!laneLease) {
       if (agenda.main?.pendingInterrupt) { shelfMain(agenda.main, 'interrupted while another action waited'); agenda.main = null }
-      return report(a, { ok: false, msg: 'resource busy or action cancelled before it could start; retry' }, { wake: false })
+      // A refusal at the lease (paused, disconnected, out of quota) says so in
+      // the model's own terms; a genuine resource conflict keeps its old text.
+      const again = boundary.check(a, { action })
+      const why = again.ok ? 'resource busy' : again.why
+      return report(a, { ok: false, msg: `${why} — nothing was started; retry when the body is free` }, { wake: false })
     }
     return leaseContext.run({ lease: laneLease, claimed: false }, async () => {
     gateCtx = action
@@ -2184,8 +2421,10 @@ function startSession (shared, onEnded) {
           return report('say', { ok: false, msg: again <= 1 ? `NOT SENT — "${text.slice(0, 60)}" is not Brazilian Portuguese. Say it again in informal PT-BR.` : 'not sent (still not Brazilian Portuguese); dropped' }, { wake: again <= 1 })
         }
         foreignSays = { n: 0, at: 0 }
-        const said = speak(text, { to: action.to ? String(action.to) : null })
-        if (!said) report('say', { ok: false, msg: 'empty text' })
+        // speak() reports its own reason (a permission that is off, a recipient
+        // that is not online); only genuinely empty text is reported here.
+        if (!text.trim()) { report('say', { ok: false, msg: 'empty text' }); return }
+        speak(text, { to: action.to ? String(action.to) : null })
         return
       }
       case 'move': // legacy name
@@ -2286,6 +2525,8 @@ function startSession (shared, onEnded) {
         return report('equip', await skills.equip({ item: action.item, where: action.where }), { wake: null })
       case 'redstone_engineer': {
         const started = performance.now()
+        // Its placements and lever flips are checked against the same
+        // permissions as everything else, on every primitive it issues.
         const res = await redstoneEngineer.act(action)
         latency.record('responseToExecMs', performance.now() - started)
         // Goal integration: a redstone build/repair earns progress from what was
@@ -2497,6 +2738,9 @@ function startSession (shared, onEnded) {
         decided(snap, { label: 'script' })
         const ctx = {
           bot, goals, memory, combat, pathfinder: wrapper, executor, system1, logger, arbiter, skills, places,
+          // A script talks to the same guarded bot as everything else: there is
+          // no unguarded handle to hand it.
+          boundary, check: (tool) => boundary.check(tool),
           escalate: (event) => brain.wake(`${event.type} ${event.item || event.text || ''}`.trim())
         }
         // A script is not safe to run twice, so a side job ends it instead of pausing it.
@@ -2527,6 +2771,60 @@ function startSession (shared, onEnded) {
     })
   }
 
+  // -------------------------------------------------- operator commands -----
+  /**
+   * Route one chat line to the control interface. Returns true when the line
+   * WAS a command (authorised or not), so it is never handed to the model as
+   * conversation.
+   */
+  /** Does this chat text start with the control prefix (and is an interface configured)? */
+  function isControlLine (text) {
+    if (!owner) return false
+    const prefix = String(config.get('control.prefix') || '').toLowerCase()
+    if (!prefix) return false
+    return String(text || '').trim().toLowerCase().startsWith(prefix)
+  }
+
+  async function handleChatCommand (raw) {
+    if (!owner) return false
+    const parsed = filter.parseChatLine(raw, { players: Object.keys(bot.players || {}) })
+    if (!parsed) return false // command-shaped but unattributable: not ours to interpret
+    const uuid = resolvePlayerUuid(parsed.sender)
+    const authorisation = owner.authorize({ source: 'chat', uuid, name: parsed.sender })
+    // A refused command is logged (without its body, without the raw sender) and
+    // otherwise ignored: an unauthorised player gets no signal at all, so the
+    // surface cannot be probed. control.announce can make that explicit.
+    if (!authorisation.ok) {
+      await owner.command(raw, { source: 'chat', uuid, name: parsed.sender })
+      if (config.get('control.announce') === true) speak('esse comando é do operador do servidor, não posso atender por chat')
+      return true
+    }
+    // The interface must stay usable after `stop`: a paused body still answers
+    // its operator, so the answer path is a whisper through the same speech
+    // permission (never public chat, never the model).
+    const out = await owner.command(raw, { source: 'chat', uuid, name: parsed.sender })
+    // The answer goes to the operator who asked, privately, and never into the
+    // public channel: it names limits and reasons that are operational.
+    if (out?.reply && parsed.sender) {
+      const lines = String(out.reply).split('\n').slice(0, 8)
+      for (const line of lines) { try { guard.whisper(parsed.sender, line.slice(0, 200)) } catch { /* invalid name */ } }
+    }
+    return true
+  }
+
+  /**
+   * A player's UUID, from the player list or (for `!zinc` self-authorisation)
+   * from the server's own tab entry. Usernames alone are NEVER identity, so a
+   * missing UUID means "unauthorised", never "trust the name".
+   */
+  function resolvePlayerUuid (name) {
+    try {
+      const entry = bot.players?.[name] || Object.values(bot.players || {}).find((p) => String(p?.username || '').toLowerCase() === String(name).toLowerCase())
+      const uuid = entry?.uuid || entry?.entity?.uuid || null
+      return uuid ? String(uuid).toLowerCase() : null
+    } catch { return null }
+  }
+
   // ------------------------------------------ optional Scout & Relocate --
   async function scoutAndRelocate () {
     const sc = cfg.scout || {}
@@ -2553,15 +2851,91 @@ function startSession (shared, onEnded) {
     }
   }
 
-  // ------------------------------------------------------ event wiring ---
-  bot.on('login', () => logger.info(TAG, `logged in as ${bot.username}`))
+  /**
+   * The route check the death recovery uses: a real A* probe from where the
+   * body stands to the designated room, so a blocked route is reported once
+   * instead of being walked into repeatedly.
+   * @returns {Promise<{ok:boolean, why?:string}>}
+   */
+  async function checkRouteHome (from, to) {
+    try {
+      const { GoalNear } = require('mineflayer-pathfinder').goals
+      const goal = new GoalNear(Math.trunc(to.x), Math.trunc(to.y), Math.trunc(to.z), 2)
+      const paths = bot.pathfinder?.getPathFromTo
+      if (typeof paths !== 'function') return { ok: true, why: 'route not checkable here' }
+      const movements = bot.pathfinder.movements
+      if (!movements) return { ok: true, why: 'route not checkable here' }
+      const it = paths.call(bot.pathfinder, movements, new Vec3(from.x, from.y, from.z), goal, { timeout: 4000, tickTimeout: 40 })
+      const step = it.next()
+      const status = step?.value?.result?.status
+      if (status === 'noPath') return { ok: false, why: 'no way through' }
+      if (status === 'timeout') return { ok: false, why: 'the route took too long to find' }
+      return { ok: true, why: status || 'unknown' }
+    } catch (err) {
+      return { ok: false, why: String(err?.message || err).slice(0, 100) }
+    }
+  }
 
-  bot.on('spawn', () => {
+  /**
+   * After a respawn: inspect the real body, re-check the objectives, decide
+   * about the designated room, and tell the model ONE honest sentence.
+   */
+  async function reconcileAfterRespawn () {
+    const p = here()
+    const observation = {
+      position: p,
+      dimension: dim(),
+      health: bot.health,
+      inventory: bot.inventory?.items?.() || []
+    }
+    // 1. Objectives: a death never erases the plan, but the world may have
+    //    moved on. Everything still open is re-verified where it can be.
+    let rechecked = 0
+    try { rechecked = reconcileRestored() } catch (err) { logger.debug(TAG, `goal reconcile: ${err.message || err}`) }
+    // 2. The designated room: one decision, reported once, never a loop.
+    const recovery = await deathRecovery.onRespawn(observation)
+    // 3. Resume only what remains valid: goals that could be verified are put
+    //    back on the agenda as resumable+needsVerify; a goal already done in
+    //    the world was completed by reconcileRestored/reconcileGoal.
+    const open = goalReg.openGoals()
+    const pending = open.length ? `; unfinished: ${open.slice(0, 4).map((g) => goalReg.describe(g)).join(' | ')}` : ''
+    const summary = require('./death_recovery').respawnSummary(deathRecovery.lastDeath, observation)
+    const tail = recovery.verdict === 'go_home'
+      ? `; ${recovery.why}`
+      : recovery.verdict === 'report'
+        ? `; cannot return to the designated room: ${recovery.why}`
+        : ''
+    brain?.wake(`respawned — ${summary}${pending}${rechecked ? ` (re-checked ${rechecked} goal(s) against the world)` : ''}${tail}`, { external: true, important: true })
+    if (recovery.verdict === 'go_home' && recovery.target) {
+      // A single ordinary task, so it is cancellable and visible like any other.
+      try {
+        startMain({
+          tool: 'go_to',
+          label: `return to the designated room (${recovery.target.x},${recovery.target.y},${recovery.target.z})`,
+          askedBy: null,
+          detail: { args: { x: recovery.target.x, y: recovery.target.y, z: recovery.target.z }, cause: 'respawn' },
+          run: () => skills.goTo({ x: recovery.target.x, y: recovery.target.y, z: recovery.target.z })
+        })
+      } catch (err) { logger.warn(TAG, `return-home task could not start: ${err?.message || err}`) }
+    }
+    return { observation, recovery, rechecked }
+  }
+
+  // ------------------------------------------------------ event wiring ---
+  onBot('login', () => logger.info(TAG, `logged in as ${bot.username}`))
+
+  onBot('spawn', () => {
     alive = true
+    owner?.markDead?.(false)
     const first = !spawned
     spawned = true
     shared.everSpawned = true
     shared.attempts = 0
+    // Tell the link manager (and the process-level host) that this session is
+    // really in the world. Until it hears this, the boundary refuses every
+    // physical action — which is exactly why a stale connection cannot act.
+    try { hooks?.onSpawn?.() } catch (err) { logger.debug(TAG, `spawn hook: ${err?.message || err}`) }
+    try { owner?.noteSpawn?.({ first }) } catch { /* noop */ }
 
     // A fresh Movements every spawn; the wrapper re-applies EVERYTHING to it
     // (doors, mode, digging guard, scaffolding policy, threat costs).
@@ -2571,17 +2945,13 @@ function startSession (shared, onEnded) {
     wrapper.apply()
 
     if (systemsReady) {
-      // Respawn: same bot object, same stack. Nobody owns anything any more.
+      // Respawn: same bot object, same stack, NEW life. Reconcile against what
+      // the body actually is now — never against the life that ended.
       const p = here()
       logger.info(TAG, 'respawned')
+      owner?.markDead?.(false)
       wrapper.setMode(cfg.behavior.mode || 'explorer')
-      // A death does not erase the plan: the objectives went back to the
-      // registry as resumable, and are re-checked against the world.
-      let rechecked = 0
-      try { rechecked = reconcileRestored() } catch (err) { logger.debug(TAG, `goal reconcile: ${err.message || err}`) }
-      const open = goalReg.openGoals()
-      const pending = open.length ? `; unfinished: ${open.slice(0, 4).map((g) => goalReg.describe(g)).join(' | ')}` : ''
-      brain.wake(`respawned at ${p ? `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}` : 'spawn'}; items were dropped at place "last death"${pending}${rechecked ? ` (re-checked ${rechecked} goal(s) against the world)` : ''}`)
+      reconcileAfterRespawn().catch((err) => logger.warn(TAG, `respawn reconcile failed: ${err?.message || err}`))
       return
     }
     systemsReady = true
@@ -2618,8 +2988,8 @@ function startSession (shared, onEnded) {
     combat.start()
 
     const taskLane = arbiter.lane('task', PRIORITY.task)
-    executor = new BuilderExecutor(bot, { scaffoldBlocks: cfg.build.scaffoldBlocks, logger: wrapperLog, hands: taskLane })
-    skills = new Skills(bot, { arbiter, places, logger: wrapperLog, whisper: guard.whisper, executor: () => executor, pathfinder: () => wrapper })
+    executor = new BuilderExecutor(bot, { scaffoldBlocks: cfg.build.scaffoldBlocks, logger: wrapperLog, hands: taskLane, boundary })
+    skills = new Skills(bot, { arbiter, places, logger: wrapperLog, whisper: guard.whisper, executor: () => executor, pathfinder: () => wrapper, boundary })
     wrapper.setMode(cfg.behavior.mode || 'explorer')
 
     brain = new Brain({
@@ -2769,14 +3139,14 @@ function startSession (shared, onEnded) {
       lastHurt = { at: now, text: cause.text }
     }
   }).start()
-  bot.on('entityHurt', (entity) => { if (entity !== bot.entity) system1?.onEntityHurt(entity) })
+  onBot('entityHurt', (entity) => { if (entity !== bot.entity) system1?.onEntityHurt(entity) })
 
   // ------------------------------------------------- entity perception ---
   // Spawn/despawn/damage of everything else used to be invisible to the model:
   // only the reflex layer subscribed to entityHurt. Every branch below is cheap
   // and coalesces, so a horde does not become 200 prompt lines.
   const ENTITY_INTEREST_RE = /^(player|zombie|skeleton|spider|creeper|enderman|witch|slime|magma_cube|blaze|ghast|phantom|drowned|husk|stray|pillager|vindicator|ravager|piglin|hoglin|zombified_piglin|wither_skeleton|warden|elder_guardian|guardian|iron_golem|wolf|cat|fox|horse|villager|wandering_trader|allay|bee|axolotl|goat|cow|pig|sheep|chicken|rabbit|turtle|panda|strider|boat|minecart|item|arrow|trident|fireball|small_fireball|wind_charge|tnt|primed_tnt)$/
-  bot.on('entitySpawn', (entity) => {
+  onBot('entitySpawn', (entity) => {
     if (!systemsReady || !entity || entity === bot.entity) return
     const name = String(entity.name || entity.displayName || 'entity')
     if (!ENTITY_INTEREST_RE.test(name)) return
@@ -2797,7 +3167,7 @@ function startSession (shared, onEnded) {
       wake: null
     })
   })
-  bot.on('entityGone', (entity) => {
+  onBot('entityGone', (entity) => {
     if (!systemsReady || !entity || entity === bot.entity) return
     const name = String(entity.name || entity.displayName || 'entity')
     if (!ENTITY_INTEREST_RE.test(name)) return
@@ -2815,7 +3185,7 @@ function startSession (shared, onEnded) {
       memoryType: isPlayer ? 'player_left' : 'despawn'
     })
   })
-  bot.on('entityHurt', (entity) => {
+  onBot('entityHurt', (entity) => {
     if (!systemsReady || !entity) return
     const name = String(entity.name || entity.displayName || 'entity')
     const isPlayer = entity.type === 'player' || entity.username
@@ -2834,7 +3204,7 @@ function startSession (shared, onEnded) {
       memoryType: 'entity_hurt'
     })
   })
-  bot.on('entityDead', (entity) => {
+  onBot('entityDead', (entity) => {
     if (!systemsReady || !entity) return
     const name = String(entity.name || entity.displayName || 'entity')
     const label = (entity.type === 'player' || entity.username) ? (entity.username || 'player') : name
@@ -2850,7 +3220,7 @@ function startSession (shared, onEnded) {
       memoryType: 'death_other'
     })
   })
-  bot.on('entityMoved', (entity) => {
+  onBot('entityMoved', (entity) => {
     if (!systemsReady || !entity || entity === bot.entity) return
     const isPlayer = entity.type === 'player' || entity.username
     const name = String(entity.name || '')
@@ -3023,7 +3393,7 @@ function startSession (shared, onEnded) {
   // a container block changing under the bot (opened or
   // broken by someone else, a new chest placed) invalidates what the index
   // thought was inside — at zero cost, no waiting for the next 3 s scan.
-  bot.on('blockUpdate', (oldBlock, newBlock) => {
+  onBot('blockUpdate', (oldBlock, newBlock) => {
     if (!systemsReady) return
     try { places.onBlockChange(oldBlock, newBlock, { dim: dim() }) } catch { /* cosmetic */ }
     // The model never saw block changes before: only the place index did.
@@ -3069,9 +3439,9 @@ function startSession (shared, onEnded) {
   // absorption/health-boost show up as hp above the vanilla 20 —
   // that observed value is the only honest base for fight odds and the
   // low-hp disengage threshold.
-  bot.on('health', () => { try { combat?.noteHealth?.(bot.health) } catch { /* cosmetic */ } })
+  onBot('health', () => { try { combat?.noteHealth?.(bot.health) } catch { /* cosmetic */ } })
 
-  bot.on('playerCollect', (collector, item) => {
+  onBot('playerCollect', (collector, item) => {
     if (!systemsReady || collector !== bot.entity) return
     const itemName = item?.name || 'item'
     let nearPlayer = null
@@ -3101,7 +3471,7 @@ function startSession (shared, onEnded) {
     })
   })
 
-  bot.on('death', () => {
+  onBot('death', () => {
     alive = false
     decisionEpoch++
     lifeEpoch++
@@ -3127,29 +3497,53 @@ function startSession (shared, onEnded) {
     try { system1?.reset() } catch { /* noop */ }
     try { arbiter.reset('death') } catch { /* noop */ }
     try { wrapper.threat.clear() } catch { /* noop */ }
-    const t = setTimeout(() => { timers.delete(t); try { bot.respawn() } catch { /* not on death screen */ } }, 1500)
-    timers.add(t)
+    // Every job that cannot survive a new life is cancelled here; the goal
+    // RECORDS above survive, which is the difference between losing work and
+    // losing the plan.
+    try { for (const job of jobs.active()) jobs.cancel(job.id, 'died') } catch { /* best effort */ }
+    // Death is an event, not a process failure: the recovery subsystem records
+    // the loss and inspects the respawn when it really happens.
+    try {
+      deathRecovery.onDeath({ position: p, dimension: dim(), inventory: bot.inventory?.items?.() || [] })
+      owner?.markDead?.(true)
+    } catch (err) { logger.debug(TAG, `death record: ${err.message || err}`) }
+    if (config.get('death.autoRespawn') === false) {
+      logger.warn(TAG, 'death.autoRespawn is off — the body stays on the death screen until "join" or a config change')
+    } else {
+      const delay = deathRecovery.respawnDelayMs()
+      const t = setTimeout(() => { timers.delete(t); try { bot.respawn() } catch { /* not on death screen */ } }, delay)
+      timers.add(t)
+    }
   })
 
-  bot.on('wake', () => {
+  onBot('wake', () => {
     if (!systemsReady) return
     note({ type: 'woke', msg: 'woke up' })
     // A task that waited for the night carries on; only an idle bot needs a thought.
     if (!resumeMain('sleeping')) brain.wake('woke up (morning)')
   })
 
-  bot.on('vanilla_command_blocked', (line) => {
+  onBot('vanilla_command_blocked', (line) => {
     logger.warn(TAG, `vanilla guard blocked: ${String(line).slice(0, 80)}`)
     report('say', { ok: false, msg: 'blocked: chat that starts with "/" is a command and you cannot run commands' })
   })
 
-  bot.on('messagestr', (raw) => {
-    if (!systemsReady) return
+  onBot('messagestr', (raw) => {
     const players = Object.keys(bot.players || {})
     const parsed = filter.parseChatLine(raw, { players })
     if (!parsed) return // server line, not attributed chat
     if (parsed.sender === bot.username) return // never react to ourselves
     const { sender, text, whisper } = parsed
+    // The CONTROL INTERFACE is checked before the systems-ready guard and before
+    // anything else: the operator must be able to stop, inspect or reconfigure
+    // the process at any point in its life, including before the model stack is
+    // up. A command line is never conversation — it does not reach the model,
+    // the conversation log or memory.
+    if (isControlLine(text)) {
+      handleChatCommand(`<${sender}> ${text}`).catch((err) => logger.debug(TAG, `control command failed: ${err?.message || err}`))
+      return
+    }
+    if (!systemsReady) return
     const pref = memory.observeChat(sender, text)
     if (pref) logger.debug(TAG, `preference learned from ${sender} (${pref.polarity}): ${pref.text}`)
     system1?.onChatLine(sender, text)
@@ -3252,7 +3646,21 @@ function startSession (shared, onEnded) {
     try { wrapper.stop() } catch { /* noop */ }
     try { arbiter.stop() } catch { /* noop */ }
     try { hurts.stop() } catch { /* noop */ }
+    // Every scoped permission dies with the session, so a reconnect can never
+    // inherit a grant that belonged to a body that no longer exists.
+    try { for (const job of jobs.active()) jobs.cancel(job.id, 'session ended') } catch { /* best effort */ }
+    // Uninstall the network guard so a stale wrapper can never answer for a
+    // bot that is gone.
+    try { physicalGuard?.uninstall?.() } catch { /* noop */ }
+    try { boundary.removeListener('refused', onRefused) } catch { /* noop */ }
+    // The listeners go with the session: nothing of this body may still be
+    // wired to an event after its link is gone.
+    for (const [event, fn] of botListeners) {
+      try { bot.removeListener(event, fn) } catch { /* noop */ }
+    }
+    botListeners.length = 0
     if (quit) { try { bot.quit() } catch { /* already gone */ } }
+    if (owner) { try { owner.detachSession?.(session) } catch { /* noop */ } }
   }
 
   function over (kind, detail) {
@@ -3261,23 +3669,97 @@ function startSession (shared, onEnded) {
     try { text = detail && detail.message ? detail.message : reasonToText(detail) } catch { text = String(detail ?? '') }
     dispose(false)
     try { bot.removeAllListeners('end'); bot.end?.() } catch { /* already gone */ }
-    onEnded({ kind, text: String(text || '').slice(0, 200), spawned })
+    onEnded?.({ kind, text: String(text || '').slice(0, 200), spawned })
   }
 
-  bot.on('kicked', (reason) => over('kicked', reason))
-  bot.on('end', (reason) => over('end', reason))
-  bot.on('error', (err) => {
+  onBot('kicked', (reason) => over('kicked', reason))
+  onBot('end', (reason) => over('end', reason))
+  onBot('error', (err) => {
     // Before spawn a socket error IS the end of this attempt; afterwards the
     // 'end' event follows and carries the session down.
     if (!spawned) over('error', err)
     else logger.error(TAG, `socket error: ${err.message || err}`)
   })
 
-  // `internals` exists for the session test; nothing in the harness uses it.
-  return {
+  /**
+   * What the Host and the control interface need from a live session.
+   *
+   * `stopPhysical` is the pause: it releases every key and pathfinder goal,
+   * cancels the cancellable work and leaves the goals, memory and listeners
+   * exactly where they are. `onResumed` is the other half: it lets the world
+   * reconciliation that `resume` performed wake the model with the result.
+   */
+  const subsystems = {
+    cfg,
+    goals: goalReg,
+    jobs,
+    lanes,
+    places,
+    continuity,
+    memory,
+    parser,
+    checkRoute: (from, to) => checkRouteHome(from, to),
+    reconcileEngine: async () => ({ deaths: deathRecovery.deaths, lastRecovery: deathRecovery.lastRecovery }),
+    onConfigChange: (name, oldValue, value) => {
+      // A parameter that changes how the body behaves takes effect here, with no
+      // restart and no behavioural "mode" change.
+      if (name === 'boundary.enabled' && value === true) {
+        logger.info(TAG, `boundary on: ${config.get('boundary.dimension')} radius ${config.get('boundary.radius')} around ${config.get('boundary.centerX')},${config.get('boundary.centerZ')}`)
+      }
+      if (name === 'connection.autoReconnect') logger.info(TAG, `auto reconnect is now ${value ? 'on' : 'off'}`)
+    },
+    activity: () => activityText(),
+    stopGoal: (goalId) => stopGoalIfRunning(goalId),
+    verifyGoal: async (goalId) => {
+      const goal = goalReg.get(goalId)
+      if (!goal) return { state: 'invalid', note: `no goal ${goalId}` }
+      return reconcileGoal(goalReg.get(goalId))
+    },
+    onResumed: (info) => {
+      if (!systemsReady || ended) return
+      const detail = info?.reconciled
+      brain?.wake(`resumed by the operator${detail?.position ? ` at ${detail.position.x},${detail.position.y},${detail.position.z}` : ''}; the world was reconciled — check what is still valid before acting`, { external: true, important: true })
+    },
+    busy: () => Boolean(skills?.current() || task || combat?.isEngaged),
+    emergency: () => Boolean(system1?.fleeing)
+  }
+  const session = {
     dispose,
     resetContext,
     bot,
+    subsystems,
+    isSpawned: () => spawned,
+    /**
+     * The operator's pause. Cancellable work is interrupted, keys are released,
+     * nothing is deleted.
+     * @returns {string[]} what was interrupted
+     */
+    stopPhysical: () => {
+      const interrupted = []
+      if (combat?.isEngaged) { leaveFight('operator stop'); interrupted.push('fight') }
+      if (skills?.current()) { skills.cancel('paused by operator'); interrupted.push(`skill ${skills.current()?.label || ''}`.trim()) }
+      if (task) interrupted.push(`task ${task.label}`)
+      try { executor?.cancel() } catch { /* noop */ }
+      try { for (const job of jobs.active()) { jobs.cancel(job.id, 'paused by operator'); interrupted.push(`job ${job.id}`) } } catch { /* best effort */ }
+      try { arbiter.halt('paused by operator') } catch { /* noop */ }
+      try { lanes.dropWaiters('paused by operator') } catch { /* noop */ }
+      try { system1?.reset() } catch { /* noop */ }
+      try { brain?.clearContext({ preserveImportant: true }) } catch { /* noop */ }
+      // Goals stay on disk, suspended, with their checkpoints.
+      try { goalReg.suspendAll({ reason: 'paused by operator' }); goalReg.save({ force: true }) } catch { /* best effort */ }
+      agenda.main = null
+      return interrupted
+    },
+    /**
+     * Check a goal against the ACTUAL world/inventory. Used by the operator's
+     * `resume` and by death recovery: a goal whose work already happened is
+     * completed, never repeated.
+     */
+    verifyGoal: async (goalId) => {
+      const goal = goalReg.get(goalId)
+      if (!goal) return { state: 'invalid', note: `no goal ${goalId}` }
+      return reconcileGoal(goal)
+    },
     internals: () => ({
       arbiter, sense, wrapper, combat, system1, skills, brain, results, agenda,
       events: pipeline, latency, redstoneEngineer, redstoneLibrary: shared.redstoneLibrary,
@@ -3285,11 +3767,33 @@ function startSession (shared, onEnded) {
       lanes, jobs, laneOf: (tool) => laneOf(tool), LANES, footprintOf,
       // Goal orchestration surface (tests and the session's own monitor):
       startMain, resumeMain, finishGoal, runGoalOp, goalLines, goalTick,
-      reconcileRestored, reconcileGoal, verifyGoalAgainstWorld, staleActionReason
+      reconcileRestored, reconcileGoal, verifyGoalAgainstWorld, staleActionReason,
+      // Control surface (tests and the operator interface):
+      host: owner, config, boundary, physicalGuard, deathRecovery, subsystems,
+      stopPhysical: session.stopPhysical, command: handleChatCommand,
+      reconcileAfterRespawn, respawn: () => bot.emit('spawn'), kill: () => bot.emit('death')
     })
   }
+  // Register with the process-level host so `status`, `stop`, `config` and the
+  // chat command interface work against THIS session.
+  if (owner && typeof owner.attachSession === 'function') {
+    try { owner.attachSession(session) } catch (err) { logger.debug(TAG, `host attach: ${err?.message || err}`) }
+  }
+  return session
 }
 
 if (require.main === module) main()
 
-module.exports = { loadConfig, validateConfig, makeShared, startSession, decideReconnect, FATAL_KICK_RE, ATTACK_WHY, SYSTEM_PROMPT, CHAT_PROMPT }
+module.exports = {
+  loadConfig,
+  validateConfig,
+  makeShared,
+  startSession,
+  createHost,
+  fatalLines,
+  decideReconnect,
+  FATAL_KICK_RE,
+  ATTACK_WHY,
+  SYSTEM_PROMPT,
+  CHAT_PROMPT
+}

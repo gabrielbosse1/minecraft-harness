@@ -258,8 +258,15 @@ const conflicts = (a, b) => {
  * real overlap instead of trusting promise plumbing.
  */
 class LaneScheduler {
-  constructor ({ now = () => Date.now() } = {}) {
+  constructor ({ now = () => Date.now(), gate = null } = {}) {
     this.now = now
+    /**
+     * Optional shared enforcement gate: (resources) => null | reason.
+     * When set, no lease is granted while it refuses, so a paused body cannot
+     * start work by waiting for the lock to free up. Waiting requests are
+     * re-tried when the gate opens (see drainIfOpen).
+     */
+    this.gate = typeof gate === 'function' ? gate : null
     this.held = new Map() // exclusive resource -> { tool, holder, since }
     /**
      * Shared resources (readers). A reader key may be held by many holders at
@@ -295,6 +302,14 @@ class LaneScheduler {
     const resources = resourcesFor(tool, meta)
     const holder = `job-${this.nextId++}`
     const t = this.now()
+    // A closed gate (the body is paused, disconnected or out of quota) never
+    // queues: it resolves null at once, so a paused body cannot accumulate
+    // waiting work that all fires the instant the pause ends.
+    const gateRefusal = this.gate ? this.gate(resources, meta) : null
+    if (gateRefusal) {
+      this.events.push({ at: t, kind: 'refused', tool, holder, reason: String(gateRefusal).slice(0, 120), lane: laneOf(tool), goalId: meta.goalId || null })
+      return Promise.resolve(null)
+    }
     if (this.canGrant(resources)) {
       this._grant(resources, { tool, holder, meta, at: t })
       return Promise.resolve(this._lease(resources, holder, tool, t, 0))
@@ -311,6 +326,7 @@ class LaneScheduler {
    */
   tryAcquire (tool, meta = {}) {
     const resources = resourcesFor(tool, meta)
+    if (this.gate && this.gate(resources, meta)) return null
     if (!this.canGrant(resources)) return null
     const holder = `job-${this.nextId++}`
     const t = this.now()
@@ -371,6 +387,14 @@ class LaneScheduler {
     this._drain()
   }
 
+  /** Re-try every waiting request (called when a pause ends or a limit lifts). */
+  drainIfOpen () {
+    if (!this.waiters.length) return 0
+    const before = this.waiters.length
+    this._drain()
+    return before - this.waiters.length
+  }
+
   _drain () {
     // Scan queued requests and grant compatible ones; this is not strict FIFO.
     let progressed = true
@@ -378,6 +402,9 @@ class LaneScheduler {
       progressed = false
       for (let i = 0; i < this.waiters.length; i++) {
         const w = this.waiters[i]
+        // A waiter queued before the pause must not be granted while the gate
+        // is closed; a request that is refused outright is always safe.
+        if (this.gate && this.gate(w.resources, w.meta)) continue
         if (!this.canGrant(w.resources)) continue
         this.waiters.splice(i, 1)
         const t = this.now()

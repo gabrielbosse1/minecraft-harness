@@ -59,6 +59,16 @@ const EQUIP_SLOTS = { hand: 'hand', mainhand: 'hand', main: 'hand', offhand: 'of
 const TOOL_TIERS = { golden: 0, wooden: 0, stone: 1, copper: 1, iron: 2, diamond: 3, netherite: 4 }
 const TOOL_NAMES = ['wooden', 'stone', 'iron', 'diamond', 'netherite']
 /** Minimum pickaxe tier per ore-family block (soils/logs need none: -1). */
+/** Best-effort coordinates of a pathfinder goal, for the boundary check. */
+function targetOfGoal (goal) {
+  if (!goal) return null
+  const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : null)
+  const x = num(goal.x ?? goal.pos?.x ?? goal.block?.x ?? goal.entity?.position?.x)
+  const z = num(goal.z ?? goal.pos?.z ?? goal.block?.z ?? goal.entity?.position?.z)
+  if (x === null || z === null) return null
+  return { x, y: num(goal.y ?? goal.pos?.y ?? goal.block?.y ?? goal.entity?.position?.y), z }
+}
+
 const HARVEST_NEED = {
   coal_ore: 0, deepslate_coal_ore: 0,
   iron_ore: 1, deepslate_iron_ore: 1, copper_ore: 1, deepslate_copper_ore: 1, lapis_ore: 1, deepslate_lapis_ore: 1, nether_gold_ore: 0, nether_quartz_ore: 0,
@@ -120,8 +130,14 @@ class Skills {
    *   executor — BuilderExecutor (for shelter scaffolding); a thunk is fine to
    *   break the construction-order cycle.
    */
-  constructor (bot, { arbiter, places, logger = () => {}, whisper = null, moveTimeoutMs = 60_000, executor = null, choreTimeoutMs = 240_000, pathfinder = null } = {}) {
+  constructor (bot, { arbiter, places, logger = () => {}, whisper = null, moveTimeoutMs = 60_000, executor = null, choreTimeoutMs = 240_000, pathfinder = null, boundary = null } = {}) {
     this.bot = bot
+    /**
+     * Optional shared physical boundary. A walk whose capability the operator
+     * switched off (or a body that is paused) stops immediately instead of
+     * fighting the guard packet by packet.
+     */
+    this.boundary = boundary
     this.arbiter = arbiter
     this.lane = arbiter.lane('task', PRIORITY.task)
     this.places = places || new PlaceIndex()
@@ -215,6 +231,13 @@ class Skills {
   async _walk (token, goal, { dynamic = false, timeoutMs = this.moveTimeoutMs, done = null, retryNoPath = true } = {}) {
     const bot = this.bot
     const lane = this.lane
+    // A destination outside the permitted area is refused before a single key is
+    // pressed, whatever route got here.
+    if (this.boundary && goal) {
+      const target = targetOfGoal(goal)
+      const away = target ? this.boundary.destinationRefusal(target) : null
+      if (away) return { ok: false, why: away, interrupted: false }
+    }
     if (bot.pathfinder && Number.isFinite(bot.pathfinder.thinkTimeout)) {
       bot.pathfinder.thinkTimeout = Math.max(bot.pathfinder.thinkTimeout, 8000)
     }
@@ -234,6 +257,12 @@ class Skills {
         const now = Date.now()
         if (token.cancelled) return { ok: false, why: token.cancelled, interrupted }
         if (!bot.entity?.position) return { ok: false, why: 'no position', interrupted }
+        // The boundary is polled here so a pause (or a permission change) ends
+        // the walk within one tick, with the keys released by the finally block
+        // rather than left held.
+        if (this.boundary && !this.boundary.check('go_to', { caps: ['move'] }).ok) {
+          return { ok: false, why: 'the body stopped being allowed to move', interrupted }
+        }
         if (!lane.isTop) { interrupted = true; last = now; idleSince = 0; continue } // a reflex is driving
         budget -= now - last
         last = now

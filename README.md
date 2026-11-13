@@ -71,6 +71,38 @@ template uses. `zincai/config.json` holds defaults only. See
 [`zincai/README.md`](zincai/README.md#configuration-and-operation) for the full
 table.
 
+## Controlling a running bot
+
+No restart is needed to stop, pause, move or reconfigure the bot, and no
+behavioural "mode" exists — only parameters, permissions and limits.
+
+- **Console (PufferPanel):** type the command alone — `status`, `stop`,
+  `resume`, `leave`, `join`, `restart-connection`, `goals`, `jobs`,
+  `cancel <goal-id>`, `config show boundary`, `config set boundary.radius 48`,
+  `help`.
+- **In-game chat:** the same commands behind a prefix (`!zinc status`), answered
+  by whisper. Only the Minecraft **UUIDs** in `control.operators` (template
+  variable `operators`, `ZINC_OPERATORS`) may use it; anyone else is ignored
+  and logged without a hint that the interface exists.
+- `stop` pauses the body and suspends — never deletes — open goals; `resume`
+  reconciles the real world before handing work back; `leave` drops the link but
+  keeps the process, memory, goals and the interface alive; `join` reconnects
+  that same process once, without duplicate listeners or jobs.
+- Every limit (`boundary.*`, `actions.allow*`, `limits.*`, `communication.*`,
+  `connection.*`, `death.*`, `control.*`) is a typed, validated, persisted
+  parameter. `config show` lists the effective values and the defaults.
+- One enforcement boundary (`zincai/boundary.js`) sits in front of every
+  physical route — scheduler lanes, reflexes, the builder, tool dispatch, and
+  the Mineflayer primitives themselves — so no path can press a key, dig, place
+  or attack while the body is paused, disconnected, dead or outside the
+  permitted area. Reasoning, memory and (if allowed) chat keep working.
+- Death is not a crash: the body suspends its physical work, waits for the
+  respawn, inspects the real position/inventory and only then resumes what is
+  still valid. A route that is blocked or outside the permitted area is
+  reported, never retried forever.
+
+Details: [`zincai/README.md#operator-control-runtime-no-restart`](zincai/README.md#operator-control-runtime-no-restart).
+
 ## Behavior and safety
 
 - **Flee first.** The survival body recognizes hostile mobs that can see or
@@ -86,7 +118,9 @@ table.
 - **One owner for movement.** Survival, combat and task lanes arbitrate
   movement goals and keys (`survival > combat > task`), so concurrent behavior
   cannot leave controls held or cancel a more urgent flee.
-- **Vanilla-only operation.** No RCON, no console commands, no teleporting.
+- **Vanilla-only operation.** No RCON, no server console commands, no
+  teleporting. The operator interface is a chat prefix plus the panel's own
+  stdin — it needs no admin rights on the Minecraft server.
 - **Digging is the model's call.** Pathfinding never breaks blocks on its own:
   it opens doors, routes around, or reports no path. The model asks with the
   `dig` tool, optionally restricting which block ids it may break
@@ -115,7 +149,7 @@ vendor/            vendored Minecraft 26.3 data, installed by `npm ci`
 ## Checks and tests
 
 ```sh
-npm test              # 120 tests: mock bots + a scripted local model
+npm test              # 297 tests: mock bots + a scripted local model
 npm run check         # syntax-check every module
 npm run dry-run       # resolve config, print it, no network
 npm run ping          # server reachability/version, no join, no model call

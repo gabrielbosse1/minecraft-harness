@@ -33,6 +33,10 @@ class Lane {
     this.arbiter = arbiter
     this.name = name
     this.priority = priority
+    /** Set by the arbiter when a physical boundary gates this lane's writes. */
+    this.gate = null
+    /** Physical writes refused by the boundary since the last acquire/release. */
+    this.refused = 0
     this.active = false
     this.keys = {}
     this.goal = undefined // undefined = no opinion, null = "no goal", object = goal
@@ -95,6 +99,18 @@ class Lane {
     return this.isTop
   }
 
+  /**
+   * May this lane drive the body right now? The boundary is consulted HERE so
+   * that a pause, a permission or an area limit stops the keys and the
+   * pathfinder goal even for a lane that started before the change.
+   */
+  allowed (cap = 'move') {
+    if (!this.gate) return true
+    const verdict = this.gate(cap)
+    if (!verdict.ok) { this.refused++; return false }
+    return true
+  }
+
   /** Mirror of bot.clearControlStates() for this lane only. */
   clearControlStates () {
     for (const key of Object.keys(this.keys)) this.setControlState(key, false)
@@ -120,6 +136,8 @@ class Lane {
   setGoal (goal, dynamic = false) {
     this.goal = goal === undefined ? null : goal
     this.dynamic = Boolean(dynamic)
+    // Releasing a goal is always allowed; only DRIVING the body is gated.
+    if (this.goal !== null && !this.allowed('move')) return false
     if (this.active && this.isTop) {
       this.arbiter._applyGoal(this.goal, this.dynamic)
       this.arbiter._pressAll(this)
@@ -151,6 +169,7 @@ class ControlArbiter extends EventEmitter {
     if (existing) return existing
     const p = typeof priority === 'string' ? (PRIORITY[priority] ?? PRIORITY.task) : priority
     const lane = new Lane(this, name, p)
+    lane.gate = this.gate ? (cap) => this.gate(cap) : null
     this.lanes.set(name, lane)
     return lane
   }
@@ -200,6 +219,24 @@ class ControlArbiter extends EventEmitter {
     for (const key of KEYS) this._press(key, Boolean(top && top.keys[key]))
   }
 
+  /**
+   * Release everything a lane is pressing and hold it inactive — used by
+   * `stop` (the operator's pause) so no key and no pathfinder goal survives it.
+   * @returns {string[]} the names of the lanes that were released
+   */
+  halt (reason = 'paused') {
+    const released = []
+    for (const lane of this.lanes.values()) {
+      if (lane.active) { lane.release(reason); released.push(`${lane.name} lane released`) }
+      else { lane.keys = {}; lane.goal = undefined }
+    }
+    this._releaseEverything()
+    this._appliedGoal = undefined
+    this._handBusy = null
+    this.emit('halt', { reason, lanes: released })
+    return released
+  }
+
   /** Called on death/respawn: nobody owns anything any more. */
   reset (reason = 'reset') {
     for (const lane of this.lanes.values()) if (lane.active) lane.release(reason)
@@ -211,6 +248,18 @@ class ControlArbiter extends EventEmitter {
 
   _press (key, value) {
     try { this.bot.setControlState(key, Boolean(value)) } catch { /* bot gone / mock */ }
+  }
+
+  /**
+   * Install the shared physical gate. Every lane created afterwards inherits
+   * it, and existing lanes are updated too, so installing it late still covers
+   * the survival/combat/task lanes the session built earlier.
+   * @param {(cap:string) => { ok:boolean, why?:string }} gate
+   */
+  setGate (gate) {
+    this.gate = typeof gate === 'function' ? gate : null
+    for (const lane of this.lanes.values()) lane.gate = this.gate ? (cap) => this.gate(cap) : null
+    return this
   }
 
   _pressAll (lane) {
@@ -303,7 +352,8 @@ class ControlArbiter extends EventEmitter {
  * Pass-through "hands" for callers that run without an arbiter (harness A,
  * unit tests): same interface as a Lane, applied straight to the bot.
  */
-function directHands (bot) {
+function directHands (bot, gate = null) {
+  const allow = (cap) => (typeof gate === 'function' ? Boolean(gate(cap)?.ok) : true)
   return {
     name: 'direct',
     active: true,
@@ -315,7 +365,11 @@ function directHands (bot) {
       try { for (const key of KEYS) bot.setControlState(key, false) } catch { /* gone */ }
       return true
     },
-    setControlState (key, value) { try { bot.setControlState(key, Boolean(value)) } catch { /* gone */ } return true },
+    setControlState (key, value) {
+      if (value && !allow('move')) return false
+      try { bot.setControlState(key, Boolean(value)) } catch { /* gone */ }
+      return true
+    },
     clearControlStates () { try { for (const key of KEYS) bot.setControlState(key, false) } catch { /* gone */ } },
     pulse (key, ms = 150) {
       try {
@@ -325,7 +379,9 @@ function directHands (bot) {
       return true
     },
     setGoal (goal, dynamic = false) {
-      try { bot.pathfinder?.setGoal?.(goal === undefined ? null : goal, Boolean(dynamic)) } catch { /* pathfinder absent */ }
+      const next = goal === undefined ? null : goal
+      if (next !== null && !allow('move')) return false
+      try { bot.pathfinder?.setGoal?.(next, Boolean(dynamic)) } catch { /* pathfinder absent */ }
       return true
     }
   }

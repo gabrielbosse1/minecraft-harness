@@ -196,6 +196,30 @@
       "required": true,
       "userEdit": true
     },
+    "operators": {
+      "type": "string",
+      "value": "",
+      "display": "Operator UUIDs",
+      "desc": "Comma-separated Minecraft UUIDs allowed to control the bot (status/stop/resume/leave/join/config/goals/jobs/cancel). Usernames alone are never accepted: offline-mode names are not identity. Leave empty to disable chat commands and use the console instead.",
+      "required": false,
+      "userEdit": true
+    },
+    "commandprefix": {
+      "type": "string",
+      "value": "!zinc",
+      "display": "Command Prefix",
+      "desc": "Chat prefix for operator commands, for example \"!zinc status\". Console commands need no prefix.",
+      "required": true,
+      "userEdit": true
+    },
+    "joinonstart": {
+      "type": "boolean",
+      "value": true,
+      "display": "Join On Start",
+      "desc": "Join the server when the process starts. Off = the process comes up idle and waits for \"join\" on the console.",
+      "required": true,
+      "userEdit": true
+    },
     "log": {
       "type": "string",
       "value": "info",
@@ -295,6 +319,16 @@
       "order": 4
     },
     {
+      "display": "Operator Control",
+      "description": "Who may control the running bot, and how. Commands work in chat with the prefix, or on the console without it; none of them restart the process.",
+      "variables": [
+        "operators",
+        "commandprefix",
+        "joinonstart"
+      ],
+      "order": 5
+    },
+    {
       "display": "Installation",
       "description": "Where the bot comes from and which runtime it uses.",
       "variables": [
@@ -305,7 +339,7 @@
         "autostart",
         "autorecover"
       ],
-      "order": 5
+      "order": 6
     }
   ],
   "install": [
@@ -415,6 +449,9 @@
       "INFERENCE_HEARTBEAT_MS": "${heartbeat}",
       "RECONNECT": "${reconnect}",
       "RECONNECT_MAX_ATTEMPTS": "${maxattempts}",
+      "ZINC_OPERATORS": "${operators}",
+      "ZINC_COMMAND_PREFIX": "${commandprefix}",
+      "ZINC_JOIN_ON_START": "${joinonstart}",
       "ZINC_DATA_DIR": "${datadir}",
       "LOG_LEVEL": "${log}"
     },

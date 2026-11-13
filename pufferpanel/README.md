@@ -24,7 +24,8 @@ instead. Restart PufferPanel so it loads the template.
 ## 2. Create the server
 
 Pick **Minecraft Agent (ZincAI)** on the create-server page. The variables are
-grouped as Endpoint, Minecraft Server, Behaviour, Limits and Installation.
+grouped as Endpoint, Minecraft Server, Behaviour, Limits, Operator Control and
+Installation.
 
 | Variable | Environment | Default | Notes |
 | --- | --- | --- | --- |
@@ -45,6 +46,9 @@ grouped as Endpoint, Minecraft Server, Behaviour, Limits and Installation.
 | `heartbeat` | `INFERENCE_HEARTBEAT_MS` | `90000` | Self-prompt when idle; `0` disables. |
 | `reconnect` | `RECONNECT` | `true` | Retry a dropped link after a spawn. |
 | `maxattempts` | `RECONNECT_MAX_ATTEMPTS` | `40` | Retry cap before the process exits. |
+| `operators` | `ZINC_OPERATORS` | *(empty)* | Comma-separated Minecraft **UUIDs** allowed to control the bot over chat. Empty closes the chat interface; the console still works. Usernames are not identity. |
+| `commandprefix` | `ZINC_COMMAND_PREFIX` | `!zinc` | Chat prefix for operator commands. |
+| `joinonstart` | `ZINC_JOIN_ON_START` | `true` | Off = the process starts without joining and waits for `join` on the console. |
 | `log` | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. |
 | `datadir` | `ZINC_DATA_DIR` | `data` | Relative to the server folder, so backups include it. |
 | `repo`, `branch`, `nodeversion` | — | this repo / `main` / `22` | Installation only. |
@@ -91,6 +95,33 @@ Every start:
 
 Stop sends `SIGINT` (`stopCode: 2`), which is the bot's graceful shutdown: it
 saves memory and places, quits the bot and prints a session summary.
+
+### Controlling the bot without restarting it
+
+The **Console** tab is the operator interface: type a command on its own and
+press enter. Nothing restarts the process, and none of it needs admin rights on
+the Minecraft server.
+
+```
+status                      connection, life, activity, goals, jobs, limits
+stop                        pause the body; suspend (never delete) open goals
+resume                      reconcile the world, then resume what is still valid
+leave                       disconnect; keep the process, goals and this console
+join                        reconnect this process to the server
+restart-connection          rebuild the link without a new process
+goals / jobs                what is running, what is waiting
+cancel g7                   cancel one goal and its jobs
+config show boundary        every boundary limit, with defaults
+config set boundary.radius 48
+config set operators <uuid>,<uuid>
+help
+```
+
+The same commands work in Minecraft chat behind the prefix (`!zinc status`) for
+the UUIDs listed in `operators`; the answer arrives by whisper. Config changes
+are written to `datadir/runtime-config.json` and survive a reinstall or a
+restart. A change that cannot take effect mid-action says so and is applied at
+the next safe boundary.
 
 ## 4. Verifying a deployment
 

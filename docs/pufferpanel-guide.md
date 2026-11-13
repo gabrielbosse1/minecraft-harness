@@ -263,4 +263,5 @@ the next start.
 | Bot can't join | Wrong `host`/`port`, server not in offline mode, or `ZincAI` not whitelisted. |
 | `!zinc status` in chat is ignored | `operators` is empty, or your UUID is wrong — check the `control:` line and `config show control`. |
 | Console commands do nothing | The process isn't running (a stopped server has no stdin). |
-| Bot stops as soon as it starts | `autorestart` is `false` and the process exited; check for a fatal first-join message. |
+| Bot stops as soon as it starts | `autorestart` is `false` (that flag means "restart after a *clean* exit") and the process exited; check the console for a fatal first-join message. `autorecover` handles crashes. |
+| **No template listed at all** | The panel could not decode the JSON and skipped the file silently. Run `node pufferpanel/doctor.js` — a `decoder:` line other than `OK` names the field. See [the README](../pufferpanel/README.md#it-does-not-show-up-at-all-nothing-listed-no-error). |

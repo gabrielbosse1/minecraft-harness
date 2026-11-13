@@ -301,3 +301,122 @@ test('import.js: --print emits the named JSON the web UI needs', () => {
 test('import.js: the committed template validates with no errors', () => {
   assert.deepEqual(validate(template), [])
 })
+
+// ---------------------------------------------------------------------------
+// The decoder, not just the conditions.
+//
+// services/templates.go GetAllFromRepo -> readTemplateFromDisk decodes the
+// file into pufferpanel.Server (a Go struct) and, on any error, logs and
+// `continue`s. The template is then not merely incompatible: it is absent.
+// That is what happened with:
+//
+//     "run": { "autostart": "${autostart}", "autorecover": "${autorecover}" }
+//
+// Execution.Autostart is a Go bool, encoding/json cannot unmarshal a string
+// into it, and the panel listed nothing at all. These tests keep that from
+// coming back, and keep the doctor/import checks honest about catching it.
+// ---------------------------------------------------------------------------
+
+test('template: run.autostart/autorecover/autorestart are real booleans, not tokens', () => {
+  // A Go bool field. A "${var}" string here makes the panel drop the template.
+  for (const key of ['autostart', 'autorecover', 'autorestart']) {
+    if (template.run[key] === undefined) continue
+    assert.equal(typeof template.run[key], 'boolean', `run.${key} must be a JSON boolean`)
+  }
+  assert.equal(typeof template.run.stopCode, 'number', 'stopCode is a Go int')
+})
+
+test('template: no variable shadows a panel-owned server flag', () => {
+  // run.autostart / run.autorecover are template-level booleans that the panel
+  // copies onto each server; there is no way for a ${token} to reach them.
+  // Exposing them as variables therefore could never work, so they must not
+  // exist — and must not be referenced from a group either.
+  for (const key of ['autostart', 'autorecover', 'autorestart']) {
+    assert.equal(template.data[key], undefined, `data.${key} cannot be forwarded to run.${key} (Go bool)`)
+  }
+  for (const group of template.groups || []) {
+    for (const key of ['autostart', 'autorecover', 'autorestart']) {
+      assert.ok(!group.variables.includes(key), `group "${group.display}" references data.${key}, which does not exist`)
+    }
+  }
+})
+
+test('template: every group variable exists, and every user-visible variable is grouped', () => {
+  const declared = new Set(Object.keys(template.data))
+  const grouped = new Set()
+  for (const group of template.groups || []) {
+    for (const name of group.variables) {
+      assert.ok(declared.has(name), `group "${group.display}" lists "${name}", which is not in data`)
+      grouped.add(name)
+    }
+  }
+  for (const [name, variable] of Object.entries(template.data)) {
+    // ui/Variables.vue filters `internal` variables out of the settings page, so
+    // an internal variable without a group is intentional (`entrypoint` is only
+    // read by the install/run commands). A non-internal one would be invisible
+    // to the operator for no reason.
+    if (variable.internal) continue
+    assert.ok(grouped.has(name), `data.${name} belongs to no group, so the create-server page will not show it`)
+  }
+})
+
+test('template: the panel\'s decoder accepts it (doctor.decodeErrors)', () => {
+  const { decodeErrors, SERVER_FIELDS, EXECUTION_FIELDS } = require('../pufferpanel/doctor')
+  assert.deepEqual(decodeErrors(template), [])
+  // The mirror must stay in step with pufferpanel.Server / Execution, or it
+  // would happily pass a template the panel silently drops.
+  assert.equal(SERVER_FIELDS.run, 'object')
+  assert.equal(EXECUTION_FIELDS.autostart, 'boolean')
+  assert.equal(EXECUTION_FIELDS.autorecover, 'boolean')
+  assert.equal(EXECUTION_FIELDS.stopCode, 'integer')
+})
+
+test('doctor: names the decoder failure instead of blaming the environment', () => {
+  const script = path.join(__dirname, '..', 'pufferpanel', 'doctor.js')
+  // Every compatibility predicate passes, so the old doctor said "OK" here.
+  const broken = JSON.stringify({ ...template, run: { ...template.run, autostart: '${autostart}', autorecover: '${autorecover}' } })
+  let out = ''
+  let code = 0
+  try {
+    out = execFileSync(process.execPath, [script, '--json', broken, '--env', 'host', '--os', 'linux', '--arch', 'arm64'], { encoding: 'utf8' })
+  } catch (err) {
+    code = err.status
+    out = String(err.stdout)
+  }
+  assert.equal(code, 1, 'an undecodable template must fail, not report ready')
+  assert.match(out, /environment: OK/)
+  assert.match(out, /decoder:\s+WOULD BE DROPPED/)
+  assert.match(out, /run\.autostart is string .* declares boolean/)
+  assert.doesNotMatch(out, /will be offered for that node/)
+})
+
+test('doctor: --scan flags a template the panel would silently drop', () => {
+  const script = path.join(__dirname, '..', 'pufferpanel', 'doctor.js')
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'repo-decode-'))
+  fs.mkdirSync(path.join(tmp, 'agent'))
+  fs.writeFileSync(path.join(tmp, 'agent', 'agent.json'),
+    JSON.stringify({ type: 'minecraft-java', display: 'x', run: { command: 'node x.js', autostart: '${autostart}' }, environment: { type: 'host' }, supportedEnvironments: [{ type: 'host' }] }))
+  let code = 0
+  let out = ''
+  try {
+    execFileSync(process.execPath, [script, '--scan', tmp], { encoding: 'utf8' })
+  } catch (err) {
+    code = err.status
+    out = String(err.stdout)
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+  assert.equal(code, 1, 'a dropped template must fail the scan')
+  assert.match(out, /DROPPED/)
+  assert.match(out, /silently dropped/)
+})
+
+test('import.js: refuses the token-in-a-bool that made the template vanish', () => {
+  const broken = JSON.parse(JSON.stringify(template))
+  broken.run.autostart = '${autostart}'
+  const errors = validate(broken)
+  assert.ok(errors.some((e) => /run\.autostart is string .* declares boolean/.test(e)),
+    `expected a bool-shape error, got: ${JSON.stringify(errors)}`)
+  // And the real template is still clean.
+  assert.deepEqual(validate(template), [])
+})

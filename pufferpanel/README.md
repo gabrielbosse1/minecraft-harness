@@ -119,6 +119,48 @@ If the panel *still* greys the template out:
 | `requirements.arch` / `requirements.os` in a **forked** copy | Those are single strings; `arch` cannot list both `x64` and `arm64`, so leave them out. |
 | Node too old / wrong arch | Nothing here is architecture-specific; on a host node `nodejsdl` downloads `linux/arm64` (or `armv7l`) by itself. |
 
+### It does not show up at all (nothing listed, no error)
+
+A template the panel cannot **decode** is not greyed out — it is absent. The
+scanner opens each JSON with `json.NewDecoder(file).Decode(&Template)` and, if
+that returns an error, logs it and `continue`s (`services/templates.go`), so the
+row simply never exists. The browser then shows an empty list, which looks like
+a broken panel rather than a broken template.
+
+The decoder is strict about the JSON type of every field, and several fields in
+`run` are Go scalars rather than strings:
+
+| Field | Go type | So |
+| --- | --- | --- |
+| `run.autostart` | `bool` | `true` / `false` only |
+| `run.autorecover` | `bool` | `true` / `false` only |
+| `run.autorestart` | `bool` | `true` / `false` only |
+| `run.stopCode` | `int` | a number, never `"2"` |
+| `run.stop`, `run.workingDirectory` | `string` | strings |
+
+A `"${autostart}"` token in `run.autostart` is a **string**, so `Decode` fails
+and the whole template disappears. That was a real bug in this template, and it
+is why it is now gone:
+
+- `run.autostart` and `run.autorecover` are literal `true`.
+- The `autostart` / `autorecover` **variables are gone**. There was never a way
+  to forward them: the panel assigns those booleans per server, from the
+  **Edit → flags** endpoint (`GET`/`POST /api/servers/{id}/flags`), not from a
+  template variable. A variable by that name could only ever have been a
+  string in a bool field.
+
+Both checks in this repository now catch the class of bug:
+
+```sh
+node pufferpanel/import.js            # structural + Go-type validation
+node pufferpanel/doctor.js            # adds the `decoder:` line
+node pufferpanel/doctor.js --scan .   # DROPPED = the panel would skip the file
+```
+
+Install-time behaviour is unchanged and still controlled per server:
+`autorecover: true` is what makes the panel restart the process after an
+unexpected exit (up to `daemon.data.crashLimit`, default 3).
+
 ### It shows up with no name (and stays "incompatible" forever)
 
 PufferPanel does **not** look for "the template" in your repo. It scans *every*
@@ -159,14 +201,26 @@ PUFFER_URL=http://127.0.0.1:8080 PUFFER_USER=admin PUFFER_PASS=... \
   node pufferpanel/doctor.js --refresh
 ```
 
-It deletes and re-adds each git template repository over the panel's own API
-(`DELETE`/`POST /api/templates`), which wipes `<data>/cache/template-repos/<id>`
-and forces a fresh clone, then prints what the panel now lists — flagging any
-entry with **no display name**. Over SSH on the Pi the equivalent is:
+`PUFFER_USER` is the account **email** (that is what `POST /auth/login` takes);
+`PUFFER_PASS` is its password. It logs in the same way the browser does, then
+deletes and re-adds each git template repository over the panel's own API
+(`DELETE`/`POST /api/templates`). The new row gets a new id, so the panel has no
+cached clone to reuse and the next listing clones from scratch. It then prints
+what the panel really lists and checks each entry the same way the server does
+(missing display name, or a JSON type the decoder rejects). Exit code is
+non-zero if anything is still broken.
+
+Over SSH on the node the equivalent is to delete the clone directory and reload
+the page — but note the location is a **config value**, not a fixed path:
 
 ```sh
-sudo rm -rf /var/lib/pufferpanel/cache/template-repos/*   # then reload the page
+# the cache root is `daemon.data.cache` (default: <data folder>/cache)
+sudo ls -d /var/lib/pufferpanel/cache/template-repos/*   # then remove the ones to refresh
 ```
+
+If you are not sure where the panel keeps its data, check the `dataFolder` /
+`daemon.data.cache` settings in the panel's config rather than assuming
+`/var/lib/pufferpanel`.
 
 Two things to check first, because they account for most of these:
 
@@ -208,7 +262,7 @@ Minecraft Server, Behaviour, Limits, Operator Control and Installation.
 | `log` | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. |
 | `datadir` | `ZINC_DATA_DIR` | `data` | Relative to the server folder, so backups include it. |
 | `repo`, `branch`, `nodeversion` | — | this repo / `main` / `22` | Installation only. |
-| `autostart`, `autorecover` | — | `true` | Panel behaviour. |
+| ~~`autostart`, `autorecover`~~ | — | — | **Removed.** The panel owns these two flags per server; see [It does not show up at all](#it-does-not-show-up-at-all-nothing-listed-no-error). |
 
 Nothing else is needed: no `.env`, no file to edit, no command to type. The
 template passes the values in `run.environmentVars` and the bot reads them

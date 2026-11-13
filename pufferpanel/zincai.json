@@ -253,22 +253,6 @@
       "desc": "Where memories, places, goals and metrics live. Relative to the server directory, so it is included in a normal backup.",
       "required": true,
       "userEdit": false
-    },
-    "autostart": {
-      "type": "boolean",
-      "value": true,
-      "display": "Start With Node",
-      "desc": "Start the bot automatically when the node boots.",
-      "required": true,
-      "userEdit": false
-    },
-    "autorecover": {
-      "type": "boolean",
-      "value": true,
-      "display": "Recover From Crash",
-      "desc": "Restart the process if it crashes unexpectedly.",
-      "required": true,
-      "userEdit": false
     }
   },
   "groups": [
@@ -335,9 +319,7 @@
         "repo",
         "branch",
         "nodeversion",
-        "datadir",
-        "autostart",
-        "autorecover"
+        "datadir"
       ],
       "order": 6
     }
@@ -455,8 +437,8 @@
       "ZINC_DATA_DIR": "${datadir}",
       "LOG_LEVEL": "${log}"
     },
-    "autostart": "${autostart}",
-    "autorecover": "${autorecover}",
+    "autostart": true,
+    "autorecover": true,
     "autorestart": false
   },
   "environment": {

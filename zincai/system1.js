@@ -162,6 +162,13 @@ class System1 {
     this.hands = this.arbiter.lane('survival', PRIORITY.survival)
     this.buoyancy = this.arbiter.lane('buoyancy', PRIORITY.idle)
     this.sense = opts.sense || new ThreatSense(bot, { now: this.now })
+    /**
+     * Optional shared physical boundary (boundary.js). The reflex layer writes
+     * through the arbiter and the guarded bot, so its keys and its equips are
+     * checked like everything else; it reads the boundary only to report WHY it
+     * could not act (a paused body does not move).
+     */
+    this.boundary = opts.boundary || null
     this.eatBelowFood = opts.eatBelowFood ?? 18
     this.lowHealth = opts.lowHealth ?? 10
     this.fleeBelowHealth = opts.fleeBelowHealth ?? 6

@@ -314,6 +314,186 @@ route keep the strict no-dig geometry. Doors, gates and trapdoors are never
 breakable in any window, and a route never carves into liquid or mines what
 holds up gravel or a mob.
 
+## Operator control (runtime, no restart)
+
+Zinc keeps its identity, its goals and its own decisions; what an operator gets
+is a **control plane**, not a personality. Nothing here kills the Node.js
+process, restarts the bot, or switches it into a different "mode" — there is no
+autonomous/safe/building/restricted switch anywhere in this code. There are
+parameters, permissions and limits, each of which can be read and changed while
+the bot is running.
+
+### Commands
+
+Two entry points, one implementation (`zincai/host.js`, described by
+`zincai/control_commands.js`):
+
+- **console / stdin** — the PufferPanel console. A command is typed on its own:
+  `status`, `stop`, `config show boundary`.
+- **chat** — `<prefix> <command>`, `!zinc status` by default. The prefix comes
+  from `control.prefix` (`ZINC_COMMAND_PREFIX`).
+
+The answer is always **whispered to the operator** (or printed on the console).
+A refused command produces no public chat line; the reason is logged without
+revealing internals. `control.announce = true` optionally makes a refusal
+visible in public chat ("I'm not allowed to take that from you"), which is a
+social choice, not an information leak.
+
+| Command | What it does |
+| --- | --- |
+| `status` | connection state, life, pause, activity, open goals, running jobs, effective limits |
+| `stop` | pause the body now: no new physical action, cancellable work interrupted, open goals **suspended — never deleted**, memory/identity/process untouched |
+| `resume` | inspect the real world and inventory first, then hand back only the goals that still make sense |
+| `leave` | disconnect Mineflayer; the process, memory, goals, reasoning and this interface stay up |
+| `join` | reconnect the existing process to the configured server |
+| `restart-connection` | drop and rebuild the link without a new process |
+| `goals` | open, suspended, waiting and completed objectives |
+| `jobs` | background jobs, their resources and cancellation state |
+| `cancel <goal-id>` | cancel exactly one goal and the jobs that belong to it |
+| `config` | `config show [group\|name]`, `config set <name> <value>`, `config reset <name>` |
+| `help` | the list above, with the current authorisation status |
+
+`stop` and `leave` are different on purpose: a paused bot is still standing in
+the world and can still talk; a bot that has left is not in the world at all.
+Both keep the goal registry on disk and the scheduler alive.
+
+### Authorisation
+
+Only the Minecraft **UUIDs** listed in `control.operators` may run a command.
+Usernames are never accepted as identity, because on an offline-mode server a
+name is not an identity at all. `control.operatorNames` exists so the log and
+`status` can say *who* acted, but it never grants authority.
+
+- No UUID configured → the chat interface is closed (console still works).
+- A command from anyone else → logged as `ignored command from <name>`, no
+  reply, no hint that a command interface exists.
+- `control.allowConsole` (default on) is the console path; turn it off if the
+  panel console is shared with people who should not steer the body.
+
+Both paths are audited in the log with the command, the actor and the outcome
+(`control.auditLog`).
+
+### Parameters
+
+Every limit is a named, typed, persisted parameter in
+`<datadir>/runtime-config.json` (`zincai/runtime_config.js`). They are inspected
+and changed with the generic `config` command — there is no per-setting command
+to remember, and `config show` lists defaults and effective values together.
+
+| Parameter | Type | Default | Applies |
+| --- | --- | --- | --- |
+| `boundary.enabled` | boolean | false | immediate |
+| `boundary.centerX` / `centerZ` | integer | 0 / 0 | immediate |
+| `boundary.radius` | integer | 256 | immediate |
+| `boundary.dimension` | string | overworld | immediate |
+| `boundary.homeX` / `homeY` / `homeZ` | integer | 0 / 64 / 0 | immediate |
+| `boundary.homeDimension` | string | overworld | immediate |
+| `boundary.returnHomeOnDeath` | boolean | false | immediate |
+| `boundary.blockOutside` | boolean | true | immediate |
+| `actions.allowMovement` | boolean | true | immediate |
+| `actions.allowDig` | boolean | true | immediate |
+| `actions.allowPlace` | boolean | true | immediate |
+| `actions.allowAttack` | boolean | true | immediate |
+| `actions.allowContainers` | boolean | true | immediate |
+| `actions.allowUse` | boolean | true | immediate |
+| `actions.allowEquip` | boolean | true | immediate |
+| `actions.allowEat` | boolean | true | immediate |
+| `actions.allowToss` | boolean | true | immediate |
+| `actions.allowCraft` | boolean | true | immediate |
+| `actions.allowScripts` | boolean | true | immediate |
+| `limits.maxConcurrentJobs` | integer | 4 | next safe boundary |
+| `limits.maxPhysicalActionsPerMinute` | integer | 240 | immediate |
+| `limits.maxPublicChatPerMinute` | integer | 12 | immediate |
+| `limits.maxGoalRuntimeMinutes` | integer | 0 (off) | immediate |
+| `communication.publicChat` | boolean | true | immediate |
+| `communication.privateMessages` | boolean | true | immediate |
+| `communication.replyToChat` | boolean | true | immediate |
+| `connection.joinOnStart` | boolean | true | immediate |
+| `connection.autoReconnect` | boolean | true | immediate |
+| `connection.retryDelayMs` / `minRetryDelayMs` / `maxRetryDelayMs` | integer | 5000 / 5000 / 120000 | immediate |
+| `connection.maxRetries` | integer | 40 | immediate |
+| `death.autoRespawn` | boolean | true | immediate |
+| `death.respawnDelayMs` | integer | 1500 | immediate |
+| `control.prefix` | string | `!zinc` | immediate |
+| `control.operators` | uuid list | *(empty)* | immediate |
+| `control.operatorNames` | name list | *(empty)* | immediate |
+| `control.allowConsole` | boolean | true | immediate |
+| `control.announce` | boolean | false | immediate |
+| `control.auditLog` | boolean | true | immediate |
+
+`config set` validates the type and range, rejects unknown names, prints the old
+and new value, and writes the file atomically, so a restart (or a `leave` /
+`join` cycle) keeps the change. A parameter that cannot take effect mid-action
+(`limits.maxConcurrentJobs`) reports **"will be applied at the next safe
+boundary — NOT yet in force"** and is applied when the body goes idle; it is
+never silently dropped, and it never changes the bot's identity.
+
+The communication switches are permissions, not opinions: `communication.publicChat
+= false` stops a line from leaving, and says so to the model, but it does not
+tell Zinc whom to like, trust or cooperate with.
+
+### One enforcement boundary
+
+`zincai/boundary.js` is the single place a physical action is authorised, and
+every route asks it:
+
+- `zincai/lanes.js` — a BODY lane lease is refused before it starts;
+- `ControlArbiter` — every key and pathfinder goal write passes a gate;
+- `Skills` (walk, dig, build, gather, combat helpers) — before the act;
+- `BuilderExecutor` — between blocks, so a stop lands mid-build;
+- the executor's tool dispatch — before a tool body runs;
+- **`installPhysicalGuard`** — at the wire: `setControlState`, `dig`,
+  `placeBlock`, `attack`, `useItem`, `activateBlock`, `toss`, `equip`, the
+  pathfinder and the chat/whisper calls are wrapped on the bot object itself,
+  so even a module that bypasses the scheduler cannot press a key while the
+  body is paused, disconnected, dead or outside its permissions. Key
+  *releases* are always allowed, so nothing is left held.
+
+The order of a decision is: pause / connection / death → the per-capability
+parameter → the permitted area (body and, for a walk or a build, the
+destination) → the sliding action rate limit. Reads and reasoning (`inspect_block`,
+`inspect_region`, `find`, `redstone_scan`, `logic_test`, `recall`, `social`,
+`goal`, `idle`) are never blocked by any of it: a paused bot may keep thinking,
+planning and — if the operator allows it — talking.
+
+A refusal is not silent *to the model*: the action prompt carries a one-line
+`body:` field (`PAUSED by the operator`, `not connected`, `refused:
+actions.allowDig is off`), so the model re-plans instead of retrying blind.
+
+### Connection lifecycle
+
+`zincai/connection.js` is a small state machine: `DISCONNECTED`, `CONNECTING`,
+`CONNECTED`, `RECONNECTING`, `DISCONNECTING`, `ERROR`. The process outlives the
+link: while disconnected there are no physical actions, no fabricated events,
+and no stale world snapshot presented as current — reasoning and the control
+interface keep working, and goals stay on disk. On reconnect the manager
+verifies the connection, hands the session ONE set of listeners (a disposed
+session takes its listeners off its own bot with it), inspects the real state,
+reconciles position/health/inventory/dimension, and only then lets work resume.
+Retries are bounded: a rejected first join is fatal, a dropped link is retried
+with backoff between `connection.minRetryDelayMs` and
+`connection.maxRetryDelayMs`, at most `connection.maxRetries` times. Hooks are
+epoch-guarded, so a late callback from an old session can never act on a new one.
+
+### Death and respawn
+
+A death is not a failure of the process. `zincai/death_recovery.js` records what
+was lost, suspends the physical work, waits out `death.respawnDelayMs`, and then
+**inspects** the respawn: real coordinates, real dimension, real inventory. If
+`boundary.returnHomeOnDeath` is on and the home is reachable inside the
+permitted area, the body walks back; if the home is in another dimension, or
+outside the permitted area, or the route is blocked, it **reports** — it never
+repeats an impossible walk.
+
+### Tests
+
+`test/control-runtime.test.js` covers the whole surface against the real
+session: pause/resume, stop mid-walk, stop mid-build, stop during a background
+job, disconnect with a goal open, reconnect without a new process, reconnect
+without duplicate listeners, death → respawn → recovery, config persistence
+across a restart, a config change while a goal runs, a targeted `cancel`, and a
+stale world (an action planned before a change is refused with the reason).
+
 ## Configuration and operation
 
 [`config.json`](config.json) holds **defaults only**. Everything it contains is
@@ -336,6 +516,9 @@ no dotenv; nothing is read from a file the panel does not control.
 | `BOT_LANGUAGE` | Reply-language check (`pt-BR`, `en`, `es`, `fr`, `de`; empty = off). |
 | `INFERENCE_RPM`, `INFERENCE_MIN_INTERVAL_MS`, `INFERENCE_HEARTBEAT_MS` | Call budget, spacing and self-prompt. |
 | `RECONNECT`, `RECONNECT_MAX_ATTEMPTS` | Post-spawn reconnection behaviour. |
+| `ZINC_OPERATORS` | Comma-separated operator UUIDs (`control.operators`). Empty closes the chat command interface. |
+| `ZINC_COMMAND_PREFIX` | Chat prefix for operator commands (`control.prefix`, default `!zinc`). |
+| `ZINC_JOIN_ON_START` | Join the server when the process starts (`connection.joinOnStart`); `false` waits for `join`. |
 | `ZINC_DATA_DIR` | Writable data directory (relative to the server folder in the template). |
 | `LOG_LEVEL` | `debug`, `info`, `warn` or `error`. |
 
@@ -388,20 +571,24 @@ npm run check
 
 The suite uses mock bots and scripted model responses — no engine, no account,
 no network. `test/session.test.js` drives whole sessions through the real
-dispatcher, `test/zincai.test.js` covers perception/memory/tools, and
+dispatcher, `test/zincai.test.js` covers perception/memory/tools,
+`test/control-runtime.test.js` drives the operator interface, the boundary, the
+connection state machine and death recovery against a live session, and
 `test/settings.test.js` proves the template-to-environment wiring documented
 above.
 
 ## Known limits / unverified assumptions
 
 - Use only a supervised disposable world with enforced server-side boundaries.
-  In a synthetic session, an equip already in progress allowed build/shelter to
-  invoke placement after `stop`; shelter also attempted cleanup. Other actions
-  may cross awaited operations. A stop response is not proof all mutations have
-  ceased, and direct gathering cannot distinguish natural resources from the
-  same blocks in a structure. This does not require tracking an owner for every
-  item or block; use appropriate world/region safeguards for tests. No live
-  mutation was tested.
+  The pause is enforced at the scheduler, at every skill, inside the builder
+  loop and at the Mineflayer primitives, and a synthetic session confirms that a
+  stop mid-walk, mid-build and mid-job all land — but a single primitive already
+  on the wire cannot be recalled. A stop response means "nothing new starts and
+  everything held is released", not "every mutation has already ceased".
+  Shelter cleanup and an equip already in progress are the two places where a
+  step can still complete after the pause. Direct gathering cannot distinguish
+  natural resources from the same blocks in a structure. No live mutation was
+  tested.
 - Neither the AMD live endpoint nor `tool_choice: "required"` has been tested
   from this environment. Its fallback to `"auto"` is implemented, not an
   assertion that AMD accepts either payload.

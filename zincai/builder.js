@@ -253,6 +253,18 @@ class BuilderExecutor {
     this.cancelRequested = false
     this.placedScaffolds = [] // { pos, name } — only blocks WE placed via pillar towers
     this._trackedKeys = new Set() // dedupe re-placements of the same cell
+    /**
+     * Optional shared physical boundary (boundary.js). The builder asks once
+     * per build, and stops cleanly when the answer is "no" — a pause must not
+     * leave half a wall standing while the loop keeps trying.
+     */
+    this.boundary = opts.boundary || null
+  }
+
+  /** May this build continue? Called between steps, so a pause is noticed fast. */
+  mayBuild () {
+    if (!this.boundary) return true
+    return this.boundary.check('build', { caps: ['move', 'place'] }).ok
   }
 
   cancel () { this.cancelRequested = true }
@@ -480,9 +492,18 @@ class BuilderExecutor {
    */
   async build (plan, { stage = null, onProgress = null, allowScaffold = true } = {}) {
     this.cancelRequested = false
+    // One check for the whole build, so a build started while permitted is not
+    // chopped into pieces by a per-block check; the loop re-checks mayBuild()
+    // so a pause mid-build stops at the next block instead of running to the end.
+    if (this.boundary) {
+      const verdict = this.boundary.check('build', { caps: ['move', 'place'] })
+      if (!verdict.ok) return { ok: false, reason: 'refused', why: verdict.why, placed: 0, alreadyPresent: 0, skipped: [], missing: [], towerUsed: 0, stage }
+    }
     this.hands?.acquire?.({ reason: 'building' })
     try {
-      return await this._build(plan, { stage, onProgress, allowScaffold })
+      const out = await this._build(plan, { stage, onProgress, allowScaffold })
+      if (out?.reason === 'cancelled' && !this.cancelRequested) out.why = 'the body stopped being allowed to build'
+      return out
     } finally {
       this.hands?.setGoal?.(null)
     }
@@ -509,6 +530,9 @@ class BuilderExecutor {
     for (const step of steps) {
       await this._waitForHands()
       if (this.cancelRequested) return { ok: false, reason: 'cancelled', placed, alreadyPresent, skipped, missing: [], towerUsed, stage: wanted }
+      // Paused / disconnected / forbidden: stop BETWEEN blocks, never halfway
+      // through a placement, so the world is left consistent.
+      if (!this.mayBuild()) { this.cancelRequested = true; return { ok: false, reason: 'cancelled', placed, alreadyPresent, skipped, missing: [], towerUsed, stage: wanted } }
       const target = new (require('vec3').Vec3)(step.x, step.y, step.z)
       // Idempotency & fixture safety: never overwrite existing chests/beds/doors/redstone.
       try {

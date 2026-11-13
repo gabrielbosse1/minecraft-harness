@@ -193,7 +193,7 @@ function addPlayer (bot, id, username, x, z, held = null) {
  *   tool call). chat: `(prompt) => ({ text, task })`. Arrays are also accepted
  *   and consumed in order.
  */
-function startTestSession ({ chat = [], actions = [], bot = simulatedBot(), cfg: tweak = null, dataDir: sharedDir = null } = {}) {
+function startTestSession ({ chat = [], actions = [], bot = simulatedBot(), cfg: tweak = null, dataDir: sharedDir = null, host: wantHost = false } = {}) {
   // A test that simulates a restart passes the same dataDir in for both
   // sessions (and keeps it); otherwise each session gets its own temp dir.
   const ownDir = !sharedDir
@@ -240,8 +240,13 @@ function startTestSession ({ chat = [], actions = [], bot = simulatedBot(), cfg:
   cfg.reconnect = { enabled: false }
   if (tweak) tweak(cfg)
   const shared = index.makeShared(cfg, { dataDir })
+  // The process-level Host, exactly as main() builds it: the operator interface,
+  // the boundary and the connection state machine all hang off it. It never
+  // joins by itself here (only main() calls boot(), and only if a test does).
+  shared.host = index.createHost(shared, cfg, { dataDir })
+  if (!wantHost) shared.host.attachStdin = () => false
   const ended = []
-  const session = index.startSession(shared, (info) => ended.push(info))
+  const session = index.startSession(shared, (info) => ended.push(info), { host: shared.host })
 
   return {
     bot,
@@ -261,6 +266,9 @@ function startTestSession ({ chat = [], actions = [], bot = simulatedBot(), cfg:
       return false
     },
     stop () {
+      // Any session the Host built after a `join` must go too, or it keeps
+      // ticking against the simulated bot after the test is over.
+      try { shared.host?.connection?.leave?.({ reason: 'test over' }) } catch { /* noop */ }
       try { session.dispose(true) } catch { /* noop */ }
       bot.stopSim?.()
       globalThis.fetch = realFetch

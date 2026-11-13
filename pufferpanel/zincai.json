@@ -366,19 +366,19 @@
       ]
     },
     {
-      "if": "env == 'host' && os != 'windows' && nodeversion != ''",
+      "if": "(env == 'host' || env == 'tty' || env == 'standard') && os != 'windows' && nodeversion != ''",
       "type": "nodejsdl",
       "version": "${nodeversion}"
     },
     {
-      "if": "env == 'host' && os != 'windows'",
+      "if": "(env == 'host' || env == 'tty' || env == 'standard') && os != 'windows'",
       "type": "command",
       "commands": [
         "npm${nodeversion} ci --omit=dev --no-audit --no-fund"
       ]
     },
     {
-      "if": "env != 'host' || os == 'windows'",
+      "if": "!(env == 'host' || env == 'tty' || env == 'standard') || os == 'windows'",
       "type": "command",
       "commands": [
         "npm ci --omit=dev --no-audit --no-fund"
@@ -392,14 +392,14 @@
   "run": {
     "pre": [
       {
-        "if": "env == 'host' && os != 'windows'",
+        "if": "(env == 'host' || env == 'tty' || env == 'standard') && os != 'windows'",
         "type": "command",
         "commands": [
           "node${nodeversion} ${entrypoint} --dry-run"
         ]
       },
       {
-        "if": "env == 'host' && os == 'windows'",
+        "if": "(env == 'host' || env == 'tty' || env == 'standard') && os == 'windows'",
         "type": "command",
         "commands": [
           "node ${entrypoint} --dry-run"
@@ -416,11 +416,11 @@
     "command": [
       {
         "command": "node${nodeversion} ${entrypoint}",
-        "if": "env == 'host' && os != 'windows'"
+        "if": "(env == 'host' || env == 'tty' || env == 'standard') && os != 'windows'"
       },
       {
         "command": "node ${entrypoint}",
-        "if": "env == 'host' && os == 'windows'"
+        "if": "(env == 'host' || env == 'tty' || env == 'standard') && os == 'windows'"
       },
       {
         "command": "node ${entrypoint}"
@@ -465,6 +465,12 @@
   "supportedEnvironments": [
     {
       "type": "host"
+    },
+    {
+      "type": "tty"
+    },
+    {
+      "type": "standard"
     },
     {
       "type": "docker",

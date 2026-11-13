@@ -86,6 +86,39 @@ node pufferpanel/import.js          # checks the template, prints both paths
 - The node has no network/git access to the URL: check the panel log for the
   clone error, and use an SSH URL plus a deploy key for a private repository.
 
+### "Incompatible with environment 'host'" (Orange Pi, Raspberry Pi, any node)
+
+The create-server page filters templates **in the browser**, with a strict string
+comparison against what the node reports (`SelectTemplate.vue` →
+`template.supportedEnvironments.some(e => e.type === env)`, where `env` comes
+from `GET /daemon/features` on that node). PufferPanel implements `host`, `tty`
+and `standard` with one and the same environment (`servers/env_loader.go`), but
+a node that calls it `tty` will not match a template that only lists `host`.
+
+The template now declares `host`, `tty`, `standard` and `docker`, and its
+conditions treat all three host names alike, so this cannot happen again. To
+check a template against your own node — including whether the board is the
+problem, which it never is — run:
+
+```sh
+node pufferpanel/doctor.js --env tty --os linux --arch arm64   # what your node reports
+node pufferpanel/doctor.js --env docker                        # if you use the Docker env
+```
+
+It prints the three real predicates (`env`, `os`, `arch`), says which one fails
+and why, and names the host-family trap explicitly. Useful values: `--env` is
+one of `host`, `tty`, `standard`, `docker`; get the node's own answer from
+**Nodes → your node** or from `GET /api/nodes/<id>/features`.
+
+If the panel *still* greys the template out:
+
+| Check | Why |
+| --- | --- |
+| `--env docker` on a node without a working Docker socket | Docker is only advertised when the node can reach its socket. |
+| A stale template in the panel | The panel caches the template repository for ~5 minutes; re-add the repo or wait. |
+| `requirements.arch` / `requirements.os` in a **forked** copy | Those are single strings; `arch` cannot list both `x64` and `arm64`, so leave them out. |
+| Node too old / wrong arch | Nothing here is architecture-specific; on a host node `nodejsdl` downloads `linux/arm64` (or `armv7l`) by itself. |
+
 ## 2. Create the server
 
 **Servers → New server**, then pick the template — it appears as **zincai**

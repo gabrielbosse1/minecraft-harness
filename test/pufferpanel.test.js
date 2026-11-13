@@ -108,11 +108,64 @@ test('template: an invalid key fails the install step and is named', () => {
   assert.ok(v(clone).some((e) => /apikey/.test(e)), 'a template without the key variable is rejected')
 })
 
-test('template: both supported environments are declared', () => {
+test('template: every host-family environment is declared (host, tty, standard) plus docker', () => {
   const types = template.supportedEnvironments.map((e) => e.type)
-  assert.deepEqual(types.sort(), ['docker', 'host'])
+  // PufferPanel maps host/tty/standard to the SAME implementation
+  // (servers/env_loader.go) but SelectTemplate.vue compares the strings exactly,
+  // so a node reporting "tty" must find its own entry or the template is greyed
+  // out as "Incompatible with environment 'host'".
+  assert.deepEqual(types.sort(), ['docker', 'host', 'standard', 'tty'])
   const docker = template.supportedEnvironments.find((e) => e.type === 'docker')
   assert.match(docker.image, /^node:\$\{nodeversion\}/, 'the Docker image follows the nodeversion variable')
+})
+
+test('template: the doctor agrees with every host-family environment name', () => {
+  const { compatibility } = require('../pufferpanel/doctor')
+  for (const env of ['host', 'tty', 'standard', 'docker']) {
+    const v = compatibility(template, { env, os: 'linux', arch: 'arm64' })
+    assert.equal(v.env.ok, true, `${env} must be offered on an arm64 linux node`)
+    assert.equal(v.os.ok, true)
+    assert.equal(v.arch.ok, true, 'no architecture requirement is declared')
+  }
+  // An unknown environment is still refused, so the check is real.
+  assert.equal(compatibility(template, { env: 'nope', os: 'linux', arch: 'arm64' }).env.ok, false)
+})
+
+test('template: host conditions treat host, tty and standard alike', () => {
+  const conditions = allOperations().map((op) => op.if).filter(Boolean)
+  // Nothing may still compare only against 'host': that is the bug that made
+  // the template unusable on a node that reports another host-family name.
+  for (const cond of conditions) {
+    if (!/\bhost\b/.test(cond)) continue
+    for (const alias of ['tty', 'standard']) {
+      assert.match(cond, new RegExp(alias), `condition "${cond}" must accept "${alias}" too`)
+    }
+  }
+  // And the docker branch must not swallow a tty node.
+  const fallback = template.install.find((op) => /npm ci/.test((op.commands || []).join(' ')) && /^\!/.test(op.if || ''))
+  assert.ok(fallback, 'a non-host install branch exists')
+  assert.match(fallback.if, /tty/)
+})
+
+test('doctor: reports the node it was given, and fails a real incompatibility', () => {
+  const script = path.join(__dirname, '..', 'pufferpanel', 'doctor.js')
+  const good = execFileSync(process.execPath, [script, '--env', 'tty', '--os', 'linux', '--arch', 'arm64'], { encoding: 'utf8' })
+  assert.match(good, /environment: OK/)
+  assert.match(good, /arm64/)
+
+  // A template that lists only "host" is what produced the reported error.
+  const onlyHost = JSON.stringify({ ...template, supportedEnvironments: [{ type: 'host' }, { type: 'docker' }] })
+  let out = ''
+  let code = 0
+  try {
+    out = execFileSync(process.execPath, [script, '--env', 'tty', '--json', onlyHost], { encoding: 'utf8' })
+  } catch (err) {
+    code = err.status
+    out = String(err.stdout)
+  }
+  assert.equal(code, 1, 'an incompatible template must exit non-zero')
+  assert.match(out, /INCOMPATIBLE/)
+  assert.match(out, /host-family trap/)
 })
 
 test('import.js: --dir, --apply and --print are parsed, unknown flags are refused', () => {

@@ -131,6 +131,52 @@ The login name is hard-coded to **`ZincAI`**. With `auth = offline` the
 Minecraft server must run `online-mode=false`, and if it has a whitelist,
 `ZincAI` has to be on it. A rejected first join is fatal by design.
 
+## If the template is greyed out: "Incompatible with environment"
+
+This is a **browser-side** filter, not a failure of your board. `SelectTemplate.vue`
+compares strings, exactly:
+
+```js
+supportedEnvironments.some(e => e.type === env)      // env, os, arch come from
+!requirements.os   || requirements.os === os         // GET /daemon/features on
+!requirements.arch || requirements.arch === arch     // the node you picked
+```
+
+PufferPanel implements `host`, `tty` and `standard` with **one** environment
+(`servers/env_loader.go` maps all three to `CreateTTYEnvironment`), but if your
+node reports `tty`, a template that only lists `host` will not match. That was a
+real bug in this template; it now declares all three plus `docker`.
+
+Diagnose your own node:
+
+```sh
+node pufferpanel/doctor.js --env tty --os linux --arch arm64
+node pufferpanel/doctor.js --env docker        # if you want the Docker env
+```
+
+It prints the exact three predicates and explains the failure. The node's own
+answer is in **Nodes → \<your node\>** (or `GET /api/nodes/<id>/features`):
+
+```json
+{ "environments": ["host","tty","standard"], "os": "linux", "arch": "arm64" }
+```
+
+### On an Orange Pi 5 / Raspberry Pi specifically
+
+Nothing in this project is architecture-specific — it is plain Node.js, and the
+only native dependency (`minecraft-protocol`'s crypto) ships prebuilt for
+`linux/arm64`. On a **host** node, PufferPanel's `nodejsdl` downloads
+`node-v22-linux-arm64.tar.xz` itself and symlinks `node22`/`npm22`, so do not
+install Node by hand. What *can* bite on a small ARM board:
+
+| Symptom | Cause / fix |
+| --- | --- |
+| Install succeeds, Start dies at once | Out of RAM (a 4 GB board is fine; 1–2 GB boards need swap). `--dry-run` needs ~150 MB, a full session more. |
+| `npm ci` killed mid-install | Same: add swap, or set the Install memory limit higher. |
+| Bot joins then the panel shows it stopped | `autorestart` is `false`; a crash is a crash. Read the console. |
+| Slow replies, timeouts | The model runs in the cloud; latency is the endpoint, not the board. |
+| "Unsupported environment on the selected node" | The node advertises nothing (`docker.disallowHost=true` in the daemon config removes host/tty/standard). |
+
 ## Step 4 — install and start
 
 Press **Install**. On a host node the template:
@@ -188,6 +234,7 @@ the next start.
 | Template saves from the UI but is nameless | The pasted JSON had no `name` field — use `import.js --print`. |
 | Install fails at `npm ci` | Node too old on the node, or no network to the npm registry. |
 | Start fails immediately | Read the `--dry-run` output above the failure: it names the bad variable. |
+| Template greyed out, "Incompatible with environment 'host'" | The browser-side env match — see the section above; run `node pufferpanel/doctor.js --env <what the node reports>`. |
 | Bot can't join | Wrong `host`/`port`, server not in offline mode, or `ZincAI` not whitelisted. |
 | `!zinc status` in chat is ignored | `operators` is empty, or your UUID is wrong — check the `control:` line and `config show control`. |
 | Console commands do nothing | The process isn't running (a stopped server has no stdin). |

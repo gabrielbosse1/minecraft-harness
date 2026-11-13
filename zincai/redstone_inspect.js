@@ -13,20 +13,40 @@ function componentKind (name) {
   if (name === 'redstone_wire') return 'dust'
   if (name === 'repeater' || name === 'comparator' || name === 'observer') return name
   if (name === 'piston' || name === 'sticky_piston') return 'piston'
+  if (name === 'piston_head') return 'piston_head'
   if (name === 'redstone_torch' || name === 'redstone_wall_torch') return 'torch'
   if (name === 'lever') return 'lever'
   if (/_button$/.test(name)) return 'button'
   if (/_pressure_plate$/.test(name)) return 'pressure_plate'
-  if (['redstone_block', 'redstone_lamp', 'target', 'daylight_detector', 'hopper', 'dropper', 'dispenser', 'tripwire_hook', 'sculk_sensor', 'calibrated_sculk_sensor', 'note_block'].includes(name)) return name
+  if (/_door$/.test(name)) return 'door'
+  if (/_trapdoor$/.test(name)) return 'trapdoor'
+  if (name === 'tripwire') return 'tripwire'
+  if (['redstone_block', 'redstone_lamp', 'target', 'daylight_detector', 'hopper', 'dropper', 'dispenser', 'tripwire_hook', 'trapped_chest', 'sculk_sensor', 'calibrated_sculk_sensor', 'note_block'].includes(name)) return name
   return null
 }
 const wanted = {
   dust: ['north', 'south', 'east', 'west', 'power'],
   repeater: ['facing', 'delay', 'locked', 'powered'],
   comparator: ['facing', 'mode', 'powered'],
-  observer: ['facing', 'powered'], piston: ['facing', 'extended'],
-  torch: ['facing', 'lit'], lever: ['face', 'facing', 'powered'],
-  button: ['face', 'facing', 'powered'], pressure_plate: ['powered', 'power']
+  observer: ['facing', 'powered'],
+  piston: ['facing', 'extended'],
+  piston_head: ['facing', 'type', 'short'],
+  torch: ['facing', 'lit'],
+  lever: ['face', 'facing', 'powered'],
+  button: ['face', 'facing', 'powered'],
+  pressure_plate: ['powered', 'power'],
+  hopper: ['facing', 'enabled'],
+  dropper: ['facing', 'triggered'],
+  dispenser: ['facing', 'triggered'],
+  redstone_lamp: ['lit'],
+  target: ['power'],
+  note_block: ['instrument', 'note', 'powered'],
+  daylight_detector: ['power', 'inverted'],
+  tripwire_hook: ['facing', 'attached', 'powered'],
+  tripwire: ['powered', 'attached', 'disarmed', 'north', 'south', 'east', 'west'],
+  door: ['facing', 'open', 'powered', 'half'],
+  trapdoor: ['facing', 'open', 'powered', 'half'],
+  trapped_chest: ['facing', 'type']
 }
 const safeValue = (v) => typeof v === 'boolean' || (typeof v === 'number' && Number.isFinite(v) && Math.abs(v) <= 999999) || (typeof v === 'string' && /^[a-z0-9_]{1,24}$/.test(v))
 function component (block, x, y, z) {

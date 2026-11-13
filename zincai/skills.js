@@ -784,12 +784,29 @@ class Skills {
   }
 
   /**
+   * True when a non-ore resource block at `p` directly adjoins crafted
+   * architectural blocks (planks, doors, glass, stairs, chests, redstone, etc.),
+   * indicating it is part of a built structure rather than wild terrain.
+   */
+  _isStructuralResourceBlock (p, blockName = '') {
+    if (/_ore$|^ancient_debris$/.test(blockName)) return false
+    const STRUCTURAL_NEIGHBOR_RE = /(_planks|_bricks|_door|_trapdoor|^glass|_stained_glass|_pane$|^chest$|^trapped_chest$|^barrel$|shulker_box|_bed$|^furnace$|^blast_furnace$|^smoker$|^crafting_table$|_sign$|_stairs$|_slab$|_fence$|_fence_gate$|cobblestone_wall|brick_wall|stone_brick_wall|repeater|comparator|piston|redstone_wire|lantern|bookshelf)/
+    const offsets = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]
+    for (const [dx, dy, dz] of offsets) {
+      let nb = null
+      try { nb = this.bot.blockAt(p.offset ? p.offset(dx, dy, dz) : { x: p.x + dx, y: p.y + dy, z: p.z + dz }) } catch { nb = null }
+      if (nb && STRUCTURAL_NEIGHBOR_RE.test(nb.name || '')) return true
+    }
+    return false
+  }
+
+  /**
    * Gather a raw resource by digging it: logs, ores, soils. The ONLY blocks
    * ever dug are blocks whose identity IS the requested resource (or the
-   * whitelisted alias for it); if none is in `radius`, the answer is "walk
-   * closer / go_to a place first", never free-form digging.
+   * whitelisted alias for it), skipping blocks attached to crafted structures
+   * or protected player claims.
    */
-  gather ({ item, count = 1, radius = 32 } = {}) {
+  gather ({ item, count = 1, radius = 32, guard = null } = {}) {
     const bot = this.bot
     return this._run('gather', async (token) => {
       const want = fold(item).replace(/\s+/g, '_')
@@ -811,12 +828,40 @@ class Skills {
       const progress = () => `dig calls completed: ${dug}/${wanted}; exact inventory ${want} net change: ${countExact() - before} (not attributable; other drops or later pickup not counted)`
       let dug = 0
       let misses = 0
+      let skippedProtected = 0
+      let protectedReason = ''
+      const skippedKeys = new Set()
       const deadline = Date.now() + (this.choreTimeoutMs || 240_000)
       while (dug < wanted && misses < 4 && Date.now() < deadline) {
         if (token.cancelled) break
-        let positions = []
-        try { positions = bot.findBlocks({ matching: targets.ids, maxDistance: radius, count: 8 }) } catch (err) { return fail(`search failed: ${err.message || err}`) }
-        if (!positions.length) return dug > 0 ? ok(`${progress()}; no more targets within ${radius} blocks`) : fail(`no ${targets.names.join(' or ')} within ${radius} blocks — go_to a place first, then gather again`)
+        let allPositions = []
+        try { allPositions = bot.findBlocks({ matching: targets.ids, maxDistance: radius, count: 24 }) } catch (err) { return fail(`search failed: ${err.message || err}`) }
+        if (!allPositions.length) return dug > 0 ? ok(`${progress()}; no more targets within ${radius} blocks`) : fail(`no ${targets.names.join(' or ')} within ${radius} blocks — go_to a place first, then gather again`)
+        const positions = []
+        for (const p of allPositions) {
+          const k = `${p.x},${p.y},${p.z}`
+          if (skippedKeys.has(k)) continue
+          const g = typeof guard === 'function' ? guard(p) : null
+          if (g && g.ok === false) {
+            skippedKeys.add(k)
+            skippedProtected++
+            if (!protectedReason) protectedReason = g.reason || 'protected player property'
+            continue
+          }
+          const preBlock = bot.blockAt(p)
+          if (preBlock && this._isStructuralResourceBlock(p, preBlock.name)) {
+            skippedKeys.add(k)
+            skippedProtected++
+            if (!protectedReason) protectedReason = 'attached to an existing built structure'
+            continue
+          }
+          positions.push(p)
+          if (positions.length >= 8) break
+        }
+        if (!positions.length) {
+          if (dug > 0) return ok(`${progress()}; remaining nearby ${want} skipped (${protectedReason})`)
+          return fail(`refused to mine ${want} here: nearby ${want} is ${protectedReason || 'part of a structure'} — move to natural terrain first`)
+        }
         for (const p of positions) {
           if (dug >= wanted || token.cancelled || Date.now() >= deadline) break
           const near = await this._walk(token, new (this._goals().GoalGetToBlock)(p.x, p.y, p.z))

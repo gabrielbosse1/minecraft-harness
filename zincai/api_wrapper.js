@@ -71,12 +71,16 @@ const ACTION_TOOLS = [
   }),
   tool('follow', 'Follow a player until stopped.', { player: STR('Player name.') }, ['player']),
   tool('stop', 'Cancel current task, follow, fight and paused tasks.'),
-  tool('goal', 'Your objectives (survive death/restart/context loss): list|show|add|resume|suspend|cancel|complete|update|verify.', {
-    operation: { type: 'string', enum: ['list', 'show', 'add', 'resume', 'suspend', 'cancel', 'complete', 'update', 'verify'] },
-    id: STR('Goal id (g3).'),
-    description: STR('For add: one short sentence.'),
+  tool('goal', 'Manage persistent objectives (survive death/restart/context reset): list|show|add|resume|suspend|cancel|complete|update|combine|verify.', {
+    operation: { type: 'string', enum: ['list', 'show', 'add', 'resume', 'suspend', 'cancel', 'complete', 'update', 'combine', 'verify'] },
+    id: STR('Goal id (g3), or comma-separated ids for combine ("g1,g2").'),
+    description: STR('Goal description (for add/update/combine).'),
+    reason: STR('Why this goal matters (motivation).'),
     priority: INT('0–100, higher = more important.'),
-    note: STR('What changed / why.'),
+    parent: STR('Parent goal id for subgoals (e.g. g1).'),
+    origin: { type: 'string', enum: ['self_generated', 'player_requested', 'shared_project'] },
+    player: STR('Player name(s) when player_requested or shared_project.'),
+    note: STR('Progress or status note.'),
     percent: INT('For update: 0–100.')
   }, ['operation']),
   tool('attack', 'Fight. The ONLY way a fight ever starts. `target` = mob id or "any"; `player` = exact PvP target.', {
@@ -121,10 +125,28 @@ const ACTION_TOOLS = [
     what: STR('Id, label, or "storage".'),
     page: INT('Storage page (default 1).')
   }, ['what']),
-  tool('remember_here', 'Save current position under a place name.', {
+  tool('remember_here', 'Save current position under a place name, with optional ownership or verified home tag.', {
     name: STR('Place name.'),
-    note: STR('Optional note.')
+    note: STR('Optional note.'),
+    ownership: { type: 'string', enum: ['own', 'shared', 'player', 'unknown'] },
+    owner: STR('Owner player name if ownership="player".'),
+    home: { type: 'boolean', description: 'True ONLY if this is your verified home (built by you or explicitly assigned to you).' }
   }, ['name']),
+  tool('note', 'Record a durable discovery, lesson, or ownership observation in long-term memory, or add/drop a personal interest.', {
+    text: STR('Short factual note or lesson learned.'),
+    interest: STR('Emerging personal interest to add, or "-topic" to drop.')
+  }),
+  tool('social', 'Inspect or update your independent view/relationship with a player, or record your decision on their request.', {
+    operation: { type: 'string', enum: ['list', 'show', 'update', 'decide'] },
+    player: STR('Player name (for show/update/decide).'),
+    stance: STR('Your own category/label (e.g. friend, acquaintance, cautious, distrusted, rival, avoid, collaborator, or custom nuance).'),
+    trust: INT('Your trust assessment -100..100.'),
+    confidence: INT('Confidence 0–100 (keep modest on thin evidence; raise with consistency).'),
+    willingness: STR('How you want to engage (e.g. cooperate, help when free, verify claims, negotiate, avoid, decline).'),
+    opinion: STR('Nuanced free-form summary of your opinion and why.'),
+    evidence: STR('Supporting observation or experience behind this update.'),
+    decision: { type: 'string', enum: ['accept', 'decline', 'ignore', 'negotiate', 'delay'] }
+  }, ['operation']),
   tool('craft', 'Craft item (walks to nearby table if needed).', { item: STR('Item id.') }, ['item']),
   tool('gather', 'Dig named raw logs/ores/soils nearby (avoid unauthorized builds; ores need pickaxe).', {
     item: STR('Resource id/alias (oak_log, iron, stone…).'),
@@ -144,6 +166,31 @@ const ACTION_TOOLS = [
     adder_width: INT('Exhaustive unsigned adder width 1–4 (A, B, Cin -> S, Cout).'),
     project: STR('Optional project name to save.')
   }, ['inputs', 'gates', 'outputs']),
+  tool('redstone_engineer', 'Understand, design, build, test or repair redstone (Java 1.21.4/26.3). operation=analyze|diagnose|simulate|design|place|verify|trace|library|lesson.', {
+    operation: { type: 'string', enum: ['analyze', 'diagnose', 'simulate', 'design', 'place', 'verify', 'trace', 'library', 'lesson'] },
+    x: INT('Center X (analyze/diagnose/simulate/place).'),
+    y: INT('Center Y.'),
+    z: INT('Center Z.'),
+    radius: INT('Scan radius 0–6 (default 3) for analyze/diagnose.'),
+    design: STR('Design name or behaviour phrase (design/place): and, or, not, xor, latch, clock, pulse, sorter, farm, detector.'),
+    rotate: { type: 'string', enum: ['north', 'south', 'east', 'west'], description: 'Rotate the design layout (place).' },
+    inputs: { type: 'array', description: 'verify: lever/button positions [{x,y,z},…] to toggle.', items: { type: 'object', properties: { x: INT('X'), y: INT('Y'), z: INT('Z') }, required: ['x', 'y', 'z'], additionalProperties: false }, minItems: 1, maxItems: 4 },
+    outputs: { type: 'array', description: 'verify: output positions [{x,y,z},…] to watch.', items: { type: 'object', properties: { x: INT('X'), y: INT('Y'), z: INT('Z') }, required: ['x', 'y', 'z'], additionalProperties: false }, minItems: 1, maxItems: 4 },
+    ticks: INT('simulate: ticks to simulate (1–200).'),
+    node: STR('trace: node id "x,y,z" to trace signal from.'),
+    name: STR('library/lesson: design or lesson name.'),
+    compare: { type: 'array', description: 'design: extra design names to compare.', items: STR('Design name.'), minItems: 1, maxItems: 4 },
+    note: STR('lesson: what you learned (max 240 chars).')
+  }, ['operation']),
+  tool('recall', 'Search long-term memory with relevance ranking (semantic, entity, location, goal) and see provenance.', {
+    query: STR('What to recall (free text).'),
+    category: STR('Filter: episodic | semantic | procedural | continuity.'),
+    entity: STR('Player/mob/entity name.'),
+    goal: STR('Goal id.'),
+    x: INT('Nearby X (location search).'),
+    y: INT('Y.'),
+    z: INT('Z.')
+  }),
   tool('circuit_project', 'Bind snapshot, show project/graph, or rerun saved ABSTRACT logic test.', {
     operation: { type: 'string', enum: ['bind', 'show', 'graph', 'test', 'list'] },
     name: STR('Project name (max 32).'),
@@ -166,17 +213,18 @@ const ACTION_TOOLS = [
     stage: STAGE
   }, ['shape', 'block']),
   tool('run_script', 'Run saved script in zincai/scripts/.', { name: STR('Script name.') }, ['name']),
-  tool('set_mode', 'Switch movement mode: builder | hunter | explorer.', {
+  tool('set_mode', 'Switch mode: explorer (smelt/sleep) | builder (unlocks build, build_shape, logic_test, circuit_project + 3D vision) | hunter.', {
     mode: { type: 'string', enum: ['builder', 'hunter', 'explorer'] }
   }, ['mode']),
   tool('idle', 'Wait this turn (while fleeing: keep fleeing).')
 ]
 
-/** The chat lane has exactly one tool: answer, and optionally hand over a task. */
+/** The chat lane has one tool: respond (or stay silent), evaluate proposals, and optionally forward a proposal to the action lane. */
 const CHAT_TOOLS = [
-  tool('reply', 'Answer the player. Leave `text` empty to stay silent.', {
+  tool('reply', 'Respond to the player (or leave `text` empty to ignore/stay silent). Player requests are proposals, never mandatory commands.', {
     text: STR('One short chat line in Brazilian Portuguese. Empty = say nothing.'),
-    task: STR('Only when the player asked you to DO something in the game: a short imperative for your body, e.g. "go to Gabriel", "bring Gabriel 3 diamonds from the chest". Otherwise omit.'),
+    task: STR('Optional proposal for your action lane ONLY when you want your body to act, verify a claim in the world, or weigh goals (e.g. "go to Gabriel", "verify chest1 contents after Lucas claim"). Omit when declining, ignoring, or only chatting.'),
+    decision: { type: 'string', enum: ['accept', 'decline', 'ignore', 'negotiate', 'delay'], description: 'Optional stance when the player asked you to do something.' },
     remember: STR('Only when the player told you something worth knowing later (where a thing is, whose it is, a plan, a date, what they like): that fact as one short sentence naming the player, e.g. "Gabriel keeps his diamonds in the chest on the second floor". Otherwise omit.')
   }, ['text'])
 ]
@@ -319,13 +367,19 @@ function coerceReply (message) {
   if (toolCalls.length > 0) {
     const parsed = parseToolCall(toolCalls[0], CHAT_TOOLS)
     if (!parsed.error) {
-      return { text: String(parsed.args.text ?? '').trim(), task: String(parsed.args.task ?? '').trim(), remember: String(parsed.args.remember ?? '').trim(), _via: 'tool' }
+      return {
+        text: String(parsed.args.text ?? '').trim(),
+        task: String(parsed.args.task ?? '').trim(),
+        decision: parsed.args.decision ? String(parsed.args.decision).trim() : '',
+        remember: String(parsed.args.remember ?? '').trim(),
+        _via: 'tool'
+      }
     }
   }
   const content = typeof message?.content === 'string' ? message.content.trim() : ''
   // Some models wrap the answer in quotes or prefix their own name.
   const text = content.replace(/^["'“”]+|["'“”]+$/g, '').replace(/^(zinc(ai)?|me)\s*:\s*/i, '').split('\n')[0].trim()
-  return { text, task: '', remember: '', _via: 'prose' }
+  return { text, task: '', decision: '', remember: '', _via: 'prose' }
 }
 
 /**

@@ -27,13 +27,15 @@
  */
 'use strict'
 
+const { performance } = require('node:perf_hooks')
+
 class Brain {
   /**
    * @param {{
-   *   act: (reasons: string[]) => Promise<{ idle: boolean }>,   one ACTION-lane turn
-   *   talk: (sender: string, lines: Array<{text:string, whisper:boolean}>) => Promise<void>,  one CHAT-lane turn
+   *   act: (reasons: string[], meta?: object) => Promise<{ idle: boolean }>,   one ACTION-lane turn
+   *   talk: (sender: string, lines: Array<{text:string, whisper:boolean}>, meta?: object) => Promise<void>,  one CHAT-lane turn
    *   logger?: (level:string, msg:string) => void,
-   *   minIntervalMs?: number, chatMinIntervalMs?: number, rpm?: number,
+   *   minIntervalMs?: number, fastMinIntervalMs?: number, chatMinIntervalMs?: number, rpm?: number,
    *   chatReserve?: number, urgentMinIntervalMs?: number,
    *   heartbeatMs?: number, maxSelfChain?: number, selfChainPauseMs?: number,
    *   now?: () => number }} opts
@@ -41,8 +43,10 @@ class Brain {
   constructor ({
     act,
     talk,
+    isBodyBusy = () => false,
     logger = () => {},
     minIntervalMs = 3000,
+    fastMinIntervalMs = 800,
     chatMinIntervalMs = 1200,
     rpm = 18,
     chatReserve = 4,
@@ -54,23 +58,25 @@ class Brain {
   }) {
     this.act = act
     this.talk = talk
+    this.isBodyBusy = isBodyBusy
     this.log = logger
     this.minIntervalMs = minIntervalMs
+    this.fastMinIntervalMs = Math.min(fastMinIntervalMs, minIntervalMs)
     this.chatMinIntervalMs = chatMinIntervalMs
     this.rpm = rpm
     // Calls per minute only the chat lane may use: the action lane stops at
     // rpm - chatReserve. Never more than a third of the budget, so a small rpm
     // still leaves the body most of it.
     this.chatReserve = Math.max(0, Math.min(Math.trunc(chatReserve) || 0, Math.floor(rpm / 3)))
-    this.urgentMinIntervalMs = Math.min(urgentMinIntervalMs, minIntervalMs)
+    this.urgentMinIntervalMs = Math.min(urgentMinIntervalMs, this.fastMinIntervalMs)
     this.heartbeatMs = heartbeatMs
     this.maxSelfChain = maxSelfChain
     this.selfChainPauseMs = selfChainPauseMs
     this.now = now
 
-    /** Pending ACTION-lane reasons: { text, external, urgent, at } — consumed all at once. */
+    /** Pending ACTION-lane reasons: { text, external, urgent, fast, important, at, mono } — consumed all at once. */
     this.pending = []
-    /** Pending CHAT-lane lines: { sender, text, whisper } in arrival order. */
+    /** Pending CHAT-lane lines: { sender, text, whisper, at, mono } in arrival order. */
     this.chatQueue = []
     this.busyAction = false
     this.busyChat = false
@@ -82,35 +88,80 @@ class Brain {
     this.selfChain = 0
     this.selfChainUntil = 0
     this.calls = [] // { at, lane } of the last minute (shared rate limit)
-    this.stats = { actionTurns: 0, chatTurns: 0, heartbeats: 0, queuedPeak: 0 }
+    this.stats = { actionTurns: 0, chatTurns: 0, heartbeats: 0, queuedPeak: 0, fastTurns: 0, urgentTurns: 0 }
     this._timer = null
+    this._kickScheduled = false
+  }
+
+  _kick () {
+    if (!this._timer || this.paused || this._kickScheduled) return
+    this._kickScheduled = true
+    queueMicrotask(() => {
+      this._kickScheduled = false
+      if (!this._timer || this.paused) return
+      this.tick().catch((err) => this.log('error', `brain kick: ${err.message || err}`))
+    })
   }
 
   start (intervalMs = 250) {
     if (this._timer) return
     this._timer = setInterval(() => { this.tick().catch((err) => this.log('error', `brain tick: ${err.message || err}`)) }, intervalMs)
+    if (this.pending.length || this.chatQueue.length) this._kick()
   }
 
   stop () {
     clearInterval(this._timer)
     this._timer = null
+    this._kickScheduled = false
+  }
+
+  /**
+   * Clear transient pending triggers on context reset without dropping rate limits.
+   * Important undelivered external wakes (`important: true` or `urgent: true`) can
+   * be preserved when `preserveImportant` is set so mid-reset hazards/events survive.
+   */
+  clearContext ({ preserveImportant = false } = {}) {
+    this.pending = preserveImportant ? this.pending.filter((p) => p.urgent || p.important) : []
+    this.chatQueue = []
+    this.idleStreak = 0
+    this.failStreak = 0
+    this.selfChain = 0
+    this.selfChainUntil = 0
   }
 
   /**
    * Ask for an ACTION-lane turn. `external` = something happened in the world
    * (chat task, threat, damage, death). `false` = the bot's own action
    * reported back; a long run of only those is rate-capped (self-chain).
+   * `fast: true` uses `fastMinIntervalMs` for time-sensitive non-emergency events.
    */
-  wake (text, { external = true, urgent = false } = {}) {
+  wake (text, { external = true, urgent = false, fast = false, important = false } = {}) {
     const reason = String(text || 'event').replace(/\s+/g, ' ').trim().slice(0, 200)
     const same = this.pending.find((p) => p.text === reason)
-    if (same) same.urgent = same.urgent || Boolean(urgent)
-    else {
-      this.pending.push({ text: reason, external: Boolean(external), urgent: Boolean(urgent), at: this.now() })
-      if (this.pending.length > 8) this.pending.splice(0, this.pending.length - 8)
+    if (same) {
+      same.urgent = same.urgent || Boolean(urgent)
+      same.fast = same.fast || Boolean(fast) || Boolean(urgent)
+      same.important = same.important || Boolean(important) || Boolean(urgent)
+    } else {
+      this.pending.push({
+        text: reason,
+        external: Boolean(external),
+        urgent: Boolean(urgent),
+        fast: Boolean(fast) || Boolean(urgent),
+        important: Boolean(important) || Boolean(urgent),
+        at: this.now(),
+        mono: performance.now()
+      })
+      if (this.pending.length > 24) {
+        // Drop oldest non-urgent, non-important item first so bursts never evict critical wakes.
+        const dropIdx = this.pending.findIndex((p) => !p.urgent && !p.important)
+        if (dropIdx >= 0) this.pending.splice(dropIdx, 1)
+        else this.pending.shift()
+      }
     }
     if (external) { this.selfChain = 0; this.selfChainUntil = 0 }
     this.stats.queuedPeak = Math.max(this.stats.queuedPeak, this.pending.length)
+    this._kick()
   }
 
   /** True while either lane has a model call in flight. */
@@ -121,8 +172,15 @@ class Brain {
 
   /** Queue a line for the CHAT lane. */
   hear (sender, text, { whisper = false } = {}) {
-    this.chatQueue.push({ sender, text: String(text).slice(0, 240), whisper: Boolean(whisper) })
-    if (this.chatQueue.length > 12) this.chatQueue.splice(0, this.chatQueue.length - 12)
+    this.chatQueue.push({
+      sender,
+      text: String(text).slice(0, 240),
+      whisper: Boolean(whisper),
+      at: this.now(),
+      mono: performance.now()
+    })
+    if (this.chatQueue.length > 24) this.chatQueue.splice(0, this.chatQueue.length - 24)
+    this._kick()
   }
 
   /** May `lane` make a call now? Chat may use the whole budget; the body leaves chat its reserve. */
@@ -162,26 +220,37 @@ class Brain {
     const sender = this.chatQueue[0].sender
     const lines = this.chatQueue.filter((l) => l.sender === sender)
     this.chatQueue = this.chatQueue.filter((l) => l.sender !== sender)
+    const earliestMono = lines.reduce((m, l) => Number.isFinite(l.mono) ? Math.min(m, l.mono) : m, Infinity)
+    const invokeMono = performance.now()
     this.busyChat = true
     this.lastChatAt = now
     this.calls.push({ at: now, lane: 'chat' })
     this.stats.chatTurns++
     return Promise.resolve()
-      .then(() => this.talk(sender, lines))
+      .then(() => this.talk(sender, lines, {
+        queuedMono: Number.isFinite(earliestMono) ? earliestMono : invokeMono,
+        invokeMono
+      }))
       .catch((err) => this.log('error', `chat lane failed: ${err.message || err}`))
-      .finally(() => { this.busyChat = false })
+      .finally(() => {
+        this.busyChat = false
+        if (this.chatQueue.length) this._kick()
+      })
   }
 
   // 2. The body.
   _actionStep () {
     const now = this.now()
     const urgent = this.pending.some((p) => p.urgent)
-    const spacing = Math.max(urgent ? this.urgentMinIntervalMs : this.minIntervalMs, this._failWait())
+    const fast = !urgent && this.pending.some((p) => p.fast)
+    const baseSpacing = urgent ? this.urgentMinIntervalMs : (fast ? this.fastMinIntervalMs : this.minIntervalMs)
+    const spacing = Math.max(baseSpacing, this._failWait())
     if (now - this.lastActionAt < spacing) return null
     if (!this.pending.length) {
+      if (this.isBodyBusy()) return null
       if (now - this.lastActionAt < this._heartbeatEvery()) return null
       if (!this._rateOk(now, 'action')) return null
-      this.pending.push({ text: 'heartbeat (nothing new — idle is fine)', external: true, urgent: false, at: now })
+      this.pending.push({ text: 'autonomous check-in (pursue an open/new goal, explore, or idle if content)', external: true, urgent: false, fast: false, important: false, at: now, mono: performance.now() })
       this.stats.heartbeats++
     } else if (!this._rateOk(now, 'action')) return null
     const onlySelf = this.pending.every((p) => !p.external)
@@ -191,14 +260,23 @@ class Brain {
       const waited = Math.round((now - (p.at ?? now)) / 1000)
       return waited >= 4 ? `${p.text} (${waited}s ago)` : p.text
     })
-    const raw = this.pending.map((p) => p.text)
+    const raw = this.pending.slice()
+    const earliestMono = raw.reduce((m, p) => Number.isFinite(p.mono) ? Math.min(m, p.mono) : m, Infinity)
+    const invokeMono = performance.now()
+    const reactionClass = urgent ? 'immediate' : (fast ? 'fast' : 'deliberate')
     this.pending = []
     this.busyAction = true
     this.lastActionAt = now
     this.calls.push({ at: now, lane: 'action' })
     this.stats.actionTurns++
+    if (urgent) this.stats.urgentTurns++
+    else if (fast) this.stats.fastTurns++
     return Promise.resolve()
-      .then(() => this.act(reasons))
+      .then(() => this.act(reasons, {
+        queuedMono: Number.isFinite(earliestMono) ? earliestMono : invokeMono,
+        invokeMono,
+        reactionClass
+      }))
       .then(({ idle }) => {
         this.failStreak = 0
         this.idleStreak = idle ? this.idleStreak + 1 : 0
@@ -213,9 +291,16 @@ class Brain {
         this.failStreak++
         this.log('error', `action lane failed: ${err.message || err}`)
         // Do not lose what the turn was about.
-        for (const text of raw) if (!/^heartbeat/.test(text)) this.wake(text, { external: true })
+        for (const item of raw) {
+          if (!/^autonomous check-in|^heartbeat/.test(item.text)) {
+            this.wake(item.text, { external: true, urgent: item.urgent, fast: item.fast, important: item.important })
+          }
+        }
       })
-      .finally(() => { this.busyAction = false })
+      .finally(() => {
+        this.busyAction = false
+        if (this.pending.length) this._kick()
+      })
   }
 }
 

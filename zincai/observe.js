@@ -2,7 +2,7 @@
  * observe.js — what the model is shown about the bot and its surroundings.
  *
  * The old prompt had no inventory (yet `equip` wanted a slot number), listed
- * players as "player Gabriel 12m" with no position or direction (yet `move`
+ * players as "player Steve 12m" with no position or direction (yet `move`
  * wanted coordinates), capped entities at 16 and counted item frames as mobs.
  * Everything here is a short, labelled line with totals, compass directions
  * and absolute coordinates where a tool can use them.

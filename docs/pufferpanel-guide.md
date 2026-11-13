@@ -50,7 +50,7 @@ to it, which is exactly the layout above.
    | Field | Value |
    | --- | --- |
    | Name | `ZincAI` |
-   | Url | `https://github.com/gabrielbosse1/minecraft-harness.git` |
+   | Url | `https://github.com/<you>/minecraft-harness.git` — fork this repo first |
    | Branch | `main` |
 
 3. The template appears immediately as **`zincai`** → display name

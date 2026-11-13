@@ -38,7 +38,7 @@ minecraft-harness/
 1. Make sure the branch you want is pushed to a repository the panel node can
    reach (public, or with a deploy key / PAT configured on the repo entry).
 2. In the panel: **Templates → Add repo**. Name `ZincAI`, Url
-   `https://github.com/gabrielbosse1/minecraft-harness.git`, Branch `main`.
+   `https://github.com/<you>/minecraft-harness.git`, Branch `main`.
 3. The panel clones it and lists the template. It refreshes the clone every few
    minutes, so a push to the branch shows up without touching the panel.
 

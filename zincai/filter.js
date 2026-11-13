@@ -88,7 +88,7 @@ const STRONG_FOREIGN = new Set(['hola', 'gracias', 'bonjour', 'merci', 'oui', 'h
 /**
  * Is this outgoing chat line in the server's language?
  * @param {string} text
- * @param {{ names?: string[] }} [opts] player names to ignore ("Gabriel" is not a word of any language)
+ * @param {{ names?: string[] }} [opts] player names to ignore ("Steve" is not a word of any language)
  * @returns {{ ok: boolean, pt: number, en: number, words: number }}
  */
 function checkPortuguese (text, { names = [] } = {}) {

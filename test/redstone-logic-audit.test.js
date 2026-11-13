@@ -4,7 +4,7 @@
  *
  * Every expectation in this file is derived from *documented Java Edition
  * mechanics* (see the citations in
- * .zinc-test-run/reports/REDSTONE_LOGIC_AND_LIVE_VERIFICATION_AUDIT.md), never
+ * REDSTONE_LOGIC_AND_LIVE_VERIFICATION_AUDIT.md), never
  * from the current engine behaviour. The worlds below are built from the
  * engine's own placement plans wherever possible, so "the design is buildable"
  * and "the model agrees with Java" are tested as one property.

@@ -66,7 +66,7 @@ test('G1: a goal has a durable identity, a full record and a legal lifecycle', (
     const g = reg.add({
       description: 'build small_house (walls)',
       kind: 'build',
-      origin: 'player:Gabriel',
+      origin: 'player:Steve',
       priority: 60,
       parentId: null,
       resources: [{ name: 'oak_planks', count: 120 }],
@@ -116,10 +116,10 @@ test('G2: a restart never leaves a goal "active"; it comes back resumable, with 
   const file = path.join(dir, 'goals.json')
   try {
     let reg = new GoalRegistry({ file })
-    const build = reg.add({ description: 'build small_house (walls)', kind: 'build', origin: 'player:Gabriel', detail: { at: [12, 64, -3], stage: 'walls', args: { blueprint: 'small_house' } } })
+    const build = reg.add({ description: 'build small_house (walls)', kind: 'build', origin: 'player:Steve', detail: { at: [12, 64, -3], stage: 'walls', args: { blueprint: 'small_house' } } })
     reg.resume(build.id)
     reg.progress(build.id, { done: 55, total: 120 })
-    const pending = reg.add({ description: 'give Pedro bread', kind: 'give' })
+    const pending = reg.add({ description: 'give Herobrine bread', kind: 'give' })
     reg.cancel(reg.add({ description: 'old chore' }).id)
     assert.equal(reg.save({ force: true }), true)
 
@@ -148,10 +148,10 @@ test('G3: a build interrupted mid-way resumes at the SAME origin and from the ob
     s.spawn()
     await sleep(150)
     const it = s.internals()
-    await it.executeAction({ a: 'build_shape', shape: 'wall', params: { l: 8, h: 2 }, block: 'dirt', at: [3, 64, 2] }, snapNow(it, { askedBy: 'Gabriel' }))
+    await it.executeAction({ a: 'build_shape', shape: 'wall', params: { l: 8, h: 2 }, block: 'dirt', at: [3, 64, 2] }, snapNow(it, { askedBy: 'Steve' }))
     const goal = openOf(s).find((g) => g.kind === 'build_shape')
     assert.ok(goal, 'the build became a durable goal')
-    assert.equal(goal.origin, 'player:Gabriel')
+    assert.equal(goal.origin, 'player:Steve')
     assert.deepEqual(goal.detail.at, [3, 64, 2], 'the origin is captured when the build starts')
     assert.equal(goal.status, 'active')
     const firstJobId = it.agenda.main.jobId
@@ -191,13 +191,13 @@ test('G3: a build interrupted mid-way resumes at the SAME origin and from the ob
 
 test('G4: a death does not delete the objective — it becomes resumable and the respawn says so', async () => {
   const bot = simulatedBot()
-  addPlayer(bot, 2, 'Gabriel', 8.5, 0.5)
+  addPlayer(bot, 2, 'Steve', 8.5, 0.5)
   const s = startTestSession({ bot })
   try {
     s.spawn()
     await sleep(150)
     const it = s.internals()
-    await it.executeAction({ a: 'follow', player: 'Gabriel' }, { threatIds: [], askedBy: 'Gabriel' })
+    await it.executeAction({ a: 'follow', player: 'Steve' }, { threatIds: [], askedBy: 'Steve' })
     const goal = openOf(s).find((g) => g.kind === 'follow')
     assert.ok(goal)
     assert.equal(goal.status, 'active')
@@ -208,7 +208,7 @@ test('G4: a death does not delete the objective — it becomes resumable and the
     const dead = s.shared.goals.get(goal.id)
     assert.equal(dead.status, 'resumable')
     assert.match(dead.suspendReason, /died at/)
-    assert.deepEqual(dead.detail.args, { player: 'Gabriel' }, 'the checkpoint is intact')
+    assert.deepEqual(dead.detail.args, { player: 'Steve' }, 'the checkpoint is intact')
 
     bot.entity.position.set(0.5, 64, 0.5)
     s.spawn()
@@ -218,7 +218,7 @@ test('G4: a death does not delete the objective — it becomes resumable and the
     // Resuming it runs the same objective again (not a new anonymous one).
     await it.executeAction({ a: 'goal', operation: 'resume', id: goal.id }, { threatIds: [], askedBy: null })
     assert.equal(s.shared.goals.get(goal.id).status, 'active')
-    assert.ok(await s.until(() => /following Gabriel/.test(it.skills.current()?.label || ''), 3000))
+    assert.ok(await s.until(() => /following Steve/.test(it.skills.current()?.label || ''), 3000))
   } finally { s.stop() }
 })
 
@@ -231,19 +231,19 @@ test('G5: after a restart the objectives are restored, verified against the worl
     //     completion event never reached the goal record (process killed).
     const botA = simulatedBot({ items: [['dirt', 32]] })
     buildable(botA)
-    addPlayer(botA, 2, 'Gabriel', 6.5, 0.5)
+    addPlayer(botA, 2, 'Steve', 6.5, 0.5)
     const a = startTestSession({ bot: botA, dataDir: dir })
     a.spawn()
     await sleep(150)
     const built = a.shared.goals.add({
       description: 'build box of dirt (walls 4x4)',
       kind: 'build_shape',
-      origin: 'player:Gabriel',
+      origin: 'player:Steve',
       detail: { at, args: { shape: 'box', params: { w: 4, d: 4, h: 2 }, block: 'dirt' } }
     })
     a.shared.goals.resume(built.id)
     // Another objective that is genuinely unfinished.
-    const open = a.shared.goals.add({ description: 'follow Gabriel', kind: 'follow', origin: 'player:Gabriel', detail: { args: { player: 'Gabriel' } } })
+    const open = a.shared.goals.add({ description: 'follow Steve', kind: 'follow', origin: 'player:Steve', detail: { args: { player: 'Steve' } } })
     a.shared.goals.resume(open.id)
     a.shared.goals.save({ force: true })
     a.stop()
@@ -255,7 +255,7 @@ test('G5: after a restart the objectives are restored, verified against the worl
     const botB = simulatedBot({ items: [['dirt', 32]] })
     const placed = buildable(botB)
     for (const [x, y, z] of cells) placed.set(`${x},${y},${z}`, 'dirt')
-    addPlayer(botB, 2, 'Gabriel', 6.5, 0.5)
+    addPlayer(botB, 2, 'Steve', 6.5, 0.5)
     const b = startTestSession({ bot: botB, dataDir: dir })
     try {
       b.spawn()
@@ -274,32 +274,32 @@ test('G5: after a restart the objectives are restored, verified against the worl
 
 test('G6: a replaced long task is set aside, not forgotten (not only builds)', async () => {
   const bot = simulatedBot()
-  addPlayer(bot, 2, 'Gabriel', 20.5, 0.5)
+  addPlayer(bot, 2, 'Steve', 20.5, 0.5)
   const s = startTestSession({ bot })
   try {
     s.spawn()
     await sleep(150)
     const it = s.internals()
-    await it.executeAction({ a: 'follow', player: 'Gabriel' }, snapNow(it, { askedBy: 'Gabriel' }))
+    await it.executeAction({ a: 'follow', player: 'Steve' }, snapNow(it, { askedBy: 'Steve' }))
     const follow = openOf(s).find((g) => g.kind === 'follow')
     await it.executeAction({ a: 'go_to', x: 3, z: 3 }, snapNow(it))
     const after = s.shared.goals.get(follow.id)
     assert.equal(after.status, 'suspended')
     assert.match(after.suspendReason, /set aside: go to 3,3 was started/)
     assert.ok(it.agenda.shelved.some((x) => x.goalId === follow.id), 'the agenda shelf shows it')
-    assert.match(it.buildActionPrompt(['test']).text, new RegExp(`${follow.id} SUSPENDED follow Gabriel`))
+    assert.match(it.buildActionPrompt(['test']).text, new RegExp(`${follow.id} SUSPENDED follow Steve`))
   } finally { s.stop() }
 })
 
 test('G7: eight interruptions set a task aside instead of deleting it', async () => {
   const bot = simulatedBot()
-  addPlayer(bot, 2, 'Gabriel', 20.5, 0.5)
+  addPlayer(bot, 2, 'Steve', 20.5, 0.5)
   const s = startTestSession({ bot })
   try {
     s.spawn()
     await sleep(150)
     const it = s.internals()
-    await it.executeAction({ a: 'follow', player: 'Gabriel' }, { threatIds: [], askedBy: 'Gabriel' })
+    await it.executeAction({ a: 'follow', player: 'Steve' }, { threatIds: [], askedBy: 'Steve' })
     const main = it.agenda.main
     const goal = s.shared.goals.get(main.goalId)
     assert.ok(goal)
@@ -329,7 +329,7 @@ test('G8: an objective whose world changed is not blindly resumed', async () => 
     blocks: { '6,64,0': 'chest' },
     containers: { '6,64,0': {} } // the chest a player emptied during the interruption
   })
-  addPlayer(bot, 2, 'Gabriel', 3.5, 0.5)
+  addPlayer(bot, 2, 'Steve', 3.5, 0.5)
   const s = startTestSession({ bot })
   try {
     s.spawn()
@@ -342,7 +342,7 @@ test('G8: an objective whose world changed is not blindly resumed', async () => 
     const goal = s.shared.goals.add({
       description: 'take diamond x8 from chest1',
       kind: 'take',
-      origin: 'player:Gabriel',
+      origin: 'player:Steve',
       detail: { args: { item: 'diamond', count: 8, where: 'chest' } }
     })
     s.shared.goals.resume(goal.id)
@@ -368,7 +368,7 @@ test('G8: an objective whose world changed is not blindly resumed', async () => 
 
 test('G9: a decision generated for an old situation is refused before it acts', async () => {
   const bot = simulatedBot()
-  addPlayer(bot, 2, 'Gabriel', 12.5, 0.5)
+  addPlayer(bot, 2, 'Steve', 12.5, 0.5)
   const s = startTestSession({ bot })
   try {
     s.spawn()
@@ -388,12 +388,12 @@ test('G9: a decision generated for an old situation is refused before it acts', 
     // (b) the active task changed while the model was thinking.
     delete bot.entities[40]
     it.sense.assess()
-    await it.executeAction({ a: 'follow', player: 'Gabriel' }, { threatIds: [], askedBy: null })
+    await it.executeAction({ a: 'follow', player: 'Steve' }, { threatIds: [], askedBy: null })
     const staleSnap = { threatIds: [], askedBy: null, goalId: null }
     await it.executeAction({ a: 'take', item: 'bread', where: 'chest' }, staleSnap)
     assert.equal(it.results.at(-1).ok, false)
     assert.match(it.results.at(-1).msg, /active task changed while you were deciding/)
-    assert.equal(it.agenda.main?.label, 'follow Gabriel', 'the running task was not replaced by the stale answer')
+    assert.equal(it.agenda.main?.label, 'follow Steve', 'the running task was not replaced by the stale answer')
 
     // The explicit debugging opt-out disables the guard, not the controls arbiter.
     const action = { a: 'take', item: 'bread', where: 'chest' }
@@ -442,30 +442,30 @@ test('G10: a goal is complete only when the world says so — a returned call is
 
 test('G11: two requests from two players are both recorded; the newer one runs, the older one waits', async () => {
   const bot = simulatedBot({ items: [['bread', 5]] })
-  addPlayer(bot, 2, 'Gabriel', 10.5, 0.5)
-  addPlayer(bot, 3, 'Pedro', -10.5, 0.5)
+  addPlayer(bot, 2, 'Steve', 10.5, 0.5)
+  addPlayer(bot, 3, 'Herobrine', -10.5, 0.5)
   bot.toss = async (type, _m, n) => { bot.log.tossed = (bot.log.tossed || 0) + n }
   const s = startTestSession({
     bot,
-    chat: (p) => (/Pedro/.test(p) ? { text: 'já vou', task: 'give Pedro 1 bread' } : { text: 'já vou', task: 'follow Gabriel' })
+    chat: (p) => (/Herobrine/.test(p) ? { text: 'já vou', task: 'give Herobrine 1 bread' } : { text: 'já vou', task: 'follow Steve' })
   })
   try {
     s.spawn()
     await sleep(200)
     const it = s.internals()
-    s.say('<Gabriel> zinc me segue')
-    assert.ok(await s.until(() => s.prompts.action.some((p) => /chat request from Gabriel/.test(p)), 3000))
-    await it.executeAction({ a: 'follow', player: 'Gabriel' }, { threatIds: [], askedBy: 'Gabriel' })
-    s.say('<Pedro> zinc me da um pao')
-    assert.ok(await s.until(() => s.prompts.action.some((p) => /chat request from Pedro/.test(p)), 3000))
-    await it.executeAction({ a: 'give', player: 'Pedro', item: 'bread', count: 1 }, { threatIds: [], askedBy: 'Pedro' })
+    s.say('<Steve> zinc me segue')
+    assert.ok(await s.until(() => s.prompts.action.some((p) => /chat request from Steve/.test(p)), 3000))
+    await it.executeAction({ a: 'follow', player: 'Steve' }, { threatIds: [], askedBy: 'Steve' })
+    s.say('<Herobrine> zinc me da um pao')
+    assert.ok(await s.until(() => s.prompts.action.some((p) => /chat request from Herobrine/.test(p)), 3000))
+    await it.executeAction({ a: 'give', player: 'Herobrine', item: 'bread', count: 1 }, { threatIds: [], askedBy: 'Herobrine' })
 
     const open = openOf(s)
-    assert.ok(open.some((g) => g.kind === 'follow' && g.origin === 'player:Gabriel'), 'Gabriel\'s objective is kept')
-    assert.ok(open.some((g) => g.kind === 'give' && g.origin === 'player:Pedro'), 'Pedro\'s objective is kept')
+    assert.ok(open.some((g) => g.kind === 'follow' && g.origin === 'player:Steve'), 'Steve\'s objective is kept')
+    assert.ok(open.some((g) => g.kind === 'give' && g.origin === 'player:Herobrine'), 'Herobrine\'s objective is kept')
     assert.ok(await s.until(() => (bot.log.tossed || 0) === 1, 8000))
     // The older follow resumes by itself after the side job.
-    assert.ok(await s.until(() => /following Gabriel/.test(it.skills.current()?.label || ''), 5000))
+    assert.ok(await s.until(() => /following Steve/.test(it.skills.current()?.label || ''), 5000))
     assert.equal(s.shared.goals.get(open.find((g) => g.kind === 'follow').id).status, 'active')
     assert.equal(s.shared.goals.get(open.find((g) => g.kind === 'give').id).status, 'completed')
   } finally { s.stop() }
@@ -478,25 +478,25 @@ test('G12: the goal tool records, lists, updates, verifies and cancels objective
     s.spawn()
     await sleep(150)
     const it = s.internals()
-    const snap = { threatIds: [], askedBy: 'Gabriel', goalId: null }
-    assert.equal(coerceAction({ tool_calls: [{ function: { name: 'goal', arguments: JSON.stringify({ operation: 'add', description: 'deliver 3 bread to Pedro' }) } }] }).a, 'goal')
+    const snap = { threatIds: [], askedBy: 'Steve', goalId: null }
+    assert.equal(coerceAction({ tool_calls: [{ function: { name: 'goal', arguments: JSON.stringify({ operation: 'add', description: 'deliver 3 bread to Herobrine' }) } }] }).a, 'goal')
 
-    await it.executeAction({ a: 'goal', operation: 'add', description: 'deliver 3 bread to Pedro', priority: 70 }, snap)
+    await it.executeAction({ a: 'goal', operation: 'add', description: 'deliver 3 bread to Herobrine', priority: 70 }, snap)
     const declared = s.shared.goals.list({ status: 'pending' })[0]
     assert.ok(declared, 'the declared objective exists')
     assert.equal(declared.priority, 70)
     assert.match(it.results.at(-1).msg, new RegExp(`${declared.id} recorded`))
-    assert.match(it.buildActionPrompt(['test']).text, new RegExp(`- ${declared.id} PENDING deliver 3 bread to Pedro`))
+    assert.match(it.buildActionPrompt(['test']).text, new RegExp(`- ${declared.id} PENDING deliver 3 bread to Herobrine`))
 
     // A main task started right after is linked as its step.
-    addPlayer(bot, 2, 'Pedro', 4.5, 0.5)
-    await it.executeAction({ a: 'go_to', player: 'Pedro' }, { threatIds: [], askedBy: 'Gabriel' })
+    addPlayer(bot, 2, 'Herobrine', 4.5, 0.5)
+    await it.executeAction({ a: 'go_to', player: 'Herobrine' }, { threatIds: [], askedBy: 'Steve' })
     const step = s.shared.goals.list({ status: 'active' }).find((g) => g.kind === 'go_to')
     assert.equal(step.parentId, declared.id, 'the step is a child of the declared objective')
 
-    await it.executeAction({ a: 'goal', operation: 'update', id: declared.id, note: 'Pedro is at the base', percent: 30 }, snap)
+    await it.executeAction({ a: 'goal', operation: 'update', id: declared.id, note: 'Herobrine is at the base', percent: 30 }, snap)
     assert.equal(s.shared.goals.get(declared.id).progress.percent, 30)
-    assert.match(s.shared.goals.get(declared.id).detail.lastNote, /Pedro is at the base/)
+    assert.match(s.shared.goals.get(declared.id).detail.lastNote, /Herobrine is at the base/)
 
     await it.executeAction({ a: 'goal', operation: 'cancel', id: declared.id }, snap)
     assert.equal(s.shared.goals.get(declared.id).status, 'cancelled')
@@ -512,7 +512,7 @@ test('G12: the goal tool records, lists, updates, verifies and cancels objective
 
 test('G13: a goal that stops making progress wakes the model once — and is not failed for being slow', async () => {
   const bot = simulatedBot()
-  addPlayer(bot, 2, 'Gabriel', 20.5, 0.5)
+  addPlayer(bot, 2, 'Steve', 20.5, 0.5)
   const s = startTestSession({
     bot,
     cfg: (c) => { c.goals = { ...(c.goals || {}), stallMs: 60, remindMs: 60_000, tickMs: 30, starveMs: 600_000 } }
@@ -521,7 +521,7 @@ test('G13: a goal that stops making progress wakes the model once — and is not
     s.spawn()
     await sleep(150)
     const it = s.internals()
-    await it.executeAction({ a: 'follow', player: 'Gabriel' }, { threatIds: [], askedBy: null })
+    await it.executeAction({ a: 'follow', player: 'Steve' }, { threatIds: [], askedBy: null })
     const goal = openOf(s).find((g) => g.kind === 'follow')
     assert.ok(await s.until(() => s.prompts.action.some((p) => new RegExp(`no progress on ${goal.id}`).test(p)), 4000), 'the model is nudged')
     const after = s.shared.goals.get(goal.id)
@@ -545,7 +545,7 @@ test('G14: goals survive repeated restarts without progressive degradation', () 
     const g = reg.add({
       description: 'build small_house (walls)',
       kind: 'build',
-      origin: 'player:Gabriel',
+      origin: 'player:Steve',
       priority: 55,
       detail: { at: [12, 64, -3], stage: 'walls', args: { blueprint: 'small_house', stage: 'walls' } },
       resume: 'same origin, same stage'
@@ -557,7 +557,7 @@ test('G14: goals survive repeated restarts without progressive degradation', () 
     const after = last.get(g.id)
     assert.equal(after.description, 'build small_house (walls)')
     assert.deepEqual(after.detail, { at: [12, 64, -3], stage: 'walls', args: { blueprint: 'small_house', stage: 'walls' } }, 'the checkpoint is byte-identical after five reloads')
-    assert.equal(after.origin, 'player:Gabriel')
+    assert.equal(after.origin, 'player:Steve')
     assert.equal(after.priority, 55)
     assert.equal(after.resume, 'same origin, same stage')
     assert.equal(after.progress.done, 55)

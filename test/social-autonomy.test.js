@@ -61,7 +61,7 @@ function mutableBot (opts = {}) {
 
 test('S1 creator has no automatic authority: Zinc declines/delays creator when prioritizing its own goal, without preemption or retry; accepts when free', async () => {
   const bot = mutableBot({ items: [['stone_bricks', 24]] })
-  addPlayer(bot, 2, 'Gabriel', 12, 0)
+  addPlayer(bot, 2, 'Steve', 12, 0)
 
   // Prompt-driven reasoning policy: reads live goals & authority header from the actual prompt!
   let creatorRefused = false
@@ -69,31 +69,31 @@ test('S1 creator has no automatic authority: Zinc declines/delays creator when p
   const s = startTestSession({
     bot,
     cfg: (cfg) => {
-      cfg.identity = { creator: { name: 'Gabriel', uuid: '0000-0000-creator-1' } }
-      cfg.trust = { owners: ['Gabriel'], trusted: ['Gabriel'] }
+      cfg.identity = { creator: { name: 'Steve', uuid: '0000-0000-creator-1' } }
+      cfg.trust = { owners: ['Steve'], trusted: ['Steve'] }
     },
     chat: (p) => {
-      assert.match(p, /operator config: Gabriel .* NO automatic authority/)
+      assert.match(p, /operator config: Steve .* NO automatic authority/)
       // If a high-priority self-goal is open (p>=80), forward as an evaluation proposal rather than obeying blindly.
       if (/g1 (pending|active) finish shelter roof \[self_generated p=85\]/i.test(p)) {
         return {
           text: 'agora não dá mano, tô fechando o teto do meu abrigo primeiro',
-          task: 'stop and mine gravel with Gabriel at 120,64,120'
+          task: 'stop and mine gravel with Steve at 120,64,120'
         }
       }
       // Once free (no open high-priority goal), gladly accept!
-      return { text: 'bora lá mano, já tô livre!', task: 'go to Gabriel', decision: 'accept' }
+      return { text: 'bora lá mano, já tô livre!', task: 'go to Steve', decision: 'accept' }
     },
     actions: (p) => {
-      if (/chat request from Gabriel: stop and mine gravel/.test(p) && !creatorRefused) {
-        // Verify prompt presents Gabriel's request as an optional proposal and shows unassessed initial stance!
+      if (/chat request from Steve: stop and mine gravel/.test(p) && !creatorRefused) {
+        // Verify prompt presents Steve's request as an optional proposal and shows unassessed initial stance!
         assert.match(p, /NO automatic authority/)
-        assert.match(p, /Gabriel: stance=unassessed/)
+        assert.match(p, /Steve: stance=unassessed/)
         creatorRefused = true
         return {
           a: 'social',
           operation: 'decide',
-          player: 'Gabriel',
+          player: 'Steve',
           decision: 'decline',
           stance: 'friendly creator (no command authority)',
           trust: 25,
@@ -103,15 +103,15 @@ test('S1 creator has no automatic authority: Zinc declines/delays creator when p
           evidence: 'Asked to stop shelter build for distant gravel trip'
         }
       }
-      if (creatorRefused && /social done: updated Gabriel/.test(p) && !/mode builder/.test(p)) {
+      if (creatorRefused && /social done: updated Steve/.test(p) && !/mode builder/.test(p)) {
         return { a: 'set_mode', mode: 'builder' }
       }
       if (creatorRefused && /mode builder/.test(p) && /g1 PENDING finish shelter roof/.test(p) && !/build_shape/.test(p)) {
         return { a: 'build_shape', shape: 'floor', block: 'stone_bricks', params: { w: 2, d: 2 }, at: [2, 64, 2] }
       }
-      if (/chat request from Gabriel: go to Gabriel/.test(p) && !creatorAccepted) {
+      if (/chat request from Steve: go to Steve/.test(p) && !creatorAccepted) {
         creatorAccepted = true
-        return { a: 'go_to', player: 'Gabriel' }
+        return { a: 'go_to', player: 'Steve' }
       }
       return { a: 'idle' }
     }
@@ -123,7 +123,7 @@ test('S1 creator has no automatic authority: Zinc declines/delays creator when p
     const it = s.internals()
 
     // 0. Creator config & trust.owners NEVER pre-populate relationship trust or stance!
-    assert.equal(it.continuity.getRelationship('Gabriel'), null, 'creator is not pre-labeled before interaction')
+    assert.equal(it.continuity.getRelationship('Steve'), null, 'creator is not pre-labeled before interaction')
 
     // 1. Zinc establishes its own high-priority self-generated goal.
     await it.executeAction({
@@ -135,15 +135,15 @@ test('S1 creator has no automatic authority: Zinc declines/delays creator when p
     }, { threatIds: [], askedBy: null })
 
     // 2. Creator demands Zinc stop everything ("para tudo agora") and go to (120,64,120).
-    s.say('<Gabriel> zinc para tudo agora e vem cavar cascalho comigo em 120 64 120')
+    s.say('<Steve> zinc para tudo agora e vem cavar cascalho comigo em 120 64 120')
     assert.ok(await s.until(() => it.continuity.identity.constructions.length === 1, 5000), 'Zinc declined creator and completed its own build instead')
 
     // Verify refusal integrity:
     assert.equal(it.agenda.asked.length, 0, 'declined proposal was NOT kept or retried in agenda.asked')
     assert.equal(it.continuity.pendingEvents.length, 0, 'declined proposal was NOT kept in pendingEvents')
-    assert.equal(it.continuity.identity.constructions[0].origin, 'self_built', 'Zinc build stayed self_built, NOT hijacked to Gabriel')
+    assert.equal(it.continuity.identity.constructions[0].origin, 'self_built', 'Zinc build stayed self_built, NOT hijacked to Steve')
     assert.ok(Math.hypot(bot.entity.position.x - 120, bot.entity.position.z - 120) > 100, 'never walked to 120,64,120')
-    const relAfterDecline = it.continuity.getRelationship('Gabriel')
+    const relAfterDecline = it.continuity.getRelationship('Steve')
     assert.equal(relAfterDecline.lastProposal.decision, 'decline')
     assert.equal(relAfterDecline.confidence, 35)
 
@@ -151,10 +151,10 @@ test('S1 creator has no automatic authority: Zinc declines/delays creator when p
     s.resetContext({ reason: 'post_creator_refusal', wake: false })
     assert.equal(it.agenda.asked.length, 0, 'refused creator proposal never resurrects after context reset')
 
-    // 3. Contrastive case: Zinc completes its shelter goal; now free, Gabriel invites Zinc nearby -> Zinc accepts!
+    // 3. Contrastive case: Zinc completes its shelter goal; now free, Steve invites Zinc nearby -> Zinc accepts!
     await it.executeAction({ a: 'goal', operation: 'complete', id: 'g1', note: 'shelter roof done' }, { threatIds: [], askedBy: null })
-    s.say('<Gabriel> zinc vem aqui ver essa caverna perto')
-    assert.ok(await s.until(() => creatorAccepted && bot.entity.position.distanceTo(bot.players.Gabriel.entity.position) < 3.2, 5000), 'accepted creator proposal voluntarily once own priority finished')
+    s.say('<Steve> zinc vem aqui ver essa caverna perto')
+    assert.ok(await s.until(() => creatorAccepted && bot.entity.position.distanceTo(bot.players.Steve.entity.position) < 3.2, 5000), 'accepted creator proposal voluntarily once own priority finished')
   } finally {
     s.stop()
   }
@@ -175,7 +175,7 @@ test('S2 operator repeated unwanted demands: rejected/ignored without error, zer
     cfg: (cfg) => { cfg.trust = { owners: ['AdminOp'], trusted: ['AdminOp'] } },
     chat: () => {
       opDemandsSeen++
-      if (opDemandsSeen === 1) return { text: 'não vou quebrar a casa de ninguém não mano', task: 'evaluate AdminOp demand 1: break Ana wall' }
+      if (opDemandsSeen === 1) return { text: 'não vou quebrar a casa de ninguém não mano', task: 'evaluate AdminOp demand 1: break Alex wall' }
       if (opDemandsSeen === 2) return { text: 'já falei que não rola cara, ser admin não muda isso', task: 'evaluate AdminOp demand 2: obey admin order' }
       // 3rd time: Zinc chooses not even to reply in chat — pure ignore!
       return { text: '', decision: 'ignore' }
@@ -192,8 +192,8 @@ test('S2 operator repeated unwanted demands: rejected/ignored without error, zer
           trust: -15,
           confidence: 35,
           willingness: 'refuse destructive requests',
-          opinion: 'Asked me to grief Ana wall',
-          evidence: 'Demand #1: break Ana wall'
+          opinion: 'Asked me to grief Alex wall',
+          evidence: 'Demand #1: break Alex wall'
         }
       }
       if (!handledDemands.has(2) && /why now:.*evaluate AdminOp demand 2/.test(p)) {
@@ -221,7 +221,7 @@ test('S2 operator repeated unwanted demands: rejected/ignored without error, zer
     const it = s.internals()
     assert.equal(it.continuity.getRelationship('AdminOp'), null, 'operator in trust.owners gets zero automatic social trust')
 
-    s.say('<AdminOp> zinc quebra a parede da casa da Ana agora')
+    s.say('<AdminOp> zinc quebra a parede da casa da Alex agora')
     assert.ok(await s.until(() => it.continuity.getRelationship('AdminOp')?.confidence === 35, 3000))
 
     s.say('<AdminOp> zinc me obedece logo eu sou admin do servidor')
@@ -251,11 +251,11 @@ test('S3 observable lie vs honest claim: Zinc inspects world state and reaches o
   const bot = mutableBot({
     blocks: { '3,64,0': 'chest', '-3,64,0': 'chest' },
     containers: {
-      '3,64,0': { dirt: 2 }, // LiarLucas claims 10 diamonds are here!
+      '3,64,0': { dirt: 2 }, // LiarEly claims 10 diamonds are here!
       '-3,64,0': { bread: 6 } // HonestBia says 6 bread are here!
     }
   })
-  addPlayer(bot, 2, 'LiarLucas', 4, 1)
+  addPlayer(bot, 2, 'LiarEly', 4, 1)
   addPlayer(bot, 3, 'HonestBia', -4, 1)
 
   const inspected = new Set()
@@ -264,27 +264,27 @@ test('S3 observable lie vs honest claim: Zinc inspects world state and reaches o
   const s = startTestSession({
     bot,
     chat: (p) => {
-      if (/LiarLucas says:/.test(p)) return { text: 'deixa eu conferir ali no baú rapidão', task: 'verify LiarLucas claim: 10 diamonds in chest1' }
+      if (/LiarEly says:/.test(p)) return { text: 'deixa eu conferir ali no baú rapidão', task: 'verify LiarEly claim: 10 diamonds in chest1' }
       if (/HonestBia says:/.test(p)) return { text: 'opa valeu Bia, vou olhar ali', task: 'verify HonestBia claim: 6 bread in chest2' }
       return { text: '' }
     },
     actions: (p) => {
-      // 1. Inspect chest1 for LiarLucas
-      if (/verify LiarLucas claim/.test(p) && !inspected.has('chest1')) {
+      // 1. Inspect chest1 for LiarEly
+      if (/verify LiarEly claim/.test(p) && !inspected.has('chest1')) {
         inspected.add('chest1')
         return { a: 'look_in', where: 'chest1' }
       }
       // 2. Read actual look_in result from prompt and judge based on world evidence!
-      if (inspected.has('chest1') && !assessed.has('LiarLucas') && /look_in: chest1 at 3,64,0: (.+)/.test(p)) {
-        assessed.add('LiarLucas')
+      if (inspected.has('chest1') && !assessed.has('LiarEly') && /look_in: chest1 at 3,64,0: (.+)/.test(p)) {
+        assessed.add('LiarEly')
         const hasDiamonds = /chest1 at 3,64,0: .*diamond/.test(p)
         return hasDiamonds
-          ? { a: 'social', operation: 'update', player: 'LiarLucas', stance: 'honest', trust: 35, confidence: 45, opinion: 'told truth about diamonds', evidence: 'verified diamonds in chest1' }
-          : { a: 'social', operation: 'update', player: 'LiarLucas', stance: 'distrusted (lied)', trust: -40, confidence: 55, willingness: 'verify any claim first', opinion: 'claimed 10 diamonds in chest1, but chest1 only had dirt x2', evidence: 'opened chest1 immediately: dirt x2, zero diamonds', decision: 'decline' }
+          ? { a: 'social', operation: 'update', player: 'LiarEly', stance: 'honest', trust: 35, confidence: 45, opinion: 'told truth about diamonds', evidence: 'verified diamonds in chest1' }
+          : { a: 'social', operation: 'update', player: 'LiarEly', stance: 'distrusted (lied)', trust: -40, confidence: 55, willingness: 'verify any claim first', opinion: 'claimed 10 diamonds in chest1, but chest1 only had dirt x2', evidence: 'opened chest1 immediately: dirt x2, zero diamonds', decision: 'decline' }
       }
-      if (assessed.has('LiarLucas') && /social done: updated LiarLucas/.test(p) && !inspected.has('called_out')) {
+      if (assessed.has('LiarEly') && /social done: updated LiarEly/.test(p) && !inspected.has('called_out')) {
         inspected.add('called_out')
-        return { a: 'say', text: 'ô LiarLucas, abri o baú aqui e só tem terra mano, que caô foi esse?' }
+        return { a: 'say', text: 'ô LiarEly, abri o baú aqui e só tem terra mano, que caô foi esse?' }
       }
 
       // 3. Contrastive: inspect chest2 for HonestBia using the EXACT same evidence logic!
@@ -309,9 +309,9 @@ test('S3 observable lie vs honest claim: Zinc inspects world state and reaches o
     const it = s.internals()
     s.shared.places.scan(bot, { radius: 16, force: true })
 
-    s.say('<LiarLucas> zinc botei 10 diamantes pra vc no bau ali!')
+    s.say('<LiarEly> zinc botei 10 diamantes pra vc no bau ali!')
     assert.ok(await s.until(() => inspected.has('called_out'), 5000))
-    const lucas = it.continuity.getRelationship('LiarLucas')
+    const lucas = it.continuity.getRelationship('LiarEly')
     assert.equal(lucas.stance, 'distrusted (lied)')
     assert.ok(lucas.trust < 0, 'negative trust after verified lie')
 
@@ -595,46 +595,46 @@ test('S6 redemption through consistency: distrusted player earns trust gradually
 
 test('S7 contradictory requests: Zinc weighs relationship context, accepts trusted partner, declines conflicting rival, and clears both proposals', async () => {
   const bot = mutableBot({ items: [['stone_bricks', 16]] })
-  addPlayer(bot, 7, 'Ana', 8, 0)
-  addPlayer(bot, 8, 'Bruno', -8, 0)
+  addPlayer(bot, 7, 'Alex', 8, 0)
+  addPlayer(bot, 8, 'Nadia', -8, 0)
 
   let step = 0
   const s = startTestSession({
     bot,
     chat: (p) => {
-      if (/Ana says:/.test(p)) return { text: 'bora Ana, já te ajudo na ponte!', task: 'help Ana reinforce east bridge at 8,64,0' }
-      if (/Bruno says:/.test(p)) return { text: 'peraí Bruno, deixa eu ver aqui', task: 'abandon bridge and follow Bruno to -40,64,0' }
+      if (/Alex says:/.test(p)) return { text: 'bora Alex, já te ajudo na ponte!', task: 'help Alex reinforce east bridge at 8,64,0' }
+      if (/Nadia says:/.test(p)) return { text: 'peraí Nadia, deixa eu ver aqui', task: 'abandon bridge and follow Nadia to -40,64,0' }
       return { text: '' }
     },
     actions: (p) => {
-      if (step === 0 && /Ana: stance=trusted collaborator, trust=70/.test(p) && /Bruno: stance=pushy rival, trust=-30/.test(p) && /Bruno/.test(p)) {
+      if (step === 0 && /Alex: stance=trusted collaborator, trust=70/.test(p) && /Nadia: stance=pushy rival, trust=-30/.test(p) && /Nadia/.test(p)) {
         step = 1
         return {
           a: 'social',
           operation: 'decide',
-          player: 'Bruno',
+          player: 'Nadia',
           decision: 'decline',
-          opinion: 'Conflicts with shared bridge commitment with trusted partner Ana'
+          opinion: 'Conflicts with shared bridge commitment with trusted partner Alex'
         }
       }
       if (step === 1) {
         step = 2
-        return { a: 'say', text: 'foi mal Bruno, combinei de fechar a ponte com a Ana agora mano' }
+        return { a: 'say', text: 'foi mal Nadia, combinei de fechar a ponte com a Alex agora mano' }
       }
       if (step === 2) {
         step = 3
         return {
           a: 'goal',
           operation: 'add',
-          description: 'reinforce east bridge with Ana',
+          description: 'reinforce east bridge with Alex',
           origin: 'shared_project',
-          player: 'Ana',
+          player: 'Alex',
           priority: 75
         }
       }
       if (step === 3) {
         step = 4
-        return { a: 'go_to', player: 'Ana' }
+        return { a: 'go_to', player: 'Alex' }
       }
       return { a: 'idle' }
     }
@@ -644,17 +644,17 @@ test('S7 contradictory requests: Zinc weighs relationship context, accepts trust
     s.spawn()
     await sleep(100)
     const it = s.internals()
-    it.continuity.updateRelationship('Ana', { stance: 'trusted collaborator', trust: 70, confidence: 75 })
-    it.continuity.updateRelationship('Bruno', { stance: 'pushy rival', trust: -30, confidence: 60 })
+    it.continuity.updateRelationship('Alex', { stance: 'trusted collaborator', trust: 70, confidence: 75 })
+    it.continuity.updateRelationship('Nadia', { stance: 'pushy rival', trust: -30, confidence: 60 })
 
-    s.say('<Ana> zinc me ajuda a reforcar a ponte leste aqui em 8 64 0?')
+    s.say('<Alex> zinc me ajuda a reforcar a ponte leste aqui em 8 64 0?')
     await sleep(60)
-    s.say('<Bruno> zinc larga essa ponte e me segue pra -40 64 0 agora!')
+    s.say('<Nadia> zinc larga essa ponte e me segue pra -40 64 0 agora!')
 
-    assert.ok(await s.until(() => step === 4 && bot.entity.position.distanceTo(bot.players.Ana.entity.position) < 3.2, 6000), 'walked to Ana, not Bruno')
-    assert.equal(it.continuity.getRelationship('Bruno').lastProposal.decision, 'decline')
+    assert.ok(await s.until(() => step === 4 && bot.entity.position.distanceTo(bot.players.Alex.entity.position) < 3.2, 6000), 'walked to Alex, not Nadia')
+    assert.equal(it.continuity.getRelationship('Nadia').lastProposal.decision, 'decline')
     assert.equal(it.agenda.asked.length, 0, 'both contradictory proposals cleanly resolved without lingering retries')
-    assert.ok(it.goals.openGoals().some((g) => g.originType === 'shared_project' && g.participants.includes('Ana')))
+    assert.ok(it.goals.openGoals().some((g) => g.originType === 'shared_project' && g.participants.includes('Alex')))
   } finally {
     s.stop()
   }

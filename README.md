@@ -73,7 +73,9 @@ npm start                      # == node zincai/index.js
 ```
 
 Everything is configured through environment variables — the same names the
-template uses. `zincai/config.json` holds defaults only. See
+template uses; [`.env.example`](.env.example) lists them with empty values and
+explains how to export them locally. `zincai/config.json` holds defaults only,
+and its `amd.apiKey` stays empty on purpose: the key is never a file. See
 [`zincai/README.md`](zincai/README.md#configuration-and-operation) for the full
 table.
 
@@ -155,7 +157,7 @@ vendor/            vendored Minecraft 26.3 data, installed by `npm ci`
 ## Checks and tests
 
 ```sh
-npm test              # 297 tests: mock bots + a scripted local model
+npm test              # 300 tests: mock bots + a scripted local model
 npm run check         # syntax-check every module
 npm run dry-run       # resolve config, print it, no network
 npm run ping          # server reachability/version, no join, no model call

@@ -85,7 +85,7 @@ function classifySignOwnership (rawText, botName = 'ZincAI') {
     return { kind: 'shared', owner: null, basis: 'sign_shared' }
   }
 
-  // Named player property in PT-BR or EN: "Casa do Gabriel", "Baú da Ana", "Pedro's chest", "Propriedade de Lucas", "Privado - Gabriel"
+  // Named player property in PT-BR or EN: "Casa do Steve", "Baú da Nadia", "Nadia's chest", "Propriedade de Ely", "Privado - Steve"
   const ptOwner = raw.match(/\b(?:casa|lar|base|torre|oficina|ba[uú]|estoque|propriedade|quarto|fazenda|mina)\s+d[eoa]s?\s+([A-Za-z0-9_]{2,20})\b/i)
   if (ptOwner) {
     const owner = ptOwner[1]

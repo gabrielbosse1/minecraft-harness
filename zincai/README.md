@@ -149,7 +149,7 @@ release controls.
 long task (`build`, `build_shape`, `gather`, `go_to`, `follow`, `light_up`,
 `shelter`, `corpse_run`) and every short job (`give`, `take`, `put`, `smelt`,
 `sleep`, `look_in`, `use_block`, `craft`) gets a record with an id (`g7`), an
-origin (`player:Gabriel` or `self`), a priority, a completion/failure/resume
+origin (`player:Steve` or `self`), a priority, a completion/failure/resume
 description, and a checkpoint in `detail` — a build's resolved origin and
 stage, a gather's item and count, a job's arguments.
 

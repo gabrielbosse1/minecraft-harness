@@ -26,3 +26,7 @@ npm-debug.log*
 # OS cruft
 .DS_Store
 Thumbs.db
+
+# Scratch space used while debugging a session. Not part of the suite and never
+# committed: anything worth keeping becomes a test file or a documented finding.
+.zinc-test-run/

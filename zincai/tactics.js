@@ -297,7 +297,7 @@ function cornerText (why) {
   return 'CORNERED — the only safe ground is a dead end'
 }
 
-/** "zombie x24 (nearest 5m NE)", "skeleton (15m N; ranged)", "Gabriel (3m E; player, hit you; diamond_sword, armor 20/20)". */
+/** "zombie x24 (nearest 5m NE)", "skeleton (15m N; ranged)", "Steve (3m E; player, hit you; diamond_sword, armor 20/20)". */
 function describeGroup (g) {
   const tags = []
   const stats = g.stats || mobStats(g.name)

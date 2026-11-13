@@ -53,8 +53,8 @@ function blockBot (cells, extra = {}) {
 
 test('1. several players send messages in rapid succession: all delivered, attributed, ordered', async () => {
   const bot = simulatedBot()
-  addPlayer(bot, 20, 'Gabriel', 3, 3)
-  addPlayer(bot, 21, 'Lucas', -4, 2)
+  addPlayer(bot, 20, 'Steve', 3, 3)
+  addPlayer(bot, 21, 'Ely', -4, 2)
   const seen = []
   const s = startTestSession({
     bot,
@@ -67,9 +67,9 @@ test('1. several players send messages in rapid succession: all delivered, attri
   try {
     s.spawn()
     await sleep(60)
-    s.say('<Gabriel> Zinc, vem aqui')
-    s.say('<Lucas> zinc cade voce')
-    s.say('<Gabriel> responde')
+    s.say('<Steve> Zinc, vem aqui')
+    s.say('<Ely> zinc cade voce')
+    s.say('<Steve> responde')
     const ok = await s.until(() => s.prompts.chat.length >= 1, 8000)
     const chatEvents = s.internals().events.events.filter((e) => e.eventType === 'chat')
     const ok2 = await s.until(() => s.internals().events.events.filter((e) => e.eventType === 'chat').length >= 2, 4000)
@@ -94,14 +94,14 @@ test('2. multiple entities take damage in the same interval: one line per kind, 
   for (let i = 0; i < 4; i++) {
     p.record({ source: 'mineflayer', eventType: 'entity_hurt', summary: 'zombie took damage 6m away', entities: ['zombie'], groupKey: 'hurt:zombie', importance: 1, occurredAt: Date.now(), occurrenceTimeKnown: true, dedupeKey: null })
   }
-  p.record({ source: 'mineflayer', eventType: 'entity_hurt', summary: 'Gabriel took damage 4m away', entities: ['Gabriel'], groupKey: 'hurt:Gabriel', importance: 2, occurredAt: Date.now(), occurrenceTimeKnown: true })
+  p.record({ source: 'mineflayer', eventType: 'entity_hurt', summary: 'Steve took damage 4m away', entities: ['Steve'], groupKey: 'hurt:Steve', importance: 2, occurredAt: Date.now(), occurrenceTimeKnown: true })
   const hurt = p.events.filter((e) => e.eventType === 'entity_hurt')
   assert.equal(hurt.length, 2, 'burst coalescing groups repetitive damage')
   const zombies = hurt.find((e) => e.groupKey === 'hurt:zombie')
   assert.equal(zombies.groupCount, 4, 'underlying evidence (the count) is retained')
   const text = p.formatForPrompt({ max: 6 }).text
   assert.match(text, /x4/)
-  assert.match(text, /Gabriel/)
+  assert.match(text, /Steve/)
 })
 
 test('3. a block changes while Zinc is performing another task — the model still sees it', async () => {
@@ -182,7 +182,7 @@ test('7. a restart delivers undelivered events once and never replays processed 
   const dir = tmpDir()
   const file = path.join(dir, 'journal.json')
   const first = new EventPipeline({ file })
-  const kept = first.record({ eventType: 'chat', summary: 'Gabriel: meet me at the chest', importance: 2, occurredAt: Date.now(), occurrenceTimeKnown: true }).event
+  const kept = first.record({ eventType: 'chat', summary: 'Steve: meet me at the chest', importance: 2, occurredAt: Date.now(), occurrenceTimeKnown: true }).event
   first.record({ eventType: 'entity_hurt', summary: 'cow hit', importance: 1 }).event
   first.markProcessed([99999]) // no-op, keeps the processed path honest
   first.save()
@@ -283,13 +283,13 @@ test('11. a player entering nearby while exploring is delivered as a fast event,
   try {
     s.spawn()
     await sleep(80)
-    const e = addPlayer(bot, 30, 'Pedro', 4, 4)
+    const e = addPlayer(bot, 30, 'Herobrine', 4, 4)
     bot.emit('entitySpawn', e)
     const ok = await s.until(() => s.internals().events.events.some((x) => x.eventType === 'player_arrived'), 2000)
     assert.ok(ok)
     const ev = s.internals().events.events.find((x) => x.eventType === 'player_arrived')
     assert.equal(ev.reactionClass, 'fast')
-    assert.equal(ev.entities[0], 'Pedro')
+    assert.equal(ev.entities[0], 'Herobrine')
     assert.match(ev.summary, /appeared/)
   } finally { s.stop() }
 })
@@ -361,10 +361,10 @@ test('14. an important discovery survives a restart with its provenance and time
 test('15. an observed fact is never confused with a player claim, and a claim can be contradicted', () => {
   const dir = tmpDir()
   const m = new MemorySystem({ file: path.join(dir, 'm.json'), preferencesFile: path.join(dir, 'p.json') })
-  m.rememberChat('Lucas', 'o baú chest2 no segundo andar tá cheio de diamantes, guardei 30 ali', { addressed: true })
+  m.rememberChat('Ely', 'o baú chest2 no segundo andar tá cheio de diamantes, guardei 30 ali', { addressed: true })
   const claim = m.longTerm.entries.find((e) => e.basis === 'reported')
   assert.ok(claim, 'the player statement is stored')
-  assert.match(claim.text, /Lucas claimed/)
+  assert.match(claim.text, /Ely claimed/)
   assert.ok(claim.confidence < 0.5, 'a claim carries low confidence')
   assert.equal(claim.lastVerifiedAt, null, 'a claim is not "verified"')
   // Now observing the chest empties it out.
@@ -394,8 +394,8 @@ test('16. retrieval is ranked and bounded: the right memory without loading the 
   for (let i = 0; i < 120; i++) {
     m.longTerm.add(`routine note ${i} about walking around the plains at chunk ${i}`, ['ambient'], 1, null, { category: 'episodic', importance: 1 })
   }
-  m.recordKnowledge({ text: 'Gabriel keeps his iron in the barrel beside the furnace', category: 'semantic', entities: ['Gabriel'], importance: 3, tags: ['storage', 'iron'] })
-  const r = m.longTerm.retrieve({ query: 'where does Gabriel keep the iron', entity: 'Gabriel', k: 3 })
+  m.recordKnowledge({ text: 'Steve keeps his iron in the barrel beside the furnace', category: 'semantic', entities: ['Steve'], importance: 3, tags: ['storage', 'iron'] })
+  const r = m.longTerm.retrieve({ query: 'where does Steve keep the iron', entity: 'Steve', k: 3 })
   assert.ok(r.entries.length <= 3)
   assert.match(r.entries[0].text, /iron/)
   assert.equal(r.totalStoreSize, m.longTerm.entries.length, 'the store size is reported instead of dumping it')
@@ -471,10 +471,10 @@ test('memory effectiveness: ten checks in one store', () => {
   // 3. a construction failure lesson
   m.recordKnowledge({ text: 'lesson: placing the roof before the walls left gaps — build walls first', category: 'procedural', importance: 3, tags: ['lesson', 'build'] })
   // 4. an agreement with another player
-  m.recordKnowledge({ text: 'agreed with Gabriel to build a public bridge over the river', category: 'continuity', basis: 'reported', confidence: 0.6, importance: 3, entities: ['Gabriel'], tags: ['agreement'] })
+  m.recordKnowledge({ text: 'agreed with Steve to build a public bridge over the river', category: 'continuity', basis: 'reported', confidence: 0.6, importance: 3, entities: ['Steve'], tags: ['agreement'] })
   // 5. a verified fact vs an unverified claim
   m.recordKnowledge({ text: 'chest1 at 2,64,2 holds 12 iron ingots (opened and counted)', category: 'semantic', importance: 2, location: { x: 2, y: 64, z: 2, dim: 'overworld' }, subjectKey: 'container:chest1' })
-  m.rememberChat('Lucas', 'o baú chest1 do porão tem 300 diamantes guardados', { addressed: true })
+  m.rememberChat('Ely', 'o baú chest1 do porão tem 300 diamantes guardados', { addressed: true })
   // 6. an outdated belief that later evidence will overturn
   m.recordKnowledge({ text: 'the sugar cane farm is at 30,64,30', category: 'semantic', importance: 2, subjectKey: 'place:cane_farm', location: { x: 30, y: 64, z: 30, dim: 'overworld' } })
   // 9. how a redstone mechanism worked
@@ -486,12 +486,12 @@ test('memory effectiveness: ten checks in one store', () => {
   assert.match(L.retrieve({ query: 'where is the portal', k: 1 }).entries[0].text, /portal stands at 8,64,-120/, '1. location across sessions')
   assert.match(L.retrieve({ query: 'where did I store redstone', k: 1 }).entries[0].text, /barrel1/, '2. stored resources')
   assert.match(L.retrieve({ query: 'building lesson roof', category: 'procedural', k: 1 }).entries[0].text, /build walls first/, '3. failure lesson')
-  assert.match(L.retrieve({ query: 'what did I agree with Gabriel', entity: 'Gabriel', k: 1 }).entries[0].text, /public bridge/, '4. agreement')
+  assert.match(L.retrieve({ query: 'what did I agree with Steve', entity: 'Steve', k: 1 }).entries[0].text, /public bridge/, '4. agreement')
 
   // 5. The claim exists, is labelled, and is weaker than the verified fact.
   const withClaims = L.retrieve({ query: 'chest1 contents', k: 4, includeContradicted: true }).entries
   const claim = withClaims.find((e) => e.basis === 'reported')
-  assert.ok(claim && /Lucas claimed/.test(claim.text), '5. a player statement is stored as a claim')
+  assert.ok(claim && /Ely claimed/.test(claim.text), '5. a player statement is stored as a claim')
   assert.ok(claim.confidence < 0.5 && claim.lastVerifiedAt === null, '5b. the claim is low-confidence and unverified')
   assert.match(reread.formatEntry(claim), /UNVERIFIED CLAIM/)
   const verified = withClaims.find((e) => /iron ingots/.test(e.text))
@@ -753,7 +753,7 @@ test('tool access: recall + redstone_engineer are exposed in the right modes wit
 
 test('end-to-end: the model is shown timestamped events and can act on a recalled memory', async () => {
   const bot = simulatedBot()
-  addPlayer(bot, 41, 'Gabriel', 2, 2)
+  addPlayer(bot, 41, 'Steve', 2, 2)
   const s = startTestSession({
     bot,
     actions: (prompt) => {

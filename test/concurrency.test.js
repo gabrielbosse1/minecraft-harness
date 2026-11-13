@@ -309,10 +309,10 @@ test('C13 a player message during a physical action is answered on the chat lane
   const chat = (async () => {
     const lease = await lanes.acquire('say')
     const d = r.open('chat')
-    try { answer.push('hi Gabriel'); await sleep(5) } finally { d(); lease.release() }
+    try { answer.push('hi Steve'); await sleep(5) } finally { d(); lease.release() }
   })()
   await Promise.all([action, chat])
-  assert.deepEqual(answer, ['hi Gabriel'])
+  assert.deepEqual(answer, ['hi Steve'])
   assert.equal(r.overlap('action', 'chat'), true, 'the reply did not wait for the build')
 })
 

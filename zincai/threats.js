@@ -14,7 +14,7 @@
  *     bow, a mace or a bowl near the bot means nothing.
  *   - Never: armor stands, item frames, pets, name-tagged mobs, villagers.
  *
- * It also explains damage ("fall", "starving", "hit by Gabriel") so the model
+ * It also explains damage ("fall", "starving", "hit by Steve") so the model
  * is not told "I was just attacked" when the bot is merely hungry.
  *
  * No LLM, no network. Works with partial mock bots.

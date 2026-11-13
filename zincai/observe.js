@@ -17,7 +17,7 @@ const { heldItemName } = require('../src/combat')
 const ARMOR_SLOTS = [5, 6, 7, 8]
 
 /** hp / food / position / time / mode / what is held and worn. */
-function selfLine (bot, { mode = 'explorer' } = {}) {
+function selfLine (bot) {
   const p = bot.entity?.position
   const pos = p ? `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}` : '?'
   const dim = String(bot.game?.dimension || 'overworld').replace(/^minecraft:/, '')
@@ -30,7 +30,7 @@ function selfLine (bot, { mode = 'explorer' } = {}) {
     if (item?.name) worn.push(item.name)
   }
   const off = bot.inventory?.slots?.[45]?.name
-  return `state: hp ${Math.round(Number(bot.health ?? 0))}/20 food ${Math.round(Number(bot.food ?? 0))}/20 | pos ${pos} ${dim} | ${tod}${bot.isRaining ? ', raining' : ''} | mode ${mode} | holding ${held}${off ? ` + ${off} (off-hand)` : ''}${worn.length ? ` | wearing ${worn.join(', ')}` : ' | no armor'}`
+  return `state: hp ${Math.round(Number(bot.health ?? 0))}/20 food ${Math.round(Number(bot.food ?? 0))}/20 | pos ${pos} ${dim} | ${tod}${bot.isRaining ? ', raining' : ''} | holding ${held}${off ? ` + ${off} (off-hand)` : ''}${worn.length ? ` | wearing ${worn.join(', ')}` : ' | no armor'}`
 }
 
 /** "inventory (9/36 slots): iron_sword, bread x12, …" — every kind, counted. */

@@ -45,24 +45,18 @@ const { STATUS } = require('./goals')
 const { COMMANDS } = require('./control_commands')
 
 /**
- * Chat shapes that carry operator commands. A command never goes through the
- * language filter and is never answered in chat: the answer goes to the log
- * (and to a whisper to the operator when the command is sensitive).
+ * Split one console line into a command and its arguments. There is no prefix.
+ *
+ * This used to also parse chat shapes: a `!zinc`-prefixed public message became
+ * a command, and a UUID allow-list decided who could send it. Operator control
+ * is console-only now (stdin of the process, or the supervisor's own calls), so
+ * a command is just the words on the line — `pause`, `shutdown`, `status`.
+ * Nothing coming from the game's chat can reach this function.
  */
-function parseCommandLine (raw, prefix) {
-  const text = String(raw || '').trim()
+function parseCommandLine (raw) {
+  const text = String(raw || '').trim().replace(/^\/+/, '')
   if (!text) return null
-  if (!prefix) return null
-  const p = String(prefix).toLowerCase()
-  const at = text.toLowerCase().indexOf(p)
-  // The prefix may arrive bare ("!zinc status") or inside a chat line
-  // ("<Anna> !zinc status"); the caller that already stripped it is also fine.
-  if (at < 0) return null
-  // Do not match a prefix that is part of a word ("x!zinc").
-  if (at > 0 && /[A-Za-z0-9_]/.test(text[at - 1])) return null
-  const rest = text.slice(at + p.length).trim()
-  if (!rest) return { name: 'help', args: [] }
-  return parseTokens(rest)
+  return parseTokens(text)
 }
 
 function parseTokens (text) {
@@ -439,21 +433,23 @@ class Host extends EventEmitter {
    */
   async command (line, from = {}) {
     const source = from.source || 'console'
-    const parsed = source === 'chat'
-      ? parseCommandLine(line, this.config.get('control.prefix'))
-      : (parseCommandLine(line, this.config.get('control.prefix')) || parseTokens(String(line || '').replace(/^\/+/, '')))
+    const parsed = parseCommandLine(line)
     if (!parsed) return { ok: false, silent: true }
     const { name, args } = parsed
     const spec = COMMANDS.find((c) => c.name === name)
     const who = { source, uuid: from.uuid || null, name: from.name || null }
 
-    // 1. Authorisation. Only an explicitly listed UUID may control the bot.
+    // 1. Authorisation. Console and internal callers only.
+    //
+    // There is no `chat` source any more: a command cannot arrive over the
+    // game's chat, so there is no UUID list to consult and no way for a player
+    // to probe the surface. `control.allowConsole: false` is the one switch
+    // left, for a deployment that wants the host controllable only by its own
+    // supervisor calls rather than by anyone with stdin on the container.
     const auth = this.authorize(who)
     if (!auth.ok) {
-      // Logged WITHOUT the command body or the raw sender: an unauthorised
-      // player cannot learn the surface by probing it.
       if (this.config.get('control.auditLog') !== false) {
-        this.log('warn', `control: refused a "${name}"-shaped command from an unauthorised ${source} sender (${auth.why})`)
+        this.log('warn', `control: refused a "${name}"-shaped command from ${source} (${auth.why})`)
       }
       this.emit('unauthorized', { name, source, why: auth.why })
       return { ok: false, silent: true, unauthorized: true, name }
@@ -479,19 +475,21 @@ class Host extends EventEmitter {
     return out
   }
 
-  /** Is this sender allowed to control the bot? */
-  authorize ({ source = 'chat', uuid = null, name = null } = {}) {
+  /**
+   * Is this sender allowed to control the bot?
+   *
+   * Only console and internal callers exist. The old branches — a chat source,
+   * a `control.operators` UUID allow-list, "the sender has no verified UUID" —
+   * are gone with the chat command surface. Whoever holds the process's stdin
+   * is the operator; that is the whole model.
+   */
+  authorize ({ source = 'console', name = null } = {}) {
     if (source === 'internal') return { ok: true, why: 'internal' }
     if (source === 'console') {
-      if (this.config.get('control.allowConsole') === false) return { ok: false, why: 'console commands are disabled' }
-      return { ok: true, why: 'console' }
+      if (this.config.get('control.allowConsole') === false) return { ok: false, why: 'console commands are disabled (control.allowConsole)' }
+      return { ok: true, why: 'console', name: name || null }
     }
-    const operators = this.config.get('control.operators') || []
-    if (!operators.length) return { ok: false, why: 'no operator UUID is configured' }
-    if (!uuid) return { ok: false, why: 'the sender has no verified UUID' }
-    const normalized = String(uuid).toLowerCase()
-    if (!operators.includes(normalized)) return { ok: false, why: `UUID ${normalized.slice(0, 8)}… is not in control.operators` }
-    return { ok: true, why: 'operator', name: name || null }
+    return { ok: false, why: `source "${source}" cannot control this process; control is console-only` }
   }
 
   _audit (name, who, ok) {
@@ -506,7 +504,10 @@ class Host extends EventEmitter {
   async dispatch (name, args = [], who = { source: 'internal' }) {
     switch (name) {
       case 'status': return this.commandStatus()
-      case 'stop': return { ok: true, reply: this._stopReply(this.stop({ reason: `stop by ${who.name || who.source}`, by: who.name || who.source })) }
+      // `pause` and `stop` are the same handbrake; both words work because both
+      // are in people's fingers. Reversible, deletes nothing.
+      case 'pause':
+      case 'stop': return { ok: true, reply: this._stopReply(this.stop({ reason: `paused by ${who.name || who.source}`, by: who.name || who.source })) }
       case 'resume': return { ok: true, reply: this._resumeReply(await this.resume({ by: who.name || who.source })) }
       case 'leave': {
         const r = this.connection.leave({ reason: `left by ${who.name || who.source}` })
@@ -530,6 +531,21 @@ class Host extends EventEmitter {
       case 'jobs': return this.commandJobs()
       case 'cancel': return this.commandCancel(args[0])
       case 'config': return this.commandConfig(args)
+      // The emergency stop: not a policy change, the end of the process. State
+      // is saved by the session's shutdown() before the exit, so a later start
+      // resumes from disk; `pause` is the reversible version.
+      case 'shutdown': {
+        const code = Number.isFinite(Number(args[0])) ? Number(args[0]) : 0
+        const reply = `shutting down (exit ${code}) — state is saved first; use pause instead if you only want the body stopped`
+        // Deferred so the reply reaches the console before the process dies.
+        setImmediate(() => {
+          try {
+            if (this.session?.shutdown) this.session.shutdown(code, `shutdown by ${who.name || who.source}`)
+            else { this.shutdown({ reason: `shutdown by ${who.name || who.source}` }); setTimeout(() => process.exit(code), 250) }
+          } catch { process.exit(code) }
+        })
+        return { ok: true, reply, data: { exitCode: code } }
+      }
       case 'help': return { ok: true, reply: helpText(this) }
       default: return { ok: false, reply: `unknown command "${name}" — try: help` }
     }
@@ -616,7 +632,6 @@ class Host extends EventEmitter {
       },
       rates: {
         maxPhysicalActionsPerMinute: this.config.get('limits.maxPhysicalActionsPerMinute'),
-        maxPublicChatPerMinute: this.config.get('limits.maxPublicChatPerMinute'),
         maxConcurrentJobs: this.config.get('limits.maxConcurrentJobs'),
         maxGoalRuntimeMinutes: this.config.get('limits.maxGoalRuntimeMinutes')
       },
@@ -801,9 +816,6 @@ class Host extends EventEmitter {
     if (name.startsWith('connection.') || name === 'connection.autoReconnect') {
       try { this.connection.policyChanged() } catch { /* no retry timer */ }
     }
-    if (name === 'control.operators' && Array.isArray(value)) {
-      this.log('info', `control: operator list now has ${value.length} UUID(s)`)
-    }
     try { this.subsystems?.onConfigChange?.(name, oldValue, value) } catch (err) { this.log('debug', `config hook: ${err?.message || err}`) }
   }
 
@@ -864,8 +876,6 @@ class Host extends EventEmitter {
 
 function helpText (host) {
   return require('./control_commands').helpText({
-    prefix: host.config.get('control.prefix') || '!zinc',
-    operators: host.config.get('control.operators') || [],
     allowConsole: host.config.get('control.allowConsole') !== false
   })
 }

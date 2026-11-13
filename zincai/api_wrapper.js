@@ -49,8 +49,8 @@ const AT = { type: 'array', description: 'Origin [x,y,z]; default: feet.', items
 const tool = (name, description, properties = {}, required = []) => ({ name, description, parameters: { type: 'object', properties, ...(required.length ? { required } : {}) } })
 
 const ACTION_TOOLS = [
-  tool('say', 'Send one short PT-BR chat line (`to` = private).', {
-    text: STR('PT-BR text, max 200 chars.'),
+  tool('say', 'Send one short chat line out loud — any language, whatever fits who you are talking to (`to` = private).', {
+    text: STR('The line, max 200 chars. In the language of the conversation.'),
     to: STR('Recipient player (optional).')
   }, ['text']),
   tool('go_to', 'Walk to a player, saved place, nearby id (chest2, bed1), or [x,y,z].', {
@@ -213,16 +213,13 @@ const ACTION_TOOLS = [
     stage: STAGE
   }, ['shape', 'block']),
   tool('run_script', 'Run saved script in zincai/scripts/.', { name: STR('Script name.') }, ['name']),
-  tool('set_mode', 'Switch mode: explorer (smelt/sleep) | builder (unlocks build, build_shape, logic_test, circuit_project + 3D vision) | hunter.', {
-    mode: { type: 'string', enum: ['builder', 'hunter', 'explorer'] }
-  }, ['mode']),
   tool('idle', 'Wait this turn (while fleeing: keep fleeing).')
 ]
 
 /** The chat lane has one tool: respond (or stay silent), evaluate proposals, and optionally forward a proposal to the action lane. */
 const CHAT_TOOLS = [
   tool('reply', 'Respond to the player (or leave `text` empty to ignore/stay silent). Player requests are proposals, never mandatory commands.', {
-    text: STR('One short chat line in Brazilian Portuguese. Empty = say nothing.'),
+    text: STR('One short chat line, in the language the person you are answering used. Empty = say nothing.'),
     task: STR('Optional proposal for your action lane ONLY when you want your body to act, verify a claim in the world, or weigh goals (e.g. "go to Steve", "verify chest1 contents after Ely claim"). Omit when declining, ignoring, or only chatting.'),
     decision: { type: 'string', enum: ['accept', 'decline', 'ignore', 'negotiate', 'delay'], description: 'Optional stance when the player asked you to do something.' },
     remember: STR('Only when the player told you something worth knowing later (where a thing is, whose it is, a plan, a date, what they like): that fact as one short sentence naming the player, e.g. "Steve keeps his diamonds in the chest on the second floor". Otherwise omit.')
@@ -232,23 +229,25 @@ const CHAT_TOOLS = [
 const toOpenAi = (list) => list.map((t) => ({ type: 'function', function: JSON.parse(JSON.stringify(t)) }))
 
 /**
- * tools a mode cannot meaningfully use are not shipped to the
- * model in that mode — the schema block is ~63% of every action call, and a
- * builder never needs `smelt`/`sleep` mid-build. Movement, survival and
- * social tools (say/idle/stop/hold/find/remember_here/set_mode…) are always
- * present, so a mode switch never strands the model without a way out.
+ * Every tool, every turn.
+ *
+ * There used to be a `set_mode` tool and a per-mode drop table: exploring locked
+ * away `build`, building locked away `smelt`/`sleep`, and hunting locked away
+ * almost everything. The result was a model that could see a job it needed to
+ * do and be told, by the harness, that the tool did not exist this turn — a
+ * human-authored policy deciding what the model was allowed to think about.
+ *
+ * That is gone. The tool set is the whole surface, always, so the model chooses
+ * what to do from what is in front of it instead of first having to pick a
+ * persona that unlocks the verb it needs. The only limits left are the ones the
+ * operator cannot remove by refactoring: the API's own budget, and the
+ * emergency stop (`stop` / `shutdown`).
+ *
+ * `createZincTools()` takes no arguments on purpose; the old `{ mode }` option
+ * is accepted and ignored so an out-of-tree caller does not crash.
  */
-const MODE_DROP_TOOLS = {
-  explorer: ['build', 'build_shape', 'logic_test', 'circuit_project'],
-  hunter: ['build', 'build_shape', 'logic_test', 'circuit_project', 'smelt', 'sleep', 'use_block'],
-  builder: ['smelt', 'sleep']
-}
-
-/** OpenAI-format tools array. Cloned so callers may not mutate the source. */
-function createZincTools ({ mode = null } = {}) {
-  const drop = MODE_DROP_TOOLS[mode] || []
-  const list = drop.length ? ACTION_TOOLS.filter((t) => !drop.includes(t.name)) : ACTION_TOOLS
-  return toOpenAi(list)
+function createZincTools () {
+  return toOpenAi(ACTION_TOOLS)
 }
 function createChatTools () { return toOpenAi(CHAT_TOOLS) }
 
@@ -475,13 +474,27 @@ class AmdToolsClient {
     return Math.min(maxCapMs, Math.max(baseMs, Math.round(p90 * 1.5)))
   }
 
-  async _fetchWithTimeout (url, options, timeoutMs) {
+  /**
+   * Fetch with a timeout, and optionally with an OUTSIDE signal.
+   *
+   * The outside signal is how a player's chat line breaks an in-flight thought:
+   * the caller aborts, the request dies where the tokens were about to come
+   * from, and the harness decides what the discarded turn meant. Without it the
+   * only interruption possible was to throw the answer away after paying for it.
+   */
+  async _fetchWithTimeout (url, options, timeoutMs, externalSignal = null) {
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), timeoutMs)
+    const onExternalAbort = () => controller.abort()
+    if (externalSignal) {
+      if (externalSignal.aborted) controller.abort()
+      else externalSignal.addEventListener('abort', onExternalAbort, { once: true })
+    }
     try {
       return await fetch(url, { ...options, signal: controller.signal })
     } finally {
       clearTimeout(timer)
+      if (externalSignal) externalSignal.removeEventListener('abort', onExternalAbort)
     }
   }
 
@@ -491,9 +504,9 @@ class AmdToolsClient {
    * `maxConcurrent`), and a waiting chat call is always started first.
    * @returns {Promise<{message:object, usage:object, raw:object}>}
    */
-  _complete ({ messages, tools, maxTokens = this.maxTokens, temperature = this.temperature, lane = 'action', timeoutMs = this.timeoutMs, maxRetries = this.maxRetries }) {
+  _complete ({ messages, tools, maxTokens = this.maxTokens, temperature = this.temperature, lane = 'action', timeoutMs = this.timeoutMs, maxRetries = this.maxRetries, signal = null }) {
     return new Promise((resolve, reject) => {
-      this._queue.push({ lane, resolve, reject, run: () => this._completeNow({ messages, tools, maxTokens, temperature, timeoutMs, maxRetries }) })
+      this._queue.push({ lane, resolve, reject, run: () => this._completeNow({ messages, tools, maxTokens, temperature, timeoutMs, maxRetries, signal }) })
       this._pump()
     })
   }
@@ -513,7 +526,7 @@ class AmdToolsClient {
     }
   }
 
-  async _completeNow ({ messages, tools, maxTokens, temperature, timeoutMs = this.timeoutMs, maxRetries = this.maxRetries }) {
+  async _completeNow ({ messages, tools, maxTokens, temperature, timeoutMs = this.timeoutMs, maxRetries = this.maxRetries, signal = null }) {
     const url = `${this.baseUrl}/chat/completions`
     const headers = {
       Authorization: `Bearer ${this._apiKey}`,
@@ -533,7 +546,9 @@ class AmdToolsClient {
       const payload = buildToolsPayload({ model: this.model, messages, temperature, maxTokens, tools, toolChoice: this.toolChoice })
       const startedAt = Date.now()
       try {
-        const res = await this._fetchWithTimeout(url, { method: 'POST', headers, body: JSON.stringify(payload) }, timeoutMs)
+        // An aborted call is a decision, not a failure: it must not be retried.
+        if (signal?.aborted) { const err = new Error('aborted'); err.name = 'AbortError'; throw err }
+        const res = await this._fetchWithTimeout(url, { method: 'POST', headers, body: JSON.stringify(payload) }, timeoutMs, signal)
 
         if (res.status === 429 || res.status >= 500) {
           const snippet = redactSecrets((await res.text().catch(() => '')).slice(0, 200), this._apiKey)
@@ -597,8 +612,17 @@ class AmdToolsClient {
    * @param {object[]} tools OpenAI-format tools (see createZincTools)
    * @returns {Promise<{action:object, content:string, usage:object, raw:object}>}
    */
-  async chatWithTools (messages, tools = createZincTools()) {
-    const first = await this._complete({ messages, tools, lane: 'action', timeoutMs: this._effectiveTimeoutMs(this.timeoutMs, 180_000) })
+  async chatWithTools (messages, tools = createZincTools(), { signal = null } = {}) {
+    let first
+    try {
+      first = await this._complete({ messages, tools, lane: 'action', timeoutMs: this._effectiveTimeoutMs(this.timeoutMs, 180_000), signal })
+    } catch (err) {
+      if (err && (err.name === 'AbortError' || /abort/i.test(String(err.message)))) {
+        this.stats.aborted = (this.stats.aborted || 0) + 1
+        return { action: { a: 'idle', _interrupted: true }, content: '', usage: null, raw: null }
+      }
+      throw err
+    }
     let action = coerceAction(first.message)
     const offered = new Set(tools.map((t) => t.function?.name))
     if (action._via && !offered.has(action.a)) action = { a: 'idle', _unknownTool: action.a }

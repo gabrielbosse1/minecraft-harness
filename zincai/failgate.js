@@ -53,7 +53,7 @@ class FailGate {
     this._lastPos = null
   }
 
-  /** Canonical signature for a gateable action, or null for ungateable ones (say/idle/hold/find/stop/set_mode…). */
+  /** Canonical signature for a gateable action, or null for ungateable ones (say/idle/hold/find/stop…). */
   signature (action) {
     const a = String(action?.a || '')
     if (!GATEABLE.has(a)) return null

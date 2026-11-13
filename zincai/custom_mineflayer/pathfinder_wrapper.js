@@ -999,9 +999,18 @@ class PathfinderWrapper {
     this._applied = []
     this._tickHandlers = [] // physicsTick listeners we own — removed in stop()
 
-    // 'explorer' (default, balanced) | 'builder' (steady, no sprint, cautious
-    // drops) | 'hunter' (always sprint-jump parkour).
-    this.mode = 'explorer'
+    // Movement posture, chosen by the WRAPPER from what the body is doing, not
+    // by the model picking a persona:
+    //
+    //   'balanced' (default)  normal sprint-walk rhythm, drops up to 4
+    //   'careful'             steady, no sprint, drops of 1 — while placing blocks
+    //                         or carrying something it must not lose
+    //   'urgent'              sprint-jump parkour — while fleeing or fighting
+    //
+    // There is no `set_mode` tool any more. Prefer `setCareful(bool)` and let
+    // isUrgent() win, which is what the body already knows how to do.
+    this.mode = 'balanced'
+    this._careful = false
     this.fleeRadius = Number.isFinite(opts.fleeRadius) ? opts.fleeRadius : 8
     this._jumpSprintTimer = null
 
@@ -1020,32 +1029,35 @@ class PathfinderWrapper {
     this._appliedOnce = false
   }
 
-  /** Modes: 'builder' | 'hunter' | 'explorer' */
-  setMode (mode) {
-    this.mode = ['builder', 'hunter', 'explorer'].includes(mode) ? mode : 'explorer'
+  /**
+   * Ask for the careful posture (steady, no sprint, shallow drops). Builders and
+   * item-carriers want this; nothing needs to be unlocked to get it. An urgent
+   * situation overrides it — see isUrgent().
+   */
+  setCareful (on = true) {
+    this._careful = Boolean(on)
+    this._refreshPosture()
+    return this._careful
+  }
+
+  /** Recompute the posture from `_careful`; 'urgent' still wins at apply time. */
+  _refreshPosture () {
+    this.mode = this._careful ? 'careful' : 'balanced'
     const m = this._movements()
     if (m) {
       this._applyMode(m)
       this.threat.attachToMovements(m)
     }
-    // Hunter: rhythmic jump pulses while sprinting — parkour over 1-block gaps.
-    clearInterval(this._jumpSprintTimer)
-    this._jumpSprintTimer = null
-    if (this.mode === 'hunter') {
-      this._jumpSprintTimer = setInterval(() => {
-        const bot = this.bot
-        if (!bot.entity?.onGround) return
-        if (bot.pathfinder?.isMoving?.()) {
-          bot.setControlState('jump', true)
-          setTimeout(() => { try { bot.setControlState('jump', false) } catch { /* noop */ } }, 180)
-        }
-      }, 550)
-    }
     return this.mode
   }
 
+  /** Back-compat: old persona names map onto a posture. Kept for tests/scripts. */
+  setMode (mode) {
+    return this.setCareful(mode === 'builder')
+  }
+
   _applyMode (m) {
-    if (this.mode === 'builder') { m.allowSprinting = false; m.maxDropDown = 1 } else { m.allowSprinting = true; m.maxDropDown = 4 }
+    if (this._careful && !this.isUrgent()) { m.allowSprinting = false; m.maxDropDown = 1 } else { m.allowSprinting = true; m.maxDropDown = 4 }
   }
 
   /** Register one of OUR physicsTick handlers (named so stop() can remove it). */
@@ -1630,9 +1642,9 @@ class PathfinderWrapper {
         this._sprintWalkPhase = 'sprint'
       }
       const hazard = this._nearHazard()
-      // Running for its life (or fighting) the bot sprints — builder mode included.
+      // Running for its life (or fighting) the bot sprints — careful posture included.
       if (this.isUrgent()) { movements.allowSprinting = true; return }
-      if (this.mode === 'builder') { movements.allowSprinting = false; return }
+      if (this._careful) { movements.allowSprinting = false; return }
       movements.allowSprinting = this._sprintWalkPhase === 'sprint' && !hazard
     }
     cycle()

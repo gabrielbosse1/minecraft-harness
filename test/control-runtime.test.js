@@ -46,7 +46,10 @@ const quiet = { info () {}, warn () {}, error () {}, debug () {} }
 
 test('config: every parameter has a documented type, range and apply rule', () => {
   const defs = RuntimeConfig.schema()
-  assert.ok(defs.length >= 40, `expected the full surface, got ${defs.length}`)
+  // The surface got smaller on purpose: a mode selector, a chat command prefix,
+  // an operator UUID allow-list, a name list for that allow-list, a chat-capped
+  // refused-command announcement and a public-chat rate cap are all gone.
+  assert.ok(defs.length >= 33, `expected the full surface, got ${defs.length}`)
   const names = new Set()
   for (const d of defs) {
     assert.match(d.name, /^[a-z][A-Za-z0-9]*\.[A-Za-z0-9]+$/, `odd name: ${d.name}`)
@@ -70,8 +73,10 @@ test('config: values are validated by type and range, unknown names are refused'
   assert.equal(cfg.set('boundary.radius', '12.5').ok, false, 'integers are not silently truncated')
   assert.equal(cfg.set('communication.publicChat', 'no').value, false)
   assert.equal(cfg.set('communication.publicChat', 'maybe').ok, false)
-  assert.equal(cfg.set('control.operators', 'Steve').ok, false, 'a username is not a UUID')
-  assert.equal(cfg.set('control.operators', '11111111222233334444555555555555').value[0], OPERATOR)
+  // A chat operator list no longer exists to validate against.
+  assert.equal(cfg.set('control.operators', 'Steve').ok, false, 'unknown parameter')
+  assert.equal(cfg.set('limits.maxPhysicalActionsPerMinute', 'lots').ok, false, 'a name is not a number')
+  assert.equal(cfg.set('limits.maxPhysicalActionsPerMinute', '900').value, 900)
   const unknown = cfg.set('actions.allowTeleport', 'true')
   assert.equal(unknown.ok, false)
   assert.match(unknown.error, /unknown parameter/)
@@ -128,18 +133,19 @@ test('config: a boundary-only parameter is recorded as pending while an action r
   assert.equal(cfg.isPending('limits.maxConcurrentJobs'), false)
 })
 
-test('config: the panel environment pins the operator list, prefix and join switch', () => {
+test('config: the panel environment pins the join switch, and chat-control variables are inert', () => {
   const cfg = new RuntimeConfig({
     logger: quiet,
+    // A template written for the old chat-command surface still sets these.
     env: { ZINC_OPERATORS: `${OPERATOR}, ${STRANGER}`, ZINC_COMMAND_PREFIX: '!bot', ZINC_JOIN_ON_START: 'false' }
   })
-  assert.deepEqual(cfg.get('control.operators'), [OPERATOR, STRANGER])
-  assert.equal(cfg.get('control.prefix'), '!bot')
   assert.equal(cfg.get('connection.joinOnStart'), false)
+  assert.equal(cfg.get('control.operators'), undefined, 'the operator allow-list is gone')
+  assert.equal(cfg.get('control.prefix'), undefined, 'there is no prefix; console lines are commands')
+  assert.equal(cfg.set('control.operators', OPERATOR).ok, false, 'and it cannot be set back')
   // A bad value in the environment is ignored, never trusted.
-  const bad = new RuntimeConfig({ logger: quiet, env: { ZINC_OPERATORS: 'gabriel' } })
-  assert.deepEqual(bad.get('control.operators'), [])
-  assert.equal(bad.get('control.prefix'), '!zinc', 'an unset variable leaves the default alone')
+  const bad = new RuntimeConfig({ logger: quiet, env: { ZINC_JOIN_ON_START: 'perhaps' } })
+  assert.equal(bad.get('connection.joinOnStart'), true, 'an invalid value leaves the default alone')
 })
 
 // ===========================================================================
@@ -463,31 +469,39 @@ test('death: a room outside the permitted area is reported, never walked to', as
 
 function hostFor ({ operators = [OPERATOR], dir = tmpdir() } = {}) {
   const host = new Host({ dataDir: dir, logger: quiet })
-  if (operators.length) host.config.set('control.operators', operators.join(','))
+  // No operator list exists any more: the console is the operator. The
+  // `operators` argument is kept so the call sites that passed it still read
+  // clearly, and it must have no effect.
+  assert.equal(host.config.set('control.operators', operators.join(',')).ok, false)
   return { host, dir }
 }
 
 const chat = (host, line, uuid = OPERATOR, name = 'Operator') => host.command(line, { source: 'chat', uuid, name })
 const consoleCmd = (host, line) => host.command(line, { source: 'console', name: 'console' })
 
-test('host: only a configured UUID may run a command; a stranger is ignored silently', async () => {
+test('host: the game chat is not a command channel at all', async () => {
   const { host, dir } = hostFor()
-  const good = await chat(host, '!zinc status')
+  // The console works and needs no prefix.
+  const good = await consoleCmd(host, 'status')
   assert.equal(good.ok, true)
   assert.match(good.reply, /connection:/)
 
-  const bad = await chat(host, '!zinc status', STRANGER, 'Steve')
-  assert.equal(bad.ok, false)
-  assert.equal(bad.silent, true)
-  assert.equal(bad.reply, undefined, 'an unauthorised sender learns nothing')
-  // ...and nothing about the bot leaked into the answer.
-  assert.equal(/connection:|paused:|goals:/.test(String(bad.reply || '')), false)
+  // A `chat` source is refused outright — even with the old prefix, even with
+  // an UUID that used to be an operator. There is no chat control surface, so
+  // there is nothing for a player to probe and nothing to authorise.
+  const prefixed = await chat(host, '!zinc status')
+  assert.equal(prefixed.ok, false)
+  assert.equal(prefixed.silent, true)
+  assert.equal(prefixed.reply, undefined, 'a chat sender learns nothing')
+  const bare = await chat(host, 'status', STRANGER, 'Steve')
+  assert.equal(bare.ok, false)
+  assert.equal(bare.silent, true, 'not even the command name is confirmed')
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
-test('host: no configured operator means chat commands are refused entirely', async () => {
+test('host: a chat-shaped command cannot pause the body', async () => {
   const { host, dir } = hostFor({ operators: [] })
-  const r = await chat(host, '!zinc stop', OPERATOR)
+  const r = await chat(host, 'stop', OPERATOR)
   assert.equal(r.ok, false)
   assert.equal(r.silent, true)
   assert.equal(host.paused, false, 'a refused command has no effect')
@@ -497,13 +511,37 @@ test('host: no configured operator means chat commands are refused entirely', as
 test('host: a console command needs no prefix; help lists the whole surface', async () => {
   const { host, dir } = hostFor()
   const help = await consoleCmd(host, 'help')
-  for (const name of ['status', 'stop', 'resume', 'leave', 'join', 'restart-connection', 'goals', 'jobs', 'cancel', 'config', 'help']) {
+  for (const name of ['status', 'pause', 'stop', 'shutdown', 'resume', 'leave', 'join', 'restart-connection', 'goals', 'jobs', 'cancel', 'config', 'help']) {
     assert.match(help.reply, new RegExp(`\\b${name}\\b`))
   }
-  assert.match(help.reply, /operator UUID/)
+  assert.match(help.reply, /console only, no prefix/)
+  assert.match(help.reply, /not a command channel/)
   const unknown = await consoleCmd(host, 'teleport 0 0 0')
   assert.equal(unknown.ok, false)
   assert.match(unknown.reply, /unknown command/)
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('host: pause is stop under a clearer name, and shutdown asks the session to end', async () => {
+  const { host, dir } = hostFor()
+  const paused = await consoleCmd(host, 'pause')
+  assert.equal(paused.ok, true)
+  assert.equal(host.paused, true, 'pause is the handbrake')
+  assert.match(paused.reply, /body paused/)
+  await consoleCmd(host, 'resume')
+
+  // No session attached: shutdown must still answer and give up cleanly rather
+  // than take the test process down with it. `process.exit` is stubbed here.
+  const realExit = process.exit
+  let code = null
+  process.exit = (c) => { code = c }
+  try {
+    const out = await consoleCmd(host, 'shutdown 3')
+    assert.equal(out.ok, true)
+    assert.match(out.reply, /shutting down/)
+    await new Promise((resolve) => setTimeout(resolve, 400))
+    assert.equal(code, 3, 'the exit code is honoured')
+  } finally { process.exit = realExit }
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
@@ -596,28 +634,27 @@ test('host: goals/jobs/cancel answer honestly with no session attached', async (
 // 6. The interface against a REAL session
 // ===========================================================================
 
-test('session: an operator UUID is required to command the body over chat, and the answer is private', async () => {
+test('session: a chat line is conversation, never a command — even for the operator', async () => {
   const bot = simulatedBot()
   const s = startTestSession({ bot })
   try {
     s.spawn()
     await sleep(150)
-    s.shared.host.config.set('control.operators', OPERATOR)
-    // An unauthorised player tries the prefix: nothing happens, nothing is said.
+    // Both players are connected; neither has any special standing in chat.
     bot.players.Steve = { username: 'Steve', uuid: STRANGER, entity: null }
-    s.say('<Steve> !zinc stop')
-    await sleep(200)
-    assert.equal(s.shared.host.paused, false, 'a stranger cannot pause the body')
-    assert.deepEqual(bot.log.chat, [], 'and gets no public answer')
-
-    // The operator with a real UUID: the body pauses and the answer is whispered.
     bot.players.Anna = { username: 'Anna', uuid: OPERATOR, entity: null }
-    s.say('<Anna> !zinc stop')
-    assert.ok(await s.until(() => s.shared.host.paused, 2000), 'the operator paused the body')
-    assert.ok(await s.until(() => bot.log.chat.some((l) => /no new physical action/.test(l)), 2000), 'the answer was delivered privately')
-    assert.ok(bot.log.chat.every((l) => l.startsWith('/msg Anna')), `answers must be whispers, got ${JSON.stringify(bot.log.chat)}`)
-    // A command line is not conversation: the model never saw it.
-    assert.equal(s.prompts.chat.length, 0)
+    for (const who of ['Steve', 'Anna']) s.say(`<${who}> !zinc stop`)
+    s.say('<Anna> stop')
+    // The lines reach the model as ONE batching-window chunk — that is the point.
+    assert.ok(await s.until(() => s.prompts.chat.length > 0, 4000), 'the model saw the chat')
+    const chunk = s.prompts.chat.at(-1)
+    assert.match(chunk, /Steve: !zinc stop/, 'the old prefix arrives as ordinary text')
+    assert.match(chunk, /Anna: stop/)
+    assert.match(chunk, /3 lines from Steve, Anna/, 'one window, both speakers, in order')
+    assert.ok(chunk.indexOf('Steve: !zinc stop') < chunk.indexOf('Anna: stop'), 'in arrival order')
+    await sleep(200)
+    assert.equal(s.shared.host.paused, false, 'nothing typed in chat can pause the body')
+    assert.deepEqual(bot.log.chat, [], 'and nothing is answered publicly')
   } finally { s.stop() }
 })
 
@@ -659,8 +696,7 @@ test('session: stop during a build stops between blocks and reports it, without 
     bot,
     chat: () => ({ text: 'bora', task: 'build a wall' }),
     actions: (p) => {
-      // build_shape is a builder-mode tool: switch first, then build.
-      if (!/mode builder/.test(p)) return { a: 'set_mode', mode: 'builder' }
+      // build_shape needs no mode any more: every tool is available on every turn.
       if (/why now:.*chat request/.test(p)) return { a: 'build_shape', shape: 'wall', block: 'stone', params: { l: 6, h: 4 }, at: [4, 64, 0] }
       return null
     }

@@ -101,6 +101,9 @@ test('config: template environment variables drive every documented knob', () =>
     MC_AUTH: 'MICROSOFT',
     MC_ALLOW_SCAFFOLDING: 'true',
     MC_AUTO_ELYTRA: 'false',
+    // BOT_MODE / BOT_ALIASES / BOT_LANGUAGE are set but must be INERT now:
+    // there are no modes, no name gating and no forced language. A panel
+    // template that still carries these variables keeps booting unchanged.
     BOT_MODE: 'builder',
     BOT_ALIASES: 'Zinc, Helper ,',
     BOT_LANGUAGE: 'en',
@@ -125,9 +128,10 @@ test('config: template environment variables drive every documented knob', () =>
     assert.equal(cfg.amd.maxConcurrent, 1)
     assert.equal(cfg.behavior.allowScaffolding, true)
     assert.equal(cfg.behavior.autoElytra, false)
-    assert.equal(cfg.behavior.mode, 'builder')
-    assert.deepEqual(cfg.behavior.aliases, ['zinc', 'helper'], 'aliases are lower-cased and trimmed')
-    assert.equal(cfg.behavior.language, 'en')
+    // None of these exist any more; the env vars are accepted and ignored.
+    assert.equal(cfg.behavior.mode, undefined, 'there is no mode')
+    assert.equal(cfg.behavior.aliases, undefined, 'names are not a gate')
+    assert.equal(cfg.behavior.language, undefined, 'language is the model\'s call')
     assert.equal(cfg.inference.rpm, 30)
     assert.equal(cfg.inference.minIntervalMs, 1500)
     assert.equal(cfg.inference.heartbeatMs, 0)

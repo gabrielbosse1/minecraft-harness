@@ -59,9 +59,10 @@ test('invalid specs, missing snapshots, corrupt store and invalid names fail wit
   } finally { fs.rmSync(dir, { recursive: true, force: true }) }
 })
 test('model workflow binds a snapshot, saves a named logical graph and reruns by name', async () => {
-  const tools = createZincTools({ mode: 'builder' })
+  const tools = createZincTools()
   assert.ok(tools.some((t) => t.function.name === 'circuit_project'))
-  assert.ok(!createZincTools({ mode: 'explorer' }).some((t) => t.function.name === 'circuit_project'))
+  // Unconditional: circuit work is not a persona you have to switch into.
+  assert.ok(createZincTools({ mode: 'explorer' }).some((t) => t.function.name === 'circuit_project'))
   assert.equal(call('circuit_project', { operation: 'bad' })._badArgs, 'circuit_project')
   const bot = simulatedBot(); const oldBlockAt = bot.blockAt.bind(bot)
   bot.blockAt = (p) => p.x === 0 && p.y === 64 && p.z === 0 ? { name: 'repeater', getProperties: () => ({ facing: 'north', powered: false, delay: 1, locked: false }) } : oldBlockAt(p)

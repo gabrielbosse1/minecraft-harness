@@ -70,7 +70,8 @@ test('S1 creator has no automatic authority: Zinc declines/delays creator when p
     bot,
     cfg: (cfg) => {
       cfg.identity = { creator: { name: 'Steve', uuid: '0000-0000-creator-1' } }
-      cfg.trust = { owners: ['Steve'], trusted: ['Steve'] }
+      // There is no trust list any more: the creator's standing is the model's
+      // own judgement, formed from evidence like anyone else's.
     },
     chat: (p) => {
       assert.match(p, /operator config: Steve .* NO automatic authority/)
@@ -103,10 +104,8 @@ test('S1 creator has no automatic authority: Zinc declines/delays creator when p
           evidence: 'Asked to stop shelter build for distant gravel trip'
         }
       }
-      if (creatorRefused && /social done: updated Steve/.test(p) && !/mode builder/.test(p)) {
-        return { a: 'set_mode', mode: 'builder' }
-      }
-      if (creatorRefused && /mode builder/.test(p) && /g1 PENDING finish shelter roof/.test(p) && !/build_shape/.test(p)) {
+      // No mode switch: once the refusal is recorded it goes straight to work.
+      if (creatorRefused && /social done: updated Steve/.test(p) && /g1 PENDING finish shelter roof/.test(p) && !/build_shape/.test(p)) {
         return { a: 'build_shape', shape: 'floor', block: 'stone_bricks', params: { w: 2, d: 2 }, at: [2, 64, 2] }
       }
       if (/chat request from Steve: go to Steve/.test(p) && !creatorAccepted) {
@@ -804,7 +803,7 @@ test('S10 autonomous solitude: Zinc declines/ignores social invitation, stays si
       return { text: '', decision: 'ignore' }
     },
     actions: (p) => {
-      if (!/mode builder/.test(p)) return { a: 'set_mode', mode: 'builder' }
+      // No mode to switch into: building is available on the first turn.
       if (!builtStarted && /g1 PENDING build personal redstone workshop/.test(p)) {
         builtStarted = true
         return { a: 'build_shape', shape: 'floor', block: 'stone_bricks', params: { w: 2, d: 2 }, at: [2, 64, 2] }

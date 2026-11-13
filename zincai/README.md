@@ -209,16 +209,17 @@ are checked on `goal resume` or `goal verify`. Tunables are the `goals` block in
   resumes in the morning). `stop` cancels everything. The `agenda:` line shows
   a paused task, a build that a newer task set aside, and requests from chat
   that the body has not started yet.
-- **Chat addressing:** names/aliases, whispers, a continuing conversation, or
-  an unambiguous one-player question can wake the chat lane. There is no friend
-  list. `zinc` is an alias, and nicknames built on it count ("zincão",
-  "zinquinho"; "Zinco," as a call); ordinary unrelated chatter does not call
-  the model.
-- **Language:** the server speaks Brazilian Portuguese (`behavior.language`).
-  Every outgoing line is checked by its function words. A chat reply in another
-  language is retried once and then replaced by a fixed PT-BR line; an
-  action-lane `say` in another language is not sent and the model is asked to
-  say it again.
+- **Chat is a window, not a summons.** Lines are batched for ~5 s
+  (`inference.chatBatchMs`) and handed to the model as one chunk — every
+  speaker, in arrival order, whispers marked — and only when there is data.
+  There is **no relevance filter**: nothing checks the bot's name, counts how
+  many players are online, or drops a line because the player has spoken too
+  often. The model reads the window and decides who, if anyone, it is answering.
+  A waiting chunk also preempts an in-flight action call, so a player can break
+  the model's thinking instead of waiting for it to finish.
+- **Language is the model's.** There is no language check on the way out, no
+  retry and no replacement line: it answers in the language the person it is
+  talking to used, and the words it chose are the words that go out.
 - **Hurt attribution:** health changes are tracked even when the server sends no
   hurt event. If the server names the damage source, it is reported. On servers
   that do not, a recent arm swing close to ZincAI can be reported as a
@@ -250,8 +251,7 @@ are checked on `goal resume` or `goal verify`. Tunables are the `goals` block in
 - **Building:** the action tools can build a saved blueprint, an inline grid,
   or bounded generated shapes. Building is inventory-checked and staged
   (foundation → walls/windows → roof → details); a rerun compares block names,
-  not orientation or context. `set_mode` supports `explorer`, `hunter`, and
-  `builder`. Pathfinder digging is disabled by default, but `gather` digs
+  not orientation or context. Pathfinder digging is disabled by default, but `gather` digs
   directly and cannot distinguish natural resources from the same blocks in a
   structure.
 - **Survival:** the body eats from a food whitelist, uses a water bucket only
@@ -271,12 +271,14 @@ The complete action tool list is:
 `smelt`, `sleep`, `give`, `eat`, `equip`, `use_block`, `inspect_block`,
 `inspect_region`, `redstone_scan`, `redstone_component`, `find`, `remember_here`,
 `craft`, `gather`, `light_up`, `shelter`, `corpse_run`, `logic_test`,
-`circuit_project`, `build`, `build_shape`, `run_script`, `goal`, `set_mode`,
-`idle`.
-Explorer mode omits the four builder/logic/project tools from the offered set,
-not all mutators; the model can also select `set_mode`. Modes are not a
-property-permission boundary. Shape floors use `{w,d}` and boxes `{w,d,h}`;
-unsupported parameters and oversized plans are refused rather than guessed.
+`circuit_project`, `build`, `build_shape`, `run_script`, `goal`, `idle`.
+
+**That is the whole list, on every turn.** There is no mode, no `set_mode` and
+no per-mode subset: the schema is byte-identical from call to call (which also
+keeps prefix caching cheap), so the model never discovers that the verb it needs
+was hidden by a persona it picked ten minutes ago. Shape floors use `{w,d}` and
+boxes `{w,d,h}`; unsupported parameters and oversized plans are refused rather
+than guessed.
 
 The separate chat lane has one `reply(text, task, remember)` tool. `task` is
 optional and is used only when the player asks ZincAI to do something in the
@@ -325,24 +327,20 @@ the bot is running.
 
 ### Commands
 
-Two entry points, one implementation (`zincai/host.js`, described by
+One entry point, one implementation (`zincai/host.js`, described by
 `zincai/control_commands.js`):
 
-- **console / stdin** — the PufferPanel console. A command is typed on its own:
-  `status`, `stop`, `config show boundary`.
-- **chat** — `<prefix> <command>`, `!zinc status` by default. The prefix comes
-  from `control.prefix` (`ZINC_COMMAND_PREFIX`).
+- **console / stdin** — the PufferPanel console. A command is typed on its own,
+  with **no prefix**: `status`, `pause`, `shutdown 1`, `config show boundary`.
 
-The answer is always **whispered to the operator** (or printed on the console).
-A refused command produces no public chat line; the reason is logged without
-revealing internals. `control.announce = true` optionally makes a refusal
-visible in public chat ("I'm not allowed to take that from you"), which is a
-social choice, not an information leak.
+The answer is printed on the console. Nothing typed in **game chat** is a
+command, for anyone.
 
 | Command | What it does |
 | --- | --- |
 | `status` | connection state, life, pause, activity, open goals, running jobs, effective limits |
-| `stop` | pause the body now: no new physical action, cancellable work interrupted, open goals **suspended — never deleted**, memory/identity/process untouched |
+| `pause` (alias `stop`) | the emergency handbrake: no new physical action, cancellable work interrupted, open goals **suspended — never deleted**, memory/identity/process untouched. Changes no policy: everything the model may do, it may still do |
+| `shutdown [code]` | the other half of the emergency stop: save memory/places/goals, leave the server, exit the process. `pause` is the reversible one |
 | `resume` | inspect the real world and inventory first, then hand back only the goals that still make sense |
 | `leave` | disconnect Mineflayer; the process, memory, goals, reasoning and this interface stay up |
 | `join` | reconnect the existing process to the configured server |
@@ -351,26 +349,27 @@ social choice, not an information leak.
 | `jobs` | background jobs, their resources and cancellation state |
 | `cancel <goal-id>` | cancel exactly one goal and the jobs that belong to it |
 | `config` | `config show [group\|name]`, `config set <name> <value>`, `config reset <name>` |
-| `help` | the list above, with the current authorisation status |
+| `help` | the list above |
 
-`stop` and `leave` are different on purpose: a paused bot is still standing in
+`pause` and `leave` are different on purpose: a paused bot is still standing in
 the world and can still talk; a bot that has left is not in the world at all.
 Both keep the goal registry on disk and the scheduler alive.
 
 ### Authorisation
 
-Only the Minecraft **UUIDs** listed in `control.operators` may run a command.
-Usernames are never accepted as identity, because on an offline-mode server a
-name is not an identity at all. `control.operatorNames` exists so the log and
-`status` can say *who* acted, but it never grants authority.
+**Whoever holds the process's console is the operator.** That is the whole
+model. There is no chat command surface to authorise, so there is no prefix, no
+UUID allow-list, and no `control.operators` / `control.operatorNames` /
+`control.announce` to maintain — a player cannot probe a surface that does not
+exist.
 
-- No UUID configured → the chat interface is closed (console still works).
-- A command from anyone else → logged as `ignored command from <name>`, no
-  reply, no hint that a command interface exists.
 - `control.allowConsole` (default on) is the console path; turn it off if the
-  panel console is shared with people who should not steer the body.
+  panel console is shared with people who should not steer the body. The
+  supervisor's own pause/stop calls still work.
+- `ZINC_OPERATORS` and `ZINC_COMMAND_PREFIX` are read by nobody. A template that
+  still sets them keeps booting; the variables are inert.
 
-Both paths are audited in the log with the command, the actor and the outcome
+Console commands are audited in the log with the command, the actor and the outcome
 (`control.auditLog`).
 
 ### Parameters
@@ -403,7 +402,6 @@ to remember, and `config show` lists defaults and effective values together.
 | `actions.allowScripts` | boolean | true | immediate |
 | `limits.maxConcurrentJobs` | integer | 4 | next safe boundary |
 | `limits.maxPhysicalActionsPerMinute` | integer | 240 | immediate |
-| `limits.maxPublicChatPerMinute` | integer | 12 | immediate |
 | `limits.maxGoalRuntimeMinutes` | integer | 0 (off) | immediate |
 | `communication.publicChat` | boolean | true | immediate |
 | `communication.privateMessages` | boolean | true | immediate |
@@ -414,11 +412,7 @@ to remember, and `config show` lists defaults and effective values together.
 | `connection.maxRetries` | integer | 40 | immediate |
 | `death.autoRespawn` | boolean | true | immediate |
 | `death.respawnDelayMs` | integer | 1500 | immediate |
-| `control.prefix` | string | `!zinc` | immediate |
-| `control.operators` | uuid list | *(empty)* | immediate |
-| `control.operatorNames` | name list | *(empty)* | immediate |
 | `control.allowConsole` | boolean | true | immediate |
-| `control.announce` | boolean | false | immediate |
 | `control.auditLog` | boolean | true | immediate |
 
 `config set` validates the type and range, rejects unknown names, prints the old
@@ -511,13 +505,10 @@ no dotenv; nothing is read from a file the panel does not control.
 | `AMD_API_KEY`, `API_KEY`, `RADEON_API_KEY` | API key. Set it as a panel variable; it is never written to disk. |
 | `AMD_API_BASE_URL`, `AMD_MODEL` | Endpoint base URL and model alias. |
 | `AMD_MAX_TOKENS`, `AMD_TEMPERATURE`, `AMD_API_TIMEOUT_MS`, `AMD_CHAT_TIMEOUT_MS`, `AMD_MAX_CONCURRENT` | Model-call shape and lane concurrency. |
-| `BOT_MODE` | `explorer`, `hunter` or `builder`. |
-| `BOT_ALIASES` | Comma-separated chat names besides `ZincAI`. |
-| `BOT_LANGUAGE` | Reply-language check (`pt-BR`, `en`, `es`, `fr`, `de`; empty = off). |
+| `BOT_MODE`, `BOT_ALIASES`, `BOT_LANGUAGE` | **Inert.** There are no modes, no name gating and no language check. A template that still sets them keeps booting. |
 | `INFERENCE_RPM`, `INFERENCE_MIN_INTERVAL_MS`, `INFERENCE_HEARTBEAT_MS` | Call budget, spacing and self-prompt. |
 | `RECONNECT`, `RECONNECT_MAX_ATTEMPTS` | Post-spawn reconnection behaviour. |
-| `ZINC_OPERATORS` | Comma-separated operator UUIDs (`control.operators`). Empty closes the chat command interface. |
-| `ZINC_COMMAND_PREFIX` | Chat prefix for operator commands (`control.prefix`, default `!zinc`). |
+| `ZINC_OPERATORS`, `ZINC_COMMAND_PREFIX` | **Inert.** Control is console-only; there is no chat command interface to configure. |
 | `ZINC_JOIN_ON_START` | Join the server when the process starts (`connection.joinOnStart`); `false` waits for `join`. |
 | `ZINC_DATA_DIR` | Writable data directory (relative to the server folder in the template). |
 | `LOG_LEVEL` | `debug`, `info`, `warn` or `error`. |
@@ -606,9 +597,6 @@ above.
   jump physics and no mob AI; mobs are treated as points, so "breaking out"
   through a crowd is geometry, not a promise about hits taken. The first live
   session should watch exactly these.
-- The language check knows Portuguese from English by function words. It does
-  not detect other languages, and a very short English line with no function
-  word in it can pass.
 - Shield behavior through `activateItem(true)`, water-bucket placement on a
   real server, `/msg` support, and sign-text APIs need server-side/live
   verification.
@@ -617,9 +605,9 @@ above.
 - Skills `follow`, `put`, `smelt`, `sleep`, and `use_block` have not all been
   exercised against a real server. The code's unit/session tests are not a
   substitute for those live checks.
-- Structure perception is a local heuristic, not a full-world oracle; the
-  builder-mode ASCII grid is a simple voxel slice, not pixels seen by a
-  multimodal model.
+- Structure perception is a local heuristic, not a full-world oracle; the ASCII
+  grid (offered whenever the bot is holding build materials) is a simple voxel
+  slice, not pixels seen by a multimodal model.
 
 The root [`README.md`](../README.md) covers both Zinc and ZincAI.
 

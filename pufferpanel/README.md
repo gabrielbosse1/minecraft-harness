@@ -38,9 +38,21 @@ minecraft-harness/
 1. Make sure the branch you want is pushed to a repository the panel node can
    reach (public, or with a deploy key / PAT configured on the repo entry).
 2. In the panel: **Templates → Add repo**. Name `ZincAI`, Url
-   `https://github.com/<you>/minecraft-harness.git`, Branch `main`.
+   `https://github.com/gabrielbosse1/minecraft-harness.git` (or your fork),
+   Branch `main`.
 3. The panel clones it and lists the template. It refreshes the clone every few
    minutes, so a push to the branch shows up without touching the panel.
+
+> **The "Invalid username or token" install failure.** If Install stops at
+> `git clone` asking for a Username/Password and then reports
+> *remote: Invalid username or token. Password authentication is not supported*,
+> the template is cloning a repository that does not exist or is not reachable
+> without credentials — a placeholder URL (`github.com/your-name/…`) left in
+> `data.repo`, or a private repo with no deploy key. It is **not** a problem with
+> your GitHub account. Fix the `Repository` value on the template's
+> **Edit** page (or set a real URL in `zincai.json`), then run Install again.
+> `node pufferpanel/doctor.js` now checks for this and refuses to call a
+> template usable when its clone URL is a placeholder.
 
 > The repository root is what the panel scans, so the JSON must be inside a
 > subfolder of the clone root. `pufferpanel/` is that subfolder; if you fork and

@@ -5,11 +5,11 @@
   "data": {
     "repo": {
       "type": "string",
-      "value": "https://github.com/your-name/minecraft-harness.git",
+      "value": "https://github.com/gabrielbosse1/minecraft-harness.git",
       "display": "Repository",
-      "desc": "Clone URL of YOUR copy of this repository (fork it first). For a private repository use SSH (git@github.com:owner/repo.git) with a deploy key on the node.",
+      "desc": "Clone URL of the repository the panel installs from. The default is this project's public repo and needs no credentials. Point it at YOUR fork if you have one — the box is editable, and a fork is the normal way to run your own copy. For a PRIVATE repository use SSH (git@github.com:owner/repo.git) with a deploy key on the node, or the install will fail asking for a password.",
       "required": true,
-      "userEdit": false
+      "userEdit": true
     },
     "branch": {
       "type": "string",

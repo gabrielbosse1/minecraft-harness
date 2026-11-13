@@ -35,7 +35,7 @@ const SOURCE = path.join(__dirname, 'zincai.json')
 const HOST_FAMILY = ['host', 'tty', 'standard']
 
 function parseArgs (argv) {
-  const out = { env: 'host', os: process.platform === 'linux' ? 'linux' : process.platform, arch: null, json: null, scan: null, help: false }
+  const out = { env: 'host', os: process.platform === 'linux' ? 'linux' : process.platform, arch: null, json: null, scan: null, refresh: false, help: false }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (a === '--help' || a === '-h') out.help = true
@@ -48,6 +48,7 @@ function parseArgs (argv) {
     else if (a === '--json') out.json = argv[++i]
     else if (a === '--scan') out.scan = argv[++i] || path.join(__dirname, '..')
     else if (a.startsWith('--scan=')) out.scan = a.slice('--scan='.length)
+    else if (a === '--refresh') out.refresh = true
     else throw new Error(`unknown argument: ${a}`)
   }
   if (!out.arch) out.arch = process.arch
@@ -98,10 +99,11 @@ function scanRepo (root) {
 function main () {
   const args = parseArgs(process.argv.slice(2))
   if (args.help) {
-    console.log('usage: node pufferpanel/doctor.js [--env host|tty|standard|docker] [--os linux] [--arch arm64|x64] [--json <template>] [--scan <repo root>]')
+    console.log('usage: node pufferpanel/doctor.js [--env host|tty|standard|docker] [--os linux] [--arch arm64|x64] [--json <template>] [--scan <repo root>] [--refresh]')
     return 0
   }
 
+  if (args.refresh) return refreshMain()
   if (args.scan) return scanMain(args)
 
   const template = args.json ? JSON.parse(args.json) : JSON.parse(fs.readFileSync(SOURCE, 'utf8'))
@@ -159,7 +161,16 @@ function main () {
 
 if (require.main === module) {
   try {
-    process.exitCode = main()
+    const result = main()
+    // --refresh is async; everything else returns a number.
+    if (result && typeof result.then === 'function') {
+      result.then((code) => { process.exitCode = code }).catch((err) => {
+        console.error(err.message)
+        process.exitCode = 1
+      })
+    } else {
+      process.exitCode = result
+    }
   } catch (err) {
     console.error(err.message)
     process.exitCode = 1
@@ -194,4 +205,78 @@ function scanMain (args) {
   return 0
 }
 
-module.exports = { compatibility, parseArgs, scanRepo, HOST_FAMILY }
+/**
+ * Force the panel to re-pull the template repository.
+ *
+ * validateRepoOnDisk caches the clone per repo ID and only re-pulls when
+ * LastRefreshed is older than 5 minutes; while a pull is in flight it holds
+ * pathLock, so other requests may report an error instead of a template list.
+ * Removing and re-adding the repo wipes the clone from
+ * <data>/cache/template-repos/<id>, which is the reliable way to pick up a new
+ * commit immediately.
+ *
+ * Note that the panel clones the URL stored in the repo row — if that is your
+ * fork, an upstream merge changes nothing until the fork has the commit.
+ */
+async function refreshMain () {
+  const base = process.env.PUFFER_URL || 'http://127.0.0.1:8080'
+  const user = process.env.PUFFER_USER
+  const pass = process.env.PUFFER_PASS
+  if (!user || !pass) {
+    console.error('Set PUFFER_USER and PUFFER_PASS (a panel admin) — optionally PUFFER_URL.')
+    console.error('This logs in, deletes the template repository and re-adds the same URL,')
+    console.error('which clears <data>/cache/template-repos/<id> and forces a fresh clone.')
+    return 1
+  }
+
+  const auth = 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64')
+  const call = async (method, endpoint, body) => {
+    const res = await fetch(base.replace(/\/$/, '') + endpoint, {
+      method,
+      headers: { Authorization: auth, 'Content-Type': 'application/json' },
+      body: body ? JSON.stringify(body) : undefined
+    })
+    const text = await res.text()
+    return { status: res.status, body: text ? JSON.parse(text) : null }
+  }
+
+  try {
+    const repos = await call('GET', '/api/templates')
+    if (repos.status !== 200) {
+      console.error(`GET /api/templates -> ${repos.status}: ${JSON.stringify(repos.body)}`)
+      return 1
+    }
+    const rows = Array.isArray(repos.body) ? repos.body : []
+    for (const repo of rows) {
+      if (repo.id === 0) {
+        console.log(`repo 0 "${repo.name}" is the local templates table, not a git repo — skipped`)
+        continue
+      }
+      console.log(`refreshing repo ${repo.id} "${repo.name}" ${repo.url} (branch ${repo.branch})`)
+      const del = await call('DELETE', `/api/templates/${repo.id}`)
+      if (del.status >= 300) {
+        console.error(`  DELETE -> ${del.status}: ${JSON.stringify(del.body)}`)
+        return 1
+      }
+      const add = await call('POST', '/api/templates', { name: repo.name, url: repo.url, branch: repo.branch })
+      if (add.status >= 300) {
+        console.error(`  POST -> ${add.status}: ${JSON.stringify(add.body)}`)
+        return 1
+      }
+      const fresh = await call('GET', `/api/templates/${repo.id}`)
+      const names = Array.isArray(fresh.body) ? fresh.body.map((t) => `${t.name}${t.display ? ` (${t.display})` : ' <-- NO NAME'}`) : []
+      console.log(`  now lists: ${names.length ? names.join(', ') : '(nothing)'}`)
+      if (names.some((n) => n.includes('NO NAME'))) {
+        console.log('  a nameless entry means a non-template *.json still sits in a scanned folder')
+        return 1
+      }
+    }
+    console.log('\nDone. The create-server page will now offer these templates.')
+    return 0
+  } catch (err) {
+    console.error(`could not talk to the panel: ${err.message}`)
+    return 1
+  }
+}
+
+module.exports = { compatibility, parseArgs, scanRepo, refreshMain, HOST_FAMILY }

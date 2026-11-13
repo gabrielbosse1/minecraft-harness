@@ -198,6 +198,29 @@ test('doctor: --scan exits non-zero for a repo with a stray JSON, zero for ours'
   assert.match(out, /nameless/)
 })
 
+test('doctor: --refresh refuses to run without credentials, and exports the helper', () => {
+  const script = path.join(__dirname, '..', 'pufferpanel', 'doctor.js')
+  const env = { ...process.env }
+  delete env.PUFFER_USER
+  delete env.PUFFER_PASS
+  let code = 0
+  let err = ''
+  try {
+    execFileSync(process.execPath, [script, '--refresh'], { encoding: 'utf8', env, stdio: 'pipe' })
+  } catch (e) {
+    code = e.status
+    err = String(e.stderr)
+  }
+  assert.equal(code, 1, 'no credentials must be a failure, not a silent success')
+  assert.match(err, /PUFFER_USER/)
+
+  const { refreshMain } = require('../pufferpanel/doctor')
+  assert.equal(typeof refreshMain, 'function')
+  // It must be async: the old sync entry point printed
+  // "The code argument must be of type number. Received an instance of Promise".
+  assert.ok(refreshMain.constructor.name === 'AsyncFunction')
+})
+
 test('config: the shipped defaults live outside the folder the panel scans', () => {
   // zincai/config/defaults.json is three levels deep on purpose: <folder>/<file>.json
   // would be picked up as a template by the panel and shown as a blank entry.

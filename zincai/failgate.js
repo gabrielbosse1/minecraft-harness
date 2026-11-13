@@ -1,8 +1,8 @@
 /**
  * failgate.js — stops the model from burning the call budget on an action
- * the body keeps refusing or failing (audit2 B1).
+ * the body keeps refusing or failing .
  *
- * The measured failure shape (audit/repro/05): the model answers a refused
+ * The measured failure shape: the model answers a refused
  * `attack` again every 3 s — six calls in 14 s, each a full ~3.7k-token
  * prompt, converging never. The same shape appears with `craft` at a table
  * that stayed out of reach, or `take` from a chest another player emptied.

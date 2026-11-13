@@ -1,5 +1,5 @@
 /**
- * Goal-orchestration audit regression suite (GOAL_ORCHESTRATION_AUDIT.md).
+ * Goal-orchestration suite: durable goals across interruptions, deaths and restarts.
  *
  * Half unit (goals.js — lifecycle, persistence, restart recovery) and half
  * whole-harness (the real zincai/index.js session: agenda + goal registry +

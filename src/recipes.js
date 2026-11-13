@@ -21,7 +21,12 @@
  */
 'use strict'
 
-const { isValidItemName } = require('./actionParser')
+const ITEM_NAME_RE = /^[a-z0-9_]{1,64}$/
+
+/** Validate item ids like "oak_planks" (used by the craft action + recipe resolver). */
+function isValidItemName (v) {
+  return typeof v === 'string' && ITEM_NAME_RE.test(v)
+}
 
 const TABLE_REACH = 8
 
@@ -91,7 +96,7 @@ function resolveRecipe (bot, itemName) {
 /**
  * Craft one `itemName`. Never throws.
  *
- * audit2 B3/E: the table finder looks 8 m out but bot.craft needs the table
+ * The table finder looks 8 m out but bot.craft needs the table
  * within interaction reach (~4.5 m), so a table 4.5-8 m away failed with a
  * window error and the model just retried forever. `approach` (optional)
  * walks the bot next to the table first; callers own HOW (ZincAI routes it

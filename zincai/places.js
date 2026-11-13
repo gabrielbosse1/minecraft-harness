@@ -454,7 +454,7 @@ class PlaceIndex {
   // ------------------------------------------------------------ rendering --
 
   /**
-   * audit2 B10: contents are a MEMORY ("as of last look"), not a live view —
+   * contents are a MEMORY ("as of last look"), not a live view —
    * another player can move stock between scans. Older than a minute, say so.
    */
   _ageSuffix (e) {
@@ -582,7 +582,7 @@ class PlaceIndex {
 module.exports = { PlaceIndex, kindOf, signTextOf, chestPartner, signSupport, CONTAINER_KINDS, STATION_KINDS }
 
 // ---------------------------------------------------------------------------
-// audit2 B15 — instant invalidation/adoption (method lives on
+// instant invalidation/adoption (method lives on
 // PlaceIndex.prototype so the class body above stays untouched):
 
 /**

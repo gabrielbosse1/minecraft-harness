@@ -10,7 +10,7 @@
  * minecraft-protocol@1.68.0 / mineflayer@4.39.0 / prismarine-chunk@1.41.0
  * do not implement them, so the bot crashed (`ctx.entityDelta is not a
  * function`) and was kicked (`invalid_player_movement`) ~400 ms after spawn
- * on a real 26.3 server (see .zinc-test-run/reports/FAILURES.md F1).
+ * on a real 26.3 server (see scripts/apply-26.3-data.js).
  * Upstream fixes exist as open PRs (node-minecraft-protocol#1538/#1553,
  * mineflayer#4144/#4125/#4146/#4194/#4206, prismarine-chunk#334); this
  * script ports the join-critical & gameplay-critical subset into the

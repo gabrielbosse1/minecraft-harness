@@ -1,0 +1,448 @@
+{
+  "type": "minecraft-java",
+  "display": "Minecraft Agent (ZincAI)",
+  "icon": "minecraft-java",
+  "data": {
+    "repo": {
+      "type": "string",
+      "value": "https://github.com/gabrielbosse1/minecraft-harness.git",
+      "display": "Repository",
+      "desc": "Clone URL of the bot. For a private repository use SSH (git@github.com:owner/repo.git) with a deploy key on the node.",
+      "required": true,
+      "userEdit": false
+    },
+    "branch": {
+      "type": "string",
+      "value": "main",
+      "display": "Branch",
+      "desc": "Git branch to run. Install again to update the server to the newest commit of this branch.",
+      "required": true,
+      "userEdit": true
+    },
+    "entrypoint": {
+      "type": "string",
+      "value": "zincai/index.js",
+      "display": "Entry Point",
+      "desc": "The bot's main file.",
+      "required": true,
+      "userEdit": false,
+      "internal": true
+    },
+    "nodeversion": {
+      "type": "string",
+      "value": "22",
+      "display": "Node.js Version",
+      "desc": "Node.js major version, installed automatically on host nodes as node${nodeversion} / npm${nodeversion}. The Docker image already contains Node.js.",
+      "required": true,
+      "userEdit": true
+    },
+    "apikey": {
+      "type": "string",
+      "value": "",
+      "display": "AMD Radeon Cloud API Key",
+      "desc": "Your rc-... Token Factory key. Passed in as the AMD_API_KEY environment variable, never written to disk, so it stays out of the console and out of git.",
+      "required": true,
+      "userEdit": true
+    },
+    "model": {
+      "type": "string",
+      "value": "Qwen3.8-Flash-Next",
+      "display": "Model",
+      "desc": "Model alias served by the endpoint. DeepSeek-V4-Flash-0731 also works.",
+      "required": true,
+      "userEdit": true
+    },
+    "amdurl": {
+      "type": "string",
+      "value": "https://developer.amd.com.cn/radeon/api/v1",
+      "display": "API Base URL",
+      "desc": "OpenAI-compatible base URL. Change it only to point at a proxy.",
+      "required": true,
+      "userEdit": true
+    },
+    "host": {
+      "type": "string",
+      "value": "127.0.0.1",
+      "display": "Minecraft Server Address",
+      "desc": "Address the bot joins. If the Minecraft server runs on this same node, use the host gateway (host.docker.internal in Docker) and the port below.",
+      "required": true,
+      "userEdit": true
+    },
+    "port": {
+      "type": "integer",
+      "value": 25565,
+      "display": "Minecraft Server Port",
+      "desc": "Port the bot joins — the Minecraft server's port, not this server's panel port.",
+      "required": true,
+      "userEdit": true
+    },
+    "mcversion": {
+      "type": "string",
+      "value": "",
+      "display": "Minecraft Version",
+      "desc": "Pin a protocol version (1.21.4) or leave empty to auto-detect it from the server.",
+      "required": false,
+      "userEdit": true
+    },
+    "auth": {
+      "type": "string",
+      "value": "offline",
+      "display": "Authentication",
+      "desc": "offline joins a private/cracked server with the fixed name ZincAI whitelisted. microsoft needs a premium account and an interactive device-code login on the first run.",
+      "required": true,
+      "userEdit": true,
+      "options": [
+        {
+          "value": "offline",
+          "display": "Offline"
+        },
+        {
+          "value": "microsoft",
+          "display": "Microsoft"
+        }
+      ]
+    },
+    "mode": {
+      "type": "string",
+      "value": "explorer",
+      "display": "Agent Mode",
+      "desc": "Which tool set the model gets. Every mode keeps the same policy: it never starts a fight and never attacks a player unless the model names that exact player.",
+      "required": true,
+      "userEdit": true,
+      "options": [
+        {
+          "value": "explorer",
+          "display": "Explorer"
+        },
+        {
+          "value": "hunter",
+          "display": "Hunter"
+        },
+        {
+          "value": "builder",
+          "display": "Builder"
+        }
+      ]
+    },
+    "aliases": {
+      "type": "string",
+      "value": "zinc",
+      "display": "Chat Aliases",
+      "desc": "Comma-separated names the bot also answers to in chat, besides its login name ZincAI.",
+      "required": false,
+      "userEdit": true
+    },
+    "language": {
+      "type": "string",
+      "value": "pt-BR",
+      "display": "Reply Language",
+      "desc": "Every chat line is checked against this language; a reply in another one is retried once, then replaced. Recognised: pt-BR, en, es, fr, de. Empty switches the check off.",
+      "required": false,
+      "userEdit": true
+    },
+    "candig": {
+      "type": "boolean",
+      "value": false,
+      "display": "Allow Digging",
+      "desc": "Let the bot break blocks it does not own while pathfinding. Off keeps it to jumping and detours.",
+      "required": true,
+      "userEdit": true
+    },
+    "scaffolding": {
+      "type": "boolean",
+      "value": false,
+      "display": "Allow Scaffolding",
+      "desc": "Let the bot place and remove scaffolding blocks while building.",
+      "required": true,
+      "userEdit": true
+    },
+    "elytra": {
+      "type": "boolean",
+      "value": true,
+      "display": "Auto Elytra",
+      "desc": "Glide across long gaps with a carried elytra and fireworks instead of walking around.",
+      "required": true,
+      "userEdit": true
+    },
+    "rpm": {
+      "type": "integer",
+      "value": 18,
+      "display": "Calls Per Minute",
+      "desc": "Shared model-call budget. Part of it is reserved for chat so a long task can never starve replies.",
+      "required": true,
+      "userEdit": true
+    },
+    "mininterval": {
+      "type": "integer",
+      "value": 3000,
+      "display": "Minimum Call Spacing (ms)",
+      "desc": "Shortest gap between two action-lane calls.",
+      "required": true,
+      "userEdit": true
+    },
+    "heartbeat": {
+      "type": "integer",
+      "value": 90000,
+      "display": "Heartbeat (ms)",
+      "desc": "Self-prompt when nothing happens. 0 turns it off: the bot then only thinks when someone talks to it or the world changes.",
+      "required": true,
+      "userEdit": true
+    },
+    "reconnect": {
+      "type": "boolean",
+      "value": true,
+      "display": "Reconnect",
+      "desc": "After a session that spawned, retry a dropped link or a server restart with back-off under the same name. A rejected FIRST join is still fatal.",
+      "required": true,
+      "userEdit": true
+    },
+    "maxattempts": {
+      "type": "integer",
+      "value": 40,
+      "display": "Reconnect Attempts",
+      "desc": "How many times a dropped connection is retried before the process exits.",
+      "required": true,
+      "userEdit": true
+    },
+    "log": {
+      "type": "string",
+      "value": "info",
+      "display": "Log Level",
+      "desc": "debug adds packet detail; warn and error quieten the console.",
+      "required": true,
+      "userEdit": true,
+      "options": [
+        {
+          "value": "debug",
+          "display": "Debug"
+        },
+        {
+          "value": "info",
+          "display": "Info"
+        },
+        {
+          "value": "warn",
+          "display": "Warning"
+        },
+        {
+          "value": "error",
+          "display": "Error"
+        }
+      ]
+    },
+    "datadir": {
+      "type": "string",
+      "value": "data",
+      "display": "Data Directory",
+      "desc": "Where memories, places, goals and metrics live. Relative to the server directory, so it is included in a normal backup.",
+      "required": true,
+      "userEdit": false
+    },
+    "autostart": {
+      "type": "boolean",
+      "value": true,
+      "display": "Start With Node",
+      "desc": "Start the bot automatically when the node boots.",
+      "required": true,
+      "userEdit": false
+    },
+    "autorecover": {
+      "type": "boolean",
+      "value": true,
+      "display": "Recover From Crash",
+      "desc": "Restart the process if it crashes unexpectedly.",
+      "required": true,
+      "userEdit": false
+    }
+  },
+  "groups": [
+    {
+      "display": "Endpoint",
+      "description": "Where the model runs and which key it uses. The key only ever exists as an environment variable.",
+      "variables": [
+        "apikey",
+        "model",
+        "amdurl"
+      ],
+      "order": 1
+    },
+    {
+      "display": "Minecraft Server",
+      "description": "The server the bot joins.",
+      "variables": [
+        "host",
+        "port",
+        "mcversion",
+        "auth"
+      ],
+      "order": 2
+    },
+    {
+      "display": "Behaviour",
+      "description": "How the bot plays and speaks.",
+      "variables": [
+        "mode",
+        "aliases",
+        "language",
+        "candig",
+        "scaffolding",
+        "elytra"
+      ],
+      "order": 3
+    },
+    {
+      "display": "Limits",
+      "description": "Model budget, recovery and logging.",
+      "variables": [
+        "rpm",
+        "mininterval",
+        "heartbeat",
+        "reconnect",
+        "maxattempts",
+        "log"
+      ],
+      "order": 4
+    },
+    {
+      "display": "Installation",
+      "description": "Where the bot comes from and which runtime it uses.",
+      "variables": [
+        "repo",
+        "branch",
+        "nodeversion",
+        "datadir",
+        "autostart",
+        "autorecover"
+      ],
+      "order": 5
+    }
+  ],
+  "install": [
+    {
+      "if": "!in_path('git')",
+      "type": "command",
+      "commands": [
+        "echo 'git is required: install git on the node (apt install git / dnf install git) and run Install again' && exit 1"
+      ]
+    },
+    {
+      "if": "!file_exists('.git')",
+      "type": "command",
+      "commands": [
+        "git clone --depth 1 --branch ${branch} ${repo} ."
+      ]
+    },
+    {
+      "if": "file_exists('.git')",
+      "type": "command",
+      "commands": [
+        "git fetch --depth 1 origin ${branch}",
+        "git checkout -B ${branch} FETCH_HEAD"
+      ]
+    },
+    {
+      "if": "env == 'host' && os != 'windows' && nodeversion != ''",
+      "type": "nodejsdl",
+      "version": "${nodeversion}"
+    },
+    {
+      "if": "env == 'host' && os != 'windows'",
+      "type": "command",
+      "commands": [
+        "npm${nodeversion} ci --omit=dev --no-audit --no-fund"
+      ]
+    },
+    {
+      "if": "env != 'host' || os == 'windows'",
+      "type": "command",
+      "commands": [
+        "npm ci --omit=dev --no-audit --no-fund"
+      ]
+    },
+    {
+      "type": "mkdir",
+      "target": "${datadir}"
+    }
+  ],
+  "run": {
+    "pre": [
+      {
+        "if": "env == 'host' && os != 'windows'",
+        "type": "command",
+        "commands": [
+          "node${nodeversion} ${entrypoint} --dry-run"
+        ]
+      },
+      {
+        "if": "env == 'host' && os == 'windows'",
+        "type": "command",
+        "commands": [
+          "node ${entrypoint} --dry-run"
+        ]
+      },
+      {
+        "if": "env == 'docker'",
+        "type": "command",
+        "commands": [
+          "node ${entrypoint} --dry-run"
+        ]
+      }
+    ],
+    "command": [
+      {
+        "command": "node${nodeversion} ${entrypoint}",
+        "if": "env == 'host' && os != 'windows'"
+      },
+      {
+        "command": "node ${entrypoint}",
+        "if": "env == 'host' && os == 'windows'"
+      },
+      {
+        "command": "node ${entrypoint}"
+      }
+    ],
+    "stopCode": 2,
+    "stdin": {
+      "type": "stdin"
+    },
+    "environmentVars": {
+      "NODE_ENV": "production",
+      "AMD_API_KEY": "${apikey}",
+      "AMD_API_BASE_URL": "${amdurl}",
+      "AMD_MODEL": "${model}",
+      "MC_HOST": "${host}",
+      "MC_PORT": "${port}",
+      "MC_VERSION": "${mcversion}",
+      "MC_AUTH": "${auth}",
+      "MC_CAN_DIG": "${candig}",
+      "MC_ALLOW_SCAFFOLDING": "${scaffolding}",
+      "MC_AUTO_ELYTRA": "${elytra}",
+      "BOT_MODE": "${mode}",
+      "BOT_ALIASES": "${aliases}",
+      "BOT_LANGUAGE": "${language}",
+      "INFERENCE_RPM": "${rpm}",
+      "INFERENCE_MIN_INTERVAL_MS": "${mininterval}",
+      "INFERENCE_HEARTBEAT_MS": "${heartbeat}",
+      "RECONNECT": "${reconnect}",
+      "RECONNECT_MAX_ATTEMPTS": "${maxattempts}",
+      "ZINC_DATA_DIR": "${datadir}",
+      "LOG_LEVEL": "${log}"
+    },
+    "autostart": "${autostart}",
+    "autorecover": "${autorecover}",
+    "autorestart": false
+  },
+  "environment": {
+    "type": "host"
+  },
+  "supportedEnvironments": [
+    {
+      "type": "host"
+    },
+    {
+      "type": "docker",
+      "image": "node:${nodeversion}-bookworm-slim"
+    }
+  ],
+  "requirements": {}
+}

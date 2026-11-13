@@ -55,7 +55,7 @@ const FUELS = { coal: 8, charcoal: 8, coal_block: 80, blaze_rod: 12, dried_kelp_
 const WOOD_FUEL = /(_planks|_log|_wood|_stem|_hyphae)$/ // 1.5 items each
 const EQUIP_SLOTS = { hand: 'hand', mainhand: 'hand', main: 'hand', offhand: 'off-hand', 'off-hand': 'off-hand', off: 'off-hand', head: 'head', helmet: 'head', chest: 'torso', torso: 'torso', legs: 'legs', feet: 'feet', boots: 'feet' }
 
-// --- gather allowlist (audit2 B4/C): what the body is ever allowed to dig --
+// --- gather allowlist : what the body is ever allowed to dig --
 const TOOL_TIERS = { golden: 0, wooden: 0, stone: 1, copper: 1, iron: 2, diamond: 3, netherite: 4 }
 const TOOL_NAMES = ['wooden', 'stone', 'iron', 'diamond', 'netherite']
 /** Minimum pickaxe tier per ore-family block (soils/logs need none: -1). */
@@ -661,7 +661,7 @@ class Skills {
   // ---------------------------------------------------------------- craft --
 
   /**
-   * Craft with a reachable table (audit2 B3/E): craftItem finds a table up
+   * Craft with a reachable table : craftItem finds a table up
    * to 8 m away but can only use it from ~4.5 m — walk there through the
    * task lane first, then craft. Runs as one skill so `stop` and the flee
    * reflex treat the whole thing as one job.
@@ -692,7 +692,7 @@ class Skills {
   }
 
   // ------------------------------------------------- resource chores -----
-  // audit2 B4/C: deterministic acquisition. The model names WHAT; the body
+  // deterministic acquisition. The model names WHAT; the body
   // digs only blocks that ARE the requested resource (never arbitrary cells),
   // from an explicit allowlist. This is not an ownership check: player-built
   // structures can contain the same resource blocks.

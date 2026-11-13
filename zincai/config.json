@@ -1,12 +1,12 @@
 {
-  "_comment": "ZincAI runtime config. Every value can be overridden by environment variables (env wins): MC_HOST, MC_PORT, MC_USERNAME, MC_VERSION, MC_AUTH, MC_CAN_DIG, AMD_API_BASE_URL, AMD_MODEL, AMD_API_KEY (or API_KEY), ZINC_DATA_DIR, LOG_LEVEL. Credentials: leave amd.apiKey EMPTY and pass AMD_API_KEY/API_KEY via the process environment (Pufferpanel 'secret variables'), or fill amd.apiKey here if the repo stays private. Never commit a real key to a public repo.",
+  "_comment": "ZincAI runtime defaults. Every value can be overridden by environment variables, which is how a PufferPanel template configures it: MC_HOST, MC_PORT, MC_VERSION, MC_AUTH, MC_CAN_DIG, MC_ALLOW_SCAFFOLDING, MC_AUTO_ELYTRA, AMD_API_BASE_URL, AMD_MODEL, AMD_API_KEY (or API_KEY / RADEON_API_KEY), AMD_MAX_TOKENS, AMD_TEMPERATURE, AMD_API_TIMEOUT_MS, AMD_CHAT_TIMEOUT_MS, AMD_MAX_CONCURRENT, BOT_MODE, BOT_ALIASES, BOT_LANGUAGE, INFERENCE_RPM, INFERENCE_MIN_INTERVAL_MS, INFERENCE_HEARTBEAT_MS, RECONNECT, RECONNECT_MAX_ATTEMPTS, ZINC_DATA_DIR, LOG_LEVEL. Dotted names (server.host, amd.model, ...) are accepted too and mean the same key in this file. There is no .env: leave amd.apiKey EMPTY and let the panel pass the key as a secret variable.",
   "server": {
-    "host": "bidders-scholar.tun.ply.gg",
+    "host": "127.0.0.1",
     "port": 25565,
     "username": "ZincAI",
     "auth": "offline",
     "version": "",
-    "_note": "version '' = auto-detect (recommended for 26.3). auth 'offline' for whitelist name-join; 'microsoft' needs a real account and interactive device-code login."
+    "_note": "Built-in defaults only: the panel (MC_HOST / MC_PORT / MC_VERSION / MC_AUTH) always wins. version '' = auto-detect. auth 'offline' joins a private server with the fixed name ZincAI whitelisted; 'microsoft' needs a premium account and an interactive device-code login."
   },
   "amd": {
     "apiKey": "",
@@ -16,7 +16,7 @@
     "maxTokens": 512,
     "temperature": 0.25,
     "timeoutMs": 120000,
-    "_timeoutNote": "26.1 live test (2026-11-12): Qwen3.8-27B measured 47-99s per action-lane call (9.7k-token prompts) and hit 256-token cutoffs. Raised maxTokens to 512 and chatTimeoutMs to 90000; see .zinc-test-run/reports/FINAL_REPORT.md.",
+    "_timeoutNote": "26.1 live test (2026-11-12): Qwen3.8-27B measured 47-99s per action-lane call (9.7k-token prompts) and hit 256-token cutoffs. Raised maxTokens to 512 and chatTimeoutMs to 90000.",
     "maxRetries": 2,
     "maxConcurrent": 2,
     "chatTimeoutMs": 90000,
@@ -35,7 +35,7 @@
     "chatMaxTokens": 120,
     "failGateAfter": 2,
     "failWindowMs": 120000,
-    "_failGateNote": "audit2 B1: the same tool call with the same arguments failing failGateAfter times inside failWindowMs is refused locally (no wake) until the world changes (success, movement, hurt, new threat, timeout)."
+    "_failGateNote": "the same tool call with the same arguments failing failGateAfter times inside failWindowMs is refused locally (no wake) until the world changes (success, movement, hurt, new threat, timeout)."
   },
   "memory": {
     "file": "zincai-data/memories.json",
@@ -46,10 +46,10 @@
     "preferencesFile": "zincai-data/preferences.json",
     "factsPerPlayer": 6,
     "chatRecallMaxAgeMs": 120000,
-    "_chatRecallNote": "Memory recall on non-chat wakes uses the last chat line only while it is this fresh (audit2 B5): hours-old chat stopped steering recall into flee/task prompts."
+    "_chatRecallNote": "Memory recall on non-chat wakes uses the last chat line only while it is this fresh : hours-old chat stopped steering recall into flee/task prompts."
   },
   "trust": {
-    "_note": "audit2 B11/D: EMPTY lists = old behavior (everyone equal, gate off). Once owners or trusted names are set, a guest whose chat request reaches the action lane may NOT take/give valuables (diamond/netherite/emerald-tier items or labels) or run_script; the bot's own initiative is never gated. CAUTION: offline-mode usernames are not proof of identity - run online-mode or a whitelist if that matters.",
+    "_note": "EMPTY lists = old behavior (everyone equal, gate off). Once owners or trusted names are set, a guest whose chat request reaches the action lane may NOT take/give valuables (diamond/netherite/emerald-tier items or labels) or run_script; the bot's own initiative is never gated. CAUTION: offline-mode usernames are not proof of identity - run online-mode or a whitelist if that matters.",
     "owners": [],
     "trusted": []
   },
@@ -67,7 +67,7 @@
     "perceptionRange": 10,
     "chatCooldownMs": 1500,
     "chatPerPlayerPerMinute": 8,
-    "_chatRateNote": "audit2 scenario 32: one player spamming the bot may use at most this many chat-lane wakes per minute; extra lines are still logged and remembered, just not answered.",
+    "_chatRateNote": "one player spamming the bot may use at most this many chat-lane wakes per minute; extra lines are still logged and remembered, just not answered.",
     "useArmorManager": true,
     "mode": "explorer",
     "perception3D": false,

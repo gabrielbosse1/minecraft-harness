@@ -175,7 +175,7 @@ const CHAT_TOOLS = [
 const toOpenAi = (list) => list.map((t) => ({ type: 'function', function: JSON.parse(JSON.stringify(t)) }))
 
 /**
- * audit2 G: tools a mode cannot meaningfully use are not shipped to the
+ * tools a mode cannot meaningfully use are not shipped to the
  * model in that mode — the schema block is ~63% of every action call, and a
  * builder never needs `smelt`/`sleep` mid-build. Movement, survival and
  * social tools (say/idle/stop/hold/find/remember_here/set_mode…) are always
@@ -361,7 +361,7 @@ class AmdToolsClient {
   constructor ({ apiKey, baseUrl, model, timeoutMs = 20_000, maxRetries = 2, temperature = 0.25, maxTokens = 512, toolChoice = 'required', maxConcurrent = 2, chatTimeoutMs = null, chatMaxRetries = 1 }) {
     if (!apiKey) {
       // Never include the (missing) key in the error — only the variable name.
-      throw new Error('AMD API key missing: set AMD_API_KEY (or API_KEY) in .env')
+      throw new Error('AMD API key missing: set AMD_API_KEY (or API_KEY / RADEON_API_KEY)')
     }
     this.baseUrl = String(baseUrl).replace(/\/+$/, '')
     this.model = model

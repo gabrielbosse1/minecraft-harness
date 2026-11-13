@@ -18,7 +18,7 @@
  *   - Chat has its OWN in-flight slot and a reserved share of the budget. A
  *     chase used to spend all 18 calls a minute on the action lane, and a
  *     slow action call (20 s timeout × 3) held the single slot: a friend's
- *     line then waited 20 s or more (audit/repro/11). Now a reply never waits
+ *     line then waited 20 s or more. Now a reply never waits
  *     for the body's call, and `chatReserve` calls a minute are chat's alone.
  *   - An URGENT wake (the body just started running for its life, or is
  *     cornered) may run sooner than the normal spacing.

@@ -46,14 +46,15 @@
 const fs = require('fs')
 const path = require('path')
 
-// Load .env if present (local dev convenience). Real deployments (Pufferpanel)
-// inject AMD_API_KEY/API_KEY as secret environment variables — those win,
-// because dotenv never overrides variables that are already set.
-require('dotenv').config()
+// No .env and no dotenv: everything arrives as environment variables, which is
+// exactly what a PufferPanel template's run.environmentVars becomes. Secrets
+// (AMD_API_KEY / API_KEY / RADEON_API_KEY) are read only by src/settings.js
+// and are never logged.
+const settings = require('../src/settings')
 
 const ROOT = path.join(__dirname, '..')
 const ZINC_DIR = __dirname
-const DATA_DIR = process.env.ZINC_DATA_DIR || path.join(ROOT, 'zincai-data')
+const DATA_DIR = settings.str('ZINC_DATA_DIR', path.join(ROOT, 'zincai-data'))
 const SYSTEM_PROMPT = fs.readFileSync(path.join(ZINC_DIR, 'system_prompt.txt'), 'utf8').trim()
 const CHAT_PROMPT = fs.readFileSync(path.join(ZINC_DIR, 'chat_prompt.txt'), 'utf8').trim()
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
@@ -81,34 +82,41 @@ const ATTACK_WHY = {
 }
 
 // ============================================================ config ====
+function option (envName, configName, fallback, allowed) {
+  return settings.option([envName, configName], fallback, allowed)
+}
+
 function loadConfig () {
   const file = path.join(ZINC_DIR, 'config.json')
   const raw = JSON.parse(fs.readFileSync(file, 'utf8'))
-  const str = (envName, fallback) => (process.env[envName] !== undefined && process.env[envName] !== '' ? process.env[envName] : fallback)
-  const int = (envName, fallback) => {
-    const v = Number(process.env[envName])
-    return Number.isFinite(v) && process.env[envName] !== '' ? Math.trunc(v) : fallback
-  }
-  return {
+  const rejected = []
+  const opt = (res) => { if (res.rejected) rejected.push(res.rejected); return res.value }
+
+  const auth = opt(option('MC_AUTH', 'auth', raw.server.auth || 'offline', ['offline', 'microsoft']))
+  const version = settings.str(['MC_VERSION', 'server.version'], raw.server.version || '')
+
+  const cfg = {
     server: {
-      host: str('MC_HOST', raw.server.host),
-      port: int('MC_PORT', raw.server.port),
+      // The server the bot joins. PufferPanel's MC_HOST may be an IP or a host
+      // name (play.example.net); the port is the Minecraft port, not the panel's.
+      host: settings.str(['MC_HOST', 'server.host'], raw.server.host),
+      port: settings.int(['MC_PORT', 'server.port'], raw.server.port, { min: 1, max: 65535 }),
       // HARD RULE: always ZincAI, no matter what config/env says.
       username: 'ZincAI',
-      auth: str('MC_AUTH', raw.server.auth || 'offline'),
-      version: str('MC_VERSION', raw.server.version || '') || false
+      auth,
+      version: version || false
     },
     amd: {
-      apiKey: process.env.AMD_API_KEY || process.env.API_KEY || process.env.RADEON_API_KEY || raw.amd.apiKey || null,
-      baseUrl: str('AMD_API_BASE_URL', raw.amd.baseUrl).replace(/\/+$/, ''),
-      model: str('AMD_MODEL', raw.amd.model),
-      maxTokens: raw.amd.maxTokens ?? 256,
-      temperature: raw.amd.temperature ?? 0.25,
-      timeoutMs: raw.amd.timeoutMs ?? 20_000,
-      maxRetries: raw.amd.maxRetries ?? 2,
-      maxConcurrent: raw.amd.maxConcurrent ?? 2,
-      chatTimeoutMs: raw.amd.chatTimeoutMs ?? null,
-      chatMaxRetries: raw.amd.chatMaxRetries ?? 1
+      apiKey: settings.apiKey() || raw.amd.apiKey || null,
+      baseUrl: settings.str(['AMD_API_BASE_URL', 'amd.baseUrl'], raw.amd.baseUrl).replace(/\/+$/, ''),
+      model: settings.str(['AMD_MODEL', 'amd.model'], raw.amd.model),
+      maxTokens: settings.int(['AMD_MAX_TOKENS', 'amd.maxTokens'], raw.amd.maxTokens ?? 256, { min: 16, max: 4096 }),
+      temperature: settings.float(['AMD_TEMPERATURE', 'amd.temperature'], raw.amd.temperature ?? 0.25, { min: 0, max: 1.5 }),
+      timeoutMs: settings.int(['AMD_API_TIMEOUT_MS', 'amd.timeoutMs'], raw.amd.timeoutMs ?? 20_000, { min: 1_000, max: 600_000 }),
+      maxRetries: settings.int(['AMD_API_MAX_RETRIES', 'amd.maxRetries'], raw.amd.maxRetries ?? 2, { min: 0, max: 5 }),
+      maxConcurrent: settings.int(['AMD_MAX_CONCURRENT', 'amd.maxConcurrent'], raw.amd.maxConcurrent ?? 2, { min: 1, max: 8 }),
+      chatTimeoutMs: settings.int(['AMD_CHAT_TIMEOUT_MS', 'amd.chatTimeoutMs'], raw.amd.chatTimeoutMs ?? null, { min: 1_000, max: 600_000 }),
+      chatMaxRetries: settings.int(['AMD_CHAT_MAX_RETRIES', 'amd.chatMaxRetries'], raw.amd.chatMaxRetries ?? 1, { min: 0, max: 5 })
     },
     inference: raw.inference || {},
     memory: raw.memory || {},
@@ -125,14 +133,38 @@ function loadConfig () {
     places: raw.places || {},
     goals: raw.goals || {}
   }
+
+  // A handful of behaviour knobs are worth exposing to the panel without a
+  // config.json edit; they win over the file only when actually set.
+  const aliases = settings.str('BOT_ALIASES', null)
+  if (aliases !== null) cfg.behavior.aliases = aliases.split(',').map((a) => a.trim().toLowerCase()).filter(Boolean)
+  const language = settings.str('BOT_LANGUAGE', null)
+  if (language !== null) cfg.behavior.language = language
+  if (settings.lookup('MC_CAN_DIG') !== undefined) cfg.behavior.allowDigging = settings.bool('MC_CAN_DIG', false)
+  cfg.behavior.allowScaffolding = settings.bool('MC_ALLOW_SCAFFOLDING', cfg.behavior.allowScaffolding ?? false)
+  cfg.behavior.autoElytra = settings.bool('MC_AUTO_ELYTRA', cfg.behavior.autoElytra ?? true)
+  cfg.behavior.mode = settings.str('BOT_MODE', cfg.behavior.mode)
+  cfg.inference.rpm = settings.int('INFERENCE_RPM', cfg.inference.rpm, { min: 1, max: 600 })
+  cfg.inference.minIntervalMs = settings.int('INFERENCE_MIN_INTERVAL_MS', cfg.inference.minIntervalMs, { min: 0 })
+  cfg.inference.heartbeatMs = settings.int('INFERENCE_HEARTBEAT_MS', cfg.inference.heartbeatMs, { min: 0 })
+  cfg.reconnect.enabled = settings.bool('RECONNECT', cfg.reconnect.enabled ?? true)
+  cfg.reconnect.maxAttempts = settings.int('RECONNECT_MAX_ATTEMPTS', cfg.reconnect.maxAttempts, { min: 1 })
+
+  // Used by validateConfig() and the --dry-run summary; never logged with values.
+  Object.defineProperty(cfg, '_rejectedOptions', { value: rejected, enumerable: false })
+  return cfg
 }
 
 function validateConfig (cfg) {
   const errors = []
-  if (!cfg.amd.apiKey) errors.push('AMD API key missing — set AMD_API_KEY (or API_KEY) in the environment or a local .env, or amd.apiKey in zincai/config.json')
-  if (!['offline', 'microsoft'].includes(cfg.server.auth)) errors.push('server.auth must be "offline" or "microsoft"')
-  if (!Number.isFinite(cfg.server.port) || cfg.server.port < 1 || cfg.server.port > 65535) errors.push('server.port out of range')
-  try { new URL(cfg.amd.baseUrl) } catch { errors.push('amd.baseUrl is not a valid URL') }
+  if (!cfg.amd.apiKey) errors.push('AMD API key missing — set the template variable AMD_API_KEY (or API_KEY / RADEON_API_KEY) to an rc-... key')
+  if (!cfg.server.host) errors.push('MC_HOST is empty — set it to the Minecraft server address')
+  if (!['offline', 'microsoft'].includes(cfg.server.auth)) errors.push('MC_AUTH must be "offline" or "microsoft"')
+  if (!Number.isFinite(cfg.server.port) || cfg.server.port < 1 || cfg.server.port > 65535) errors.push('MC_PORT out of range (1-65535)')
+  try { new URL(cfg.amd.baseUrl) } catch { errors.push('AMD_API_BASE_URL is not a valid URL') }
+  for (const r of cfg._rejectedOptions || []) {
+    errors.push(`${r.name}="${r.value}" is not one of: ${r.allowed.join(', ')}`)
+  }
   return errors
 }
 
@@ -226,6 +258,9 @@ function main () {
     const errors = validateConfig(cfg)
     logger.info(TAG, `config: host=${cfg.server.host} port=${cfg.server.port} user=${cfg.server.username} auth=${cfg.server.auth} version=${cfg.server.version || 'auto'}`)
     logger.info(TAG, `amd: model=${cfg.amd.model} base=${cfg.amd.baseUrl} key=${cfg.amd.apiKey ? 'present' : 'MISSING'}`)
+    logger.info(TAG, `data dir: ${DATA_DIR} (memories, places, goals, metrics)`)
+    logger.info(TAG, `behaviour: mode=${cfg.behavior.mode} aliases=${(cfg.behavior.aliases || []).join(',') || '-'} language=${cfg.behavior.language || 'off'} dig=${cfg.behavior.allowDigging ? 'yes' : 'no'} elytra=${cfg.behavior.autoElytra ? 'yes' : 'no'}`)
+    logger.info(TAG, `limits: rpm=${cfg.inference.rpm} minInterval=${cfg.inference.minIntervalMs}ms heartbeat=${cfg.inference.heartbeatMs}ms reconnect=${cfg.reconnect.enabled ? `${cfg.reconnect.maxAttempts} attempts` : 'off'}`)
     logger.info(TAG, `prompts: action ${SYSTEM_PROMPT.split(/\s+/).length} words, chat ${CHAT_PROMPT.split(/\s+/).length} words (static), ${ZINC_TOOLS.length} tools`)
     logger.info(TAG, 'policy: flee from real threats until the model decides; no PvP unless the model names a player; no friend list')
     for (const e of errors) logger.error(TAG, e)
@@ -316,7 +351,7 @@ function startSession (shared, onEnded) {
   const observe = require('./observe')
   const { AdvancedCombat } = require('../src/combat')
   const { craftItem } = require('../src/recipes')
-  const { reasonToText } = require('../src/agent')
+  const { reasonToText } = require('../src/reasonToText')
 
   const wrapperLog = (level, msg) => logger[level === 'debug' ? 'debug' : level]?.(TAG, msg)
 
@@ -460,7 +495,7 @@ function startSession (shared, onEnded) {
 
   // ------------------------------------------------------ action results --
   const INFORMATIONAL = new Set(['find', 'look_in', 'inspect_block', 'inspect_region', 'logic_test', 'redstone_scan', 'redstone_component', 'circuit_project', 'goal'])
-  // audit2 B1: stop the model re-issuing a call the body keeps refusing.
+  // stop the model re-issuing a call the body keeps refusing.
   const failGate = new FailGate({
     windowMs: cfg.inference?.failWindowMs ?? 120_000,
     maxFails: cfg.inference?.failGateAfter ?? 2
@@ -504,7 +539,7 @@ function startSession (shared, onEnded) {
 
   // ------------------------------------------------------------ trust ----
   /**
-   * audit2 B11/D: optional trust gate. The default has NO lists configured
+   * optional trust gate. The default has NO lists configured
    * and behaves exactly as before (everyone equal). Once trust.owners or
    * trust.trusted name players, a guest whose chat request reached the body
    * may not: take/give valuables, run scripts. The bot's own initiative
@@ -1316,9 +1351,9 @@ function startSession (shared, onEnded) {
     const mode = wrapper.mode || 'explorer'
     const nearby = pos ? places.describeNearby(pos, { dim: dim() }) : ''
     const named = pos ? places.describeNamed(pos, { dim: dim() }) : ''
-    // audit2 B5: the memory-recall query for a non-chat wake must be RECENT
+    // the memory-recall query for a non-chat wake must be RECENT
     // chat — otherwise a question asked hours ago keeps steering recall into
-    // unrelated threat/task prompts (measured in audit/repro/13).
+    // unrelated threat/task prompts (measured).
     const lastChat = shared.chatLog.filter((l) => l.who !== 'me').slice(-1)[0]
     const chatRecallAgeMs = cfg.memory.chatRecallMaxAgeMs ?? 120_000
     const request = [...reasons].reverse().find((r) => /^chat request/.test(r)) ||
@@ -1330,7 +1365,7 @@ function startSession (shared, onEnded) {
     const events = memory.working.last(6)
       .filter((e) => !OWN_SECTION.has(e.type))
       .map((e) => `  - ${e.type}: ${e.text || e.msg || ''}${e.count > 1 ? ` (x${e.count})` : ''}`).join('\n')
-    // audit2 B9/K: wire the (previously write-only) ephemeral buffer as a
+    // wire the (previously write-only) ephemeral buffer as a
     // "just now" line: the last ~4 things inside a 30 s window that no other
     // section already shows (chat, said, results, threat events have their own).
     const ephItems = (memory.ephemeral?.snapshot?.() || [])
@@ -1410,7 +1445,7 @@ function startSession (shared, onEnded) {
   /** Tools that start or change something in the world: after one of them a request counts as taken up. */
   const PASSIVE = new Set(['idle', 'say', 'hold', 'find', 'equip', 'eat', 'set_mode', 'remember_here', 'goal'])
 
-  // audit2 G.4: one metrics JSONL line per model call — the usage numbers in
+  // one metrics JSONL line per model call — the usage numbers in
   // this repo's cost tables stop being estimates the first time this runs
   // against a live endpoint that reports them.
   let metricsWarned = false
@@ -1430,7 +1465,7 @@ function startSession (shared, onEnded) {
       if (!metricsWarned) { metricsWarned = true; logger.warn(TAG, `metrics log unavailable: ${err.message || err}`) }
     }
   }
-  // audit2 G.3: per-mode tool schemas (cached; one JSON per mode so prefix
+  // per-mode tool schemas (cached; one JSON per mode so prefix
   // caching still sees a stable schema block within a mode).
   const modeToolsCache = new Map()
   function modeTools (mode) {
@@ -1445,7 +1480,7 @@ function startSession (shared, onEnded) {
     const epoch = decisionEpoch
     const life = lifeEpoch
     logger.debug(TAG, `action turn (${reasons.join(' | ')})`)
-    // audit2 G: the action lane ships only the tools the current mode can
+    // the action lane ships only the tools the current mode can
     // use (build tools only in builder mode) — a smaller schema block per call.
     const tools = modeTools(wrapper.mode || 'explorer')
     const t0 = Date.now()
@@ -1557,7 +1592,7 @@ function startSession (shared, onEnded) {
     } else {
       origin = bot.entity.position.floored()
     }
-    // audit2 F: plan FIRST so a staged build checks only ITS phase's
+    // plan FIRST so a staged build checks only ITS phase's
     // materials — "roof" must not fail because detailing blocks are missing.
     const plan = parser.plan({ name: label, blocks }, origin, bot.entity.position)
     const phaseBlocks = stage && plan.steps ? plan.steps.filter((s) => (s.phase || 'walls') === stage).map((s) => ({ name: s.name })) : blocks
@@ -1596,11 +1631,11 @@ function startSession (shared, onEnded) {
       return report(action.a || 'action', { ok: false, msg: `refused: ${vanilla.why} — you cannot run commands` })
     }
     const a = action.a
-    // audit2 D-min: a guest (chat-asker outside the trust lists) may not
+    // min: a guest (chat-asker outside the trust lists) may not
     // reach valuables or automation. Off when no lists are configured.
     const trustRefusal = trustCheck(a, action, snap?.askedBy)
     if (trustRefusal) return report(a, { ok: false, msg: trustRefusal })
-    // audit2 B1: the exact same call failed repeatedly seconds ago — refuse
+    // the exact same call failed repeatedly seconds ago — refuse
     // it locally instead of running the world mutation again. No wake: the
     // quiet refusal shows up in the next natural prompt's results.
     if (a !== 'idle') {
@@ -1766,7 +1801,7 @@ function startSession (shared, onEnded) {
         return startMain({ tool: 'corpse_run', label: 'going back to last death', askedBy: snap.askedBy, decision: decided(snap, { label: 'corpse_run' }), run: () => skills.corpseRun() })
       }
       case 'craft': {
-        // audit2 B3/E: runs as a side job through skills.craft, which WALKS
+        // runs as a side job through skills.craft, which WALKS
         // to the table (task lane) before crafting. A main task pauses for it.
         const item = String(action.i ?? action.item ?? '')
         if (!item) return report('craft', { ok: false, msg: 'craft needs an item' })
@@ -2010,7 +2045,7 @@ function startSession (shared, onEnded) {
     isReady: () => systemsReady && !ended,
     onHurt: (cause, { hp }) => {
       note({ type: 'hurt', msg: cause.text })
-      // audit2 B1: do NOT clear the fail gate here — being hit is exactly the
+      // do NOT clear the fail gate here — being hit is exactly the
       // state in which "too hurt to fight" keeps failing; clearing re-armed
       // the churn loop (repro 05). Death and new threats still clear it.
       const now = Date.now()
@@ -2020,7 +2055,7 @@ function startSession (shared, onEnded) {
   }).start()
   bot.on('entityHurt', (entity) => { if (entity !== bot.entity) system1?.onEntityHurt(entity) })
 
-  // audit2 B10/B15: a container block changing under the bot (opened or
+  // a container block changing under the bot (opened or
   // broken by someone else, a new chest placed) invalidates what the index
   // thought was inside — at zero cost, no waiting for the next 3 s scan.
   bot.on('blockUpdate', (oldBlock, newBlock) => {
@@ -2028,7 +2063,7 @@ function startSession (shared, onEnded) {
     try { places.onBlockChange(oldBlock, newBlock, { dim: dim() }) } catch { /* cosmetic */ }
   })
 
-  // audit2 B13: absorption/health-boost show up as hp above the vanilla 20 —
+  // absorption/health-boost show up as hp above the vanilla 20 —
   // that observed value is the only honest base for fight odds and the
   // low-hp disengage threshold.
   bot.on('health', () => { try { combat?.noteHealth?.(bot.health) } catch { /* cosmetic */ } })
@@ -2101,7 +2136,7 @@ function startSession (shared, onEnded) {
     memory.rememberChat(sender, text, { addressed: Boolean(why) })
     logger.debug(TAG, `chat from ${sender}: ${text} (${why ? `for me: ${why}` : 'not for me'})`)
     if (!why) return
-    // audit2 scenario 32: one spamming player may not monopolize the chat
+    // one spamming player may not monopolize the chat
     // lane's reserved budget — over the per-player limit the line is dropped
     // (still logged/remembered above, just never answered).
     if (!chatRate.allow(sender)) {

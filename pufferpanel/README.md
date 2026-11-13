@@ -144,6 +144,37 @@ also works in CI. Rule of thumb: **a `.json` at `<folder>/<file>.json` is a
 template** unless the file is called `data.json` — no template JSON anywhere
 else in the repo.
 
+### The template vanished after an update
+
+Usually not a disappeared file — usually the panel **failed to clone**. The repo
+row is re-pulled by `git` on every cache miss, and while that pull is running
+`validateRepoOnDisk` holds a lock; a failing pull (wrong branch name, private
+repo with no credentials, network blip) makes the template list come back empty
+or error, and the page shows nothing to pick.
+
+Force it and see what the panel really has:
+
+```sh
+PUFFER_URL=http://127.0.0.1:8080 PUFFER_USER=admin PUFFER_PASS=... \
+  node pufferpanel/doctor.js --refresh
+```
+
+It deletes and re-adds each git template repository over the panel's own API
+(`DELETE`/`POST /api/templates`), which wipes `<data>/cache/template-repos/<id>`
+and forces a fresh clone, then prints what the panel now lists — flagging any
+entry with **no display name**. Over SSH on the Pi the equivalent is:
+
+```sh
+sudo rm -rf /var/lib/pufferpanel/cache/template-repos/*   # then reload the page
+```
+
+Two things to check first, because they account for most of these:
+
+| Check | Why it matters |
+| --- | --- |
+| The repo row's branch | It must be a branch that exists *in the repo it clones*. The template default is `main`. |
+| Which repository is cloned | The row clones **its own stored URL**. If that is your fork, the fix must be on the fork's branch — upstream `main` is not enough. |
+
 ## 2. Create the server
 
 **Servers → New server**, then pick the template — it appears as **zincai**

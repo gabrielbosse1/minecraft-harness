@@ -197,7 +197,8 @@ If the panel *still* greys the template out:
 | `--env docker` on a node without a working Docker socket | Docker is only advertised when the node can reach its socket. |
 | A stale template in the panel | The panel caches the template repository for ~5 minutes; re-add the repo or wait. |
 | `requirements.arch` / `requirements.os` in a **forked** copy | Those are single strings; `arch` cannot list both `x64` and `arm64`, so leave them out. |
-| Node too old / wrong arch | Nothing here is architecture-specific; on a host node `nodejsdl` downloads `linux/arm64` (or `armv7l`) by itself. |
+| `npm22: command not found` (older templates only) | The old install pinned `nodeversion=22` and ran `npm22 ci`. `nodejsdl` writes `node22`/`npm22` into the panel's **binaries** folder, which is not on `PATH`, so npm was never found even though the clone worked. `nodeversion` now defaults to **empty**: the install runs plain `npm ci` against the node's own Node.js. Leave it empty. |
+| Node missing on the node (`missing binary: node OR npm`) | `requirements.binaries` is checked **before** the server is created. Install Node.js 18+ and git on the node, then create the server again. |
 
 ### It does not show up at all (nothing listed, no error)
 
@@ -368,7 +369,9 @@ Minecraft Server, Behaviour, Limits, Operator Control and Installation.
 | `joinonstart` | `ZINC_JOIN_ON_START` | `true` | Off = the process starts without joining and waits for `join` on the console. |
 | `log` | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. |
 | `datadir` | `ZINC_DATA_DIR` | `data` | Relative to the server folder, so backups include it. |
-| `repo`, `branch`, `nodeversion` | — | this repo / `main` / `22` | Installation only. |
+| `repo`, `branch` | — | this repo / `main` | Installation only. |
+| `nodeversion` | — | **empty** | Installation only. Empty = use the node's own `node`/`npm` (default; checked by `requirements.binaries`). A major version (e.g. `22`) opts into `nodejsdl`, which only works if the panel binaries folder is on `PATH`. |
+| `dockerimage` | — | `node:22-bookworm-slim` | Installation only, Docker only. Must contain Node.js and npm. |
 | ~~`autostart`, `autorecover`~~ | — | — | **Removed.** The panel owns these two flags per server; see [It does not show up at all](#it-does-not-show-up-at-all-nothing-listed-no-error). |
 
 Nothing else is needed: no `.env`, no file to edit, no command to type. The
@@ -397,9 +400,11 @@ Install:
 1. refuses to continue if `git` is missing;
 2. clones `repo`/`branch` into the server directory (or fetches/checks it out on
    re-install);
-3. installs Node.js on host nodes (`nodejsdl` → `node22`, `npm22`) — the Docker
-   image already ships it;
-4. runs `npm ci --omit=dev` (which also applies the vendored 26.3 data patch);
+3. downloads Node.js only if `nodeversion` was set (`nodejsdl` → `node22`,
+   `npm22`); by default it uses the `node`/`npm` already on `PATH`, which the
+   create-server page verified against `requirements.binaries`;
+4. runs `npm ci --omit=dev` on the same `node`/`npm` for every environment
+   (which also applies the vendored 26.3 data patch);
 5. creates the data directory.
 
 Every start:
@@ -408,7 +413,7 @@ Every start:
    resolved server, endpoint, data directory, behaviour switches and limits and
    exits non-zero if a variable is invalid, so a bad deployment fails before it
    touches the network;
-2. runs `node zincai/index.js` (host: `node22`, Docker: `node`).
+2. runs `node zincai/index.js` — the same `node` on host and Docker.
 
 Stop sends `SIGINT` (`stopCode: 2`), which is the bot's graceful shutdown: it
 saves memory and places, quits the bot and prints a session summary.
@@ -479,8 +484,9 @@ can take a moment to appear.
 
 - PufferPanel 3.x
 - `git` on the node (host environment)
-- Node.js 18+ — installed by the template on host nodes; the Docker
-  environment uses `node:${nodeversion}-bookworm-slim`
+- Node.js 18+ and npm on the node (`node`, `npm` on `PATH`) — the template
+  checks this at create time via `requirements.binaries`. The Docker
+  environment uses `node:22-bookworm-slim` (the `dockerimage` variable) instead.
 - a `rc-...` AMD Radeon Cloud key
 - a Minecraft server in offline mode (or a premium account for
   `auth = microsoft`)

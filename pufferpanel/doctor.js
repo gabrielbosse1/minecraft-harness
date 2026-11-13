@@ -279,9 +279,9 @@ function main () {
   // rather than leaving the operator wondering whether the board is the problem.
   if (args.arch === 'arm64' || args.arch === 'arm') {
     console.log('\nNote on ARM (Orange Pi, Raspberry Pi): nothing in this project is')
-    console.log('architecture-specific — it is plain Node.js. On a host node PufferPanel')
-    console.log(`downloads Node.js ${template.data && template.data.nodeversion ? template.data.nodeversion.value : '22'} for linux/${args.arch} itself`)
-    console.log('(operations/nodejsdl maps GOARCH arm64 → arm64, arm → armv7l).')
+    console.log('architecture-specific — it is plain Node.js, so an ARM node runs it with')
+    console.log(`its own node/npm. If an operator does pin a version, operations/nodejsdl`)
+    console.log(`downloads the matching linux build itself (GOARCH ${args.arch}).`)
   }
   return 1
 }

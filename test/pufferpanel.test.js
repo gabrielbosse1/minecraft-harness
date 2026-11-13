@@ -55,14 +55,14 @@ test('template: conditions only use CEL-safe syntax and known variables', () => 
   }
 })
 
-test('template: the run command is a list of alternatives with a default', () => {
+test('template: the run command is plain node on every environment', () => {
   const cmds = template.run.command
   assert.ok(Array.isArray(cmds))
-  assert.ok(cmds.some((c) => c.if === undefined), 'one unconditional command must exist as the fallback')
-  const docker = cmds.find((c) => c.command === 'node ${entrypoint}' && c.if === undefined)
-  assert.ok(docker, 'Docker gets a plain node command: the image already has Node.js')
-  const host = cmds.find((c) => /^node\$\{nodeversion\}/.test(c.command) && /host/.test(c.if))
-  assert.ok(host, 'a host run uses the installed node${nodeversion} binary')
+  assert.deepEqual(cmds, [{ command: 'node ${entrypoint}' }],
+    'node is node: no per-environment binary aliases, no branches to drift apart')
+  // The pre-flight uses the same binary the real run does.
+  const pre = template.run.pre.flatMap((op) => op.commands || [])
+  assert.deepEqual(pre, ['node ${entrypoint} --dry-run'])
 })
 
 test('template: stop is a signal code, and the bot handles SIGINT/SIGTERM', () => {
@@ -72,18 +72,34 @@ test('template: stop is a signal code, and the bot handles SIGINT/SIGTERM', () =
   assert.match(src, /process\.on\('SIGTERM'/)
 })
 
-test('template: Node.js is provisioned on host nodes only', () => {
+test('template: the node\'s own Node.js is used by default', () => {
+  // The panel's nodejsdl drops node22/npm22 into the daemon's binaries folder,
+  // which is NOT on PATH on a normal node — so `npm22 ci` died with
+  // "npm22: command not found" after a successful clone. Default to the
+  // system node and let the requirement check gate creation instead.
+  assert.equal(template.data.nodeversion.value, '',
+    'no version means no download: node/npm must already be on PATH')
   const dl = template.install.find((op) => op.type === 'nodejsdl')
-  assert.ok(dl, 'nodejsdl is used on host nodes')
-  assert.match(dl.if, /host/)
-  assert.match(dl.if, /nodeversion/)
-  assert.equal(template.data.nodeversion.value, '22')
+  assert.ok(dl, 'the downloader is still available as an explicit opt-in')
+  assert.match(dl.if, /nodeversion != ''/, 'it only runs when an operator asks for a version')
+  assert.match(dl.if, /host/, 'and only on host-family nodes')
+  assert.match(dl.if, /os != 'windows'/)
+})
+
+test('template: a missing node/npm fails at create time, not mid-install', () => {
+  const req = template.requirements
+  assert.ok(req, 'requirements are declared')
+  assert.deepEqual(req.binaries, ['node', 'npm'],
+    'PufferPanel checks this before creating the server (web/daemon/server.go)')
 })
 
 test('template: dependencies are installed without dev dependencies', () => {
   const commands = template.install.flatMap((op) => op.commands || []).join(' \n ')
-  assert.match(commands, /npm\$\{nodeversion\} ci --omit=dev/, 'host install uses the downloaded npm')
-  assert.match(commands, /npm ci --omit=dev/, 'docker install uses the image npm')
+  assert.match(commands, /npm ci --omit=dev/, 'one npm ci, on every environment')
+  assert.equal(commands.includes('npm${nodeversion}'), false,
+    'an alias that may not be on PATH must never reach the install script')
+  // npm ci needs a lockfile; ours is committed.
+  assert.ok(fs.existsSync(path.join(__dirname, '..', 'package-lock.json')))
 })
 
 test('template: install never regenerates a settings file — variables come from the panel', () => {
@@ -116,7 +132,9 @@ test('template: every host-family environment is declared (host, tty, standard) 
   // out as "Incompatible with environment 'host'".
   assert.deepEqual(types.sort(), ['docker', 'host', 'standard', 'tty'])
   const docker = template.supportedEnvironments.find((e) => e.type === 'docker')
-  assert.match(docker.image, /^node:\$\{nodeversion\}/, 'the Docker image follows the nodeversion variable')
+  assert.equal(docker.image, '${dockerimage}',
+    'the Docker image is its own variable: nodeversion is empty on host nodes and would make the tag invalid')
+  assert.match(template.data.dockerimage.value, /^node:\d+/, 'a real, pullable default tag')
 })
 
 test('template: the doctor agrees with every host-family environment name', () => {
@@ -141,10 +159,10 @@ test('template: host conditions treat host, tty and standard alike', () => {
       assert.match(cond, new RegExp(alias), `condition "${cond}" must accept "${alias}" too`)
     }
   }
-  // And the docker branch must not swallow a tty node.
-  const fallback = template.install.find((op) => /npm ci/.test((op.commands || []).join(' ')) && /^\!/.test(op.if || ''))
-  assert.ok(fallback, 'a non-host install branch exists')
-  assert.match(fallback.if, /tty/)
+  // The install is now environment-neutral: one npm ci, no host/docker split.
+  const npm = template.install.filter((op) => /npm ci/.test((op.commands || []).join(' ')))
+  assert.equal(npm.length, 1, 'one npm ci for every environment')
+  assert.equal(npm[0].if, undefined, 'unconditional: a tty node installs exactly like a host node')
 })
 
 test('repo layout: the panel scan finds exactly one template, and it is ours', () => {

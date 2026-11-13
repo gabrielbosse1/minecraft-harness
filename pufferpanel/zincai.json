@@ -30,10 +30,10 @@
     },
     "nodeversion": {
       "type": "string",
-      "value": "22",
+      "value": "",
       "display": "Node.js Version",
-      "desc": "Node.js major version, installed automatically on host nodes as node${nodeversion} / npm${nodeversion}. The Docker image already contains Node.js.",
-      "required": true,
+      "desc": "Leave EMPTY to use the node's own Node.js/npm — that is what this template expects, and what requirements.binaries checks at create time. Setting a major version (e.g. 22) runs PufferPanel's nodejsdl, which downloads Node.js into the panel's binaries folder and creates node22/npm22 there. That folder is NOT on PATH on most nodes, so the alias can fail with \"npm22: command not found\". Only set this if your node's PATH already includes the panel binaries folder.",
+      "required": false,
       "userEdit": true
     },
     "apikey": {
@@ -199,6 +199,14 @@
       "desc": "Where memories, places, goals and metrics live. Relative to the server directory, so it is included in a normal backup.",
       "required": true,
       "userEdit": false
+    },
+    "dockerimage": {
+      "type": "string",
+      "value": "node:22-bookworm-slim",
+      "display": "Docker Image",
+      "desc": "Only used when the server runs in Docker: the image must already contain Node.js and npm. Host, tty and standard nodes ignore this and use the node's own node/npm.",
+      "required": false,
+      "userEdit": true
     }
   },
   "groups": [
@@ -255,12 +263,13 @@
     },
     {
       "display": "Installation",
-      "description": "Where the bot comes from and which runtime it uses.",
+      "description": "Where the bot comes from and which runtime it uses. Host nodes use their own node/npm; Docker uses the image below.",
       "variables": [
         "repo",
         "branch",
         "nodeversion",
-        "datadir"
+        "datadir",
+        "dockerimage"
       ],
       "order": 6
     }
@@ -294,14 +303,6 @@
       "version": "${nodeversion}"
     },
     {
-      "if": "(env == 'host' || env == 'tty' || env == 'standard') && os != 'windows'",
-      "type": "command",
-      "commands": [
-        "npm${nodeversion} ci --omit=dev --no-audit --no-fund"
-      ]
-    },
-    {
-      "if": "!(env == 'host' || env == 'tty' || env == 'standard') || os == 'windows'",
       "type": "command",
       "commands": [
         "npm ci --omit=dev --no-audit --no-fund"
@@ -315,21 +316,6 @@
   "run": {
     "pre": [
       {
-        "if": "(env == 'host' || env == 'tty' || env == 'standard') && os != 'windows'",
-        "type": "command",
-        "commands": [
-          "node${nodeversion} ${entrypoint} --dry-run"
-        ]
-      },
-      {
-        "if": "(env == 'host' || env == 'tty' || env == 'standard') && os == 'windows'",
-        "type": "command",
-        "commands": [
-          "node ${entrypoint} --dry-run"
-        ]
-      },
-      {
-        "if": "env == 'docker'",
         "type": "command",
         "commands": [
           "node ${entrypoint} --dry-run"
@@ -337,14 +323,6 @@
       }
     ],
     "command": [
-      {
-        "command": "node${nodeversion} ${entrypoint}",
-        "if": "(env == 'host' || env == 'tty' || env == 'standard') && os != 'windows'"
-      },
-      {
-        "command": "node ${entrypoint}",
-        "if": "(env == 'host' || env == 'tty' || env == 'standard') && os == 'windows'"
-      },
       {
         "command": "node ${entrypoint}"
       }
@@ -392,8 +370,13 @@
     },
     {
       "type": "docker",
-      "image": "node:${nodeversion}-bookworm-slim"
+      "image": "${dockerimage}"
     }
   ],
-  "requirements": {}
+  "requirements": {
+    "binaries": [
+      "node",
+      "npm"
+    ]
+  }
 }

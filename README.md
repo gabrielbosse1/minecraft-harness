@@ -35,7 +35,8 @@ configure by hand.
    **Easiest:** in the panel, **Templates → Add repo** with this repository's
    URL and branch — the template in `pufferpanel/` is already laid out the way
    the panel scans (`<subfolder>/<name>.json`). See
-   [`pufferpanel/README.md`](pufferpanel/README.md#1-get-the-template-into-the-panel).
+   [`pufferpanel/README.md`](pufferpanel/README.md#1-get-the-template-into-the-panel),
+   and the step-by-step walkthrough is in [`docs/pufferpanel-guide.md`](docs/pufferpanel-guide.md).
 
 2. **Servers → New server**, pick the **zincai** template, and fill in the
    variables:

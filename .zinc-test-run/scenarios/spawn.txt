@@ -1,2 +1,0 @@
-tp @a 5 106 5
-setworldspawn 5 106 5

@@ -7,7 +7,7 @@
  * Auth:      Authorization: Bearer $API_KEY   (rc-... keys sent as-is, per spec)
  *
  * KV cache / token-economy strategy (the reason this harness exists):
- *   - The system prompt is byte-identical on every call (see systemPrompt.js);
+ *   - The system prompt is byte-identical on every call (zincai/system_prompt.txt);
  *     Radeon Cloud / DeepSeek prefix-cache the longest shared prefix, so after
  *     the first call the ~110-word system prefix is billed as cache hits.
  *   - The user message is ~30-60 tokens of deltas. Nothing else is sent.
@@ -86,7 +86,7 @@ class AmdClient {
     if (!apiKey) {
       // Fail fast, before we ever create a bot. Never include the (missing)
       // key in the error — only the variable name.
-      throw new Error('AMD API key missing: set API_KEY (or AMD_API_KEY) in .env')
+      throw new Error('AMD API key missing: set AMD_API_KEY (or API_KEY / RADEON_API_KEY)')
     }
     this.baseUrl = String(baseUrl).replace(/\/+$/, '')
     this.model = model

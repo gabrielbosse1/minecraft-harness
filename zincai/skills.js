@@ -55,7 +55,7 @@ const FUELS = { coal: 8, charcoal: 8, coal_block: 80, blaze_rod: 12, dried_kelp_
 const WOOD_FUEL = /(_planks|_log|_wood|_stem|_hyphae)$/ // 1.5 items each
 const EQUIP_SLOTS = { hand: 'hand', mainhand: 'hand', main: 'hand', offhand: 'off-hand', 'off-hand': 'off-hand', off: 'off-hand', head: 'head', helmet: 'head', chest: 'torso', torso: 'torso', legs: 'legs', feet: 'feet', boots: 'feet' }
 
-// --- gather allowlist (audit2 B4/C): what the body is ever allowed to dig --
+// --- gather allowlist : what the body is ever allowed to dig --
 const TOOL_TIERS = { golden: 0, wooden: 0, stone: 1, copper: 1, iron: 2, diamond: 3, netherite: 4 }
 const TOOL_NAMES = ['wooden', 'stone', 'iron', 'diamond', 'netherite']
 /** Minimum pickaxe tier per ore-family block (soils/logs need none: -1). */
@@ -113,11 +113,14 @@ class Skills {
    * @param {object} bot
    * @param {{ arbiter: object, places: PlaceIndex, logger?: (level:string,msg:string)=>void,
    *           whisper?: (player:string,text:string)=>boolean, moveTimeoutMs?: number,
-   *           executor?: object|(()=>object), choreTimeoutMs?: number }} deps
+   *           executor?: object|(()=>object), choreTimeoutMs?: number,
+   *           pathfinder?: object|(()=>object) }} deps
+   *   pathfinder — the PathfinderWrapper; the only thing that can grant a walk
+   *   permission to break blocks (see dig()).
    *   executor — BuilderExecutor (for shelter scaffolding); a thunk is fine to
    *   break the construction-order cycle.
    */
-  constructor (bot, { arbiter, places, logger = () => {}, whisper = null, moveTimeoutMs = 60_000, executor = null, choreTimeoutMs = 240_000 } = {}) {
+  constructor (bot, { arbiter, places, logger = () => {}, whisper = null, moveTimeoutMs = 60_000, executor = null, choreTimeoutMs = 240_000, pathfinder = null } = {}) {
     this.bot = bot
     this.arbiter = arbiter
     this.lane = arbiter.lane('task', PRIORITY.task)
@@ -125,6 +128,8 @@ class Skills {
     this.log = logger
     this.whisper = whisper
     this.moveTimeoutMs = moveTimeoutMs
+    // The pathfinder wrapper owns the (one-shot) permission to break blocks.
+    this._pathfinder = typeof pathfinder === 'function' ? pathfinder : () => pathfinder
     this._executor = typeof executor === 'function' ? executor : () => executor
     this.choreTimeoutMs = choreTimeoutMs
     this._token = null
@@ -263,6 +268,9 @@ class Skills {
         if (budget <= 0) return { ok: false, why: 'timeout', interrupted }
       }
     } finally {
+      // A dig corridor is for ONE walk: whoever granted it gets it closed here,
+      // on success, on noPath and on cancellation alike.
+      if (token.digWindow) { try { this._pathfinder()?.endDigging?.(token.cancelled || 'walk done') } catch { /* gone */ } }
       // A replaced walk must not wipe the goal its replacement just set.
       if (this._token === token) {
         lane.setGoal(null)
@@ -305,6 +313,69 @@ class Skills {
    * Walk to a player, a remembered place, an indexed block or coordinates.
    * @param {{ player?:string, place?:string, x?:number, y?:number, z?:number }} target
    */
+  /**
+   * Break a way through to a destination — only when the model asks for it.
+   *
+   * Nothing here decides to destroy anything: the route is planned with the
+   * one-shot corridor `materials`/`avoid` describe, and the walk is an ordinary
+   * walk. If the destination is reachable without breaking, nothing is broken.
+   * Doors, gates and trapdoors stay unbreakable (doors.js), and the window
+   * closes as soon as the walk ends.
+   */
+  dig (target = {}) {
+    const bot = this.bot
+    const { GoalNear, GoalNearXZ } = this._goals()
+    return this._run('dig', async (token) => {
+      const wrapper = this._pathfinder()
+      if (typeof wrapper?.beginDigging !== 'function') return fail('this body cannot dig')
+
+      // Where to: a player, a saved place/id, or coordinates (same addressing as go_to).
+      let goal = null
+      let label = null
+      if (target.player) {
+        const { name, entity } = this._playerEntity(target.player)
+        if (!name) return fail(`no player named "${target.player}" is online`)
+        if (!entity) return fail(`${name} is online but too far away to see; ask for coordinates`)
+        goal = new GoalNear(Math.floor(entity.position.x), Math.floor(entity.position.y), Math.floor(entity.position.z), 2)
+        label = name
+      } else if (target.place) {
+        const named = this.places.getPlace(target.place)
+        const block = named ? null : this._resolveBlock(target.place, new Set(['chest', 'barrel', 'shulker', 'ender_chest', 'furnace', 'bed', 'crafting_table', 'enchanting_table', 'brewing_stand', 'anvil', 'station']))
+        const dest = named || block
+        if (!dest) return fail(`I know no place called "${target.place}"`)
+        if (named) {
+          const targetDim = String(named.dim || 'overworld').replace(/^minecraft:/, '')
+          if (targetDim !== this._dim()) return fail(`"${named.name}" is in ${targetDim}, but I am in ${this._dim()}; no portal route is available`)
+        }
+        goal = new GoalNear(dest.x, dest.y, dest.z, named ? 1 : 2)
+        label = named ? named.name : block.id
+      } else {
+        const x = Number(target.x); const y = Number(target.y); const z = Number(target.z)
+        if (!Number.isFinite(x) || !Number.isFinite(z)) return fail('dig needs a player, a place, or x and z')
+        goal = Number.isFinite(y) ? new GoalNear(x, y, z, 1) : new GoalNearXZ(x, z, 1)
+        label = `${Math.floor(x)},${Number.isFinite(y) ? Math.floor(y) : '~'},${Math.floor(z)}`
+      }
+
+      const materials = Array.isArray(target.materials) && target.materials.length ? target.materials : null
+      const avoid = Array.isArray(target.avoid) ? target.avoid : []
+      token.label = `digging to ${label}`
+      token.digWindow = true
+      const opened = wrapper.beginDigging({ canDig: materials, avoid, maxMs: Math.max(5_000, Math.min(this.moveTimeoutMs, 120_000)) })
+      if (!opened) return fail('could not open a way: this body cannot dig')
+
+      const r = await this._walk(token, goal, { timeoutMs: Math.max(this.moveTimeoutMs, 90_000) })
+      const p = bot.entity?.position
+      // Honest report: permission was granted for this route, not a claim about
+      // how many blocks fell (the walk only breaks what actually blocks it).
+      const allowedToBreak = materials ? `only ${materials.join('/')}` : (avoid.length ? `anything but ${avoid.join('/')}` : 'only what was in the way')
+      const coords = p ? `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}` : '?'
+      if (!r.ok) {
+        return fail(`could not get through to ${label}: ${r.why}${r.interrupted ? ' (interrupted by fleeing)' : ''} (may break ${allowedToBreak})`)
+      }
+      return ok(`reached ${label} (${coords}); this route could break ${allowedToBreak}`)
+    })
+  }
+
   goTo (target = {}) {
     const bot = this.bot
     const { GoalNear, GoalNearXZ, GoalFollow } = this._goals()
@@ -661,7 +732,7 @@ class Skills {
   // ---------------------------------------------------------------- craft --
 
   /**
-   * Craft with a reachable table (audit2 B3/E): craftItem finds a table up
+   * Craft with a reachable table : craftItem finds a table up
    * to 8 m away but can only use it from ~4.5 m — walk there through the
    * task lane first, then craft. Runs as one skill so `stop` and the flee
    * reflex treat the whole thing as one job.
@@ -692,7 +763,7 @@ class Skills {
   }
 
   // ------------------------------------------------- resource chores -----
-  // audit2 B4/C: deterministic acquisition. The model names WHAT; the body
+  // deterministic acquisition. The model names WHAT; the body
   // digs only blocks that ARE the requested resource (never arbitrary cells),
   // from an explicit allowlist. This is not an ownership check: player-built
   // structures can contain the same resource blocks.

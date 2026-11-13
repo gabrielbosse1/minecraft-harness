@@ -4,8 +4,8 @@
  *
  * The old flee picked a point 14 blocks "away" and asked A* for a route. A
  * point is not a plan: in a dead-end corridor "away" is behind the wall, and
- * the cheapest route to it went straight through the zombies (measured:
- * audit/repro/03). On a cliff edge it ended on the edge.
+ * the cheapest route to it went straight through the zombies. On a cliff
+ * edge it ended on the edge.
  *
  * This planner floods the ground the bot can actually walk (the pathfinder's
  * own neighbour generator: steps, drops, doors, no digging) and, for every

@@ -418,7 +418,7 @@ class AdvancedCombat {
     this.fleeOnDisengage = fleeOnDisengage !== false
     this.lineOfSight = typeof lineOfSight === 'function' ? lineOfSight : (e) => hasLineOfSight(this.bot, e)
     /**
-     * audit2 B13: Absorption / health-boost raise REAL hp past the vanilla 20,
+     * Absorption / health-boost raise REAL hp past the vanilla 20,
      * and we can only know by seeing it. The largest observed hp is the best
      * available base for the disengage threshold and fight-cost estimates, so
      * call this on every health event; vanilla bots never move from 20.
@@ -696,7 +696,7 @@ class AdvancedCombat {
   }
 
   /**
-   * Base score for auto-equip. audit2 B7: mace/trident/spear were invisible
+   * Base score for auto-equip. mace/trident/spear were invisible
    * to it — the bot could carry a netherite-grade arsenal and swing with a
    * fist. Trident melee (9) sits just under netherite sword; mace without a
    * fall is a weak club (its smash needs height — the dodge handles being on

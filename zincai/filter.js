@@ -73,7 +73,7 @@ const EN_WORDS = new Set((
 ).split(' '))
 // Words both languages use ("a", "as", "do", "no", "me", "so", "to", "come", "ok"…) are in neither list.
 const STRONG_EN = new Set(['hello', 'thanks', 'sorry', 'yes', 'sure', 'please', 'done', 'wait', 'coming', 'here', 'there', 'nothing', 'what', 'why', 'where', 'how', 'okay'])
-// audit2 I: the guard used to know only PT vs EN. A smaller model may drift
+// the guard used to know only PT vs EN. A smaller model may drift
 // into Spanish/French/German instead; these function words count AGAINST the
 // line exactly like English does (they never collide with the PT function set,
 // after accent folding).

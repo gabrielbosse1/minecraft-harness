@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * amd-canary.js — 60-second live proof that the configured endpoint can drive
- * this harness, BEFORE deploying the bot (audit2 roadmap item H).
+ * this harness, BEFORE deploying the bot (a pre-deploy check).
  *
  * Checks, worst things first:
  *   1. base reachability + auth           (one bare ping call)
@@ -14,16 +14,18 @@
  *
  * Usage:   AMD_API_KEY=... node scripts/amd-canary.js
  *          (reads AMD_API_BASE_URL / AMD_MODEL like zincai/config.json; env wins)
+ *          No .env is read: export the variables or run it from PufferPanel.
  */
 'use strict'
-require('dotenv').config()
 const fs = require('fs')
 const path = require('path')
 
+const settings = require('../src/settings')
+
 const cfg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'zincai', 'config.json'), 'utf8'))
-const baseUrl = process.env.AMD_API_BASE_URL || cfg.amd?.baseUrl
-const model = process.env.AMD_MODEL || cfg.amd?.model
-const apiKey = process.env.AMD_API_KEY || process.env.API_KEY || process.env.RADEON_API_KEY || cfg.amd?.apiKey
+const baseUrl = settings.str(['AMD_API_BASE_URL', 'amd.baseUrl'], cfg.amd?.baseUrl)
+const model = settings.str(['AMD_MODEL', 'amd.model'], cfg.amd?.model)
+const apiKey = settings.apiKey() || cfg.amd?.apiKey
 
 if (!apiKey || !baseUrl || !model) {
   console.error('need AMD_API_KEY (+ AMD_API_BASE_URL/AMD_MODEL or config.json amd.* values)')

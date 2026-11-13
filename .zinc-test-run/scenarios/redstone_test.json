@@ -1,7 +1,0 @@
-{
-  "steps": [
-    { "at": 5, "cmd": "say zinc, vc esta no lab de redstone? olhe a area e use redstone_scan no centro (0 105 -65)" },
-    { "at": 90, "cmd": "say zinc, agora use redstone_component num repetidor que vc viu e me diga o estado" },
-    { "at": 170, "cmd": "say zinc, resuma em pt-br o que o scan mostrou de componentes" }
-  ]
-}

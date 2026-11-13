@@ -3,7 +3,7 @@
  * STATE, not by their block type.
  *
  * Upstream mineflayer-pathfinder decides from the block type alone. The result
- * (measured, audit/repro/01): every door is a wall whether it is open or
+ * (measured): every door is a wall whether it is open or
  * closed, an OPEN fence gate is a wall, and gates newer than dark oak are not
  * known at all. Its own "useOne" step also leaves the executor in a state that
  * needs a replan, and throws when scaffolding blocks are carried.

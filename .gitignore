@@ -1,28 +1,28 @@
 # Dependencies
 node_modules/
 
-# Local secrets and overrides — .env is loaded at runtime but should never be
-# committed. Remove the tracked copy with: git rm --cached .env
+# Local overrides and secrets.
+#
+# The bot itself reads no file: configuration arrives as environment
+# variables (that is how PufferPanel passes template variables). These entries
+# only stop a hand-made file, a panel checkout or a private key from being
+# committed by accident.
 .env
-.env.local
-*.local
+.env.*
+!.env.example
+env/
+*.pem
+*.key
+id_rsa*
 
-# Logs & runtime artifacts
+# Runtime data (memories, places, goals, metrics).
+zincai-data/
+data/
+
+# Logs
 *.log
 npm-debug.log*
 
 # OS cruft
 .DS_Store
 Thumbs.db
-
-# ZincAI runtime data (memories etc.)
-zincai-data/
-
-# e2e scratch rig (local verification only)
-.e2e-scratch/
-
-# Zinc test campaign: re-downloadable binaries (JDK + server installs, ~575 MB;
-# sha1-verified downloads, see .zinc-test-run/reports/FINAL_REPORT.md §H)
-.zinc-test-run/jdk25/
-.zinc-test-run/server/
-.zinc-test-run/server-26.1/

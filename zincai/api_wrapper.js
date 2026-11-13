@@ -60,6 +60,15 @@ const ACTION_TOOLS = [
     y: INT('Y (optional).'),
     z: INT('Z.')
   }),
+  tool('dig', 'Break blocks to open a way: walks to [x,y,z] (or a player/place), breaking only what stands in the path. You decide; nothing is broken without this call.', {
+    player: STR('Target player name.'),
+    place: STR('Saved place or nearby id.'),
+    x: INT('X of the destination.'),
+    y: INT('Y of the destination (optional).'),
+    z: INT('Z of the destination.'),
+    materials: { type: 'array', description: 'Only these block ids may be broken (e.g. [oak_log, dirt]); default: whatever is in the way, within reach.', items: STR('Block id.'), minItems: 1, maxItems: 16 },
+    avoid: { type: 'array', description: 'Never break these block ids.', items: STR('Block id.'), minItems: 1, maxItems: 16 }
+  }),
   tool('follow', 'Follow a player until stopped.', { player: STR('Player name.') }, ['player']),
   tool('stop', 'Cancel current task, follow, fight and paused tasks.'),
   tool('goal', 'Your objectives (survive death/restart/context loss): list|show|add|resume|suspend|cancel|complete|update|verify.', {
@@ -175,7 +184,7 @@ const CHAT_TOOLS = [
 const toOpenAi = (list) => list.map((t) => ({ type: 'function', function: JSON.parse(JSON.stringify(t)) }))
 
 /**
- * audit2 G: tools a mode cannot meaningfully use are not shipped to the
+ * tools a mode cannot meaningfully use are not shipped to the
  * model in that mode — the schema block is ~63% of every action call, and a
  * builder never needs `smelt`/`sleep` mid-build. Movement, survival and
  * social tools (say/idle/stop/hold/find/remember_here/set_mode…) are always
@@ -224,7 +233,9 @@ function parseToolCall (call, known) {
       const spec = schema.properties[key]
       if (spec.type === 'string' && typeof value !== 'string') return { error: 'args', name }
       if (spec.type === 'integer' && !Number.isInteger(value)) return { error: 'args', name }
+      if (spec.type === 'boolean' && typeof value !== 'boolean') return { error: 'args', name }
       if (spec.type === 'array' && (!Array.isArray(value) || (spec.minItems != null && value.length < spec.minItems) || (spec.maxItems != null && value.length > spec.maxItems))) return { error: 'args', name }
+      if (spec.type === 'array' && spec.items?.type === 'string' && value.some((v) => typeof v !== 'string')) return { error: 'args', name }
       if (spec.type === 'object' && (!value || typeof value !== 'object' || Array.isArray(value))) return { error: 'args', name }
       if (spec.enum && !spec.enum.includes(value)) return { error: 'args', name }
     }
@@ -361,7 +372,7 @@ class AmdToolsClient {
   constructor ({ apiKey, baseUrl, model, timeoutMs = 20_000, maxRetries = 2, temperature = 0.25, maxTokens = 512, toolChoice = 'required', maxConcurrent = 2, chatTimeoutMs = null, chatMaxRetries = 1 }) {
     if (!apiKey) {
       // Never include the (missing) key in the error — only the variable name.
-      throw new Error('AMD API key missing: set AMD_API_KEY (or API_KEY) in .env')
+      throw new Error('AMD API key missing: set AMD_API_KEY (or API_KEY / RADEON_API_KEY)')
     }
     this.baseUrl = String(baseUrl).replace(/\/+$/, '')
     this.model = model

@@ -1,30 +1,35 @@
 {
   "name": "mineflayer-zinc-agent",
-  "version": "1.0.0",
-  "description": "Autonomous Minecraft agent (Mineflayer) backed by the AMD Radeon Cloud API \u2014 delta-state context, KV-cache-friendly static prompt, full combat/elytra/anti-stuck control.",
+  "version": "2.0.0",
+  "description": "ZincAI — autonomous Minecraft agent (Mineflayer) backed by the AMD Radeon Cloud API. Chat lane + action lane, survival reflexes, full builder/combat tool set. Ships a PufferPanel template: one server, variables, no .env.",
   "private": true,
   "license": "MIT",
-  "main": "src/index.js",
+  "main": "zincai/index.js",
   "engines": {
     "node": ">=18.0.0"
   },
   "scripts": {
-    "start": "node src/index.js",
+    "start": "node zincai/index.js",
     "postinstall": "node scripts/apply-26.3-data.js && node scripts/apply-26.3-patches.js",
-    "dry-run": "node src/index.js --dry-run",
-    "check": "node --check src/index.js && node --check src/agent.js && node --check src/amdClient.js && node --check src/deltaState.js && node --check src/combat.js && node --check src/elytra.js && node --check src/watchdog.js && node --check src/recipes.js && node --check src/config.js && node --check src/chatGuard.js && node --check src/actionParser.js && node --check src/systemPrompt.js && node --check zincai/index.js && node --check zincai/perception.js && node --check zincai/builder.js && node --check zincai/system1.js && node --check zincai/reflex_registry.js && node --check zincai/vanilla_guard.js && node --check zincai/custom_mineflayer/pathfinder_wrapper.js && node --check src/reconnect.js && node --check zincai/control.js && node --check zincai/threats.js && node --check zincai/places.js && node --check zincai/block_inspect.js && node --check zincai/logic_test.js && node --check zincai/region_inspect.js && node --check zincai/redstone_inspect.js && node --check zincai/circuit_projects.js && node --check zincai/skills.js && node --check zincai/observe.js && node --check zincai/brain.js && node --check zincai/memory.js && node --check zincai/goals.js && node --check zincai/filter.js && node --check zincai/api_wrapper.js && node --check zincai/tactics.js && node --check zincai/custom_mineflayer/doors.js && node --check zincai/custom_mineflayer/escape.js",
-    "test": "node --test test/harness.test.js test/amdClient.test.js test/zincai.test.js test/elite.test.js test/rework.test.js test/session.test.js test/zinc.session.test.js test/fixes.test.js test/fixes.session.test.js test/audit2.test.js test/final-audit.test.js test/capabilities.test.js test/logic.test.js test/redstone-inspect.test.js test/circuit-projects.test.js test/pre-session-safety.test.js test/remediation.test.js test/goal-orchestration.test.js",
+    "dry-run": "node zincai/index.js --dry-run",
+    "check": "node --check zincai/index.js && node --check zincai/api_wrapper.js && node --check zincai/brain.js && node --check zincai/builder.js && node --check zincai/circuit_projects.js && node --check zincai/control.js && node --check zincai/failgate.js && node --check zincai/filter.js && node --check zincai/goals.js && node --check zincai/logic_test.js && node --check zincai/memory.js && node --check zincai/observe.js && node --check zincai/perception.js && node --check zincai/places.js && node --check zincai/redstone_inspect.js && node --check zincai/region_inspect.js && node --check zincai/block_inspect.js && node --check zincai/reflex_registry.js && node --check zincai/skills.js && node --check zincai/system1.js && node --check zincai/tactics.js && node --check zincai/threats.js && node --check zincai/vanilla_guard.js && node --check zincai/custom_mineflayer/doors.js && node --check zincai/custom_mineflayer/escape.js && node --check zincai/custom_mineflayer/pathfinder_wrapper.js && node --check src/amdClient.js && node --check src/combat.js && node --check src/logger.js && node --check src/recipes.js && node --check src/reconnect.js && node --check src/reasonToText.js && node --check src/settings.js && node --check scripts/amd-canary.js && node --check scripts/ping-server.js && node --check pufferpanel/import.js",
+    "test": "node --test test/amdClient.test.js test/capabilities.test.js test/digging.test.js test/circuit-projects.test.js test/goal-orchestration.test.js test/logic.test.js test/redstone-inspect.test.js test/session.test.js test/pufferpanel.test.js test/settings.test.js test/zincai.test.js",
     "ping": "node scripts/ping-server.js",
-    "start:zincai": "node zincai/index.js",
-    "dry-run:zincai": "node zincai/index.js --dry-run"
+    "canary": "node scripts/amd-canary.js",
+    "pufferpanel:validate": "node pufferpanel/import.js",
+    "pufferpanel:install": "node pufferpanel/import.js --apply"
   },
   "dependencies": {
-    "dotenv": "^18.0.10",
     "minecraft-data": "^3.119.0",
+    "minecraft-protocol": "^1.68.0",
     "mineflayer": "^4.39.0",
     "mineflayer-armor-manager": "^2.0.1",
     "mineflayer-pathfinder": "^2.4.5",
-    "mineflayer-pvp": "^1.3.2",
     "prismarine-recipe": "^1.5.0"
+  },
+  "devDependencies": {
+    "prismarine-block": "^1.23.0",
+    "prismarine-registry": "^1.12.0",
+    "vec3": "^0.1.10"
   }
 }

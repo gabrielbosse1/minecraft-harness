@@ -1,7 +1,7 @@
 # ZincAI — tool-using Minecraft agent
 
-ZincAI is the larger of the repository's two Java Edition harnesses. Run it
-with `node zincai/index.js` or `npm run start:zincai`. It always logs in as
+ZincAI is the repository's Java Edition agent. Run it with
+`node zincai/index.js` or `npm start`. It always logs in as
 **`ZincAI`**. The body uses Mineflayer client packets and normal pathfinding;
 it does not use RCON, server-console access, teleport commands, or cheats.
 
@@ -293,20 +293,56 @@ Tool schemas and their argument descriptions are the source of truth in
 [`system_prompt.txt`](system_prompt.txt) and the chat voice in
 [`chat_prompt.txt`](chat_prompt.txt).
 
+## Digging is the model's decision
+
+There is no digging switch: not an operator variable, not a config flag. A
+route is always planned through the world as it is — doors and gates are
+opened, hazards are avoided, and if there is no way through the walk reports
+"no path" instead of tunnelling.
+
+Breaking is a request. The model calls the `dig` tool with a destination
+(player, saved place or `[x,y,z]`) and optionally:
+
+- `materials` — a list of block ids it may break (`[oak_log]`, `[dirt, stone]`);
+  everything else becomes unbreakable for that trip;
+- `avoid` — block ids it must never break, whatever else is allowed.
+
+That permission is a *window*, not a setting: it opens for one walk, closes
+when the walk ends (success, no-path, cancellation or a safety preemption), and
+expires on its own after at most two minutes. Escapes, `follow` and every other
+route keep the strict no-dig geometry. Doors, gates and trapdoors are never
+breakable in any window, and a route never carves into liquid or mines what
+holds up gravel or a mob.
+
 ## Configuration and operation
 
-Configuration is in [`config.json`](config.json), with environment overrides:
+[`config.json`](config.json) holds **defaults only**. Everything it contains is
+overridden by an environment variable of the same meaning, which is how a
+PufferPanel template configures the bot: template variable -> `${VAR}` in
+`run.environmentVars` -> process env -> `loadConfig()`. There is no `.env` and
+no dotenv; nothing is read from a file the panel does not control.
 
 | Variable | Meaning |
 | --- | --- |
-| `MC_HOST`, `MC_PORT` | Minecraft server address. |
+| `MC_HOST`, `MC_PORT` | Minecraft server address and port. |
 | `MC_VERSION` | Explicit protocol version; empty means auto-detect. |
-| `MC_AUTH` | `offline` or `microsoft`, as supported by the deployment. |
-| `AMD_API_KEY`, `API_KEY`, `RADEON_API_KEY` | API key; environment variables take precedence over the config value. |
-| `AMD_API_BASE_URL` | OpenAI-compatible API base URL. |
-| `AMD_MODEL` | Model name/alias accepted by the configured endpoint. |
-| `ZINC_DATA_DIR` | Writable data directory for memory, preferences, and places. |
-| `LOG_LEVEL` | `debug`, `info`, `warn`, or `error`. |
+| `MC_AUTH` | `offline` or `microsoft`. An unsupported value fails the boot. |
+| `MC_ALLOW_SCAFFOLDING`, `MC_AUTO_ELYTRA` | Pillar/bridge while travelling, and elytra gliding. |
+| `AMD_API_KEY`, `API_KEY`, `RADEON_API_KEY` | API key. Set it as a panel variable; it is never written to disk. |
+| `AMD_API_BASE_URL`, `AMD_MODEL` | Endpoint base URL and model alias. |
+| `AMD_MAX_TOKENS`, `AMD_TEMPERATURE`, `AMD_API_TIMEOUT_MS`, `AMD_CHAT_TIMEOUT_MS`, `AMD_MAX_CONCURRENT` | Model-call shape and lane concurrency. |
+| `BOT_MODE` | `explorer`, `hunter` or `builder`. |
+| `BOT_ALIASES` | Comma-separated chat names besides `ZincAI`. |
+| `BOT_LANGUAGE` | Reply-language check (`pt-BR`, `en`, `es`, `fr`, `de`; empty = off). |
+| `INFERENCE_RPM`, `INFERENCE_MIN_INTERVAL_MS`, `INFERENCE_HEARTBEAT_MS` | Call budget, spacing and self-prompt. |
+| `RECONNECT`, `RECONNECT_MAX_ATTEMPTS` | Post-spawn reconnection behaviour. |
+| `ZINC_DATA_DIR` | Writable data directory (relative to the server folder in the template). |
+| `LOG_LEVEL` | `debug`, `info`, `warn` or `error`. |
+
+Dotted names (`server.host`, `amd.model`, `behavior.allowScaffolding`, ...) are
+accepted as well and mean the same key in `config.json`, so a single default can
+be overridden without inventing a template variable. An empty variable always
+means "not set" — it can never blank a default by accident.
 
 The login name is hard-coded to `ZincAI`; `MC_USERNAME` does not rename it.
 The first join failure is fatal. Once it has spawned, a dropped connection or
@@ -317,35 +353,44 @@ Useful commands:
 
 ```sh
 npm ci
-node zincai/index.js --check      # load modules and check vendored 26.3 data
-API_KEY=rc-dummy node zincai/index.js --dry-run
-npm run start:zincai
+npm run check                     # syntax-check every module
+npm start                         # == node zincai/index.js
+npm run dry-run                   # validate config + prompt budget, no network
 ```
 
-For Pufferpanel or another process manager, inject the key as a secret
-environment variable, choose a persistent `ZINC_DATA_DIR`, and run
-`npm run start:zincai`. Do not put a real key in `config.json` or `.env` in
-Git.
+`--dry-run` prints the resolved server, endpoint, data directory, behaviour
+switches and limits, so a panel deployment can be verified by pressing the
+preflight that the template runs before every start.
+
+### Running under PufferPanel
+
+[`../pufferpanel/zincai.json`](../pufferpanel/zincai.json) is a complete
+PufferPanel 3 template: it clones the repository, installs Node.js and the
+dependencies, creates the data directory, and passes every setting above as an
+environment variable. The API key is a template variable that only ever becomes
+`AMD_API_KEY` in the process environment, never a file.
+
+```sh
+node pufferpanel/import.js                     # validate + show the target path
+node pufferpanel/import.js --dir /var/lib/pufferpanel/templates --apply
+```
+
+Then restart the panel and create a server from the "Minecraft Agent (ZincAI)"
+template. Host and Docker environments are both supported; the run command is
+chosen by the panel, not written out twice.
 
 ## Testing
 
 ```sh
-npm test
+npm test          # the suite the template ships with
 npm run check
-node zincai/index.js --check
 ```
 
-The automated suite uses mock bots and scripted model responses.
-`test/fixes.test.js` and `test/fixes.session.test.js` are the regression tests
-for the pre-release audit, named by defect id; the audit itself, the scripts
-that measured each problem and the before/after numbers are in
-[`../audit/`](../audit/) (`REPORT.md`, `FIXES.md`, `repro/`). The optional
-real-protocol loopback rig is in [`../test/e2e/`](../test/e2e/): after
-installing that directory's `flying-squid` dependency, run
-`node loopback.js --only=zincai` there. It runs the actual ZincAI process,
-Mineflayer players, and local mock model against a local Minecraft 1.16.5
-server. The model is not AMD, and flying-squid's mobs do not provide normal
-hostile AI. The runner header records the exact checks and known limitations.
+The suite uses mock bots and scripted model responses — no engine, no account,
+no network. `test/session.test.js` drives whole sessions through the real
+dispatcher, `test/zincai.test.js` covers perception/memory/tools, and
+`test/settings.test.js` proves the template-to-environment wiring documented
+above.
 
 ## Known limits / unverified assumptions
 
@@ -356,7 +401,7 @@ hostile AI. The runner header records the exact checks and known limitations.
   ceased, and direct gathering cannot distinguish natural resources from the
   same blocks in a structure. This does not require tracking an owner for every
   item or block; use appropriate world/region safeguards for tests. No live
-  mutation was tested. See [`audit/PRE_SESSION_READINESS.md`](../audit/PRE_SESSION_READINESS.md).
+  mutation was tested.
 - Neither the AMD live endpoint nor `tool_choice: "required"` has been tested
   from this environment. Its fallback to `"auto"` is implemented, not an
   assertion that AMD accepts either payload.

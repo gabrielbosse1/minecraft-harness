@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 /**
  * Reachability + version check for the configured Minecraft server.
- * Uses the same .env as the bot, never joins, never touches the AMD API.
+ * Reads the same environment variables as the bot (MC_HOST / MC_PORT /
+ * MC_VERSION), never joins, never touches the AMD API.
  *
  *   npm run ping
  *
@@ -10,10 +11,16 @@
  */
 'use strict'
 
-const { loadConfig } = require('../src/config')
+const fs = require('fs')
+const path = require('path')
 
-const cfg = loadConfig()
-const { host, port, version, username, auth } = cfg.mc
+const settings = require('../src/settings')
+const defaults = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'zincai', 'config.json'), 'utf8'))
+
+const host = settings.str(['MC_HOST', 'server.host'], defaults.server.host)
+const port = settings.int(['MC_PORT', 'server.port'], defaults.server.port, { min: 1, max: 65535 })
+const version = settings.str(['MC_VERSION', 'server.version'], defaults.server.version || '')
+const auth = settings.str(['MC_AUTH', 'server.auth'], defaults.server.auth || 'offline')
 
 let mc
 try {
@@ -34,7 +41,7 @@ async function tryPing (v) {
 }
 
 ;(async () => {
-  console.log(`pinging ${host}:${port} (bot identity: ${username}, auth=${auth})`)
+  console.log(`pinging ${host}:${port} (bot identity: ZincAI, auth=${auth})`)
   const primary = version || '26.3'
   let r = await tryPing(primary)
   if (!r.ok && primary !== mc.defaultVersion) {
@@ -43,7 +50,7 @@ async function tryPing (v) {
   }
   if (!r.ok) {
     console.error(`FAIL after ${r.ms}ms: ${r.err.code || r.err.message}`)
-    console.error('checklist: (1) is the ply.gg tunnel running? (2) is MC_PORT correct? (3) is the server actually online? (4) MC_AUTH matches server mode?')
+    console.error('checklist: (1) is the server/tunnel reachable from this host? (2) is MC_PORT correct? (3) is the server online? (4) does MC_AUTH match the server mode?')
     process.exit(1)
   }
   const v = r.res.version || {}

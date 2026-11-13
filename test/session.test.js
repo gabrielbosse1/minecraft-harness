@@ -3,7 +3,7 @@
  * lane, action lane, executor, skills, reflexes, arbiter, combat — driven by
  * a simulated bot and a scripted model (test/helpers/session.js).
  *
- * These are the audit's scenes, replayed against the shipped orchestrator.
+ * These are whole-session scenes replayed against the shipped orchestrator.
  */
 'use strict'
 

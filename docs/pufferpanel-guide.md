@@ -165,9 +165,12 @@ answer is in **Nodes → \<your node\>** (or `GET /api/nodes/<id>/features`):
 
 Nothing in this project is architecture-specific — it is plain Node.js, and the
 only native dependency (`minecraft-protocol`'s crypto) ships prebuilt for
-`linux/arm64`. On a **host** node, PufferPanel's `nodejsdl` downloads
-`node-v22-linux-arm64.tar.xz` itself and symlinks `node22`/`npm22`, so do not
-install Node by hand. What *can* bite on a small ARM board:
+`linux/arm64`. A **host** node runs it with its own `node`/`npm` (the panel
+checks both exist before it lets you create the server — `requirements.binaries`),
+so install Node.js 18+ the normal way (`apt install nodejs npm`). Do **not** rely
+on `nodejsdl`: it symlinks `node22`/`npm22` into the panel's binaries folder,
+which is not on `PATH`, which is exactly what produced `npm22: command not found`.
+What *can* bite on a small ARM board:
 
 | Symptom | Cause / fix |
 | --- | --- |
@@ -209,11 +212,13 @@ Press **Install**. On a host node the template:
 1. refuses to run if `git` is missing;
 2. clones `repo`/`branch` into the server directory (or fetches/checks out on
    re-install);
-3. downloads Node.js (`nodejsdl`, `nodeversion` = 22) and uses `node22`/`npm22`;
+3. uses the node's own `node`/`npm` (`nodeversion` is empty by default; setting
+   it opts into a `nodejsdl` download that only works if the panel binaries
+   folder is on `PATH`);
 4. runs `npm ci --omit=dev` (which also applies the vendored 26.3 data patch);
 5. creates `datadir` (`data/`).
 
-Press **Start**. The `run.pre` step runs `node22 zincai/index.js --dry-run`
+Press **Start**. The `run.pre` step runs `node zincai/index.js --dry-run`
 first: it prints the resolved server, endpoint, data dir, behaviour, limits and
 a `control:` line, and exits non-zero on a bad variable — the bot never touches
 the network with a broken config. Then the real process starts.

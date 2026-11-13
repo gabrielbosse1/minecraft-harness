@@ -70,10 +70,11 @@ test('invalid gates, cycles, unknown signals, excessive inputs and invalid vecto
     { inputs: ['a'], gates: [], outputs: ['a'], tests: [{ in_bits: '1', out_bits: 'x' }] }
   ]) assert.equal(testLogic(bad).ok, false, JSON.stringify(bad))
 })
-test('model schema exposes builder-only logic testing and dispatches into results', async () => {
-  assert.ok(createZincTools({ mode: 'builder' }).some((t) => t.function.name === 'logic_test'))
-  assert.ok(!createZincTools({ mode: 'hunter' }).some((t) => t.function.name === 'logic_test'))
-  assert.ok(!createZincTools({ mode: 'explorer' }).some((t) => t.function.name === 'logic_test'))
+test('model schema exposes logic testing unconditionally and dispatches into results', async () => {
+  // There are no modes: every caller gets the same schema, and it never shrinks.
+  for (const opts of [undefined, {}, { mode: 'builder' }, { mode: 'hunter' }, { mode: 'explorer' }]) {
+    assert.ok(createZincTools(opts).some((t) => t.function.name === 'logic_test'), `logic_test is offered for ${JSON.stringify(opts)}`)
+  }
   const spec = adder(1)
   const action = coerceAction({ tool_calls: [{ function: { name: 'logic_test', arguments: JSON.stringify(spec) } }] })
   assert.equal(action.a, 'logic_test')

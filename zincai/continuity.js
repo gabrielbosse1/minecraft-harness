@@ -177,7 +177,6 @@ class ContinuityStore {
           activity: d.currentState.activity || 'idle',
           activeGoalId: d.currentState.activeGoalId || null,
           why: clean(d.currentState.why, 120),
-          mode: d.currentState.mode || 'explorer',
           location: d.currentState.location || null,
           immediateAction: null,
           interruptedAction: d.currentState.interruptedAction || null

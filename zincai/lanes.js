@@ -61,7 +61,6 @@ const TOOL_LANES = Object.freeze({
   corpse_run: LANES.BODY,
   sleep: LANES.BODY,
   run_script: LANES.BODY,
-  set_mode: LANES.BODY,
   stop: LANES.BODY,
   hold: LANES.BODY,
   // --- COMPUTATION: no world mutation at all ---

@@ -282,9 +282,11 @@ function buildCrossSection (bot, { radius = 6, heightUp = 5, heightDown = 2 } = 
  * The "vision" block injected into System-2 prompts while building.
  * Top-down always; cross-section when the bot is in builder mode.
  */
-function buildVisionBlock (bot, { mode = 'explorer', range = 6, radius = 6, heightUp = 5, heightDown = 2 } = {}) {
+function buildVisionBlock (bot, { crossSection = true, range = 6, radius = 6, heightUp = 5, heightDown = 2 } = {}) {
   const parts = [`vision legend: ${VISION_LEGEND}`, buildTopDownGrid(bot, { range })]
-  if (mode === 'builder') parts.push(buildCrossSection(bot, { radius, heightUp, heightDown }))
+  // The cross-section is no longer a builder-mode privilege; `crossSection`
+  // is a cost switch for callers that only need the plan view.
+  if (crossSection) parts.push(buildCrossSection(bot, { radius, heightUp, heightDown }))
   return parts.join('\n')
 }
 // ============================================================================

@@ -99,7 +99,7 @@ const snapNow = (it, extra = {}) => ({ ...it.buildActionPrompt(['test']), ...ext
 // 10.1 Unprompted World Behavior & Mode Unlock Discovery
 // ============================================================================
 
-test('10.1 unprompted behavior: perceives world features/frontier, recalls autonomous memory, and chains mode switch without 90s stall', async () => {
+test('10.1 unprompted behavior: perceives world features/frontier, recalls autonomous memory, and chains build work without 90s stall', async () => {
   const blocks = {
     '4,63,0': 'water', '4,63,1': 'water', '4,63,2': 'water', '5,63,0': 'water', '5,63,1': 'water', '5,63,2': 'water',
     '-4,64,2': 'oak_log', '-4,65,2': 'oak_log', '-4,66,2': 'oak_log', '-4,67,2': 'oak_leaves', '-3,67,2': 'oak_leaves',
@@ -112,13 +112,15 @@ test('10.1 unprompted behavior: perceives world features/frontier, recalls auton
     actions: () => {
       step++
       if (step === 1) return { a: 'note', text: 'River east of spawn has a redstone repeater nearby', interest: 'river bridges' }
-      if (step === 2) return { a: 'set_mode', mode: 'builder' }
+      // No mode to switch into: the build tool is available on turn 2 exactly
+      // because nothing had to be unlocked first.
+      if (step === 2) return { a: 'build_shape', shape: 'wall', block: 'cobblestone', params: { l: 3, h: 2 }, at: [6, 64, 0] }
       return { a: 'idle' }
     }
   })
   try {
     s.spawn()
-    assert.ok(await s.until(() => step >= 3, 4000), 'chained note -> set_mode(builder) -> next turn without external chat or 90s stall')
+    assert.ok(await s.until(() => step >= 3, 4000), 'chained note -> build -> next turn without external chat or 90s stall')
     const firstPrompt = s.prompts.action[0]
     assert.match(firstPrompt, /identity: home: none established yet/, 'never fabricates home ownership on spawn')
     assert.match(firstPrompt, /world: features: .*redstone.*water|world: features: .*water.*redstone/, 'explorer mode sees semantic scene features')
@@ -126,7 +128,8 @@ test('10.1 unprompted behavior: perceives world features/frontier, recalls auton
     assert.doesNotMatch(firstPrompt, /just joined the server — look around; idle is fine/, 'startup wake is neutral, not idle-biased')
 
     const thirdPrompt = s.prompts.action[2]
-    assert.match(thirdPrompt, /mode builder/, 'switched to builder mode')
+    assert.doesNotMatch(thirdPrompt, /mode (builder|hunter|explorer)/, 'there is no mode in the state line')
+    assert.doesNotMatch(firstPrompt, /set_mode|MODES & TOOLS/, 'and no mode tool or mode block in the prompt')
     assert.match(thirdPrompt, /interests: river bridges/, 'emergent personal interest persisted from experience')
     assert.match(thirdPrompt, /River east of spawn/, 'long-term memory recalled autonomously without player chat')
   } finally {
@@ -200,7 +203,6 @@ test('10.2 self-generated goals: create with reason, subgoals, reprioritize, com
     // 4. Execute build_shape step -> links as child of g4 & records self-built construction when origin is self.
     await it.executeAction({ a: 'goal', operation: 'add', description: 'lay stone marker at camp', priority: 85 }, selfSnap)
     const g4 = it.goals.get('g4')
-    await it.executeAction({ a: 'set_mode', mode: 'builder' }, selfSnap)
     await it.executeAction({
       a: 'build_shape',
       shape: 'floor',
@@ -286,7 +288,6 @@ test('10.3 context resets (Scenarios 1–10): survives arbitrary resets without 
     it.brain.paused = wasPaused
 
     // --- Scenario 3 (During construction) & Scenario 9 (Player modifies environment) ---
-    await it.executeAction({ a: 'set_mode', mode: 'builder' }, snapNow(it, { askedBy: null }))
     await it.executeAction({ a: 'build_shape', shape: 'floor', block: 'stone_bricks', params: { w: 2, d: 2 }, at: [6, 64, 2] }, snapNow(it, { askedBy: null }))
     assert.ok(await s.until(() => !it.agenda.main && bot.blockAt(new Vec3(6, 64, 2))?.name === 'stone_bricks', 4000))
     // Player removes 2 blocks of Zinc's completed construction right before a context reset!
@@ -401,7 +402,6 @@ test('10.4 ownership & respect: protects player houses/private chests, never ass
     assert.equal(it.continuity.containerTakeGuard(gabrielChest, 'overworld', { askedBy: 'Steve' }).ok, true, 'allowed when owner explicitly asks')
 
     // 6. Autonomous build overlapping Steve's property is refused!
-    await it.executeAction({ a: 'set_mode', mode: 'builder' }, autoSnap)
     await it.executeAction({ a: 'build_shape', shape: 'floor', block: 'stone_bricks', params: { w: 2, d: 2 }, at: [5, 64, 1] }, snapNow(it, { askedBy: null }))
     assert.ok(await s.until(() => it.results.some((r) => r.label === 'build_shape' && !r.ok), 3000))
     assert.match(it.results.find((r) => r.label === 'build_shape').msg, /overlaps .*Steve's property/)
@@ -564,7 +564,6 @@ test('10.7b emergency mid-build interruption: pauses block placement during surv
     s.spawn()
     await sleep(100)
     const it = s.internals()
-    await it.executeAction({ a: 'set_mode', mode: 'builder' }, { threatIds: [], askedBy: null })
 
     await it.executeAction({
       a: 'build_shape',

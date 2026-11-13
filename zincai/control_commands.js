@@ -4,8 +4,11 @@
  *
  * The commands themselves live in host.js (they need the live process). What
  * is here is the part that must never drift from the docs: the command table,
- * the parameter groups and the exact wording of `help`, so `!zinc help`, the
- * README and a test all read the same source.
+ * the parameter groups and the exact wording of `help`, so the console's
+ * `help`, the README and a test all read the same source.
+ *
+ * Console only, no prefix: `pause`, `shutdown`, `status`. There is no chat
+ * command surface — see host.parseCommandLine for why.
  *
  * Generation is pure: no I/O, no mineflayer.
  */
@@ -22,10 +25,16 @@ const COMMANDS = Object.freeze([
     detail: 'One screen: link state, alive/dead, what the body is doing, goal counts, active jobs, every effective limit, and whether the body is paused.'
   },
   {
+    name: 'pause',
+    args: '',
+    summary: 'pause the body now (alias: stop); suspend open goals, delete nothing',
+    detail: 'Interrupts cancellable work, releases keys and pathfinder goals, cancels in-flight jobs, and suspends every open goal with its checkpoint. Memory, identity, jobs, goal progress and the Node.js process are untouched. Nothing the model MAY do changes — this is the emergency handbrake, not a change of policy.'
+  },
+  {
     name: 'stop',
     args: '',
-    summary: 'pause the body now; suspend (never delete) open goals',
-    detail: 'Interrupts cancellable work, releases keys and pathfinder goals, cancels in-flight jobs, and suspends every open goal with its checkpoint. Memory, identity, jobs, goal progress and the Node.js process are untouched.'
+    summary: 'same as pause (the older name)',
+    detail: 'Kept because it is the word in the supervisor scripts and the docs. `pause` is the clear one.'
   },
   {
     name: 'resume',
@@ -76,24 +85,30 @@ const COMMANDS = Object.freeze([
     detail: 'One generic, validated, persistent store. `config` lists everything with defaults; `config show <group>` narrows it; `config set` prints the old and the new value.'
   },
   {
+    name: 'shutdown',
+    args: '[exit-code]',
+    summary: 'stop the whole process now: body, model, everything',
+    detail: 'The other half of the emergency stop. Pauses the body, leaves the server, then exits Node.js with the given code (default 0). State on disk — memory, identity, goals, checkpoints — is saved first, so a later start resumes from it. `stop`/`pause` is the reversible one; this is the end of the process.'
+  },
+  {
     name: 'help',
     args: '',
     summary: 'this list',
-    detail: 'The commands, the prefix in force, and whether chat or console commands are accepted at all.'
+    detail: 'Every command and what it does. There is no prefix: this is the console surface, and nothing in game chat can reach it.'
   }
 ])
 
 const COMMAND_NAMES = new Set(COMMANDS.map((c) => c.name))
 
 /** The full help block, built from the live configuration. */
-function helpText ({ prefix = '!zinc', operators = [], allowConsole = true } = {}) {
-  const lines = [`commands (chat: "${prefix} <command>", console: the command alone):`]
+function helpText ({ allowConsole = true } = {}) {
+  const lines = ['commands (console only, no prefix — type the word and press enter):']
   for (const c of COMMANDS) {
     lines.push(`  ${c.name}${c.args ? ` ${c.args}` : ''}`)
     lines.push(`      ${c.summary}`)
   }
-  lines.push(`authorisation: ${operators.length ? `${operators.length} operator UUID(s) configured` : 'NO operator UUID configured — chat commands are refused; set control.operators'}`)
-  lines.push(`console: ${allowConsole ? 'enabled (stdin)' : 'disabled'}`)
+  lines.push(`console: ${allowConsole ? 'enabled (stdin)' : 'disabled by control.allowConsole'}`)
+  lines.push('authorisation: whoever holds this process\'s console. In-game chat is not a command channel.')
   return lines.join('\n')
 }
 

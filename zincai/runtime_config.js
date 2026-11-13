@@ -234,6 +234,15 @@ const SCHEMA = Object.freeze([
   },
 
   // --------------------------------------------------------------- limits --
+  // What is left here is not policy about what the model may DO with its body.
+  // It is the floor that keeps the bot from spending a server's whole tick
+  // budget, tripping the server's anti-cheat, or burning the API budget in
+  // parallel jobs.
+  //
+  // `limits.maxPublicChatPerMinute` used to sit here and it is gone: it DELETED
+  // lines the model had decided to say, once the count was reached, and the
+  // model was never told. A cap that discards speech is the harness editing the
+  // model. Speech is paced (one line a second) and never dropped.
   {
     name: 'limits.maxConcurrentJobs',
     group: 'limits',
@@ -242,27 +251,17 @@ const SCHEMA = Object.freeze([
     min: 1,
     max: 64,
     apply: 'boundary',
-    describe: 'background jobs allowed at once; a lower value takes effect as running jobs end'
+    describe: 'background jobs allowed at once — a concurrency cap on API-spending work, not on what a job may do; a lower value takes effect as running jobs end'
   },
   {
     name: 'limits.maxPhysicalActionsPerMinute',
     group: 'limits',
     type: 'integer',
-    default: 240,
+    default: 600,
     min: 0,
     max: 10_000,
     apply: 'immediate',
-    describe: 'sliding-window ceiling on physical actions (0 = no ceiling)'
-  },
-  {
-    name: 'limits.maxPublicChatPerMinute',
-    group: 'limits',
-    type: 'integer',
-    default: 12,
-    min: 0,
-    max: 200,
-    apply: 'immediate',
-    describe: 'sliding-window ceiling on public chat lines (0 = no ceiling)'
+    describe: 'sliding-window ceiling on physical actions per minute (0 = no ceiling). Self-protection: a runaway build loop can get the bot kicked or lag the server. Not a policy on what it may do.'
   },
   {
     name: 'limits.maxGoalRuntimeMinutes',
@@ -380,45 +379,22 @@ const SCHEMA = Object.freeze([
   },
 
   // -------------------------------------------------------------- control --
-  {
-    name: 'control.prefix',
-    group: 'control',
-    type: 'string',
-    default: '!zinc',
-    apply: 'immediate',
-    describe: 'chat prefix for operator commands, e.g. "!zinc status"'
-  },
-  {
-    name: 'control.operators',
-    group: 'control',
-    type: 'uuid-list',
-    default: [],
-    apply: 'immediate',
-    describe: 'Minecraft UUIDs allowed to run control commands (never usernames alone)'
-  },
-  {
-    name: 'control.operatorNames',
-    group: 'control',
-    type: 'string-list',
-    default: [],
-    apply: 'immediate',
-    describe: 'display names bound to control.operators for logs; grants no authority'
-  },
+  // Chat-based operator commands are gone, and with them the knobs that only
+  // existed to police them: `control.prefix` (there is no prefix — console lines
+  // are commands), `control.operators` (a UUID allow-list for a channel that no
+  // longer carries commands), `control.operatorNames` (display names for that
+  // list) and `control.announce` (a public-chat answer to a refused chat
+  // command). A player could probe the surface through them; there is no surface
+  // to probe now.
+  //
+  // What is left is who may type: the process's own console.
   {
     name: 'control.allowConsole',
     group: 'control',
     type: 'boolean',
     default: true,
     apply: 'immediate',
-    describe: 'accept the same commands on stdin (the PufferPanel console)'
-  },
-  {
-    name: 'control.announce',
-    group: 'control',
-    type: 'boolean',
-    default: false,
-    apply: 'immediate',
-    describe: 'answer a refused chat command in public chat (off = log only; an authorised answer is always a whisper)'
+    describe: 'accept commands on stdin (the PufferPanel console). Off means only the supervisor\'s own calls can pause or stop this process.'
   },
   {
     name: 'control.auditLog',
@@ -426,7 +402,7 @@ const SCHEMA = Object.freeze([
     type: 'boolean',
     default: true,
     apply: 'immediate',
-    describe: 'write every command and every refused attempt to the log'
+    describe: 'write every console command to the log'
   }
 ])
 
@@ -651,28 +627,15 @@ class RuntimeConfig extends EventEmitter {
 
   /**
    * Environment wins over the file for the knobs a panel template must be able
-   * to pin without an edit: the operator list, the command prefix and whether
-   * the process joins on start.
+   * to pin without an edit: whether the process joins on start, and connxion
+   * policy.
+   *
+   * `ZINC_OPERATORS` and `ZINC_COMMAND_PREFIX` are deliberately not read any
+   * more. They configured a chat command channel that no longer exists; silently
+   * accepting them would suggest a security control that is not there. A
+   * template that still sets them keeps working — the variables are just inert.
    */
   applyEnv (env = process.env) {
-    const ops = env.ZINC_OPERATORS ?? env.CONTROL_OPERATORS
-    if (ops !== undefined && String(ops).trim() !== '') {
-      const verdict = validateValue(BY_NAME.get('control.operators'), ops)
-      if (verdict.ok) {
-        this.values['control.operators'] = verdict.value
-        this.overrides['control.operators'] = 'env'
-      } else {
-        this.log('warn', `control.operators from the environment ignored: ${verdict.error}`)
-      }
-    }
-    const prefix = env.ZINC_COMMAND_PREFIX ?? env.CONTROL_PREFIX
-    if (prefix !== undefined && String(prefix).trim() !== '') {
-      const verdict = validateValue(BY_NAME.get('control.prefix'), prefix)
-      if (verdict.ok) {
-        this.values['control.prefix'] = verdict.value
-        this.overrides['control.prefix'] = 'env'
-      }
-    }
     // The panel checkbox that decides whether the process joins at all.
     const join = env.ZINC_JOIN_ON_START ?? env.CONTROL_JOIN_ON_START
     if (join !== undefined && String(join).trim() !== '') {

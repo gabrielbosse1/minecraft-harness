@@ -9,7 +9,7 @@ const os = require('os')
 
 const { MemorySystem, LongTermMemory, cosine, embed, scoreImportance } = require('../zincai/memory')
 const { BlueprintParser, BLUEPRINT_DIR } = require('../zincai/builder')
-const { chatAddressesBot, botNames, parseChatLine, blockEventTriggersSystem2 } = require('../zincai/filter')
+const { parseChatLine, blockEventTriggersSystem2 } = require('../zincai/filter')
 
 // ------------------------------------------------------------- memory ---
 test('cosine similarity ranks related text above unrelated', () => {
@@ -82,19 +82,18 @@ test('inline grid parse matches file parse semantics', () => {
 })
 
 // ------------------------------------------------------------- filter ---
-test('chat filter: the bot answers to its name, whispers and its own conversation — no friend list', () => {
-  const names = botNames('ZincAI', ['zinc'])
-  assert.deepEqual(names.sort(), ['zinc', 'zincai'])
-  assert.equal(chatAddressesBot('hey ZincAI come here', { names }), 'name')
-  assert.equal(chatAddressesBot('zinc vem aqui', { names }), 'name', 'everyone calls it "zinc"')
-  assert.equal(chatAddressesBot('ZINC!!', { names }), 'name')
-  assert.equal(chatAddressesBot('o zinco é um metal', { names }), false, 'a word that merely contains the name')
-  assert.equal(chatAddressesBot('oi', { names, whisper: true }), 'whisper')
-  assert.equal(chatAddressesBot('ok valeu', { names, inConversation: true }), 'conversation')
-  // A question is only "for the bot" when nobody else could be meant.
-  assert.equal(chatAddressesBot('what is the time?', { names, othersOnline: 1 }), 'question')
-  assert.equal(chatAddressesBot('what is the time?', { names, othersOnline: 3 }), false)
-  assert.equal(chatAddressesBot('just a friendly hello there', { names, othersOnline: 3 }), false)
+test('chat is parsed, not filtered: no relevance heuristic exists to gate the model', () => {
+  // botNames / mentionsBot / chatAddressesBot used to decide whether the model
+  // was allowed to see a line. They are gone, and this asserts they stay gone:
+  // the only chat helpers left are pure parsing.
+  const f = require('../zincai/filter')
+  for (const gone of ['botNames', 'mentionsBot', 'chatAddressesBot', 'chatTriggersSystem2', 'checkPortuguese']) {
+    assert.equal(typeof f[gone], 'undefined', `${gone} must not come back`)
+  }
+  assert.equal(typeof f.parseChatLine, 'function')
+  // An unrelated question from a crowd parses exactly like a direct address:
+  // nothing here decides that the model may not read it.
+  assert.deepEqual(f.parseChatLine('<Steve> does anyone have spare wood?'), { sender: 'Steve', text: 'does anyone have spare wood?', whisper: false })
 })
 
 test('chat line parser handles vanilla, whisper and common plugin formats', () => {
@@ -233,14 +232,19 @@ test('reflex registry validates specs loudly', () => {
 })
 
 // ------------------------------------------------------------- api_wrapper ---
-const { createZincTools, coerceAction, buildToolsPayload } = require('../zincai/api_wrapper')
+const { createZincTools, coerceAction, buildToolsPayload, ACTION_TOOLS } = require('../zincai/api_wrapper')
 
 test('createZincTools emits OpenAI-format schemas with the full action set', () => {
   const tools = createZincTools()
   const names = tools.map((t) => t.function?.name)
-  for (const required of ['say', 'go_to', 'follow', 'stop', 'attack', 'hold', 'look_in', 'take', 'put', 'smelt', 'sleep', 'give', 'eat', 'equip', 'use_block', 'find', 'remember_here', 'craft', 'build', 'build_shape', 'run_script', 'set_mode', 'idle']) {
+  for (const required of ['say', 'go_to', 'follow', 'stop', 'attack', 'hold', 'look_in', 'take', 'put', 'smelt', 'sleep', 'give', 'eat', 'equip', 'use_block', 'find', 'remember_here', 'craft', 'build', 'build_shape', 'run_script', 'idle']) {
     assert.ok(names.includes(required), `missing tool ${required}`)
   }
+  // The full surface, always: no mode exists to shrink it, and no caller can ask
+  // for a subset.
+  assert.ok(!names.includes('set_mode'), 'there is no mode to switch')
+  assert.deepEqual(createZincTools({ mode: 'hunter' }).map((t) => t.function.name), names, 'the old mode option is inert')
+  assert.equal(names.length, ACTION_TOOLS.length)
   for (const t of tools) {
     assert.equal(t.type, 'function')
     assert.ok(t.function.description.length > 10, `${t.function.name} needs a description`)

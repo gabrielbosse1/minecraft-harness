@@ -24,10 +24,12 @@
     "_lanesNote": "maxConcurrent 2 = the chat lane and the action lane each have one call in flight, so a slow action call never holds a chat reply (set 1 if the endpoint refuses parallel requests; chat still goes first). chatTimeoutMs 90000 accommodates Qwen3.8-27B latency (~47s p50) while remaining shorter than action timeoutMs (120000); adaptive p90 scaling lifts slow calls automatically."
   },
   "inference": {
-    "_note": "Two lanes: chat (answers people) and action (drives the body). Wake-ups are queued, never dropped. rpm is the shared calls-per-minute budget; chatReserve of those are for the chat lane alone (a mob chase used to spend all of them). urgentMinIntervalMs: the start of an escape or being cornered may be thought about this soon after the last call instead of minIntervalMs. heartbeatMs is the self-prompt when nothing happens (0 = off).",
+    "_note": "Two lanes: chat (reads people) and action (drives the body). Wake-ups are queued, never dropped. rpm is the shared calls-per-minute budget — the API's pacing, which is the only budget that still limits the model; chatReserve of those are for the chat lane alone. chatBatchMs is the IRC window: chat lines are collected this long and handed over as ONE chunk (several speakers, in order) instead of one model call per line; 0 turns batching off. urgentMinIntervalMs: the start of an escape or being cornered may be thought about this soon after the last call. heartbeatMs is the self-prompt when nothing happens (0 = off).",
     "minIntervalMs": 3000,
     "urgentMinIntervalMs": 1000,
     "chatMinIntervalMs": 1200,
+    "chatBatchMs": 5000,
+    "_chatBatchNote": "chat is delivered in 5 s chunks, IRC-style, and only when there is data: the first line of a quiet stretch opens the window, everything said inside it joins the same chunk. A waiting chunk also preempts an in-flight action call, so a player can break the model's thinking.",
     "rpm": 18,
     "chatReserve": 4,
     "heartbeatMs": 90000,
@@ -48,27 +50,13 @@
     "chatRecallMaxAgeMs": 120000,
     "_chatRecallNote": "Memory recall on non-chat wakes uses the last chat line only while it is this fresh : hours-old chat stopped steering recall into flee/task prompts."
   },
-  "trust": {
-    "_note": "EMPTY lists = old behavior (everyone equal, gate off). Once owners or trusted names are set, a guest whose chat request reaches the action lane may NOT take/give valuables (diamond/netherite/emerald-tier items or labels) or run_script; the bot's own initiative is never gated. CAUTION: offline-mode usernames are not proof of identity - run online-mode or a whitelist if that matters.",
-    "owners": [],
-    "trusted": []
-  },
   "behavior": {
-    "_note": "No friend list, no PvP switch, and no digging switch: the bot never attacks a player unless the model names that player, its reflex toward every real threat is to flee until the model decides, and pathfinding never breaks blocks on its own (the model asks with the `dig` tool).",
-    "aliases": [
-      "zinc"
-    ],
-    "language": "pt-BR",
-    "_languageNote": "Every outgoing chat line is checked against this language (pt-BR only; '' switches the check off). A reply in another language is retried once, then replaced by a fixed line.",
+    "_note": "No modes, no friend list, no PvP switch, no digging switch, no language: the model has every tool on every turn and decides for itself what to do, whom to answer and in which language. Its reflex toward a real threat is to flee until it decides otherwise, and pathfinding never breaks blocks on its own (the model asks with the `dig` tool).",
     "allowScaffolding": false,
     "engageRadius": 24,
     "fovDegrees": 90,
     "perceptionRange": 10,
-    "chatCooldownMs": 1500,
-    "chatPerPlayerPerMinute": 8,
-    "_chatRateNote": "one player spamming the bot may use at most this many chat-lane wakes per minute; extra lines are still logged and remembered, just not answered.",
     "useArmorManager": true,
-    "mode": "explorer",
     "perception3D": false,
     "autoElytra": true
   },

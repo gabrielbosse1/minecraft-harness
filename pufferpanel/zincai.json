@@ -102,44 +102,6 @@
         }
       ]
     },
-    "mode": {
-      "type": "string",
-      "value": "explorer",
-      "display": "Agent Mode",
-      "desc": "Which tool set the model gets. Every mode keeps the same policy: it never starts a fight and never attacks a player unless the model names that exact player.",
-      "required": true,
-      "userEdit": true,
-      "options": [
-        {
-          "value": "explorer",
-          "display": "Explorer"
-        },
-        {
-          "value": "hunter",
-          "display": "Hunter"
-        },
-        {
-          "value": "builder",
-          "display": "Builder"
-        }
-      ]
-    },
-    "aliases": {
-      "type": "string",
-      "value": "zinc",
-      "display": "Chat Aliases",
-      "desc": "Comma-separated names the bot also answers to in chat, besides its login name ZincAI.",
-      "required": false,
-      "userEdit": true
-    },
-    "language": {
-      "type": "string",
-      "value": "pt-BR",
-      "display": "Reply Language",
-      "desc": "Every chat line is checked against this language; a reply in another one is retried once, then replaced. Recognised: pt-BR, en, es, fr, de. Empty switches the check off.",
-      "required": false,
-      "userEdit": true
-    },
     "scaffolding": {
       "type": "boolean",
       "value": false,
@@ -193,22 +155,6 @@
       "value": 40,
       "display": "Reconnect Attempts",
       "desc": "How many times a dropped connection is retried before the process exits.",
-      "required": true,
-      "userEdit": true
-    },
-    "operators": {
-      "type": "string",
-      "value": "",
-      "display": "Operator UUIDs",
-      "desc": "Comma-separated Minecraft UUIDs allowed to control the bot (status/stop/resume/leave/join/config/goals/jobs/cancel). Usernames alone are never accepted: offline-mode names are not identity. Leave empty to disable chat commands and use the console instead.",
-      "required": false,
-      "userEdit": true
-    },
-    "commandprefix": {
-      "type": "string",
-      "value": "!zinc",
-      "display": "Command Prefix",
-      "desc": "Chat prefix for operator commands, for example \"!zinc status\". Console commands need no prefix.",
       "required": true,
       "userEdit": true
     },
@@ -279,11 +225,8 @@
     },
     {
       "display": "Behaviour",
-      "description": "How the bot plays and speaks.",
+      "description": "How the bot plays and speaks. There are no modes, no alias list and no reply language: every tool is always available and the model chooses its own words.",
       "variables": [
-        "mode",
-        "aliases",
-        "language",
         "scaffolding",
         "elytra"
       ],
@@ -304,10 +247,8 @@
     },
     {
       "display": "Operator Control",
-      "description": "Who may control the running bot, and how. Commands work in chat with the prefix, or on the console without it; none of them restart the process.",
+      "description": "Who may control the running bot. Console only, no prefix: pause, stop, shutdown, status, config. Nothing typed in game chat is a command.",
       "variables": [
-        "operators",
-        "commandprefix",
         "joinonstart"
       ],
       "order": 5
@@ -423,16 +364,11 @@
       "MC_AUTH": "${auth}",
       "MC_ALLOW_SCAFFOLDING": "${scaffolding}",
       "MC_AUTO_ELYTRA": "${elytra}",
-      "BOT_MODE": "${mode}",
-      "BOT_ALIASES": "${aliases}",
-      "BOT_LANGUAGE": "${language}",
       "INFERENCE_RPM": "${rpm}",
       "INFERENCE_MIN_INTERVAL_MS": "${mininterval}",
       "INFERENCE_HEARTBEAT_MS": "${heartbeat}",
       "RECONNECT": "${reconnect}",
       "RECONNECT_MAX_ATTEMPTS": "${maxattempts}",
-      "ZINC_OPERATORS": "${operators}",
-      "ZINC_COMMAND_PREFIX": "${commandprefix}",
       "ZINC_JOIN_ON_START": "${joinonstart}",
       "ZINC_DATA_DIR": "${datadir}",
       "LOG_LEVEL": "${log}"

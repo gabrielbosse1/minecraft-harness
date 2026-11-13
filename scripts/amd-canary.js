@@ -55,7 +55,7 @@ const ok = (name, cond, detail = '') => {
   try {
     reply = await client.chatReply([
       { role: 'system', content: 'You are a tool-calling test probe for a Minecraft bot. Always call the reply tool.' },
-      { role: 'user', content: 'state: hp 20 | day\nplayer Steve says: oi! tudo bem?\nAnswer with exactly one reply tool call, in Brazilian Portuguese.' }
+      { role: 'user', content: 'state: hp 20 | day\nplayer Steve says: oi! tudo bem?\nAnswer with exactly one reply tool call.' }
     ], { maxTokens: 120 })
   } catch (err) {
     ok('endpoint reachable + tool-capable', false, String(err.message || err).slice(0, 200))
@@ -64,7 +64,9 @@ const ok = (name, cond, detail = '') => {
   }
   all = ok('endpoint reachable (chat lane round trip)', true, `${Date.now() - t0} ms`) && all
   all = ok('reply tool call parsed', typeof reply.reply?.text === 'string', JSON.stringify(reply.reply).slice(0, 120)) && all
-  all = ok('reply is Portuguese-guard passable', reply.reply?.text ? require('../zincai/filter').checkPortuguese(reply.reply.text, { names: ['Steve'] }).ok : false, JSON.stringify(reply.reply?.text)) && all
+  // There is no language guard any more: the reply is whatever the model chose.
+  all = ok('reply text came back', typeof reply.reply?.text === 'string' && reply.reply.text.length > 0, JSON.stringify(reply.reply?.text)) && all
+  all = ok('no language filter rewrote the reply', typeof require('../zincai/filter').checkPortuguese === 'undefined', 'the guard is gone') && all
 
   // required vs auto
   const mode = client.toolChoice

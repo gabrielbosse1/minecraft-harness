@@ -124,7 +124,6 @@ function loadConfig () {
     },
     inference: raw.inference || {},
     memory: raw.memory || {},
-    trust: raw.trust || {},
     identity: raw.identity || {},
     behavior: raw.behavior || {},
     build: raw.build || {},
@@ -140,13 +139,8 @@ function loadConfig () {
 
   // A handful of behaviour knobs are worth exposing to the panel without a
   // defaults.json edit; they win over the file only when actually set.
-  const aliases = settings.str('BOT_ALIASES', null)
-  if (aliases !== null) cfg.behavior.aliases = aliases.split(',').map((a) => a.trim().toLowerCase()).filter(Boolean)
-  const language = settings.str('BOT_LANGUAGE', null)
-  if (language !== null) cfg.behavior.language = language
   cfg.behavior.allowScaffolding = settings.bool('MC_ALLOW_SCAFFOLDING', cfg.behavior.allowScaffolding ?? false)
   cfg.behavior.autoElytra = settings.bool('MC_AUTO_ELYTRA', cfg.behavior.autoElytra ?? true)
-  cfg.behavior.mode = settings.str('BOT_MODE', cfg.behavior.mode)
   cfg.inference.rpm = settings.int('INFERENCE_RPM', cfg.inference.rpm, { min: 1, max: 600 })
   cfg.inference.minIntervalMs = settings.int('INFERENCE_MIN_INTERVAL_MS', cfg.inference.minIntervalMs, { min: 0 })
   cfg.inference.heartbeatMs = settings.int('INFERENCE_HEARTBEAT_MS', cfg.inference.heartbeatMs, { min: 0 })
@@ -278,7 +272,7 @@ function main () {
     logger.info(TAG, `config: host=${cfg.server.host} port=${cfg.server.port} user=${cfg.server.username} auth=${cfg.server.auth} version=${cfg.server.version || 'auto'}`)
     logger.info(TAG, `amd: model=${cfg.amd.model} base=${cfg.amd.baseUrl} key=${cfg.amd.apiKey ? 'present' : 'MISSING'}`)
     logger.info(TAG, `data dir: ${DATA_DIR} (memories, places, goals, metrics, runtime-config)`)
-    logger.info(TAG, `behaviour: mode=${cfg.behavior.mode} aliases=${(cfg.behavior.aliases || []).join(',') || '-'} language=${cfg.behavior.language || 'off'} elytra=${cfg.behavior.autoElytra ? 'yes' : 'no'}`)
+    logger.info(TAG, `behaviour: elytra=${cfg.behavior.autoElytra ? 'yes' : 'no'} limits=${cfg.inference.rpm}/min`)
     logger.info(TAG, `limits: rpm=${cfg.inference.rpm} minInterval=${cfg.inference.minIntervalMs}ms heartbeat=${cfg.inference.heartbeatMs}ms reconnect=${cfg.reconnect.enabled ? `${cfg.reconnect.maxAttempts} attempts` : 'off'}`)
     logger.info(TAG, `prompts: action ${SYSTEM_PROMPT.split(/\s+/).length} words, chat ${CHAT_PROMPT.split(/\s+/).length} words (static), ${ZINC_TOOLS.length} tools`)
     logger.info(TAG, 'policy: flee from real threats until the model decides; no PvP unless the model names a player; no friend list')
@@ -286,8 +280,7 @@ function main () {
     // prefix nobody knows are configuration mistakes, not surprises at runtime.
     try {
       const rc = new (require('./runtime_config').RuntimeConfig)({ file: path.join(DATA_DIR, 'runtime-config.json') })
-      const ops = rc.get('control.operators') || []
-      logger.info(TAG, `control: prefix="${rc.get('control.prefix')}" operators=${ops.length ? ops.length : 'NONE (chat commands refused; console only)'} console=${rc.get('control.allowConsole') ? 'stdin' : 'off'} joinOnStart=${rc.get('connection.joinOnStart') ? 'yes' : 'no'}`)
+      logger.info(TAG, `control: console=${rc.get('control.allowConsole') ? 'stdin' : 'off'} (no chat commands; no prefix) joinOnStart=${rc.get('connection.joinOnStart') ? 'yes' : 'no'}`)
     } catch (err) { logger.warn(TAG, `control: could not read the runtime config: ${err?.message || err}`) }
     for (const e of errors) logger.error(TAG, e)
     process.exitCode = errors.length ? 1 : 0
@@ -348,7 +341,7 @@ function main () {
   // The control interface is up before the first join: status, config, help and
   // even stop/resume work while the link is still CONNECTING.
   host.attachStdin()
-  logger.info(TAG, `control: console commands ready${(host.config.get('control.operators') || []).length ? `, ${(host.config.get('control.operators') || []).length} operator UUID(s)` : '; no operator UUID configured, so chat commands are refused — set control.operators'}`)
+  logger.info(TAG, 'control: console commands ready (no prefix: pause, shutdown, status). In-game chat is a conversation, never a command channel.')
   host.boot()
 }
 
@@ -514,7 +507,6 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     enableWindCharge: cfg.traversal?.windCharge !== false,
     windCharge: cfg.traversal || {}
   })
-  const botNames = filter.botNames(cfg.server.username, cfg.behavior.aliases || [])
 
   let spawned = false
   let systemsReady = false
@@ -533,7 +525,6 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   let taskSeq = 0
   let lastHurt = { at: 0, text: '' }
   let lastSayAt = 0
-  const chatSaid = { recent: [] } // public lines in the last minute (limits.maxPublicChatPerMinute)
   const results = [] // what the last actions did: { label, ok, msg, ts }
   /** The most recent boundary refusal inside this session: { at, what, why }. */
   let lastRefusal = null
@@ -663,11 +654,20 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   const dim = () => PlaceIndex.dimensionOf(bot)
   const ago = (ts) => { const sec = Math.max(0, Math.round((Date.now() - ts) / 1000)); return sec < 90 ? `${sec}s` : `${Math.round(sec / 60)}m` }
 
-  // The server's language. Every outgoing line is checked (filter.js): the
-  // prompts and tool results are English, and telling the model is not enough.
-  const LANGUAGE = String(cfg.behavior.language ?? 'pt-BR').toLowerCase()
-  const inLanguage = (text) => !LANGUAGE.startsWith('pt') || filter.checkPortuguese(text, { names: Object.keys(bot.players || {}) }).ok
-  let foreignSays = { n: 0, at: 0 }
+  // Language is the model's call, not the harness's.
+  //
+  // There used to be a language gate here: every outgoing line was scored against
+  // a Portuguese word list, a non-conforming `say` was held back and retried
+  // once, and a chat reply that failed twice was replaced with a canned
+  // Portuguese sentence. That made the bot speak the operator's language even
+  // when a player was speaking another one, and it overrode the model's own
+  // judgement about what to say — the harness editing its output. Removed.
+  //
+  // What remains is the model's own copy quality: it sees who is talking, in
+  // which language, and answers accordingly. There is no `behavior.language`
+  // switch to read — a hint about "the server's usual language" would be the
+  // operator's guess about a conversation the model can see, so it is not
+  // passed in at all.
 
   // ------------------------------------------------------------- speech --
   const convoOf = (name) => { if (!shared.convo.has(name)) shared.convo.set(name, []); return shared.convo.get(name) }
@@ -680,30 +680,6 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     shared.chatLog.push({ who, text, ts: Date.now() })
     if (shared.chatLog.length > 12) shared.chatLog.splice(0, shared.chatLog.length - 12)
   }
-  /** The bot and this player exchanged lines within the last minute. */
-  // A sender may wake the chat lane at most this often (sliding minute).
-  const chatRate = {
-    hits: new Map(),
-    allow (sender) {
-      const max = cfg.behavior.chatPerPlayerPerMinute ?? 8
-      if (!(max > 0)) return true
-      const now = Date.now()
-      const key = String(sender).toLowerCase()
-      const list = (this.hits.get(key) || []).filter((t) => now - t < 60_000)
-      if (list.length >= max) { this.hits.set(key, list); return false }
-      list.push(now)
-      this.hits.set(key, list)
-      return true
-    },
-    prune () { const now = Date.now(); for (const [k, v] of this.hits) { const l = v.filter((t) => now - t < 60_000); if (!l.length) this.hits.delete(k); else this.hits.set(k, l) } }
-  }
-
-  const inConversation = (name) => {
-    const list = shared.convo.get(name)
-    const last = list && list[list.length - 1]
-    return Boolean(last) && Date.now() - last.ts < 60_000 && list.some((l) => l.who === 'me' && Date.now() - l.ts < 90_000)
-  }
-
   /**
    * Communication permissions. These are permission checks, not instructions:
    * they do not tell Zinc what to say or whom to trust — they decide only
@@ -735,24 +711,21 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   }
   function flushSay () {
     if (!sayQueue.length || ended) return
-    const wait = (cfg.behavior.chatCooldownMs ?? 1500) - (Date.now() - lastSayAt)
+    // Two things used to happen here and no longer do: a per-minute cap on
+    // public lines (limits.maxPublicChatPerMinute) that DROPPED the text once
+    // reached, and a `behavior.chatCooldownMs` gap that throttled speech. A cap
+    // that discards what the model decided to say is the harness overriding its
+    // judgement; a dropped line is also invisible to the model.
+    //
+    // What remains is a pacing floor of one line per second. That is the
+    // Minecraft server's own chat-rate behaviour (and most plugins mute a
+    // burst), written where the model can see it: the line waits in the queue
+    // and goes out, and `say` reports that it was queued. Nothing is discarded
+    // for being the fifth line of the minute — the only budget left is the
+    // model's API calls, not its words.
+    const wait = 1000 - (Date.now() - lastSayAt)
     if (wait > 0) { const t = setTimeout(() => { timers.delete(t); flushSay() }, wait + 20); timers.add(t); return }
     const { text, to, about } = sayQueue.shift()
-    // A sliding-window ceiling per minute, public chat only: a reply to one
-    // player must still be possible while the public channel is capped.
-    if (!to) {
-      const cap = Number(config.get('limits.maxPublicChatPerMinute'))
-      if (cap > 0) {
-        const now = Date.now()
-        chatSaid.recent = chatSaid.recent.filter((t) => now - t < 60_000)
-        if (chatSaid.recent.length >= cap) {
-          logger.warn(TAG, 'public chat rate limit reached — line dropped')
-          if (sayQueue.length) flushSay()
-          return
-        }
-      }
-    }
-    if (!to) chatSaid.recent.push(Date.now())
     lastSayAt = Date.now()
     try {
       const whispered = to ? guard.whisper(to, text) : false
@@ -875,33 +848,16 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   }
 
   // ------------------------------------------------------------ trust ----
-  /**
-   * optional trust gate. The default has NO lists configured
-   * and behaves exactly as before (everyone equal). Once trust.owners or
-   * trust.trusted name players, a guest whose chat request reached the body
-   * may not: take/give valuables, run scripts. The bot's own initiative
-   * (askedBy null) is never gated. Matching is offline-safe best effort —
-   * username spoofing is a server-config matter (documented in README).
-   */
-  const trustCfg = cfg.trust || {}
-  const trustLists = { owners: (trustCfg.owners || []).map((n) => String(n).toLowerCase()), trusted: (trustCfg.trusted || []).map((n) => String(n).toLowerCase()) }
-  const trustConfigured = trustLists.owners.length > 0 || trustLists.trusted.length > 0
-  const TRUST_VALUABLE = /(diamond|diamante|netherite|esmeralda|emerald|ancient_debris|elytra|beacon|tesouro|valioso|enchanted_golden)/i
-  function trustLevel (name) {
-    if (!name) return 'self'
-    const n = String(name).toLowerCase()
-    if (trustLists.owners.includes(n)) return 'owner'
-    if (trustLists.trusted.includes(n)) return 'trusted'
-    return 'guest'
-  }
-  function trustCheck (a, action, askedBy) {
-    if (!trustConfigured || !askedBy || trustLevel(askedBy) !== 'guest') return null
-    const who = `${askedBy} is not in the trust list (config trust.owners/trusted) — an owner can ask this. Tell the player that`
-    if (a === 'run_script') return `refused for ${askedBy}: ${who}`
-    if (a === 'give' && TRUST_VALUABLE.test(String(action.item || ''))) return `refused for ${askedBy}: ${who}`
-    if (a === 'take' && (TRUST_VALUABLE.test(String(action.item || '')) || TRUST_VALUABLE.test(String(action.where || '')))) return `refused for ${askedBy}: ${who}`
-    return null
-  }
+  // The trust gate is gone.
+  //
+  // It was a name list in the config that decided, for chat-initiated actions
+  // only, whether the model was allowed to give away a diamond or run a script:
+  // an O(nobody)-line policy whose stated premise was that offline-mode names
+  // are not identity anyway. The model reads who asked, what it has done for
+  // them before and what it stands to lose, and decides; the harness does not
+  // get a second veto it cannot explain to the model. Ownership and property
+  // protection still exist and are still enforced, because those protect OTHER
+  // players' builds from being damaged, not the model from thinking.
 
   // ------------------------------------------------------------ agenda ---
   /**
@@ -1836,6 +1792,23 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     return shared.chatLog.slice(-max).map((l) => `  ${l.who === 'me' ? 'you' : l.who}: ${l.text}`).join('\n')
   }
 
+  /**
+   * Is the body holding something you *build* with? The 3D cross-section used
+   * to be builder-mode-only; the grid is now offered whenever the situation
+   * looks like building, so the model is never handed a build job blind.
+   */
+  const BUILD_BLOCK_HINT = /(planks|log|stone|dirt|cobble|brick|concrete|terracotta|wool|glass|sand|gravel|deepslate|_slab|_stairs|_fence|_wall|scaffold|torch|redstone|_door|_trapdoor|ladder|rail)/i
+  function holdingBuildMaterials () {
+    try {
+      const held = bot.heldItem?.name
+      if (held && BUILD_BLOCK_HINT.test(held)) return true
+      // Mid-build the executor holds a scaffold or a placement item even when
+      // the model is between tool calls; the running task is the better signal.
+      if (task && /build/i.test(String(task.tool || ''))) return true
+      return false
+    } catch { return false }
+  }
+
   function coreIdentity () {
     const creator = cfg.identity?.creator || {}
     const name = String(creator.name || '').trim().slice(0, 40)
@@ -1854,8 +1827,6 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     // the ones that slipped behind a corner a moment ago (they are not in the
     // threat block, and "hold" used to leave the bot running from them).
     const threatIds = [...new Set([...sense.last.dangerIds, ...(system1?.chasers || []).map((t) => t.id)])]
-    const mode = wrapper.mode || 'explorer'
-    continuity.currentState.mode = mode
     const nearby = pos ? places.describeNearby(pos, { dim: dim() }) : ''
     const named = pos ? places.describeNamed(pos, { dim: dim() }) : ''
     // Build a grounded recall query: recent chat request if present, otherwise
@@ -1906,7 +1877,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       coreIdentity(),
       continuityBlock || null,
       visibleFacts.length ? `visible player memories (name-based, unverified): ${visibleFacts.join(' | ')}` : null,
-      observe.selfLine(bot, { mode }),
+      observe.selfLine(bot),
       observe.inventoryLine(bot),
       doingLine(),
       agendaLine(),
@@ -1927,8 +1898,11 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       justNow,
       `why now: ${reasons.join('; ')}`
     ]
-    if (mode === 'builder') {
-      try { lines.push(`grid (builder mode; legend: ${VISION_LEGEND}):\n${buildVisionBlock(bot, { mode, range: 6, radius: 6, heightUp: 5, heightDown: 2 })}`) } catch { /* cosmetic */ }
+    // The 3D grid used to be builder-only. Building is something the model
+    // chooses, so the sense it builds WITH must not be locked behind a persona:
+    // if it is holding blocks (or something it made), it gets the grid.
+    if (holdingBuildMaterials()) {
+      try { lines.push(`grid (legend: ${VISION_LEGEND}):\n${buildVisionBlock(bot, { range: 6, radius: 6, heightUp: 5, heightDown: 2 })}`) } catch { /* cosmetic */ }
     }
     // Who asked for what this turn is about (the newest chat request among the reasons).
     const asked = /^chat request from (\S+?):/.exec([...reasons].reverse().find((r) => /^chat request from /.test(r)) || '')
@@ -1945,14 +1919,28 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     }
   }
 
+  /**
+   * The chat chunk, as a person reads a chat window.
+   *
+   * `incoming` is every line from the batching window — several players, replies
+   * to each other, whispers mixed in, in arrival order. The model is given the
+   * whole thing and decides what concerns it; nothing here scores relevance,
+   * matches its name, or decides which line is "for" it. The one thing this
+   * function does do is make the stream legible: who spoke, in what order, and
+   * whether it was said aloud or whispered.
+   */
   function buildChatPrompt (sender, incoming) {
     const pos = here()
     if (pos) { try { places.scan(bot, { radius: cfg.places.scanRadius ?? 16 }) } catch { /* partial world */ } }
     const nearby = pos ? places.describeNearby(pos, { dim: dim() }) : ''
     const named = pos ? places.describeNamed(pos, { dim: dim() }) : ''
-    const history = convoOf(sender).slice(0, -incoming.length || undefined).slice(-8)
+    // Per-speaker history. `sender` is the newest speaker; the others in the
+    // chunk get no extra history — their lines are in the chunk itself.
+    const history = convoOf(sender).slice(0, -incoming.filter((l) => l.sender === sender || !l.sender).length || undefined).slice(-8)
       .map((l) => `  ${l.who === 'me' ? 'you' : sender}: ${l.text}`).join('\n')
-    const latest = incoming.map((l) => `${l.whisper ? '(whisper) ' : ''}${l.text}`).join(' / ')
+    const latest = incoming.map((l) => `${l.whisper ? '(whisper from ' + l.sender + ') ' : (incoming.length > 1 ? `${l.sender}: ` : '')}${l.text}`).join(' / ')
+    const speakers = [...new Set(incoming.map((l) => l.sender).filter(Boolean))]
+    const others = speakers.filter((n) => n !== sender)
     const recalled = memory.recallBlock(latest, cfg.memory.topK ?? 3)
     const prefs = memory.preferencesLine(sender)
     // What this player told the bot before, in the model's own words.
@@ -1963,7 +1951,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       .map((e) => `${e.type}: ${e.text || e.msg || ''}`).join(' | ')
     const lines = [
       coreIdentity(),
-      observe.selfLine(bot, { mode: wrapper.mode || 'explorer' }),
+      observe.selfLine(bot),
       observe.inventoryLine(bot, { max: 16 }),
       doingLine(),
       agendaLine(),
@@ -1978,7 +1966,13 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       known.length ? `you know from ${sender}:\n${known.map((t) => `  - ${t}`).join('\n')}` : null,
       recalled || null,
       history ? `conversation with ${sender} so far:\n${history}` : null,
-      `${sender} says: ${latest}`
+      incoming.length > 1
+        ? `the last few seconds of chat (${incoming.length} lines from ${speakers.join(', ')}; in arrival order, "you" is you):\n` +
+          incoming.map((l) => `  ${l.sender}: ${l.whisper ? '(whisper) ' : ''}${l.text}`).join('\n')
+        : `${sender} says: ${latest}`,
+      others.length
+        ? `more than one person is talking; decide for yourself who (if anyone) you are answering, and say it if it is unclear.`
+        : null
     ]
     return lines.filter(Boolean).join('\n')
   }
@@ -1988,7 +1982,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   function isPreDecisionInspect (action) {
     if (!action) return false
     const a = String(action.a || '')
-    if (['look_in', 'inspect_block', 'inspect_region', 'redstone_scan', 'redstone_component', 'redstone_engineer', 'recall', 'find', 'set_mode', 'equip', 'eat'].includes(a)) return true
+    if (['look_in', 'inspect_block', 'inspect_region', 'redstone_scan', 'redstone_component', 'redstone_engineer', 'recall', 'find', 'equip', 'eat'].includes(a)) return true
     if (a === 'social' && ['list', 'show'].includes(String(action.operation || 'list'))) return true
     if (a === 'goal' && ['list', 'show', 'verify'].includes(String(action.operation || 'list'))) return true
     return false
@@ -2014,14 +2008,9 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       if (!metricsWarned) { metricsWarned = true; logger.warn(TAG, `metrics log unavailable: ${err.message || err}`) }
     }
   }
-  // per-mode tool schemas (cached; one JSON per mode so prefix
-  // caching still sees a stable schema block within a mode).
-  const modeToolsCache = new Map()
-  function modeTools (mode) {
-    const m = ['explorer', 'hunter', 'builder'].includes(mode) ? mode : 'explorer'
-    if (!modeToolsCache.has(m)) modeToolsCache.set(m, createZincTools({ mode: m }))
-    return modeToolsCache.get(m)
-  }
+  // One tool schema, built once. It is byte-identical on every call, which is
+  // what prefix caching needs, and it never shrinks: there is no mode to be in.
+  const ALL_TOOLS = createZincTools()
 
   async function act (reasons, meta = null) {
     if (!alive || ended) return { idle: true }
@@ -2029,21 +2018,45 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     const epoch = decisionEpoch
     const life = lifeEpoch
     logger.debug(TAG, `action turn (${reasons.join(' | ')})`)
-    // the action lane ships only the tools the current mode can
-    // use (build tools only in builder mode) — a smaller schema block per call.
-    const tools = modeTools(wrapper.mode || 'explorer')
+    const tools = ALL_TOOLS
     const t0 = Date.now()
     const invokeMono = performance.now()
     if (meta && Number.isFinite(meta.queuedMono)) {
       latency.record('queueToModelMs', Math.max(0, (meta.invokeMono || invokeMono) - meta.queuedMono))
     }
-    const { action, usage } = await amd.chatWithTools([
-      { role: 'system', content: SYSTEM_PROMPT },
-      { role: 'user', content: snap.text }
-    ], tools)
+    // This turn is abortable. `brain` calls it when a chat chunk is waiting and
+    // this thought has been running long enough to be worth interrupting: the
+    // HTTPS request is cancelled, the tokens are never generated, and the turn
+    // is retried with the conversation in front of it. Being interruptible is
+    // the difference between "the model thinks" and "the model thinks and can
+    // be told something new".
+    const controller = new AbortController()
+    brain.inflightAbort = (why) => {
+      if (controller.signal.aborted) return false
+      logger.info(TAG, `interrupting action turn (${why}); the chat chunk goes first`)
+      controller.abort()
+      return true
+    }
+    let result
+    try {
+      result = await amd.chatWithTools([
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user', content: snap.text }
+      ], tools, { signal: controller.signal })
+    } finally {
+      if (brain) brain.inflightAbort = null
+    }
+    const { action, usage } = result
     latency.record('modelInferenceMs', performance.now() - invokeMono)
     logUsage('action', reasons.join(' | '), usage, Date.now() - t0, action?.a)
     if (ended) return { idle: true }
+    // A turn killed by a chat chunk is not a failure and not an idle: the
+    // situation is about to change under it, so ask again once the players have
+    // been answered. Nothing the model "decided" mid-abort may be executed.
+    if (action && action._interrupted) {
+      brain.wake(`reassess: your previous thinking was interrupted so a player's message could go first. ${reasons.join('; ')}`, { external: true, fast: true })
+      return { idle: false }
+    }
     if (epoch !== decisionEpoch) {
       const context = life === lifeEpoch ? reasons.join('; ') : 'previous life ended; reassess after respawn'
       brain.wake(`decision discarded: situation changed while thinking; reassess. ${context}`, { external: true })
@@ -2097,26 +2110,11 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     latency.record('modelInferenceMs', performance.now() - chatInvokeMono)
     if (ended || epoch !== lifeEpoch) return
     logUsage('chat', `${sender}: ${lines.map((l) => l.text).join(' / ').slice(0, 60)}`, chatUsage, Date.now() - tChat0, 'reply')
-    // Language guard: one more try with a plain instruction, then a fixed line.
-    if (reply.text && !inLanguage(reply.text)) {
-      logger.warn(TAG, `chat reply was not ${LANGUAGE} ("${reply.text.slice(0, 80)}") — asking once more`)
-      brain?.spent?.('chat')
-      try {
-        const again = await amd.chatReply([
-          ...messages,
-          { role: 'assistant', content: reply.text },
-          { role: 'user', content: 'That reply was not in Brazilian Portuguese. Call reply again: the same meaning in informal Brazilian Portuguese (PT-BR), nothing else changed.' }
-        ], { maxTokens })
-        reply = {
-          ...again.reply,
-          task: again.reply.task || reply.task,
-          decision: again.reply.decision || reply.decision,
-          remember: again.reply.remember || reply.remember
-        }
-      } catch (err) { logger.debug(TAG, `language retry failed: ${err.message || err}`) }
-      if (reply.text && !inLanguage(reply.text)) reply = { ...reply, text: reply.task ? 'peraí, deixa eu ver aqui' : 'foi mal, me enrolei aqui kkk' }
-    }
     if (ended || epoch !== lifeEpoch) return
+    // A chunk may mix whispers and public lines. Answer the loudest constraint:
+    // if any line in it was whispered to the bot, the reply stays private, so a
+    // private question is never answered in public just because someone else
+    // said something in the same five seconds.
     const whisper = lines.some((l) => l.whisper)
     if (reply.text && !canReplyToChat()) {
       logger.warn(TAG, `chat reply to ${sender} not sent: communication.replyToChat is off`)
@@ -2344,10 +2342,6 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     const destination = destinationOf(action)
     const awayTarget = destination ? boundary.destinationRefusal(destination) : null
     if (awayTarget) return report(a, { ok: false, msg: `refused: ${awayTarget}` }, { wake: false })
-    // min: a guest (chat-asker outside the trust lists) may not
-    // reach valuables or automation. Off when no lists are configured.
-    const trustRefusal = trustCheck(a, action, snap?.askedBy)
-    if (trustRefusal) return report(a, { ok: false, msg: trustRefusal })
     // the exact same call failed repeatedly seconds ago — refuse
     // it locally instead of running the world mutation again. No wake: the
     // quiet refusal shows up in the next natural prompt's results.
@@ -2396,7 +2390,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     }
     return leaseContext.run({ lease: laneLease, claimed: false }, async () => {
     gateCtx = action
-    const IMMEDIATE_TRACKED = new Set(['say', 'stop', 'hold', 'equip', 'redstone_scan', 'redstone_component', 'redstone_engineer', 'recall', 'circuit_project', 'logic_test', 'inspect_region', 'inspect_block', 'find', 'remember_here', 'note', 'social', 'goal', 'set_mode'])
+    const IMMEDIATE_TRACKED = new Set(['say', 'stop', 'hold', 'equip', 'redstone_scan', 'redstone_component', 'redstone_engineer', 'recall', 'circuit_project', 'logic_test', 'inspect_region', 'inspect_block', 'find', 'remember_here', 'note', 'social', 'goal'])
     currentActId = IMMEDIATE_TRACKED.has(a)
       ? continuity.beginAction({ tool: a, summary: `${a} ${JSON.stringify(goalArgs(action)).slice(0, 80)}`, sig: `${a}:${JSON.stringify(goalArgs(action))}`, goalId: agenda.main?.goalId || null, args: goalArgs(action) })
       : null
@@ -2413,14 +2407,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         return
       case 'say': {
         const text = String(action.t ?? action.text ?? '')
-        if (text.trim() && !inLanguage(text)) {
-          // Not the server's language: hold it back and ask again — once.
-          const again = Date.now() - foreignSays.at < 60_000 ? foreignSays.n + 1 : 1
-          foreignSays = { n: again, at: Date.now() }
-          logger.warn(TAG, `say held back (not ${LANGUAGE}): "${text.slice(0, 80)}"`)
-          return report('say', { ok: false, msg: again <= 1 ? `NOT SENT — "${text.slice(0, 60)}" is not Brazilian Portuguese. Say it again in informal PT-BR.` : 'not sent (still not Brazilian Portuguese); dropped' }, { wake: again <= 1 })
-        }
-        foreignSays = { n: 0, at: 0 }
+        // No language check: what the model chose to say goes out as said.
         // speak() reports its own reason (a permission that is off, a recipient
         // that is not online); only genuinely empty text is reported here.
         if (!text.trim()) { report('say', { ok: false, msg: 'empty text' }); return }
@@ -2749,13 +2736,6 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       case 'goal': {
         return report('goal', await runGoalOp(action, snap))
       }
-      case 'set_mode': {
-        const prevMode = wrapper.mode || 'explorer'
-        const applied = wrapper.setMode(String(action.mode || ''))
-        cfg.behavior.mode = applied
-        continuity.currentState.mode = applied
-        return report('set_mode', { ok: true, msg: `mode switched to ${applied}` }, { wake: prevMode !== applied })
-      }
       default:
         return report(String(a), { ok: false, msg: `unknown action "${a}"` })
     }
@@ -2772,58 +2752,17 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   }
 
   // -------------------------------------------------- operator commands -----
-  /**
-   * Route one chat line to the control interface. Returns true when the line
-   * WAS a command (authorised or not), so it is never handed to the model as
-   * conversation.
-   */
-  /** Does this chat text start with the control prefix (and is an interface configured)? */
-  function isControlLine (text) {
-    if (!owner) return false
-    const prefix = String(config.get('control.prefix') || '').toLowerCase()
-    if (!prefix) return false
-    return String(text || '').trim().toLowerCase().startsWith(prefix)
-  }
-
-  async function handleChatCommand (raw) {
-    if (!owner) return false
-    const parsed = filter.parseChatLine(raw, { players: Object.keys(bot.players || {}) })
-    if (!parsed) return false // command-shaped but unattributable: not ours to interpret
-    const uuid = resolvePlayerUuid(parsed.sender)
-    const authorisation = owner.authorize({ source: 'chat', uuid, name: parsed.sender })
-    // A refused command is logged (without its body, without the raw sender) and
-    // otherwise ignored: an unauthorised player gets no signal at all, so the
-    // surface cannot be probed. control.announce can make that explicit.
-    if (!authorisation.ok) {
-      await owner.command(raw, { source: 'chat', uuid, name: parsed.sender })
-      if (config.get('control.announce') === true) speak('esse comando é do operador do servidor, não posso atender por chat')
-      return true
-    }
-    // The interface must stay usable after `stop`: a paused body still answers
-    // its operator, so the answer path is a whisper through the same speech
-    // permission (never public chat, never the model).
-    const out = await owner.command(raw, { source: 'chat', uuid, name: parsed.sender })
-    // The answer goes to the operator who asked, privately, and never into the
-    // public channel: it names limits and reasons that are operational.
-    if (out?.reply && parsed.sender) {
-      const lines = String(out.reply).split('\n').slice(0, 8)
-      for (const line of lines) { try { guard.whisper(parsed.sender, line.slice(0, 200)) } catch { /* invalid name */ } }
-    }
-    return true
-  }
-
-  /**
-   * A player's UUID, from the player list or (for `!zinc` self-authorisation)
-   * from the server's own tab entry. Usernames alone are NEVER identity, so a
-   * missing UUID means "unauthorised", never "trust the name".
-   */
-  function resolvePlayerUuid (name) {
-    try {
-      const entry = bot.players?.[name] || Object.values(bot.players || {}).find((p) => String(p?.username || '').toLowerCase() === String(name).toLowerCase())
-      const uuid = entry?.uuid || entry?.entity?.uuid || null
-      return uuid ? String(uuid).toLowerCase() : null
-    } catch { return null }
-  }
+  // There is no chat command surface any more.
+  //
+  // It used to live here: a `!zinc`-prefixed line in public chat was parsed,
+  // matched against a UUID allow-list, and dispatched to the process host, with
+  // the answer whispered back. That meant a command channel existed wherever a
+  // player could type — the game server's own chat — authorised by a list the
+  // panel maintained, and every refusal was a probe.
+  //
+  // Control is the console only: the process's stdin, or the `pause` / `stop` /
+  // `shutdown` functions the supervisor already calls. Bare words, no prefix —
+  // see control_commands.js and host.attachStdin().
 
   // ------------------------------------------ optional Scout & Relocate --
   async function scoutAndRelocate () {
@@ -2950,7 +2889,6 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       const p = here()
       logger.info(TAG, 'respawned')
       owner?.markDead?.(false)
-      wrapper.setMode(cfg.behavior.mode || 'explorer')
       reconcileAfterRespawn().catch((err) => logger.warn(TAG, `respawn reconcile failed: ${err?.message || err}`))
       return
     }
@@ -2990,7 +2928,6 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     const taskLane = arbiter.lane('task', PRIORITY.task)
     executor = new BuilderExecutor(bot, { scaffoldBlocks: cfg.build.scaffoldBlocks, logger: wrapperLog, hands: taskLane, boundary })
     skills = new Skills(bot, { arbiter, places, logger: wrapperLog, whisper: guard.whisper, executor: () => executor, pathfinder: () => wrapper, boundary })
-    wrapper.setMode(cfg.behavior.mode || 'explorer')
 
     brain = new Brain({
       act,
@@ -2999,6 +2936,9 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       logger: (level, msg) => logger[level]?.(TAG, msg),
       minIntervalMs: cfg.inference.minIntervalMs ?? 3000,
       chatMinIntervalMs: cfg.inference.chatMinIntervalMs ?? 1200,
+      // The IRC window: chat is handed over in chunks this long, not one wake
+      // per line. 0 disables batching (each line is its own chunk).
+      chatBatchMs: cfg.inference.chatBatchMs ?? 5000,
       rpm: cfg.inference.rpm ?? 18,
       chatReserve: cfg.inference.chatReserve ?? 4,
       urgentMinIntervalMs: cfg.inference.urgentMinIntervalMs ?? 1000,
@@ -3528,21 +3468,31 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     report('say', { ok: false, msg: 'blocked: chat that starts with "/" is a command and you cannot run commands' })
   })
 
+  /**
+   * Every attributable chat line goes into the IRC stream.
+   *
+   * What used to happen here, in order: a control-prefix check intercepted
+   * operator commands out of public chat; `chatAddressesBot` scored the line for
+   * relevance (its name? a question with one person online? already in
+   * conversation?) and RETURNED on anything it judged "not for me", so the model
+   * never saw it; and `chatRate` silently dropped a player's excess lines before
+   * the brain got them. Three separate human-authored policies deciding what the
+   * model was allowed to notice, on top of the model's own judgement.
+   *
+   * None of that is here. A line is logged, perceived, remembered, and handed to
+   * `brain.hear`, which batches the last few seconds into one chunk. The model
+   * reads the window and decides who (if anyone) it is answering — that
+   * judgement is the model's job, and it is better at it than a name regex,
+   * because it can see the surrounding conversation.
+   *
+   * Operator control is console-only now; nothing in chat is a command.
+   */
   onBot('messagestr', (raw) => {
     const players = Object.keys(bot.players || {})
     const parsed = filter.parseChatLine(raw, { players })
     if (!parsed) return // server line, not attributed chat
     if (parsed.sender === bot.username) return // never react to ourselves
     const { sender, text, whisper } = parsed
-    // The CONTROL INTERFACE is checked before the systems-ready guard and before
-    // anything else: the operator must be able to stop, inspect or reconfigure
-    // the process at any point in its life, including before the model stack is
-    // up. A command line is never conversation — it does not reach the model,
-    // the conversation log or memory.
-    if (isControlLine(text)) {
-      handleChatCommand(`<${sender}> ${text}`).catch((err) => logger.debug(TAG, `control command failed: ${err?.message || err}`))
-      return
-    }
     if (!systemsReady) return
     const pref = memory.observeChat(sender, text)
     if (pref) logger.debug(TAG, `preference learned from ${sender} (${pref.polarity}): ${pref.text}`)
@@ -3559,22 +3509,8 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       occurrenceTimeKnown: true, observationBasis: 'direct', importance: 2,
       memoryType: 'chat', remember: false
     })
-    const why = filter.chatAddressesBot(text, {
-      names: botNames,
-      whisper,
-      inConversation: inConversation(sender),
-      othersOnline: players.filter((p) => p !== bot.username).length
-    })
-    memory.rememberChat(sender, text, { addressed: Boolean(why) })
-    logger.debug(TAG, `chat from ${sender}: ${text} (${why ? `for me: ${why}` : 'not for me'})`)
-    if (!why) return
-    // one spamming player may not monopolize the chat
-    // lane's reserved budget — over the per-player limit the line is dropped
-    // (still logged/remembered above, just never answered).
-    if (!chatRate.allow(sender)) {
-      logger.warn(TAG, `chat rate limit: dropping extra line from ${sender}`)
-      return
-    }
+    memory.rememberChat(sender, text, { addressed: null })
+    logger.debug(TAG, `chat from ${sender}: ${text}`)
     pushConvo(sender, 'them', text)
     brain.hear(sender, text, { whisper })
   })
@@ -3730,6 +3666,19 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     subsystems,
     isSpawned: () => spawned,
     /**
+     * The operator's `shutdown`: the irreversible half of the emergency stop.
+     * `dispose()` only tears down this session's body and model stack; the
+     * process-level shutdown saves memory, places and conversation, prints the
+     * summary and exits. Exposed here so the host's console command can reach
+     * it without the host knowing about this module's internals.
+     */
+    shutdown: (code = 0, reason = 'shutdown') => {
+      if (typeof shared.shutdown === 'function') return shared.shutdown(code, reason)
+      try { dispose() } catch { /* already gone */ }
+      setTimeout(() => process.exit(code), 250)
+      return false
+    },
+    /**
      * The operator's pause. Cancellable work is interrupted, keys are released,
      * nothing is deleted.
      * @returns {string[]} what was interrupted
@@ -3770,7 +3719,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       reconcileRestored, reconcileGoal, verifyGoalAgainstWorld, staleActionReason,
       // Control surface (tests and the operator interface):
       host: owner, config, boundary, physicalGuard, deathRecovery, subsystems,
-      stopPhysical: session.stopPhysical, command: handleChatCommand,
+      stopPhysical: session.stopPhysical,
       reconcileAfterRespawn, respawn: () => bot.emit('spawn'), kill: () => bot.emit('death')
     })
   }

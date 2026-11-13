@@ -54,6 +54,7 @@ class Brain {
     heartbeatMs = 90_000,
     maxSelfChain = 12,
     selfChainPauseMs = 30_000,
+    chatBatchMs = 5000,
     now = () => Date.now()
   }) {
     this.act = act
@@ -170,7 +171,19 @@ class Brain {
   /** A turn made one more call than usual (a retry): count it against the budget. */
   spent (lane = 'chat') { this.calls.push({ at: this.now(), lane }) }
 
-  /** Queue a line for the CHAT lane. */
+  /**
+   * Queue one line of the IRC stream for the CHAT lane.
+   *
+   * Lines do NOT become a wake of their own. They accumulate for `chatBatchMs`
+   * (5 s by default) and are then handed to the model as ONE chunk, the way a
+   * person reads a chat window: several people talking, a burst of replies,
+   * someone answering ten seconds later — all of it in context, in order, with
+   * who said what. A wake per line used to cost one model call per message and
+   * give the model a single line with no idea what had just been said around it.
+   *
+   * The batch is not a filter: nothing is dropped, nothing is scored for
+   * relevance, and the model decides what (if anything) concerns it.
+   */
   hear (sender, text, { whisper = false } = {}) {
     this.chatQueue.push({
       sender,
@@ -179,8 +192,27 @@ class Brain {
       at: this.now(),
       mono: performance.now()
     })
-    if (this.chatQueue.length > 24) this.chatQueue.splice(0, this.chatQueue.length - 24)
-    this._kick()
+    if (this.chatQueue.length > 64) this.chatQueue.splice(0, this.chatQueue.length - 64)
+    // A thought in flight is interruptible the moment the first line lands, not
+    // at the next tick: a player typing should not wait for a 250 ms scheduler
+    // slot to be noticed.
+    if (this.busyAction && this.inflightAbort) this.inflightAbort('chat arrived')
+    this._scheduleChat()
+  }
+
+  /**
+   * Start (or keep) the batching window. The first line of a quiet stretch
+   * opens the window; later lines inside it join the same chunk. That is what
+   * makes a 5 s rhythm out of a burst instead of one turn per message.
+   */
+  _scheduleChat () {
+    if (this._chatTimer) return
+    if (!(this.chatBatchMs > 0)) { this._kick(); return }
+    this._chatTimer = setTimeout(() => {
+      this._chatTimer = null
+      this._kick()
+    }, this.chatBatchMs)
+    if (typeof this._chatTimer.unref === 'function') this._chatTimer.unref()
   }
 
   /** May `lane` make a call now? Chat may use the whole budget; the body leaves chat its reserve. */
@@ -206,6 +238,12 @@ class Brain {
   /** One scheduling step. Starts at most one call per lane; the lanes do not wait for each other. */
   async tick () {
     if (this.paused) return
+    // People break thoughts. This check belongs HERE, not in _actionStep: that
+    // step is skipped while an action call is in flight, which is exactly the
+    // moment there is something worth interrupting. A chat chunk that is
+    // waiting — and past its window — cancels the in-flight completion, and the
+    // action lane re-plans once the players have been answered.
+    if (this.busyAction && this.chatQueue.length && this.inflightAbort) this.inflightAbort('chat chunk waiting')
     const jobs = []
     if (!this.busyChat) { const job = this._chatStep(); if (job) jobs.push(job) }
     if (!this.busyAction) { const job = this._actionStep(); if (job) jobs.push(job) }
@@ -217,9 +255,11 @@ class Brain {
     const now = this.now()
     if (!this.chatQueue.length || now - this.lastChatAt < this.chatMinIntervalMs) return null
     if (!this._rateOk(now, 'chat')) return null
-    const sender = this.chatQueue[0].sender
-    const lines = this.chatQueue.filter((l) => l.sender === sender)
-    this.chatQueue = this.chatQueue.filter((l) => l.sender !== sender)
+    // The whole window goes to the model as one chunk — every speaker, in order,
+    // with replies to each other intact. `sender` is the most recent speaker
+    // (the model gets all of them in the prompt, and picks its own addressee).
+    const lines = this.chatQueue.splice(0, this.chatQueue.length)
+    const sender = lines[lines.length - 1].sender
     const earliestMono = lines.reduce((m, l) => Number.isFinite(l.mono) ? Math.min(m, l.mono) : m, Infinity)
     const invokeMono = performance.now()
     this.busyChat = true

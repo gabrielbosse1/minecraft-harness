@@ -346,9 +346,6 @@ Minecraft Server, Behaviour, Limits, Operator Control and Installation.
 | `port` | `MC_PORT` | `25565` | The Minecraft port, not the panel port. |
 | `mcversion` | `MC_VERSION` | *(empty)* | Empty = auto-detect the server version. |
 | `auth` | `MC_AUTH` | `offline` | `offline` or `microsoft`. |
-| `mode` | `BOT_MODE` | `explorer` | `explorer`, `hunter`, `builder`. |
-| `aliases` | `BOT_ALIASES` | `zinc` | Comma-separated chat names. |
-| `language` | `BOT_LANGUAGE` | `pt-BR` | Reply check; empty disables it. |
 | `scaffolding` | `MC_ALLOW_SCAFFOLDING` | `false` | Place/remove scaffolding while building. |
 | `elytra` | `MC_AUTO_ELYTRA` | `true` | Glide across long gaps. |
 | `rpm` | `INFERENCE_RPM` | `18` | Shared model-call budget per minute. |
@@ -356,8 +353,6 @@ Minecraft Server, Behaviour, Limits, Operator Control and Installation.
 | `heartbeat` | `INFERENCE_HEARTBEAT_MS` | `90000` | Self-prompt when idle; `0` disables. |
 | `reconnect` | `RECONNECT` | `true` | Retry a dropped link after a spawn. |
 | `maxattempts` | `RECONNECT_MAX_ATTEMPTS` | `40` | Retry cap before the process exits. |
-| `operators` | `ZINC_OPERATORS` | *(empty)* | Comma-separated Minecraft **UUIDs** allowed to control the bot over chat. Empty closes the chat interface; the console still works. Usernames are not identity. |
-| `commandprefix` | `ZINC_COMMAND_PREFIX` | `!zinc` | Chat prefix for operator commands. |
 | `joinonstart` | `ZINC_JOIN_ON_START` | `true` | Off = the process starts without joining and waits for `join` on the console. |
 | `log` | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. |
 | `datadir` | `ZINC_DATA_DIR` | `data` | Relative to the server folder, so backups include it. |
@@ -423,15 +418,17 @@ goals / jobs                what is running, what is waiting
 cancel g7                   cancel one goal and its jobs
 config show boundary        every boundary limit, with defaults
 config set boundary.radius 48
-config set operators <uuid>,<uuid>
+pause                       # emergency handbrake: stop the body, delete nothing
+shutdown 0                  # emergency stop: save state and exit the process
 help
 ```
 
-The same commands work in Minecraft chat behind the prefix (`!zinc status`) for
-the UUIDs listed in `operators`; the answer arrives by whisper. Config changes
-are written to `datadir/runtime-config.json` and survive a reinstall or a
-restart. A change that cannot take effect mid-action says so and is applied at
-the next safe boundary.
+**The console is the only control surface, and nothing in game chat is a
+command** — not with a prefix, not from a server operator. There is no prefix and
+no UUID allow-list to configure, because there is no chat command interface to
+authorise. Config changes are written to `datadir/runtime-config.json` and
+survive a reinstall or a restart. A change that cannot take effect mid-action
+says so and is applied at the next safe boundary.
 
 ## 4. Verifying a deployment
 
@@ -444,9 +441,8 @@ npm run check                   # syntax-check every module
 
 The panel's **Console** shows the same lines the preflight prints, so a
 variable that is wrong is visible there before the bot joins anything. Expect a
-`control:` line naming the command prefix, how many operator UUIDs are
-configured and whether the process joins on start — if it says
-`operators=NONE`, chat commands will be refused and only the console will work.
+`control:` line saying whether the console is enabled and whether the process
+joins on start: `control: console=stdin (no chat commands; no prefix)`.
 
 Type an operator command straight into the console (no prefix, one line, press
 enter) to prove the control path end to end:

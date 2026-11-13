@@ -6,7 +6,7 @@ into two lanes that share one call budget:
 
 | Lane | What it does |
 | --- | --- |
-| **Chat** | Answers a player in one short line (PT-BR by default), and may hand the body a task and a fact to remember. |
+| **Chat** | Reads the last few seconds of chat as one IRC-style window, answers whoever (if anyone) it judges needs an answer — in that person's language — and may hand the body a task and a fact to remember. |
 | **Action** | One structured function-tool call per turn: move, gather, craft, build, fight, sleep, remember. |
 
 The agent does not decide to attack on its own. A local reflex layer flees from
@@ -15,6 +15,45 @@ A player is attacked only after the model names that exact username. There is no
 friend list, no “attack nearby player” reflex, and no server-side control. The
 bot uses normal client packets; the only deliberate command exception is a
 guarded private `/msg` when the model asks to whisper.
+
+## Complete model freedom
+
+The model is not steered by the harness. Concretely:
+
+- **No modes.** `explorer` / `hunter` / `builder` and the `set_mode` tool are
+  gone. Every tool — build, `build_shape`, `logic_test`, `circuit_project`,
+  combat, redstone inspection, everything — is in the schema on **every** turn.
+  The per-turn schema is byte-identical, which also keeps prefix caching cheap.
+  Movement posture (cautious while placing blocks, parkour while fleeing) is
+  chosen by the wrapper from what the body is doing, never by a persona.
+- **No relevance filter.** A chat line is not scored for whether it mentions
+  the bot's name, whether a question “must” be for it, or whether that player
+  has spoken too often. Every attributable line is logged, remembered and given
+  to the model, which decides what concerns it.
+- **IRC-style chat.** Lines are collected in a ~5 s window
+  (`inference.chatBatchMs`) and delivered as **one chunk**: several speakers, in
+  arrival order, whispers marked. A burst of eight lines is one model call, not
+  eight, and nothing in the window is dropped for volume.
+- **Interruptible thinking.** A chunk that is waiting cancels an in-flight
+  action call at the socket (`AbortController`), so a player can break the
+  model's train of thought instead of waiting for it to finish. An interrupted
+  turn executes nothing it half-decided and re-plans with the conversation in
+  front of it.
+- **Language is free.** There is no language guard, no retry, and no canned
+  replacement line. The model answers in whatever language the person it is
+  talking to is using, and the words it chooses are the words that go out.
+- **No trust lists.** `trust.owners` / `trust.trusted` are gone. The model
+  forms its own view of every player from evidence — the system prompt still
+  tells it that nobody, including its creator, has automatic authority.
+- **The only limits left** are not policy about what the model may think or do:
+  the **API budget** (`inference.rpm`, `minIntervalMs`, `heartbeatMs`,
+  `chatReserve`), a **self-protection rate** on physical actions that keeps the
+  server's anti-cheat from kicking the bot
+  (`limits.maxPhysicalActionsPerMinute`, default 600), one-line-per-second
+  speech pacing (a Minecraft server limit, not a cap on what may be said), and
+  the **emergency stop**: `pause` / `stop` and `shutdown` on the console.
+  Owner and property protection remain, because those protect *other players'*
+  builds from damage, not the model from its own judgement.
 
 It ships with a **PufferPanel template**: the panel clones the repository,
 installs Node.js and the dependencies, passes every setting in as an environment
@@ -47,10 +86,10 @@ configure by hand.
    | `host` / `port` | the Minecraft server the bot joins (not the panel port) |
    | `auth` | `offline` for a private server with the name `ZincAI` whitelisted, `microsoft` for a premium account |
    | `mcversion` | a version like `1.21.4`, or empty to auto-detect |
-   | `mode` | `explorer`, `hunter` or `builder` |
 
-   The rest have working defaults: model, call budget, aliases, reply language,
-   digging/scaffolding/elytra switches, reconnection, log level.
+   The rest have working defaults: model, call budget, digging/scaffolding/
+   elytra switches, reconnection, log level. There is no `mode`, no alias list
+   and no reply language to configure — see **Complete model freedom** below.
 
 3. Press **Install**, then **Start**. Install clones the branch, installs
    dependencies and creates `data/`; every start first runs
@@ -81,18 +120,22 @@ table.
 
 ## Controlling a running bot
 
-No restart is needed to stop, pause, move or reconfigure the bot, and no
-behavioural "mode" exists — only parameters, permissions and limits.
+No restart is needed to stop, pause or reconfigure the bot.
 
-- **Console (PufferPanel):** type the command alone — `status`, `stop`,
-  `resume`, `leave`, `join`, `restart-connection`, `goals`, `jobs`,
-  `cancel <goal-id>`, `config show boundary`, `config set boundary.radius 48`,
-  `help`.
-- **In-game chat:** the same commands behind a prefix (`!zinc status`), answered
-  by whisper. Only the Minecraft **UUIDs** in `control.operators` (template
-  variable `operators`, `ZINC_OPERATORS`) may use it; anyone else is ignored
-  and logged without a hint that the interface exists.
-- `stop` pauses the body and suspends — never deletes — open goals; `resume`
+**The console is the only control surface, and there is no prefix.** Type the
+command alone — `status`, `pause`, `stop`, `resume`, `leave`, `join`,
+`restart-connection`, `goals`, `jobs`, `cancel <goal-id>`,
+`config show boundary`, `config set boundary.radius 48`, `help` — and the two
+emergency ones: `pause` (stop the body, keep everything) and `shutdown`
+(save state, leave the server, exit the process).
+
+Nothing typed in **game chat** is a command, for anyone: not with a `!prefix`,
+not from a server operator, not from the account's creator. Chat is conversation
+and reaches the model like any other line. There is no UUID allow-list and no
+command prefix to configure, because there is nothing in chat to authorise.
+
+- `pause` (alias `stop`) stops the body and suspends — never deletes — open
+  goals; `resume`
   reconciles the real world before handing work back; `leave` drops the link but
   keeps the process, memory, goals and the interface alive; `join` reconnects
   that same process once, without duplicate listeners or jobs.
@@ -127,8 +170,8 @@ Details: [`zincai/README.md#operator-control-runtime-no-restart`](zincai/README.
   movement goals and keys (`survival > combat > task`), so concurrent behavior
   cannot leave controls held or cancel a more urgent flee.
 - **Vanilla-only operation.** No RCON, no server console commands, no
-  teleporting. The operator interface is a chat prefix plus the panel's own
-  stdin — it needs no admin rights on the Minecraft server.
+  teleporting. The operator interface is the panel's own stdin — it needs no
+  admin rights on the Minecraft server, and nothing in game chat can reach it.
 - **Digging is the model's call.** Pathfinding never breaks blocks on its own:
   it opens doors, routes around, or reports no path. The model asks with the
   `dig` tool, optionally restricting which block ids it may break
@@ -157,7 +200,7 @@ vendor/            vendored Minecraft 26.3 data, installed by `npm ci`
 ## Checks and tests
 
 ```sh
-npm test              # 300 tests: mock bots + a scripted local model
+npm test              # 338 tests: mock bots + a scripted local model
 npm run check         # syntax-check every module
 npm run dry-run       # resolve config, print it, no network
 npm run ping          # server reachability/version, no join, no model call

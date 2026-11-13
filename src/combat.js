@@ -531,8 +531,8 @@ class AdvancedCombat {
    * @param {string|{name?:string, player?:string}} request
    *   "zombie"            → nearest zombie in line of sight (exact type name)
    *   "any" / "hostile"   → nearest hostile mob in line of sight
-   *   {player:"Gabriel"}  → that player, and nobody else
-   *   "Gabriel"           → same, when an online player has exactly that name
+   *   {player:"Steve"}  → that player, and nobody else
+   *   "Steve"           → same, when an online player has exactly that name
    * @returns {{ target: object|null, why?: string }}
    */
   resolveTarget (request, { explicitPlayersOnly = false } = {}) {

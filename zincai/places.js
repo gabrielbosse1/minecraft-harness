@@ -4,7 +4,7 @@
  * Two kinds of knowledge, both persisted to zincai-data/places.json:
  *
  *   1. Named places the model (or a player, through the model) asked to keep:
- *      "home", "mina", "casa do Gabriel" → coordinates.
+ *      "home", "mina", "casa do Steve" → coordinates.
  *   2. An index of useful blocks seen while walking around: chests, barrels,
  *      shulker boxes, furnaces, beds, work stations and signs — each with its
  *      coordinates, the text of the sign next to it (people label chests),

@@ -22,37 +22,37 @@ const line = (prompt, label) => prompt.split('\n').find((l) => l.startsWith(labe
 
 test('chat in PT-BR: "zinc vem aqui" is heard, answered, turned into a task, done and reported back', async () => {
   const bot = simulatedBot({ items: [['iron_sword'], ['bread', 5]], held: 'iron_sword' })
-  addPlayer(bot, 2, 'Gabriel', 10.5, 0.5, 'diamond_pickaxe')
+  addPlayer(bot, 2, 'Steve', 10.5, 0.5, 'diamond_pickaxe')
   const s = startTestSession({
     bot,
-    chat: () => ({ text: 'já vou!', task: 'go to Gabriel' }),
+    chat: () => ({ text: 'já vou!', task: 'go to Steve' }),
     actions: (p) => {
-      if (/why now:.*go_to done: reached Gabriel/.test(p)) return { a: 'say', text: 'cheguei, e aí?' }
-      if (/why now:.*chat request from Gabriel/.test(p)) return { a: 'go_to', player: 'Gabriel' }
+      if (/why now:.*go_to done: reached Steve/.test(p)) return { a: 'say', text: 'cheguei, e aí?' }
+      if (/why now:.*chat request from Steve/.test(p)) return { a: 'go_to', player: 'Steve' }
       return null // idle
     }
   })
   try {
     s.spawn()
     await sleep(200)
-    s.say('<Gabriel> zinc vem aqui')
-    assert.ok(await s.until(() => s.internals().results.some((r) => /reached Gabriel/.test(r.msg)), 8000), 'the bot walked to Gabriel')
+    s.say('<Steve> zinc vem aqui')
+    assert.ok(await s.until(() => s.internals().results.some((r) => /reached Steve/.test(r.msg)), 8000), 'the bot walked to Steve')
     assert.ok(await s.until(() => bot.log.chat.length === 2, 3000))
 
     assert.deepEqual(bot.log.chat, ['já vou!', 'cheguei, e aí?'], 'accents intact, both lines delivered')
-    assert.ok(bot.entity.position.distanceTo(bot.players.Gabriel.entity.position) <= 3.3)
+    assert.ok(bot.entity.position.distanceTo(bot.players.Steve.entity.position) <= 3.3)
 
     // The chat lane saw who spoke, where they are and the message.
-    assert.match(s.prompts.chat[0], /Gabriel says: zinc vem aqui/)
-    assert.match(s.prompts.chat[0], /players: Gabriel 10m E at 10,64,0/)
+    assert.match(s.prompts.chat[0], /Steve says: zinc vem aqui/)
+    assert.match(s.prompts.chat[0], /players: Steve 10m E at 10,64,0/)
     // The action lane got the request, with names it can use…
-    const asked = s.prompts.action.find((p) => /chat request from Gabriel: go to Gabriel/.test(p))
+    const asked = s.prompts.action.find((p) => /chat request from Steve: go to Steve/.test(p))
     assert.ok(asked, 'the task reached the action lane')
     assert.match(asked, /inventory \(2\/36 slots\): iron_sword, bread x5/)
     // …and was woken with the RESULT when the walk ended (it used to hear nothing).
-    const after = s.prompts.action.find((p) => /why now: go_to done: reached Gabriel/.test(p))
+    const after = s.prompts.action.find((p) => /why now: go_to done: reached Steve/.test(p))
     assert.ok(after, 'completion wakes the model')
-    assert.match(after, /results \(your last actions\):\n {2}- go_to: reached Gabriel/)
+    assert.match(after, /results \(your last actions\):\n {2}- go_to: reached Steve/)
   } finally { s.stop() }
 })
 
@@ -104,18 +104,18 @@ test('a zombie appears: the reflex flees and reports; nothing is attacked until 
 
 test('a player hits the bot: it backs off and talks; PvP happens only when the model names that player', async () => {
   const bot = simulatedBot({ items: [['iron_sword']], held: 'iron_sword' })
-  const gabriel = addPlayer(bot, 2, 'Gabriel', 2.5, 0.5, 'diamond_sword')
-  addPlayer(bot, 3, 'Pedro', -2.5, 0.5, 'bow') // a bystander holding a bow, closer than nobody
+  const gabriel = addPlayer(bot, 2, 'Steve', 2.5, 0.5, 'diamond_sword')
+  addPlayer(bot, 3, 'Herobrine', -2.5, 0.5, 'bow') // a bystander holding a bow, closer than nobody
   // A model that escalates step by step, reading its own results.
   const s = startTestSession({
     bot,
     actions: (p) => {
-      if (!/hit by player Gabriel/.test(p)) return null
+      if (!/hit by player Steve/.test(p)) return null
       const failed = (p.match(/attack: FAILED/g) || []).length
-      if (!/you: \(to Gabriel\)/.test(p)) return { a: 'say', text: 'ei Gabriel, para com isso', to: 'Gabriel' }
+      if (!/you: \(to Steve\)/.test(p)) return { a: 'say', text: 'ei Steve, para com isso', to: 'Steve' }
       if (failed === 0) return { a: 'attack', target: 'player' } // refused: no name
       if (failed === 1) return { a: 'attack', target: 'any' } // refused: "any" is never a player
-      return /fighting Gabriel/.test(p) ? null : { a: 'attack', player: 'Gabriel' } // the explicit decision
+      return /fighting Steve/.test(p) ? null : { a: 'attack', player: 'Steve' } // the explicit decision
     }
   })
   try {
@@ -127,12 +127,12 @@ test('a player hits the bot: it backs off and talks; PvP happens only when the m
     bot.emit('entityHurt', bot.entity) // the bare event…
     bot.emit('entityHurt', bot.entity, gabriel) // …then the one that names the source
     assert.ok(await s.until(() => bot.log.chat.length > 0, 4000))
-    assert.deepEqual(bot.log.chat, ['/msg Gabriel ei Gabriel, para com isso'], 'a private warning, nothing else')
-    s.internals().brain.wake('Gabriel keeps hitting')
-    const told = s.prompts.action.find((p) => /hit by player Gabriel/.test(p))
-    assert.match(line(told, 'why now:'), /hurt: hit by player Gabriel \(hp 17\)/)
-    assert.match(line(told, 'threats:'), /Gabriel \(\d+m \w+; player, hit you; diamond_sword, armor 0\/20\)/)
-    assert.ok(!/Pedro/.test(line(told, 'threats:')), 'the bystander is not a threat')
+    assert.deepEqual(bot.log.chat, ['/msg Steve ei Steve, para com isso'], 'a private warning, nothing else')
+    s.internals().brain.wake('Steve keeps hitting')
+    const told = s.prompts.action.find((p) => /hit by player Steve/.test(p))
+    assert.match(line(told, 'why now:'), /hurt: hit by player Steve \(hp 17\)/)
+    assert.match(line(told, 'threats:'), /Steve \(\d+m \w+; player, hit you; diamond_sword, armor 0\/20\)/)
+    assert.ok(!/Herobrine/.test(line(told, 'threats:')), 'the bystander is not a threat')
     assert.equal(bot.log.attack.length, 0)
 
     // Vague attack requests never land on a player.
@@ -143,7 +143,7 @@ test('a player hits the bot: it backs off and talks; PvP happens only when the m
 
     // Naming the player is the model's explicit decision — only then.
     assert.ok(await s.until(() => bot.log.attack.length > 0, 10_000), 'explicit duel')
-    assert.ok(bot.log.attack.every((id) => id === 2), 'only Gabriel, never the bystander')
+    assert.ok(bot.log.attack.every((id) => id === 2), 'only Steve, never the bystander')
   } finally { s.stop() }
 })
 
@@ -153,15 +153,15 @@ test('a friend\'s house: the model addresses chests by the ids it is shown; resu
     blocks: { '4,64,3': 'chest', '6,64,3': 'furnace', '5,64,-2': 'red_bed' },
     containers: { '4,64,3': { diamond: 12, iron_ingot: 30 } }
   })
-  addPlayer(bot, 2, 'Gabriel', 3.5, -3.5)
+  addPlayer(bot, 2, 'Steve', 3.5, -3.5)
   // The model works through the errand from what each result tells it.
   const s = startTestSession({
     bot,
     actions: (p) => {
       if (/give: tossed/.test(p)) return null
-      if (/take: took diamond x3/.test(p)) return { a: 'give', player: 'Gabriel', item: 'diamond', count: 3 }
+      if (/take: took diamond x3/.test(p)) return { a: 'give', player: 'Steve', item: 'diamond', count: 3 }
       if (/look_in: chest1/.test(p)) return { a: 'take', item: 'diamond', count: 3, where: 'chest1' }
-      if (/chat request from Gabriel/.test(p)) return { a: 'look_in', where: 'chest1' }
+      if (/chat request from Steve/.test(p)) return { a: 'look_in', where: 'chest1' }
       return null
     }
   })
@@ -171,17 +171,17 @@ test('a friend\'s house: the model addresses chests by the ids it is shown; resu
     s.spawn()
     await sleep(200)
     const { brain } = s.internals()
-    brain.wake('chat request from Gabriel: bring Gabriel 3 diamonds from the chest')
+    brain.wake('chat request from Steve: bring Steve 3 diamonds from the chest')
 
     assert.ok(await s.until(() => tossed !== null, 12_000), 'the errand completes')
     assert.deepEqual(tossed, { name: 'diamond', n: 3 })
-    const first = s.prompts.action.find((p) => /chat request from Gabriel/.test(p))
+    const first = s.prompts.action.find((p) => /chat request from Steve/.test(p))
     const room = first.split('\n').find((l) => /^ {2}y64 /.test(l)) || ''
     for (const id of ['chest1 [not opened yet]', 'furnace1', 'bed1 (red)']) assert.ok(room.includes(id), `the room line names ${id}: ${room}`)
     const results = s.internals().results.map((r) => `${r.label}: ${r.msg}`)
     assert.ok(results.some((r) => /^look_in: chest1 at 4,64,3: iron_ingot x30, diamond x12 \(25 free slots\)$/.test(r)), results.join(' | '))
     assert.ok(results.some((r) => /^take: took diamond x3 from chest1 \(9 left there\)$/.test(r)), results.join(' | '))
-    assert.ok(results.some((r) => /^give: tossed diamond x3 to Gabriel$/.test(r)), results.join(' | '))
+    assert.ok(results.some((r) => /^give: tossed diamond x3 to Steve$/.test(r)), results.join(' | '))
     // What it saw is remembered for next time.
     const later = s.prompts.action[s.prompts.action.length - 1]
     assert.match(later, /chest1 \[iron_ingot x30, diamond x9\]/)

@@ -23,17 +23,23 @@ configure by hand.
 
 ## Quick start (PufferPanel)
 
-1. Install the template on the panel node:
+1. Get the template into the panel — PufferPanel 3 takes it either from a git
+   repository or pasted into the web UI; it has no template folder and no
+   "Import" button:
 
    ```sh
-   node pufferpanel/import.js                     # validate + show where it goes
-   node pufferpanel/import.js --dir /var/lib/pufferpanel/templates --apply
+   node pufferpanel/import.js            # validate + explain both paths
+   node pufferpanel/import.js --print    # the JSON to paste into Templates → New
    ```
 
-   (Or use **Templates → Import** in the panel and paste
-   `pufferpanel/zincai.json`.) Restart the panel afterwards.
+   **Easiest:** in the panel, **Templates → Add repo** with this repository's
+   URL and branch — the template in `pufferpanel/` is already laid out the way
+   the panel scans (`<subfolder>/<name>.json`). See
+   [`pufferpanel/README.md`](pufferpanel/README.md#1-get-the-template-into-the-panel),
+   and the step-by-step walkthrough is in [`docs/pufferpanel-guide.md`](docs/pufferpanel-guide.md).
 
-2. Create a server from **Minecraft Agent (ZincAI)** and fill in the variables:
+2. **Servers → New server**, pick the **zincai** template, and fill in the
+   variables:
 
    | Variable | What to put |
    | --- | --- |
@@ -67,7 +73,9 @@ npm start                      # == node zincai/index.js
 ```
 
 Everything is configured through environment variables — the same names the
-template uses. `zincai/config.json` holds defaults only. See
+template uses; [`.env.example`](.env.example) lists them with empty values and
+explains how to export them locally. `zincai/config.json` holds defaults only,
+and its `amd.apiKey` stays empty on purpose: the key is never a file. See
 [`zincai/README.md`](zincai/README.md#configuration-and-operation) for the full
 table.
 
@@ -149,7 +157,7 @@ vendor/            vendored Minecraft 26.3 data, installed by `npm ci`
 ## Checks and tests
 
 ```sh
-npm test              # 297 tests: mock bots + a scripted local model
+npm test              # 300 tests: mock bots + a scripted local model
 npm run check         # syntax-check every module
 npm run dry-run       # resolve config, print it, no network
 npm run ping          # server reachability/version, no join, no model call

@@ -70,7 +70,7 @@ test('config: values are validated by type and range, unknown names are refused'
   assert.equal(cfg.set('boundary.radius', '12.5').ok, false, 'integers are not silently truncated')
   assert.equal(cfg.set('communication.publicChat', 'no').value, false)
   assert.equal(cfg.set('communication.publicChat', 'maybe').ok, false)
-  assert.equal(cfg.set('control.operators', 'Gabriel').ok, false, 'a username is not a UUID')
+  assert.equal(cfg.set('control.operators', 'Steve').ok, false, 'a username is not a UUID')
   assert.equal(cfg.set('control.operators', '11111111222233334444555555555555').value[0], OPERATOR)
   const unknown = cfg.set('actions.allowTeleport', 'true')
   assert.equal(unknown.ok, false)
@@ -476,7 +476,7 @@ test('host: only a configured UUID may run a command; a stranger is ignored sile
   assert.equal(good.ok, true)
   assert.match(good.reply, /connection:/)
 
-  const bad = await chat(host, '!zinc status', STRANGER, 'Gabriel')
+  const bad = await chat(host, '!zinc status', STRANGER, 'Steve')
   assert.equal(bad.ok, false)
   assert.equal(bad.silent, true)
   assert.equal(bad.reply, undefined, 'an unauthorised sender learns nothing')
@@ -604,8 +604,8 @@ test('session: an operator UUID is required to command the body over chat, and t
     await sleep(150)
     s.shared.host.config.set('control.operators', OPERATOR)
     // An unauthorised player tries the prefix: nothing happens, nothing is said.
-    bot.players.Gabriel = { username: 'Gabriel', uuid: STRANGER, entity: null }
-    s.say('<Gabriel> !zinc stop')
+    bot.players.Steve = { username: 'Steve', uuid: STRANGER, entity: null }
+    s.say('<Steve> !zinc stop')
     await sleep(200)
     assert.equal(s.shared.host.paused, false, 'a stranger cannot pause the body')
     assert.deepEqual(bot.log.chat, [], 'and gets no public answer')
@@ -633,8 +633,8 @@ test('session: stop during movement releases the keys and suspends the goal', as
     s.spawn()
     await sleep(150)
     s.shared.host.config.set('control.operators', OPERATOR)
-    addPlayer(bot, 2, 'Gabriel', 2.5, 0.5)
-    s.say('<Gabriel> zinc vai pra longe')
+    addPlayer(bot, 2, 'Steve', 2.5, 0.5)
+    s.say('<Steve> zinc vai pra longe')
     assert.ok(await s.until(() => (moved = bot.entity.position.x) > 2, 4000), 'the walk started')
 
     const stop = await consoleCmd(s.shared.host, 'stop')
@@ -668,8 +668,8 @@ test('session: stop during a build stops between blocks and reports it, without 
   try {
     s.spawn()
     await sleep(150)
-    addPlayer(bot, 2, 'Gabriel', 2.5, 0.5)
-    s.say('<Gabriel> zinc constrói um muro')
+    addPlayer(bot, 2, 'Steve', 2.5, 0.5)
+    s.say('<Steve> zinc constrói um muro')
     assert.ok(await s.until(() => s.internals().goals.openGoals().some((g) => g.kind === 'build_shape'), 4000), 'the build goal opened')
     await sleep(120)
     const before = s.internals().results.length
@@ -689,14 +689,14 @@ test('session: stop during a background job cancels the job and keeps the proces
   const bot = simulatedBot({ items: [['iron_sword']], held: 'iron_sword' })
   const s = startTestSession({
     bot,
-    chat: () => ({ text: 'já vou', task: 'follow Gabriel' }),
-    actions: (p) => (/why now:.*chat request/.test(p) ? { a: 'follow', player: 'Gabriel' } : null)
+    chat: () => ({ text: 'já vou', task: 'follow Steve' }),
+    actions: (p) => (/why now:.*chat request/.test(p) ? { a: 'follow', player: 'Steve' } : null)
   })
   try {
     s.spawn()
     await sleep(150)
-    addPlayer(bot, 2, 'Gabriel', 12.5, 0.5)
-    s.say('<Gabriel> zinc me segue')
+    addPlayer(bot, 2, 'Steve', 12.5, 0.5)
+    s.say('<Steve> zinc me segue')
     assert.ok(await s.until(() => s.internals().jobs.active().length > 0 || s.internals().skills.current(), 4000), 'a background job is running')
     const r = await consoleCmd(s.shared.host, 'stop')
     assert.equal(r.ok, true)
@@ -837,7 +837,7 @@ test('session: a permission switched off mid-run stops the matching tool and lea
     // Private messages off: a whisper does not leave either.
     host.config.set('communication.publicChat', true)
     host.config.set('communication.privateMessages', false)
-    await s.internals().executeAction({ a: 'say', t: 'oi', to: 'Gabriel' }, { threatIds: [], shownActionIds: [], shownProposals: [], goalId: null })
+    await s.internals().executeAction({ a: 'say', t: 'oi', to: 'Steve' }, { threatIds: [], shownActionIds: [], shownProposals: [], goalId: null })
     assert.deepEqual(bot.log.chat, [])
     assert.match(s.internals().results.slice(-1)[0].msg, /private messages are switched off/)
   } finally { s.stop() }

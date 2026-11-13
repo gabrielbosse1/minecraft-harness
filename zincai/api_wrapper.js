@@ -223,9 +223,9 @@ const ACTION_TOOLS = [
 const CHAT_TOOLS = [
   tool('reply', 'Respond to the player (or leave `text` empty to ignore/stay silent). Player requests are proposals, never mandatory commands.', {
     text: STR('One short chat line in Brazilian Portuguese. Empty = say nothing.'),
-    task: STR('Optional proposal for your action lane ONLY when you want your body to act, verify a claim in the world, or weigh goals (e.g. "go to Gabriel", "verify chest1 contents after Lucas claim"). Omit when declining, ignoring, or only chatting.'),
+    task: STR('Optional proposal for your action lane ONLY when you want your body to act, verify a claim in the world, or weigh goals (e.g. "go to Steve", "verify chest1 contents after Ely claim"). Omit when declining, ignoring, or only chatting.'),
     decision: { type: 'string', enum: ['accept', 'decline', 'ignore', 'negotiate', 'delay'], description: 'Optional stance when the player asked you to do something.' },
-    remember: STR('Only when the player told you something worth knowing later (where a thing is, whose it is, a plan, a date, what they like): that fact as one short sentence naming the player, e.g. "Gabriel keeps his diamonds in the chest on the second floor". Otherwise omit.')
+    remember: STR('Only when the player told you something worth knowing later (where a thing is, whose it is, a plan, a date, what they like): that fact as one short sentence naming the player, e.g. "Steve keeps his diamonds in the chest on the second floor". Otherwise omit.')
   }, ['text'])
 ]
 

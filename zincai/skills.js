@@ -4,7 +4,7 @@
  * The old tool set took coordinates and inventory slot numbers the model was
  * never shown, and reported nothing back. Every skill here:
  *
- *   - takes names ("Gabriel", "home", "chest2", "bread"), never raw indices;
+ *   - takes names ("Steve", "home", "chest2", "bread"), never raw indices;
  *   - moves through the ControlArbiter's task lane, so a flee reflex can
  *     interrupt it and it resumes afterwards;
  *   - is cancellable (a new instruction or `stop` ends it);
@@ -29,7 +29,7 @@ const fold = (text) => String(text ?? '').normalize('NFD').replace(/[\u0300-\u03
  *
  * The exact id, its plural, or its head noun ("sword" → iron_sword,
  * "planks" → oak_planks). Never the material: "diamond" used to match
- * diamond_pickaxe by substring, so "give Gabriel a diamond" handed over the
+ * diamond_pickaxe by substring, so "give Steve a diamond" handed over the
  * pickaxe when no loose diamonds were carried.
  */
 function matchItem (items, name) {
@@ -163,7 +163,7 @@ class Skills {
 
   // ---------------------------------------------------------- lifecycle --
 
-  /** What is running right now, for the prompt ("following Gabriel, 12 s"). */
+  /** What is running right now, for the prompt ("following Steve, 12 s"). */
   current () {
     const t = this._token
     if (!t) return null

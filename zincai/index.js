@@ -577,7 +577,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
 
   // Chat, results, requests and what the reflex did each have a section of
   // their own in the prompt; they stay out of the five-line event window so
-  // they cannot push a real event ("hit by player Gabriel") out of it.
+  // they cannot push a real event ("hit by player Steve") out of it.
   const OWN_SECTION = new Set(['chat', 'said', 'result', 'request', 'threat', 'safe', 'fled'])
   const note = (evt, opts = {}) => { try { memory.addEvent(evt, { window: !OWN_SECTION.has(evt?.type), ...opts }) } catch { /* never let memory break the loop */ } }
 

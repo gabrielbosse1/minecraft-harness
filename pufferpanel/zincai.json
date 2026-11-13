@@ -5,9 +5,9 @@
   "data": {
     "repo": {
       "type": "string",
-      "value": "https://github.com/gabrielbosse1/minecraft-harness.git",
+      "value": "https://github.com/your-name/minecraft-harness.git",
       "display": "Repository",
-      "desc": "Clone URL of the bot. For a private repository use SSH (git@github.com:owner/repo.git) with a deploy key on the node.",
+      "desc": "Clone URL of YOUR copy of this repository (fork it first). For a private repository use SSH (git@github.com:owner/repo.git) with a deploy key on the node.",
       "required": true,
       "userEdit": false
     },

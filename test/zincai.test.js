@@ -101,15 +101,15 @@ test('chat line parser handles vanilla, whisper and common plugin formats', () =
   assert.deepEqual(parseChatLine('<Steve> hi zincAI'), { sender: 'Steve', text: 'hi zincAI', whisper: false })
   assert.deepEqual(parseChatLine('alex whispers to you: where are you?'), { sender: 'alex', text: 'where are you?', whisper: true })
   assert.equal(parseChatLine('A zombie escapes the darkness'), null)
-  const players = ['Gabriel', 'Pedro']
-  assert.deepEqual(parseChatLine('[VIP] Gabriel: oi', { players }), { sender: 'Gabriel', text: 'oi', whisper: false })
-  assert.deepEqual(parseChatLine('Gabriel » oi', { players }), { sender: 'Gabriel', text: 'oi', whisper: false })
-  assert.deepEqual(parseChatLine('<[Admin] Gabriel> oi', { players }), { sender: 'Gabriel', text: 'oi', whisper: false })
-  assert.equal(parseChatLine('[Gabriel -> me] segredo', { players }).whisper, true)
+  const players = ['Steve', 'Herobrine']
+  assert.deepEqual(parseChatLine('[VIP] Steve: oi', { players }), { sender: 'Steve', text: 'oi', whisper: false })
+  assert.deepEqual(parseChatLine('Steve » oi', { players }), { sender: 'Steve', text: 'oi', whisper: false })
+  assert.deepEqual(parseChatLine('<[Admin] Steve> oi', { players }), { sender: 'Steve', text: 'oi', whisper: false })
+  assert.equal(parseChatLine('[Steve -> me] segredo', { players }).whisper, true)
   // Loose formats only count for players who are actually online.
   assert.equal(parseChatLine('Server: restarting in 5', { players }), null)
-  assert.equal(parseChatLine('Gabriel was slain by Zombie', { players }), null)
-  assert.equal(parseChatLine('Gabriel: oi'), null, 'without the player list the loose formats are off')
+  assert.equal(parseChatLine('Steve was slain by Zombie', { players }), null)
+  assert.equal(parseChatLine('Steve: oi'), null, 'without the player list the loose formats are off')
 })
 
 test('block events beyond 20 blocks never trigger System 2', () => {
@@ -276,8 +276,8 @@ test('coerceAction maps tool_calls onto the internal action shape', () => {
   assert.deepEqual(shape.params, { l: 4, h: 2 })
   const craft = coerceAction({ tool_calls: [{ id: '3', type: 'function', function: { name: 'craft', arguments: '{"item":"crafting_table"}' } }] })
   assert.deepEqual(craft, { a: 'craft', item: 'crafting_table', i: 'crafting_table', _via: 'tool' })
-  const duel = coerceAction({ tool_calls: [{ id: '4', type: 'function', function: { name: 'attack', arguments: '{"player":"Gabriel"}' } }] })
-  assert.equal(duel.player, 'Gabriel')
+  const duel = coerceAction({ tool_calls: [{ id: '4', type: 'function', function: { name: 'attack', arguments: '{"player":"Steve"}' } }] })
+  assert.equal(duel.player, 'Steve')
   assert.equal(duel.n, undefined, 'a player is never passed as a loose type name')
   // Prose without a tool call is kept so the executor can tell the model.
   const prose = coerceAction({ content: 'Sure, I will go there now.' })

@@ -190,12 +190,12 @@ test('10.2 self-generated goals: create with reason, subgoals, reprioritize, com
       id: 'g3',
       priority: 80,
       origin: 'shared_project',
-      player: 'Gabriel',
-      note: 'Gabriel offered lanterns for the bridge'
+      player: 'Steve',
+      note: 'Steve offered lanterns for the bridge'
     }, selfSnap)
     assert.equal(it.goals.get('g3').priority, 80)
     assert.equal(it.goals.get('g3').originType, 'shared_project')
-    assert.deepEqual(it.goals.get('g3').participants, ['Gabriel'])
+    assert.deepEqual(it.goals.get('g3').participants, ['Steve'])
 
     // 4. Execute build_shape step -> links as child of g4 & records self-built construction when origin is self.
     await it.executeAction({ a: 'goal', operation: 'add', description: 'lay stone marker at camp', priority: 85 }, selfSnap)
@@ -214,10 +214,10 @@ test('10.2 self-generated goals: create with reason, subgoals, reprioritize, com
     assert.equal(it.continuity.identity.constructions[0].origin, 'self_built')
 
     // 5. Competing non-urgent player request does NOT cross-link under Zinc's self goal.
-    addPlayer(bot, 2, 'Pedro', 3, 0)
-    await it.executeAction({ a: 'go_to', player: 'Pedro' }, snapNow(it, { askedBy: 'Pedro' }))
+    addPlayer(bot, 2, 'Herobrine', 3, 0)
+    await it.executeAction({ a: 'go_to', player: 'Herobrine' }, snapNow(it, { askedBy: 'Herobrine' }))
     const pedroGoal = it.goals.list({}).find((g) => g.kind === 'go_to')
-    assert.equal(pedroGoal.origin, 'player:Pedro')
+    assert.equal(pedroGoal.origin, 'player:Herobrine')
     assert.notEqual(pedroGoal.parentId, g4.id, 'player request never mislinked as sub-step of Zinc self-goal')
   } finally {
     s.stop()
@@ -244,8 +244,8 @@ test('10.3 context resets (Scenarios 1–10): survives arbitrary resets without 
     // --- Scenario 1 (Exploring) & Scenario 5 (Right after creating a goal) ---
     it.continuity.observeEnvironment(bot, s.shared.places)
     await it.executeAction({ a: 'goal', operation: 'add', description: 'chart the northern ridge', reason: 'find high ground', priority: 65 }, snapNow(it, { askedBy: null }))
-    s.shared.convo.set('Gabriel', [{ who: 'them', text: 'huge old chat history line', ts: Date.now() }])
-    s.shared.chatLog.push({ who: 'Gabriel', text: 'huge old chat history line', ts: Date.now() })
+    s.shared.convo.set('Steve', [{ who: 'them', text: 'huge old chat history line', ts: Date.now() }])
+    s.shared.chatLog.push({ who: 'Steve', text: 'huge old chat history line', ts: Date.now() })
 
     const r15 = s.resetContext({ reason: 'mid_exploration_and_goal_create', wake: false })
     assert.equal(r15.resetCount, 1)
@@ -299,7 +299,7 @@ test('10.3 context resets (Scenarios 1–10): survives arbitrary resets without 
     // --- Scenario 4 (During combat/danger) & Scenario 7 (Multiple active/suspended goals) & Scenario 8 (Player communicating) ---
     await it.executeAction({ a: 'goal', operation: 'add', description: 'build storage room', priority: 75 }, snapNow(it, { askedBy: null }))
     await it.executeAction({ a: 'goal', operation: 'suspend', id: 'g1', note: 'pausing ridge survey while building storage' }, snapNow(it, { askedBy: null }))
-    it.continuity.addPendingEvent({ kind: 'player_request', from: 'Ana', text: 'meet Ana at the river' })
+    it.continuity.addPendingEvent({ kind: 'player_request', from: 'Alex', text: 'meet Alex at the river' })
     const zombie = addEntity(bot, 91, 'zombie', bot.entity.position.x + 3, 64, bot.entity.position.z)
     await it.system1.tick()
     assert.equal(it.system1.fleeing, true, 'fleeing from zombie')
@@ -308,7 +308,7 @@ test('10.3 context resets (Scenarios 1–10): survives arbitrary resets without 
     const p478 = it.buildActionPrompt(['post-reset']).text
     assert.match(p478, /SUSPENDED chart the northern ridge/, 'Scenario 7: suspended goal preserved')
     assert.match(p478, /PENDING build storage room/, 'Scenario 7: higher-priority pending goal preserved')
-    assert.match(p478, /Ana: "meet Ana at the river"/, 'Scenario 8: unhandled player communication survived context wipe')
+    assert.match(p478, /Alex: "meet Alex at the river"/, 'Scenario 8: unhandled player communication survived context wipe')
     delete bot.entities[zombie.id]
 
     // --- Scenario 10 (Process restart mid-multi-step action) ---
@@ -328,8 +328,8 @@ test('10.3 context resets (Scenarios 1–10): survives arbitrary resets without 
 // ============================================================================
 
 test('10.4 ownership & respect: protects player houses/private chests, never assumes home from visiting, and allows communal/own use', async () => {
-  assert.equal(classifySignOwnership('Casa do Gabriel', 'ZincAI').kind, 'player')
-  assert.equal(classifySignOwnership('Casa do Gabriel', 'ZincAI').owner, 'Gabriel')
+  assert.equal(classifySignOwnership('Casa do Steve', 'ZincAI').kind, 'player')
+  assert.equal(classifySignOwnership('Casa do Steve', 'ZincAI').owner, 'Steve')
   assert.equal(classifySignOwnership('Baú Comunitário', 'ZincAI').kind, 'shared')
   assert.equal(classifySignOwnership('Casa para Zinc', 'ZincAI').kind, 'own')
   assert.equal(classifySignOwnership('Bem-vindos ao servidor', 'ZincAI').kind, 'unknown')
@@ -358,15 +358,15 @@ test('10.4 ownership & respect: protects player houses/private chests, never ass
     assert.equal(it.results.at(-1).ok, false, 'cannot declare unverified location as home')
     assert.equal(it.continuity.identity.home, null)
 
-    // 2. Index containers and label Gabriel's chest vs communal chest.
+    // 2. Index containers and label Steve's chest vs communal chest.
     s.shared.places.scan(bot, { radius: 16, force: true })
     for (const e of s.shared.places.blocks.values()) {
-      if (e.x === 6 && e.z === 0) e.label = 'Baú do Gabriel'
+      if (e.x === 6 && e.z === 0) e.label = 'Baú do Steve'
       if (e.x === -5 && e.z === 0) e.label = 'Baú Comunitário'
     }
     it.continuity.observeEnvironment(bot, s.shared.places)
 
-    // 3. Autonomous `gather oak_log` refuses to mine logs attached to Gabriel's house!
+    // 3. Autonomous `gather oak_log` refuses to mine logs attached to Steve's house!
     const gatherHouse = await it.skills.gather({
       item: 'oak_log',
       count: 1,
@@ -376,7 +376,7 @@ test('10.4 ownership & respect: protects player houses/private chests, never ass
     assert.equal(gatherHouse.ok, false, 'refused to mine oak_log belonging to built structure/property')
     assert.equal(bot.blockAt(new Vec3(4, 64, 0)).name, 'oak_log', 'house oak_log untouched')
 
-    // 4. Add a wild tree far from Gabriel's claim at (-14,64,-10) -> `gather` mines the wild tree while skipping Gabriel's house!
+    // 4. Add a wild tree far from Steve's claim at (-14,64,-10) -> `gather` mines the wild tree while skipping Steve's house!
     bot.setBlock(-14, 64, -10, 'oak_log')
     let dugPos = null
     const origDig = bot.dig.bind(bot)
@@ -394,17 +394,17 @@ test('10.4 ownership & respect: protects player houses/private chests, never ass
     const gabrielChest = [...s.shared.places.blocks.values()].find((e) => e.x === 6)
     const sharedChest = [...s.shared.places.blocks.values()].find((e) => e.x === -5)
     await it.executeAction({ a: 'take', item: 'diamond', count: 1, where: gabrielChest.id }, autoSnap)
-    assert.equal(it.results.at(-1).ok, false, 'autonomous take from Gabriel private chest refused')
-    assert.match(it.results.at(-1).msg, /Gabriel's/)
+    assert.equal(it.results.at(-1).ok, false, 'autonomous take from Steve private chest refused')
+    assert.match(it.results.at(-1).msg, /Steve's/)
 
     assert.equal(it.continuity.containerTakeGuard(sharedChest, 'overworld', { askedBy: null }).ok, true)
-    assert.equal(it.continuity.containerTakeGuard(gabrielChest, 'overworld', { askedBy: 'Gabriel' }).ok, true, 'allowed when owner explicitly asks')
+    assert.equal(it.continuity.containerTakeGuard(gabrielChest, 'overworld', { askedBy: 'Steve' }).ok, true, 'allowed when owner explicitly asks')
 
-    // 6. Autonomous build overlapping Gabriel's property is refused!
+    // 6. Autonomous build overlapping Steve's property is refused!
     await it.executeAction({ a: 'set_mode', mode: 'builder' }, autoSnap)
     await it.executeAction({ a: 'build_shape', shape: 'floor', block: 'stone_bricks', params: { w: 2, d: 2 }, at: [5, 64, 1] }, snapNow(it, { askedBy: null }))
     assert.ok(await s.until(() => it.results.some((r) => r.label === 'build_shape' && !r.ok), 3000))
-    assert.match(it.results.find((r) => r.label === 'build_shape').msg, /overlaps .*Gabriel's property/)
+    assert.match(it.results.find((r) => r.label === 'build_shape').msg, /overlaps .*Steve's property/)
 
     // 7. Building Zinc's own shelter on unclaimed land establishes verified home!
     bot.entity.position.set(-18, 64, 12)

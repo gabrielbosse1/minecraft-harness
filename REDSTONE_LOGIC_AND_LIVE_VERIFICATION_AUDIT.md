@@ -10,9 +10,11 @@ Phase 4 report. Everything below separates three states honestly:
   `java`, and filtered egress in this environment; nothing in this report is a
   server measurement.
 
-Test counts at the time of writing: `test/redstone-logic-audit.test.js` is
-**41 tests → 36 pass, 0 fail, 5 skipped (documented gaps)**. The whole suite is
-**209 pass / 0 fail / 5 skipped**; `npm run check` passes.
+Test counts at the time of this audit: `test/redstone-logic-audit.test.js` was
+**41 tests → 36 pass, 0 fail, 5 skipped (documented gaps)** and the full suite
+was 209 pass / 0 fail / 5 skipped. The suite has grown since (see the current
+number in the top-level README); those five skipped redstone cases are still the
+five documented gaps. `npm run check` passes.
 
 ---
 
@@ -389,9 +391,9 @@ What a live server would add, and the checks that are ready to run against one:
 npm install
 npm run check
 node --test --test-timeout=20000 test/redstone-logic-audit.test.js   # 36 pass, 5 skipped
-npm test                                                              # 209 pass, 5 skipped
+npm test                                                              # the whole suite, no network
 ```
 
-Ad-hoc probes used while hunting the bugs live in `.zinc-test-run/probes/`.
-They are scratch material, not part of the suite, and they are excluded from the
-package test list on purpose.
+The ad-hoc probes used while hunting these bugs were scratch material and are not
+committed: everything that proved to be worth keeping became a case in
+`test/redstone-logic-audit.test.js`, which is what the suite runs.

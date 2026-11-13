@@ -181,7 +181,7 @@ test('the executor runs a dig request and reports the outcome back to the model'
   let asked = 0
   const session = startTestSession({
     bot,
-    actions: () => { asked++; return asked === 1 ? { a: 'dig', player: 'Gabriel' } : null }
+    actions: () => { asked++; return asked === 1 ? { a: 'dig', player: 'Steve' } : null }
   })
   try {
     session.spawn()
@@ -191,7 +191,7 @@ test('the executor runs a dig request and reports the outcome back to the model'
     assert.ok(prompts.length >= 2, 'the failed dig woke the model again')
     const feedback = prompts[prompts.length - 1]
     assert.match(feedback, /dig: FAILED/, 'the model is told the dig did not happen')
-    assert.match(feedback, /no player named "Gabriel"/, 'and why')
+    assert.match(feedback, /no player named "Steve"/, 'and why')
   } finally {
     session.stop?.()
   }

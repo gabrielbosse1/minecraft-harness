@@ -38,7 +38,6 @@ grouped as Endpoint, Minecraft Server, Behaviour, Limits and Installation.
 | `mode` | `BOT_MODE` | `explorer` | `explorer`, `hunter`, `builder`. |
 | `aliases` | `BOT_ALIASES` | `zinc` | Comma-separated chat names. |
 | `language` | `BOT_LANGUAGE` | `pt-BR` | Reply check; empty disables it. |
-| `candig` | `MC_CAN_DIG` | `false` | Break blocks it does not own. |
 | `scaffolding` | `MC_ALLOW_SCAFFOLDING` | `false` | Place/remove scaffolding while building. |
 | `elytra` | `MC_AUTO_ELYTRA` | `true` | Glide across long gaps. |
 | `rpm` | `INFERENCE_RPM` | `18` | Shared model-call budget per minute. |

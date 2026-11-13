@@ -140,7 +140,6 @@ function loadConfig () {
   if (aliases !== null) cfg.behavior.aliases = aliases.split(',').map((a) => a.trim().toLowerCase()).filter(Boolean)
   const language = settings.str('BOT_LANGUAGE', null)
   if (language !== null) cfg.behavior.language = language
-  if (settings.lookup('MC_CAN_DIG') !== undefined) cfg.behavior.allowDigging = settings.bool('MC_CAN_DIG', false)
   cfg.behavior.allowScaffolding = settings.bool('MC_ALLOW_SCAFFOLDING', cfg.behavior.allowScaffolding ?? false)
   cfg.behavior.autoElytra = settings.bool('MC_AUTO_ELYTRA', cfg.behavior.autoElytra ?? true)
   cfg.behavior.mode = settings.str('BOT_MODE', cfg.behavior.mode)
@@ -259,7 +258,7 @@ function main () {
     logger.info(TAG, `config: host=${cfg.server.host} port=${cfg.server.port} user=${cfg.server.username} auth=${cfg.server.auth} version=${cfg.server.version || 'auto'}`)
     logger.info(TAG, `amd: model=${cfg.amd.model} base=${cfg.amd.baseUrl} key=${cfg.amd.apiKey ? 'present' : 'MISSING'}`)
     logger.info(TAG, `data dir: ${DATA_DIR} (memories, places, goals, metrics)`)
-    logger.info(TAG, `behaviour: mode=${cfg.behavior.mode} aliases=${(cfg.behavior.aliases || []).join(',') || '-'} language=${cfg.behavior.language || 'off'} dig=${cfg.behavior.allowDigging ? 'yes' : 'no'} elytra=${cfg.behavior.autoElytra ? 'yes' : 'no'}`)
+    logger.info(TAG, `behaviour: mode=${cfg.behavior.mode} aliases=${(cfg.behavior.aliases || []).join(',') || '-'} language=${cfg.behavior.language || 'off'} elytra=${cfg.behavior.autoElytra ? 'yes' : 'no'}`)
     logger.info(TAG, `limits: rpm=${cfg.inference.rpm} minInterval=${cfg.inference.minIntervalMs}ms heartbeat=${cfg.inference.heartbeatMs}ms reconnect=${cfg.reconnect.enabled ? `${cfg.reconnect.maxAttempts} attempts` : 'off'}`)
     logger.info(TAG, `prompts: action ${SYSTEM_PROMPT.split(/\s+/).length} words, chat ${CHAT_PROMPT.split(/\s+/).length} words (static), ${ZINC_TOOLS.length} tools`)
     logger.info(TAG, 'policy: flee from real threats until the model decides; no PvP unless the model names a player; no friend list')
@@ -378,7 +377,6 @@ function startSession (shared, onEnded) {
     reachable: makeReachabilityCheck(bot, { Movements, goals })
   })
   const wrapper = new PathfinderWrapper(bot, {
-    allowDigging: Boolean(cfg.behavior.allowDigging),
     allowScaffolding: cfg.behavior.allowScaffolding === true,
     logger: wrapperLog,
     // A* only pays for threats that are real (line of sight / reachable / hit us).
@@ -590,7 +588,7 @@ function startSession (shared, onEnded) {
   // doing, with no checkpoint to resume from.
   const goalReg = shared.goals
   const GOALS = cfg.goals || {}
-  const GOAL_PRIORITY = { shelter: 80, corpse_run: 75, gather: 60, build: 55, build_shape: 55, craft: 50, go_to: 45, give: 45, follow: 40, take: 40, put: 40, light_up: 35, smelt: 35, sleep: 30, look_in: 25 }
+  const GOAL_PRIORITY = { shelter: 80, corpse_run: 75, gather: 60, build: 55, build_shape: 55, craft: 50, go_to: 45, dig: 45, give: 45, follow: 40, take: 40, put: 40, light_up: 35, smelt: 35, sleep: 30, look_in: 25 }
   const goalPriority = (tool) => Math.max(0, Math.min(100, Math.trunc(Number(GOAL_PRIORITY[String(tool)] ?? 45))))
   const SIDE_KINDS = new Set(['take', 'put', 'smelt', 'craft', 'sleep', 'look_in', 'use_block', 'give'])
   let goalToolSeq = 0
@@ -863,7 +861,7 @@ function startSession (shared, onEnded) {
   // Actions that are worth refusing when the world moved while the model was
   // thinking: a delayed answer must not start quiet work beside a new creeper
   // or resurrect a task that another controller already replaced.
-  const QUIET_TASKS = new Set(['build', 'build_shape', 'gather', 'take', 'put', 'smelt', 'sleep', 'use_block', 'craft', 'look_in', 'light_up', 'shelter', 'follow', 'go_to', 'run_script'])
+  const QUIET_TASKS = new Set(['build', 'build_shape', 'gather', 'take', 'put', 'smelt', 'sleep', 'use_block', 'craft', 'look_in', 'light_up', 'shelter', 'follow', 'go_to', 'dig', 'run_script'])
   function staleActionReason (action, snap) {
     if (GOALS.staleGuard === false) return null // opt out from config (debugging)
     if (!snap || !QUIET_TASKS.has(action.a)) return null
@@ -1680,6 +1678,12 @@ function startSession (shared, onEnded) {
         const where = action.player || action.place || (Number.isFinite(Number(action.x)) ? `${Math.round(Number(action.x))},${Math.round(Number(action.z))}` : 'somewhere')
         return startMain({ tool: 'go_to', label: `go to ${where}`, askedBy: snap.askedBy, detail: goalDetailFor('go_to', target), decision: decided(snap, { label: 'go_to' }), run: () => skills.goTo(target) })
       }
+      case 'dig': {
+        const target = { player: action.player, place: action.place, x: action.x, y: action.y, z: action.z, materials: action.materials, avoid: action.avoid }
+        const where = action.player || action.place || (Number.isFinite(Number(action.x)) ? `${Math.round(Number(action.x))},${Math.round(Number(action.z))}` : 'somewhere')
+        const limit = Array.isArray(action.materials) && action.materials.length ? ` breaking only ${action.materials.join('/')}` : ''
+        return startMain({ tool: 'dig', label: `dig to ${where}${limit}`, askedBy: snap.askedBy, detail: goalDetailFor('dig', target), decision: decided(snap, { label: 'dig' }), run: () => skills.dig(target) })
+      }
       case 'follow': {
         return startMain({ tool: 'follow', label: `follow ${action.player}`, askedBy: snap.askedBy, detail: goalDetailFor('follow', { player: action.player }), decision: decided(snap, { label: 'follow', ttlMs: 30 * 60_000 }), run: () => skills.follow({ player: action.player }) })
       }
@@ -1899,7 +1903,6 @@ function startSession (shared, onEnded) {
     // A fresh Movements every spawn; the wrapper re-applies EVERYTHING to it
     // (doors, mode, digging guard, scaffolding policy, threat costs).
     const movements = new Movements(bot)
-    movements.canDig = Boolean(cfg.behavior.allowDigging)
     movements.allowSprinting = true
     bot.pathfinder.setMovements(movements)
     wrapper.apply()
@@ -1953,7 +1956,7 @@ function startSession (shared, onEnded) {
 
     const taskLane = arbiter.lane('task', PRIORITY.task)
     executor = new BuilderExecutor(bot, { scaffoldBlocks: cfg.build.scaffoldBlocks, logger: wrapperLog, hands: taskLane })
-    skills = new Skills(bot, { arbiter, places, logger: wrapperLog, whisper: guard.whisper, executor: () => executor })
+    skills = new Skills(bot, { arbiter, places, logger: wrapperLog, whisper: guard.whisper, executor: () => executor, pathfinder: () => wrapper })
     wrapper.setMode(cfg.behavior.mode || 'explorer')
 
     brain = new Brain({

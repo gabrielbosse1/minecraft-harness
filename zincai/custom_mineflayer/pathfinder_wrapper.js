@@ -18,8 +18,11 @@
  *      the bot when they are in its way, and put back afterwards — but only
  *      the ones this bot touched. Never broken; iron doors and all trapdoors
  *      are never operated.
- *   2. Settable digging: config.allowDigging=false => pathfinder treats
- *      every block as unbreakable (canDig=false + safeToBreak()=>false).
+ *   2. Digging on request: the route itself never breaks blocks — a walk is
+ *      planned through what is there (doors are opened, see 1) and reports
+ *      "no path" instead of tunnelling. Breaking is something the MODEL asks
+ *      for, with the `dig` tool, which opens a bounded, one-shot corridor
+ *      (see beginDigging). Doors stay unbreakable either way.
  *   3. Door cost override: a door that needs a click costs `doorCost`
  *      (default 4) extra — the bot prefers going around when reasonably short.
  *   4. Human movement mimicry: ±2° yaw/pitch micro-jitter, variable
@@ -958,14 +961,18 @@ function scoutSafeAnchor (bot, {
 class PathfinderWrapper {
   /**
    * @param {import('mineflayer').Bot} bot
-   * @param {{ allowDigging?: boolean, allowScaffolding?: boolean, doorCost?: number,
+   * @param {{ allowScaffolding?: boolean, doorCost?: number,
    *           jitterDegrees?: number, logger?: (level:string,msg:string)=>void,
    *           threat?: object, windCharge?: object, enableWindCharge?: boolean,
    *           isUrgent?: () => boolean }} [opts]
    */
   constructor (bot, opts = {}) {
     this.bot = bot
-    this.allowDigging = opts.allowDigging !== undefined ? Boolean(opts.allowDigging) : false
+    // Digging is not an operator switch any more: planning never breaks blocks,
+    // and a `dig` request grants the pathfinder a corridor for exactly one walk.
+    // { canDig: Set<blockId|null>, cantDig: Set<blockId|null>, expiresAt } | null
+    this._digWindow = null
+    this._digTimer = null
     // Pillaring up and bridging with dirt/cobblestone is upstream's default.
     // Around other people's builds that is griefing, so it is OFF unless the
     // operator opts in (behavior.allowScaffolding) for wilderness travel.
@@ -1071,7 +1078,9 @@ class PathfinderWrapper {
    */
   configureMovements (movements = this._movements()) {
     if (!movements) return false
-    this._configureDigging(movements)
+    // The prototype patch calls this after every collision-index rebuild.
+    movements._zincaiAfterCollisionIndex = () => this._applyBreakPolicy(movements)
+    this._applyBreakPolicy(movements)
     this._configureScaffolding(movements)
     this._configureDoors(movements)
     this._configureWalkableSurfaces(movements)
@@ -1096,7 +1105,7 @@ class PathfinderWrapper {
     }
     if (this._appliedOnce) return this._applied
     this._appliedOnce = true
-    this._patchDigging()
+    this._patchCollisionIndex()
     this._patchStairClearance()
     this._onPathSeen = (result) => { if (result && Array.isArray(result.path)) this._path = result.path }
     this.bot.on('path_update', this._onPathSeen)
@@ -1227,27 +1236,133 @@ class PathfinderWrapper {
   }
 
   // ------------------------------------------------------------- digging--
-  _configureDigging (movements) {
-    if (this.allowDigging) return
-    movements.canDig = false
-    movements.digCost = 1000 // belt and braces: digging is never "cheap"
+  /**
+   * Digging by request. Planning never breaks blocks: a walk routes around,
+   * opens doors, or reports "no path". When the MODEL asks to dig, this opens a
+   * tight one-shot window and the route through it is planned around it:
+   *
+   *   options.canDig   block ids the walk MAY break (a material filter: only
+   *                    logs, or only dirt and stone). null = anything except
+   *                    the blocks that are never broken.
+   *   options.cantDig  block ids the walk must NOT break, whatever canDig says
+   *                    (a friend's build, anything precious).
+   *
+   * The window lapses as soon as the walk ends (endDigging) and in any case
+   * after maxMs. While it is open, only the current walk can use it: escapes,
+   * follow and every other path keep the stricter no-dig geometry.
+   */
+  beginDigging ({ canDig = null, cantDig = [], avoid = [], maxMs = 60_000 } = {}) {
+    const toIds = (names) => {
+      const registry = this.bot?.registry
+      const ids = new Set()
+      for (const name of [].concat(names || [])) {
+        const id = registry?.blocksByName?.[String(name).toLowerCase()]?.id
+        if (id !== undefined) ids.add(id)
+      }
+      return ids
+    }
+    this._digWindow = {
+      canDig: canDig === null ? null : toIds(canDig),
+      cantDig: toIds([].concat(cantDig || [], avoid || [])),
+      expiresAt: Date.now() + Math.max(1_000, Number(maxMs) || 60_000)
+    }
+    clearTimeout(this._digTimer)
+    this._digTimer = setTimeout(() => this.endDigging('expired'), Math.max(1_000, Number(maxMs) || 60_000))
+    try { this._digTimer.unref?.() } catch { /* older node */ }
+    // Movements objects recreate their per-move caches; reconfigure the live one.
+    const movements = this._movements()
+    if (movements) this._applyBreakPolicy(movements)
+    return this.digging
   }
 
-  _patchDigging () {
-    if (this.allowDigging) {
-      this.log('debug', 'allowDigging=true — pathfinder may break blocks to route')
-      return
+  /** Close the dig window: the next route is planned with no digging at all. */
+  endDigging (reason = 'done') {
+    if (!this._digWindow) return false
+    this._digWindow = null
+    clearTimeout(this._digTimer)
+    this._digTimer = null
+    const movements = this._movements()
+    if (movements) this._applyBreakPolicy(movements)
+    this.log('debug', `dig window closed (${reason})`)
+    return true
+  }
+
+  /** Is a dig window open right now? For prompts and logs. */
+  get digging () {
+    const w = this._digWindow
+    if (!w) return null
+    if (Date.now() > w.expiresAt) { this.endDigging('expired'); return null }
+    return { canDig: w.canDig ? [...w.canDig] : null, cantDig: [...w.cantDig], expiresAt: w.expiresAt }
+  }
+
+  /** Block ids that are never breakable, whatever the window says. */
+  _doorBlockIds () {
+    const registry = this.bot?.registry
+    const ids = []
+    if (registry?.blocksArray) for (const block of registry.blocksArray) if (doors.kindOf(block.name)) ids.push(block.id)
+    return ids
+  }
+
+  /**
+   * The whole break policy for one Movements, recomputed from scratch.
+   *
+   * It is recomputed, not patched: upstream's updateCollisionIndex() rebuilds
+   * blocksCantBreak on every plan, so anything added once disappears at the
+   * next replan. updateCollisionIndex is patched (once) to call back here, and
+   * beginDigging/endDigging call it directly.
+   */
+  _applyBreakPolicy (movements) {
+    const w = this._digWindow
+    const allowed = Boolean(w) && Date.now() <= w.expiresAt
+    // Upstream's own digCost (1) prices a break by its dig time, and its
+    // per-move cost cap (100) is what stops a very hard block from being an
+    // option at all. Raising digCost here would make a two-block-high tunnel
+    // through stone unaffordable, so the window keeps the default and the
+    // closed window is what makes breaking impossible.
+    movements.canDig = allowed
+    movements.digCost = allowed ? 1 : 1000
+    // Never carve into a liquid wall, never mine what holds gravel or a mob up.
+    movements.dontCreateFlow = true
+    movements.dontMineUnderFallingBlock = true
+
+    const set = movements.blocksCantBreak
+    if (!set) return
+    // Upstream's own defaults (chests and friends) are captured once, so a
+    // lapsed window cannot leave an allowlist behind or erase that list.
+    if (!movements._zincaiBaseCantBreak) movements._zincaiBaseCantBreak = new Set(set)
+    set.clear()
+    for (const id of movements._zincaiBaseCantBreak) set.add(id)
+    // Doors and gates are opened, never broken — in every window.
+    for (const id of this._doorBlockIds()) set.add(id)
+    const cant = (id) => { if (id !== undefined && id !== null) set.add(id) }
+    if (allowed) {
+      const registry = this.bot?.registry
+      if (w.canDig) {
+        // An allowlist: everything not named is unbreakable.
+        if (registry?.blocksArray) for (const b of registry.blocksArray) if (!w.canDig.has(b.id)) cant(b.id)
+      } else if (registry?.blocksByName) {
+        // No allowlist: anything goes except the world itself.
+        for (const name of ['bedrock', 'barrier', 'command_block', 'end_portal_frame', 'spawner']) cant(registry.blocksByName[name]?.id)
+      }
+      for (const id of w.cantDig) cant(id)
     }
-    // Prototype-level: even if something sets canDig=true later, breakable
-    // blocks still cannot be "safely broken" for moves when digging is off.
+  }
+
+  /**
+   * Upstream rebuilds blocksCantBreak inside updateCollisionIndex(), which runs
+   * on every plan — so the break policy has to be re-asserted after it, not
+   * before it. One prototype patch per loaded package, per instance hook.
+   */
+  _patchCollisionIndex () {
     try {
       const { Movements } = require('mineflayer-pathfinder')
-      this._patch(Movements.prototype, 'safeToBreak', (orig) => function () {
-        if (!this.canDig) return false
-        return orig.apply(this, arguments)
+      this._patch(Movements.prototype, 'updateCollisionIndex', (orig) => function () {
+        const out = orig.apply(this, arguments)
+        try { this._zincaiAfterCollisionIndex?.() } catch { /* fail soft */ }
+        return out
       })
     } catch (err) {
-      this.log('warn', `digging guard not patched: ${err.message || err}`)
+      this.log('warn', `break policy hook not patched: ${err.message || err}`)
     }
   }
 
@@ -1314,11 +1429,8 @@ class PathfinderWrapper {
 
   // -------------------------------------------------------------- doors--
   _configureDoors (movements) {
-    const registry = this.bot.registry
-    // Even with digging allowed, a door is opened or routed around, never broken.
-    if (registry?.blocksArray && movements.blocksCantBreak) {
-      for (const block of registry.blocksArray) if (doors.kindOf(block.name)) movements.blocksCantBreak.add(block.id)
-    }
+    // Even with digging allowed, a door is opened or routed around, never
+    // broken — _applyBreakPolicy() enforces that on every replan.
     const attached = doors.attachDoors(movements, { operate: true, isJammed: (key) => this._doorJammed(key), stepCost: this.doorCost })
     if (!attached) this.log('warn', 'door routing not attached — Movements.getBlock missing')
     return attached
@@ -1566,6 +1678,9 @@ class PathfinderWrapper {
 
   /** Remove OUR timers and physicsTick listeners (called on shutdown). */
   stop () {
+    clearTimeout(this._digTimer)
+    this._digTimer = null
+    this._digWindow = null
     clearTimeout(this._jitterTimer)
     clearTimeout(this._sprintTimer)
     clearInterval(this._jumpSprintTimer)

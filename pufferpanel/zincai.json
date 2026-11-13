@@ -140,14 +140,6 @@
       "required": false,
       "userEdit": true
     },
-    "candig": {
-      "type": "boolean",
-      "value": false,
-      "display": "Allow Digging",
-      "desc": "Let the bot break blocks it does not own while pathfinding. Off keeps it to jumping and detours.",
-      "required": true,
-      "userEdit": true
-    },
     "scaffolding": {
       "type": "boolean",
       "value": false,
@@ -284,7 +276,6 @@
         "mode",
         "aliases",
         "language",
-        "candig",
         "scaffolding",
         "elytra"
       ],
@@ -414,7 +405,6 @@
       "MC_PORT": "${port}",
       "MC_VERSION": "${mcversion}",
       "MC_AUTH": "${auth}",
-      "MC_CAN_DIG": "${candig}",
       "MC_ALLOW_SCAFFOLDING": "${scaffolding}",
       "MC_AUTO_ELYTRA": "${elytra}",
       "BOT_MODE": "${mode}",

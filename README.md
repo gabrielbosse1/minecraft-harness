@@ -86,8 +86,12 @@ table.
 - **One owner for movement.** Survival, combat and task lanes arbitrate
   movement goals and keys (`survival > combat > task`), so concurrent behavior
   cannot leave controls held or cancel a more urgent flee.
-- **Vanilla-only operation.** No RCON, no console commands, no teleporting. The
-  client refuses to break blocks it does not own unless the panel allows it.
+- **Vanilla-only operation.** No RCON, no console commands, no teleporting.
+- **Digging is the model's call.** Pathfinding never breaks blocks on its own:
+  it opens doors, routes around, or reports no path. The model asks with the
+  `dig` tool, optionally restricting which block ids it may break
+  (`materials`) or protecting others (`avoid`). The permission covers one walk
+  and lapses when it ends; doors are never broken.
 - **Reconnects.** A failed first join (including a whitelist rejection) is
   fatal. After a successful spawn, a dropped connection or server restart is
   retried with backoff under the same name.
@@ -111,7 +115,7 @@ vendor/            vendored Minecraft 26.3 data, installed by `npm ci`
 ## Checks and tests
 
 ```sh
-npm test              # 108 tests: mock bots + a scripted local model
+npm test              # 120 tests: mock bots + a scripted local model
 npm run check         # syntax-check every module
 npm run dry-run       # resolve config, print it, no network
 npm run ping          # server reachability/version, no join, no model call

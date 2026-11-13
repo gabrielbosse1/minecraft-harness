@@ -5,6 +5,7 @@
  */
 'use strict'
 
+const { EventEmitter } = require('node:events')
 const { Vec3 } = require('vec3')
 const registry = require('prismarine-registry')('1.21.4')
 const Block = require('prismarine-block')(registry)
@@ -24,13 +25,16 @@ const flat = (x, y, z) => y <= 63
  */
 function makeWorld (solidFn = flat, { items = [] } = {}) {
   const cache = new Map()
-  const bot = {
+  const bot = Object.assign(new EventEmitter(), {
     registry,
     version: '1.21.4',
     game: { minY: -64, height: 384 },
     entity: { id: 1, position: new Vec3(0.5, 64, 0.5), velocity: new Vec3(0, -0.0784, 0), onGround: true, height: 1.8, width: 0.6, yaw: 0, pitch: 0 },
     entities: {},
     inventory: { items: () => items.map(([name, count]) => ({ name, count, type: registry.itemsByName[name].id })) },
+    // mineflayer-pathfinder -> bot.pathfinder.bestHarvestTool(block) whenever a
+    // route may break a block. No tools in these worlds: an empty hand.
+    pathfinder: { bestHarvestTool: () => null },
     blockAt (p) {
       const x = Math.floor(p.x); const y = Math.floor(p.y); const z = Math.floor(p.z)
       const key = x + ',' + y + ',' + z
@@ -44,7 +48,7 @@ function makeWorld (solidFn = flat, { items = [] } = {}) {
       }
       return b
     }
-  }
+  })
   bot.entities[1] = bot.entity
   return bot
 }

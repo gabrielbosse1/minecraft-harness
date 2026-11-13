@@ -99,7 +99,6 @@ test('config: template environment variables drive every documented knob', () =>
     MC_PORT: '25566',
     MC_VERSION: '1.21.4',
     MC_AUTH: 'MICROSOFT',
-    MC_CAN_DIG: 'true',
     MC_ALLOW_SCAFFOLDING: 'true',
     MC_AUTO_ELYTRA: 'false',
     BOT_MODE: 'builder',
@@ -124,7 +123,6 @@ test('config: template environment variables drive every documented knob', () =>
     assert.equal(cfg.amd.timeoutMs, 45000)
     assert.equal(cfg.amd.chatTimeoutMs, 60000)
     assert.equal(cfg.amd.maxConcurrent, 1)
-    assert.equal(cfg.behavior.allowDigging, true)
     assert.equal(cfg.behavior.allowScaffolding, true)
     assert.equal(cfg.behavior.autoElytra, false)
     assert.equal(cfg.behavior.mode, 'builder')
@@ -156,7 +154,6 @@ test('config: with nothing set, the committed defaults are a valid offline deplo
     assert.equal(cfg.server.port, 25565)
     assert.equal(cfg.server.version, false, 'empty MC_VERSION means auto-detect')
     assert.equal(cfg.server.auth, 'offline')
-    assert.equal(cfg.behavior.allowDigging, false)
   })
 })
 

@@ -293,6 +293,27 @@ Tool schemas and their argument descriptions are the source of truth in
 [`system_prompt.txt`](system_prompt.txt) and the chat voice in
 [`chat_prompt.txt`](chat_prompt.txt).
 
+## Digging is the model's decision
+
+There is no digging switch: not an operator variable, not a config flag. A
+route is always planned through the world as it is — doors and gates are
+opened, hazards are avoided, and if there is no way through the walk reports
+"no path" instead of tunnelling.
+
+Breaking is a request. The model calls the `dig` tool with a destination
+(player, saved place or `[x,y,z]`) and optionally:
+
+- `materials` — a list of block ids it may break (`[oak_log]`, `[dirt, stone]`);
+  everything else becomes unbreakable for that trip;
+- `avoid` — block ids it must never break, whatever else is allowed.
+
+That permission is a *window*, not a setting: it opens for one walk, closes
+when the walk ends (success, no-path, cancellation or a safety preemption), and
+expires on its own after at most two minutes. Escapes, `follow` and every other
+route keep the strict no-dig geometry. Doors, gates and trapdoors are never
+breakable in any window, and a route never carves into liquid or mines what
+holds up gravel or a mob.
+
 ## Configuration and operation
 
 [`config.json`](config.json) holds **defaults only**. Everything it contains is
@@ -306,7 +327,7 @@ no dotenv; nothing is read from a file the panel does not control.
 | `MC_HOST`, `MC_PORT` | Minecraft server address and port. |
 | `MC_VERSION` | Explicit protocol version; empty means auto-detect. |
 | `MC_AUTH` | `offline` or `microsoft`. An unsupported value fails the boot. |
-| `MC_CAN_DIG`, `MC_ALLOW_SCAFFOLDING`, `MC_AUTO_ELYTRA` | World-mutation and elytra switches. |
+| `MC_ALLOW_SCAFFOLDING`, `MC_AUTO_ELYTRA` | Pillar/bridge while travelling, and elytra gliding. |
 | `AMD_API_KEY`, `API_KEY`, `RADEON_API_KEY` | API key. Set it as a panel variable; it is never written to disk. |
 | `AMD_API_BASE_URL`, `AMD_MODEL` | Endpoint base URL and model alias. |
 | `AMD_MAX_TOKENS`, `AMD_TEMPERATURE`, `AMD_API_TIMEOUT_MS`, `AMD_CHAT_TIMEOUT_MS`, `AMD_MAX_CONCURRENT` | Model-call shape and lane concurrency. |
@@ -318,7 +339,7 @@ no dotenv; nothing is read from a file the panel does not control.
 | `ZINC_DATA_DIR` | Writable data directory (relative to the server folder in the template). |
 | `LOG_LEVEL` | `debug`, `info`, `warn` or `error`. |
 
-Dotted names (`server.host`, `amd.model`, `behavior.allowDigging`, ...) are
+Dotted names (`server.host`, `amd.model`, `behavior.allowScaffolding`, ...) are
 accepted as well and mean the same key in `config.json`, so a single default can
 be overridden without inventing a template variable. An empty variable always
 means "not set" — it can never blank a default by accident.

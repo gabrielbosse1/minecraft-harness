@@ -1,5 +1,5 @@
 {
-  "_comment": "ZincAI runtime defaults. Every value can be overridden by environment variables, which is how a PufferPanel template configures it: MC_HOST, MC_PORT, MC_VERSION, MC_AUTH, MC_CAN_DIG, MC_ALLOW_SCAFFOLDING, MC_AUTO_ELYTRA, AMD_API_BASE_URL, AMD_MODEL, AMD_API_KEY (or API_KEY / RADEON_API_KEY), AMD_MAX_TOKENS, AMD_TEMPERATURE, AMD_API_TIMEOUT_MS, AMD_CHAT_TIMEOUT_MS, AMD_MAX_CONCURRENT, BOT_MODE, BOT_ALIASES, BOT_LANGUAGE, INFERENCE_RPM, INFERENCE_MIN_INTERVAL_MS, INFERENCE_HEARTBEAT_MS, RECONNECT, RECONNECT_MAX_ATTEMPTS, ZINC_DATA_DIR, LOG_LEVEL. Dotted names (server.host, amd.model, ...) are accepted too and mean the same key in this file. There is no .env: leave amd.apiKey EMPTY and let the panel pass the key as a secret variable.",
+  "_comment": "ZincAI runtime defaults. Every value can be overridden by environment variables, which is how a PufferPanel template configures it: MC_HOST, MC_PORT, MC_VERSION, MC_AUTH, MC_ALLOW_SCAFFOLDING, MC_AUTO_ELYTRA, AMD_API_BASE_URL, AMD_MODEL, AMD_API_KEY (or API_KEY / RADEON_API_KEY), AMD_MAX_TOKENS, AMD_TEMPERATURE, AMD_API_TIMEOUT_MS, AMD_CHAT_TIMEOUT_MS, AMD_MAX_CONCURRENT, BOT_MODE, BOT_ALIASES, BOT_LANGUAGE, INFERENCE_RPM, INFERENCE_MIN_INTERVAL_MS, INFERENCE_HEARTBEAT_MS, RECONNECT, RECONNECT_MAX_ATTEMPTS, ZINC_DATA_DIR, LOG_LEVEL. Dotted names (server.host, amd.model, ...) are accepted too and mean the same key in this file. There is no .env: leave amd.apiKey EMPTY and let the panel pass the key as a secret variable.",
   "server": {
     "host": "127.0.0.1",
     "port": 25565,
@@ -54,13 +54,12 @@
     "trusted": []
   },
   "behavior": {
-    "_note": "No friend list and no PvP switch: the bot never attacks a player unless the model names that player in the attack tool. Its reflex toward every real threat is to flee until the model decides.",
+    "_note": "No friend list, no PvP switch, and no digging switch: the bot never attacks a player unless the model names that player, its reflex toward every real threat is to flee until the model decides, and pathfinding never breaks blocks on its own (the model asks with the `dig` tool).",
     "aliases": [
       "zinc"
     ],
     "language": "pt-BR",
     "_languageNote": "Every outgoing chat line is checked against this language (pt-BR only; '' switches the check off). A reply in another language is retried once, then replaced by a fixed line.",
-    "allowDigging": false,
     "allowScaffolding": false,
     "engageRadius": 24,
     "fovDegrees": 90,

@@ -62,6 +62,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const { AmdToolsClient, createZincTools } = require('./api_wrapper')
 const { FailGate } = require('./failgate')
 const { ContinuityStore } = require('./continuity')
+const { LaneScheduler, JobRegistry, laneOf, LANES } = require('./lanes')
 const ZINC_TOOLS = createZincTools()
 
 // logger.js is plain text with ISO timestamps — Pufferpanel-safe by design.
@@ -338,6 +339,12 @@ function main () {
  */
 function startSession (shared, onEnded) {
   const { cfg, memory, places, amd, parser } = shared
+  // Logical execution lanes: BODY is exclusive, COMPUTATION / INTERACTION /
+  // WORLD INFO may overlap. Every tool call takes a lease, and the lease is
+  // released on success, failure, cancellation and context reset.
+  const lanes = new LaneScheduler()
+  const jobs = new JobRegistry({ lanes })
+
   const mineflayer = require('mineflayer')
   const { pathfinder, goals, Movements } = require('mineflayer-pathfinder')
   const { Vec3 } = require('vec3')
@@ -2004,6 +2011,21 @@ function startSession (shared, onEnded) {
       return report(a, { ok: false, msg: stale }, { wake: false })
     }
     if (a !== 'idle') logger.info(TAG, `action: ${a} ${JSON.stringify(Object.fromEntries(Object.entries(action).filter(([k]) => !k.startsWith('_') && k !== 'a')))}`)
+    // Take the lane this tool belongs to. BODY is exclusive, so a second
+    // physical action cannot start while one is in flight; COMPUTATION,
+    // INTERACTION and WORLD_INFO run alongside it. `tryAcquire` is used for
+    // read-only tools (they must not queue behind a long walk) and `acquire`
+    // for everything that has to be serialised. The lease is released in the
+    // finally block of the executor wrapper below.
+    let laneLease = null
+    try {
+      const lane = laneOf(a)
+      if (lane === LANES.WORLD_INFO || lane === LANES.COMPUTATION) {
+        laneLease = lanes.tryAcquire(a, { goalId: agenda.main?.goalId || null })
+      } else {
+        laneLease = await lanes.acquire(a, { goalId: agenda.main?.goalId || null })
+      }
+    } catch { laneLease = null }
     gateCtx = action
     const IMMEDIATE_TRACKED = new Set(['say', 'stop', 'hold', 'equip', 'redstone_scan', 'redstone_component', 'redstone_engineer', 'recall', 'circuit_project', 'logic_test', 'inspect_region', 'inspect_block', 'find', 'remember_here', 'note', 'social', 'goal', 'set_mode'])
     currentActId = IMMEDIATE_TRACKED.has(a)
@@ -2361,7 +2383,13 @@ function startSession (shared, onEnded) {
       default:
         return report(String(a), { ok: false, msg: `unknown action "${a}"` })
     }
-    } finally { gateCtx = null; currentActId = null }
+    } finally {
+      gateCtx = null
+      currentActId = null
+      // The lane lease is always released here — success, failure, an early
+      // return or a thrown error. A leaked BODY lock would freeze the avatar.
+      try { laneLease?.release('action finished') } catch { /* noop */ }
+    }
   }
 
   // ------------------------------------------ optional Scout & Relocate --
@@ -3030,6 +3058,9 @@ function startSession (shared, onEnded) {
    */
   function resetContext ({ reason = 'context_reset', wake = true } = {}) {
     decisionEpoch++
+    // A context reset must not leave a lane locked or a background job running
+    // against a world the model no longer remembers.
+    try { lanes.releaseAll('context reset') } catch { /* noop */ }
     results.length = 0
     try { memory.working.clear() } catch { /* noop */ }
     try { if (memory.shortTerm) memory.shortTerm.items = [] } catch { /* noop */ }
@@ -3117,6 +3148,7 @@ function startSession (shared, onEnded) {
       arbiter, sense, wrapper, combat, system1, skills, brain, results, agenda,
       events: pipeline, latency, redstoneEngineer, redstoneLibrary: shared.redstoneLibrary,
       goals: goalReg, continuity, resetContext, executeAction, buildActionPrompt, buildChatPrompt,
+      lanes, jobs, laneOf: (tool) => laneOf(tool), LANES,
       // Goal orchestration surface (tests and the session's own monitor):
       startMain, resumeMain, finishGoal, runGoalOp, goalLines, goalTick,
       reconcileRestored, reconcileGoal, verifyGoalAgainstWorld, staleActionReason

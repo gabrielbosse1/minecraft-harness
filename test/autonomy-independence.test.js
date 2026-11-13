@@ -264,6 +264,13 @@ test('10.3 context resets (Scenarios 1–10): survives arbitrary resets without 
     assert.ok(await s.until(() => !it.agenda.main && Math.hypot(bot.entity.position.x - 18, bot.entity.position.z) < 2.5, 5000), 'navigation completed smoothly across mid-walk context reset')
 
     // --- Scenario 6 (After a tool succeeded in world BEFORE model received its result!) ---
+    // Freeze the decision loop so this scenario stages exactly the race it names:
+    // the world already changed, but no model turn has received the outcome yet.
+    // (Otherwise a background turn can legitimately deliver the result first, and
+    // the assertion below would be testing the scheduler's mood, not continuity.)
+    const wasPaused = it.brain.paused
+    it.brain.paused = true
+    await s.until(() => !it.brain.busyAction, 2000)
     bot.entity.position.set(3.5, 64, 0.5)
     s.shared.places.scan(bot, { radius: 16, force: true })
     await it.executeAction({ a: 'put', item: 'iron_ingot', count: 3, where: 'chest1' }, snapNow(it, { askedBy: null }))
@@ -276,6 +283,7 @@ test('10.3 context resets (Scenarios 1–10): survives arbitrary resets without 
     assert.match(snap6.text, /completed before reset \(do NOT repeat\): .*\[act_\d+\] put.*OK/, 'undelivered completed action explicitly surfaced to prevent duplicate execution')
     it.continuity.markActionsDelivered(snap6.shownActionIds)
     assert.doesNotMatch(it.buildActionPrompt(['next-turn']).text, /completed before reset \(do NOT repeat\): .*put/)
+    it.brain.paused = wasPaused
 
     // --- Scenario 3 (During construction) & Scenario 9 (Player modifies environment) ---
     await it.executeAction({ a: 'set_mode', mode: 'builder' }, snapNow(it, { askedBy: null }))

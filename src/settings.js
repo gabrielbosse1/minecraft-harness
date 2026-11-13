@@ -13,8 +13,8 @@
  *   - SHOUTING_SNAKE_CASE (MC_HOST, AMD_MODEL, ZINC_DATA_DIR ...) — the
  *     PufferPanel template variables. Always win.
  *   - dotted.lowerCase (server.host, amd.model ...) — the same meaning as the
- *     keys inside zincai/config.json. Accepted so a deployment can override a
- *     single config.json value without a new template variable.
+ *     keys inside zincai/defaults.json. Accepted so a deployment can override a
+ *     single defaults.json value without a new template variable.
  *
  * Booleans and integers are read leniently: a template checkbox arrives as
  * "true"/"false" and a number as "10", but hand-written values ("yes", 1) work

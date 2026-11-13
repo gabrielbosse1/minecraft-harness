@@ -167,9 +167,9 @@ test('the model can call dig, and the schema says it is the only way to break an
 })
 
 test('the operator-facing digging switch is gone from config and template', () => {
-  const config = require('../zincai/config.json')
+  const config = require('../zincai/config/defaults.json')
   const template = require('../pufferpanel/zincai.json')
-  assert.equal(config.behavior.allowDigging, undefined, 'config.json has no digging switch')
+  assert.equal(config.behavior.allowDigging, undefined, 'defaults.json has no digging switch')
   assert.equal(template.data.candig, undefined, 'the template has no digging variable')
   assert.equal(template.run.environmentVars.MC_CAN_DIG, undefined, 'and no digging environment variable')
   assert.ok(template.data.scaffolding, 'scaffolding is a different switch and stays')

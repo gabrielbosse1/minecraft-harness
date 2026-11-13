@@ -177,6 +177,31 @@ install Node by hand. What *can* bite on a small ARM board:
 | Slow replies, timeouts | The model runs in the cloud; latency is the endpoint, not the board. |
 | "Unsupported environment on the selected node" | The node advertises nothing (`docker.disallowHost=true` in the daemon config removes host/tty/standard). |
 
+## Two entries, one of them blank
+
+PufferPanel scans your repo rather than looking for a specific file: **every
+non-dot top-level folder**, and **every `*.json` directly inside it** except
+`data.json`, becomes a template named after the file (`services/templates.go`).
+A JSON that is not a template is still listed — no display name, no
+`supportedEnvironments` — so it sits there blank and can never be used.
+
+If you see a nameless greyed-out entry next to the real one, that is a stray
+`<folder>/<file>.json` in the repo you forked. Check with:
+
+```sh
+node pufferpanel/doctor.js --scan .      # non-zero if anything is not a template
+```
+
+The bot's defaults file moved to `zincai/config/defaults.json` for exactly this
+reason — at `zincai/config.json` it was being imported as a nameless template.
+
+### After updating: sync your fork
+
+The `repo` variable points at **your** fork, so a fix merged upstream does not
+reach the panel until your fork has it (`git pull` the default branch, or
+"Sync fork" on GitHub), **and** the panel's 5-minute template cache expires.
+Both of those are common reasons for "I applied the fix and nothing changed".
+
 ## Step 4 — install and start
 
 Press **Install**. On a host node the template:

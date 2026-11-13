@@ -37,9 +37,9 @@
  *   node zincai/index.js --dry-run   validate config + prompts, no network
  *   node zincai/index.js --check     require-check every module, no bot
  *
- * Config: zincai/config.json (+ env overrides: MC_HOST, MC_PORT, MC_VERSION,
+ * Config: zincai/defaults.json (+ env overrides: MC_HOST, MC_PORT, MC_VERSION,
  *   MC_AUTH, AMD_API_BASE_URL, AMD_MODEL, AMD_API_KEY/API_KEY, ZINC_DATA_DIR,
- *   LOG_LEVEL). AMD key resolution order: env -> config.json.
+ *   LOG_LEVEL). AMD key resolution order: env -> defaults.json.
  */
 'use strict'
 
@@ -91,7 +91,7 @@ function option (envName, configName, fallback, allowed) {
 }
 
 function loadConfig () {
-  const file = path.join(ZINC_DIR, 'config.json')
+  const file = path.join(ZINC_DIR, 'config', 'defaults.json')
   const raw = JSON.parse(fs.readFileSync(file, 'utf8'))
   const rejected = []
   const opt = (res) => { if (res.rejected) rejected.push(res.rejected); return res.value }
@@ -139,7 +139,7 @@ function loadConfig () {
   }
 
   // A handful of behaviour knobs are worth exposing to the panel without a
-  // config.json edit; they win over the file only when actually set.
+  // defaults.json edit; they win over the file only when actually set.
   const aliases = settings.str('BOT_ALIASES', null)
   if (aliases !== null) cfg.behavior.aliases = aliases.split(',').map((a) => a.trim().toLowerCase()).filter(Boolean)
   const language = settings.str('BOT_LANGUAGE', null)

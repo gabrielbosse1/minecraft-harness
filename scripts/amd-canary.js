@@ -13,7 +13,7 @@
  *   4. a PT-BR guard sample               (is the chosen language enforceable)
  *
  * Usage:   AMD_API_KEY=... node scripts/amd-canary.js
- *          (reads AMD_API_BASE_URL / AMD_MODEL like zincai/config.json; env wins)
+ *          (reads AMD_API_BASE_URL / AMD_MODEL like zincai/defaults.json; env wins)
  *          No .env is read: export the variables or run it from PufferPanel.
  */
 'use strict'
@@ -22,13 +22,13 @@ const path = require('path')
 
 const settings = require('../src/settings')
 
-const cfg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'zincai', 'config.json'), 'utf8'))
+const cfg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'zincai', 'config', 'defaults.json'), 'utf8'))
 const baseUrl = settings.str(['AMD_API_BASE_URL', 'amd.baseUrl'], cfg.amd?.baseUrl)
 const model = settings.str(['AMD_MODEL', 'amd.model'], cfg.amd?.model)
 const apiKey = settings.apiKey() || cfg.amd?.apiKey
 
 if (!apiKey || !baseUrl || !model) {
-  console.error('need AMD_API_KEY (+ AMD_API_BASE_URL/AMD_MODEL or config.json amd.* values)')
+  console.error('need AMD_API_KEY (+ AMD_API_BASE_URL/AMD_MODEL or defaults.json amd.* values)')
   process.exit(2)
 }
 

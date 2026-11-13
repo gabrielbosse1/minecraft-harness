@@ -74,7 +74,7 @@ npm start                      # == node zincai/index.js
 
 Everything is configured through environment variables — the same names the
 template uses; [`.env.example`](.env.example) lists them with empty values and
-explains how to export them locally. `zincai/config.json` holds defaults only,
+explains how to export them locally. `zincai/defaults.json` holds defaults only,
 and its `amd.apiKey` stays empty on purpose: the key is never a file. See
 [`zincai/README.md`](zincai/README.md#configuration-and-operation) for the full
 table.

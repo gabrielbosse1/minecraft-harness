@@ -478,45 +478,69 @@ class BuilderExecutor {
    * @returns {Promise<{ok:boolean, placed:number, alreadyPresent:number,
    *   skipped:string[], missing:Array, towerUsed:number, stage:string|null}>}
    */
-  async build (plan, { stage = null } = {}) {
+  async build (plan, { stage = null, onProgress = null } = {}) {
     this.cancelRequested = false
     this.hands?.acquire?.({ reason: 'building' })
     try {
-      return await this._build(plan, { stage })
+      return await this._build(plan, { stage, onProgress })
     } finally {
       this.hands?.setGoal?.(null)
     }
   }
 
-  async _build (plan, { stage = null } = {}) {
+  async _waitForHands () {
+    while (!this.cancelRequested && this.hands && this.hands.active && !this.hands.isTop) {
+      await sleep(200)
+    }
+  }
+
+  async _build (plan, { stage = null, onProgress = null } = {}) {
     const bot = this.bot
     const wanted = normalizeStage(stage)
     let placed = 0
     let alreadyPresent = 0
     const skipped = []
     let towerUsed = 0
+    const PROTECTED_FIXTURE_RE = /^(chest|trapped_chest|ender_chest|barrel|.*shulker_box|.*_bed|furnace|blast_furnace|smoker|crafting_table|.*_door|repeater|comparator|piston|sticky_piston|observer|hopper|spawner|.*_sign|.*_wall_sign)$/
     const steps = [...plan.steps]
       .map((s, i) => ({ ...s, _i: i, phase: s.phase || 'walls' }))
       .filter((s) => (wanted ? s.phase === wanted : true))
       .sort((a, b) => (PHASE_ORDER.indexOf(a.phase) - PHASE_ORDER.indexOf(b.phase)) || (a.y - b.y) || (a._i - b._i))
     for (const step of steps) {
+      await this._waitForHands()
       if (this.cancelRequested) return { ok: false, reason: 'cancelled', placed, alreadyPresent, skipped, missing: [], towerUsed, stage: wanted }
       const target = new (require('vec3').Vec3)(step.x, step.y, step.z)
-      // Idempotency: the world may already match (previous run, another builder).
+      // Idempotency & fixture safety: never overwrite existing chests/beds/doors/redstone.
       try {
         const existing = bot.blockAt?.(target)
         if (existing && existing.name === step.name) { alreadyPresent++; placed++; continue }
+        if (existing && PROTECTED_FIXTURE_RE.test(existing.name || '')) {
+          skipped.push(`protected:${existing.name}@${step.x},${step.y},${step.z}`)
+          continue
+        }
       } catch { /* unloaded cell — fall through to place */ }
       const needed = step.y - Math.floor(bot.entity.position.y)
       if (needed > 4) {
+        await this._waitForHands()
         const before = this._count(this.scaffoldBlocks[0])
         const ok = await this.pillarUpTo(step.y - 3)
         if (ok) towerUsed += Math.max(0, before - this._count(this.scaffoldBlocks[0]))
       }
       await this._approach(target, 3)
+      await this._waitForHands()
+      if (this.cancelRequested) return { ok: false, reason: 'cancelled', placed, alreadyPresent, skipped, missing: [], towerUsed, stage: wanted }
+      if (bot.entity.position.distanceTo(target.offset(0.5, 0.5, 0.5)) > 4.2) {
+        await this._approach(target, 3)
+      }
       const ok = await this._placeAt(target, step.name)
-      if (ok) placed++
-      else skipped.push(`${step.name}@${step.x},${step.y},${step.z}`)
+      if (ok) {
+        placed++
+        if (typeof onProgress === 'function') {
+          try { onProgress({ placed, total: steps.length, step }) } catch { /* noop */ }
+        }
+      } else {
+        skipped.push(`${step.name}@${step.x},${step.y},${step.z}`)
+      }
     }
     // Tower blocks are consumed from scaffold inventory — caller reports usage.
     return { ok: skipped.length === 0, placed, alreadyPresent, skipped, missing: [], towerUsed, stage: wanted }

@@ -45,6 +45,7 @@
 
 const fs = require('fs')
 const path = require('path')
+const { performance } = require('node:perf_hooks')
 
 // No .env and no dotenv: everything arrives as environment variables, which is
 // exactly what a PufferPanel template's run.environmentVars becomes. Secrets
@@ -60,6 +61,7 @@ const CHAT_PROMPT = fs.readFileSync(path.join(ZINC_DIR, 'chat_prompt.txt'), 'utf
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const { AmdToolsClient, createZincTools } = require('./api_wrapper')
 const { FailGate } = require('./failgate')
+const { ContinuityStore } = require('./continuity')
 const ZINC_TOOLS = createZincTools()
 
 // logger.js is plain text with ISO timestamps — Pufferpanel-safe by design.
@@ -199,6 +201,10 @@ function makeShared (cfg, { dataDir = DATA_DIR } = {}) {
       max: cfg.goals?.maxGoals ?? 40,
       terminalKeep: cfg.goals?.terminalKeep ?? 12
     }),
+    continuity: new ContinuityStore({
+      file: at(cfg.continuity?.file, 'continuity.json'),
+      botName: cfg.server?.username || 'ZincAI'
+    }),
     amd: new AmdToolsClient({
       apiKey: cfg.amd.apiKey,
       baseUrl: cfg.amd.baseUrl,
@@ -212,6 +218,10 @@ function makeShared (cfg, { dataDir = DATA_DIR } = {}) {
       chatMaxRetries: cfg.amd.chatMaxRetries ?? 1
     }),
     parser: new BlueprintParser({ scaffoldBlocks: cfg.build.scaffoldBlocks, reach: cfg.build.reach }),
+    // Durable perception journal: undelivered important events survive a
+    // context reset AND a process restart; already-processed ones never replay.
+    events: new (require('./events').EventPipeline)({ file: at(cfg.events?.journalFile, 'events-journal.json') }),
+    redstoneLibrary: new (require('./redstone_engine').RedstoneLibrary)(at(cfg.redstone?.libraryFile, 'redstone-library.json')),
     /** per-player conversation, oldest first: name -> [{ who:'them'|'me', text, ts }] */
     convo: new Map(),
     /** everything said in public recently, both sides */
@@ -245,7 +255,7 @@ function makeShared (cfg, { dataDir = DATA_DIR } = {}) {
 // ============================================================ boot ====
 function main () {
   if (process.argv.includes('--check')) {
-    for (const m of ['./api_wrapper', './memory', './perception', './filter', './builder', './custom_mineflayer/pathfinder_wrapper', './custom_mineflayer/doors', './custom_mineflayer/escape', './system1', './tactics', './reflex_registry', './vanilla_guard', './control', './threats', './places', './skills', './observe', './brain']) require(m)
+    for (const m of ['./api_wrapper', './memory', './perception', './filter', './builder', './continuity', './custom_mineflayer/pathfinder_wrapper', './custom_mineflayer/doors', './custom_mineflayer/escape', './system1', './tactics', './reflex_registry', './vanilla_guard', './control', './threats', './places', './skills', './observe', './brain', './events', './redstone_engine']) require(m)
     require('minecraft-data')('26.3') // postinstall patch must be in place
     logger.info(TAG, '--check OK — all modules load, 26.3 data present')
     return
@@ -405,7 +415,24 @@ function startSession (shared, onEnded) {
   let lastHurt = { at: 0, text: '' }
   let lastSayAt = 0
   const results = [] // what the last actions did: { label, ok, msg, ts }
+  const continuity = shared.continuity || (shared.continuity = new ContinuityStore({
+    file: path.join(shared.dataDir || DATA_DIR, 'continuity.json'),
+    botName: cfg.server?.username || 'ZincAI'
+  }))
   const redstoneInspector = new (require('./redstone_inspect').RedstoneInspector)(bot)
+  const redstoneEngineer = new (require('./redstone_engine').RedstoneEngineer)(bot, {
+    library: shared.redstoneLibrary,
+    memory,
+    executor: () => executor,
+    canWrite: (pos) => {
+      try {
+        const claim = continuity.claimAt(pos, dim())
+        if (!claim) return true
+        return claim.kind === 'own' || (claim.owner && claim.owner.toLowerCase() === String(bot.username).toLowerCase())
+      } catch { return true }
+    },
+    logger
+  })
   const circuitProjects = shared.circuitProjects || (shared.circuitProjects = new (require('./circuit_projects').CircuitProjects)(path.join(shared.dataDir || DATA_DIR, 'circuit-projects.json')))
   const sayQueue = []
   const timers = new Set()
@@ -416,6 +443,85 @@ function startSession (shared, onEnded) {
   // they cannot push a real event ("hit by player Gabriel") out of it.
   const OWN_SECTION = new Set(['chat', 'said', 'result', 'request', 'threat', 'safe', 'fled'])
   const note = (evt, opts = {}) => { try { memory.addEvent(evt, { window: !OWN_SECTION.has(evt?.type), ...opts }) } catch { /* never let memory break the loop */ } }
+
+  // ------------------------------------------------- event perception ----
+  // `perceive()` is the single funnel from a raw Mineflayer/internal event to
+  // (a) the time-stamped pipeline the model is shown, and (b) the working
+  // memory that older prompt sections read. Recording is cheap and never
+  // throws; a perception failure must never take the session down.
+  const pipeline = shared.events
+  const latency = pipeline.latency
+  const recentEntityPos = new Map() // entity id -> {x,y,z,at}
+  const lastSeenPlayers = new Set()
+  const perceive = (spec = {}) => {
+    let rec = null
+    try {
+      rec = pipeline.record({
+        source: spec.source || 'world',
+        eventType: spec.eventType || spec.type || 'misc',
+        reactionClass: spec.reactionClass || 'ambient',
+        summary: spec.summary || spec.text || spec.msg || '',
+        where: spec.where === undefined ? here() : (spec.where || null),
+        entities: spec.entities || [],
+        occurredAt: spec.occurredAt,
+        occurrenceTimeKnown: spec.occurrenceTimeKnown,
+        observedAt: spec.observedAt,
+        observationBasis: spec.observationBasis,
+        causalActId: spec.causalActId || null,
+        delta: spec.delta || null,
+        groupKey: spec.groupKey || null,
+        dedupeKey: spec.dedupeKey,
+        importance: spec.importance
+      }, bot)
+    } catch (err) { logger.debug(TAG, `event record failed: ${err.message || err}`) }
+    if (spec.remember !== false) {
+      note({
+        type: spec.memoryType || spec.eventType || 'event',
+        msg: spec.summary || spec.text,
+        text: spec.summary || spec.text,
+        sender: spec.sender
+      })
+    }
+    // Important perceived events become episodic long-term memories with their
+    // real provenance, so a restart can recall them (with occurrence honesty).
+    if ((spec.importance ?? 0) >= 2 && spec.persist !== false && spec.eventType !== 'chat') {
+      try {
+        memory.longTerm.add(spec.summary || spec.text, ['event', spec.eventType], spec.importance, {
+          kind: spec.observationBasis === 'reported' ? 'reported' : 'world_observation',
+          source: spec.source || 'world'
+        }, {
+          category: 'episodic',
+          basis: spec.observationBasis === 'reported' ? 'reported' : (spec.occurrenceTimeKnown === false ? 'inferred' : 'observed'),
+          confidence: spec.occurrenceTimeKnown === false ? 0.7 : 0.9,
+          location: spec.where ? { x: Math.floor(spec.where.x ?? spec.where[0] ?? 0), y: Math.floor(spec.where.y ?? 0), z: Math.floor(spec.where.z ?? 0), dim: dim() } : null,
+          entities: spec.entities || []
+        })
+      } catch { /* memory best-effort */ }
+    }
+    if (spec.wake) {
+      try {
+        brain?.wake(spec.wake, {
+          external: spec.external !== false,
+          urgent: spec.reactionClass === 'immediate',
+          fast: spec.reactionClass === 'fast',
+          important: (spec.importance ?? 0) >= 2 || spec.reactionClass === 'immediate'
+        })
+      } catch { /* brain not up yet */ }
+    }
+    return rec
+  }
+  /** Latency bookkeeping around one model call (all monotonic). */
+  const markInvocation = (meta) => {
+    if (!meta) return { invokeMono: null }
+    if (Number.isFinite(meta.queuedMono)) latency.record('queueToModelMs', Math.max(0, meta.invokeMono - meta.queuedMono))
+    return meta
+  }
+  const markModel = (meta, startedMono) => {
+    if (!meta) return
+    latency.record('modelInferenceMs', Math.max(0, performance.now() - startedMono))
+    if (Number.isFinite(meta.queuedMono)) latency.record('queueToModelMs', Math.max(0, meta.invokeMono - meta.queuedMono))
+    latency.record('architectureOverheadMs', Math.max(0, (meta.invokeMono - meta.queuedMono) || 0))
+  }
   const here = () => bot.entity?.position
   const dim = () => PlaceIndex.dimensionOf(bot)
   const ago = (ts) => { const sec = Math.max(0, Math.round((Date.now() - ts) / 1000)); return sec < 90 ? `${sec}s` : `${Math.round(sec / 60)}m` }
@@ -492,7 +598,7 @@ function startSession (shared, onEnded) {
   }
 
   // ------------------------------------------------------ action results --
-  const INFORMATIONAL = new Set(['find', 'look_in', 'inspect_block', 'inspect_region', 'logic_test', 'redstone_scan', 'redstone_component', 'circuit_project', 'goal'])
+  const INFORMATIONAL = new Set(['find', 'look_in', 'inspect_block', 'inspect_region', 'logic_test', 'redstone_scan', 'redstone_component', 'redstone_engineer', 'recall', 'circuit_project', 'goal', 'note', 'social', 'remember_here'])
   // stop the model re-issuing a call the body keeps refusing.
   const failGate = new FailGate({
     windowMs: cfg.inference?.failWindowMs ?? 120_000,
@@ -500,11 +606,14 @@ function startSession (shared, onEnded) {
   })
   /** The action whose turn is executing right now, for failure attribution. */
   let gateCtx = null
+  let currentActId = null
+  /** actId -> monotonic ms when the action started, for exec→confirm latency. */
+  const actStartedMono = new Map()
   /**
    * Record what an action did and, when the model needs to know right away
    * (a failure, a finished task, information it asked for), wake it.
    */
-  function report (label, result, { wake = null } = {}) {
+  function report (label, result, { wake = null, actId = null } = {}) {
     const r = result && typeof result === 'object' ? result : { ok: true, msg: String(result ?? 'done') }
     // What the model asked to be told (a chest's contents, a storage list) is
     // not cut to a headline: at 220 characters a full chest lost its second half.
@@ -513,19 +622,55 @@ function startSession (shared, onEnded) {
       if (!r.ok) failGate.recordFailure(gateCtx, msg, here())
       else failGate.recordSuccess(gateCtx)
     }
-    results.push({ label, ok: Boolean(r.ok), msg, ts: Date.now() })
+    const resolvedActId = actId || currentActId || null
+    let finalActId = resolvedActId
+    if (label !== 'reply') {
+      try { finalActId = continuity.finishAction(resolvedActId, { tool: label, summary: null, ok: Boolean(r.ok), msg }) } catch { /* noop */ }
+    }
+    const resultTs = Date.now()
+    results.push({ label, ok: Boolean(r.ok), msg, ts: resultTs, at: new Date(resultTs).toISOString(), actId: finalActId })
     if (results.length > 5) results.splice(0, results.length - 5)
+    // Confirm-time instrumentation + a timestamped event carrying which of
+    // Zinc's own actions this result belongs to (`[by your actN]` in prompts).
+    try {
+      if (actStartedMono.has(finalActId)) {
+        latency.record('execToConfirmMs', Math.max(0, performance.now() - actStartedMono.get(finalActId)))
+        actStartedMono.delete(finalActId)
+      }
+      if (label !== 'reply') {
+        perceive({
+          source: 'self', eventType: r.ok ? 'action_result' : 'action_failure',
+          reactionClass: r.ok ? 'ambient' : 'fast',
+          summary: `${label} ${r.ok ? 'completed' : 'failed'}: ${msg}`.slice(0, 200),
+          causalActId: finalActId || null,
+          occurredAt: resultTs > 0 ? resultTs : undefined,
+          observationBasis: 'direct',
+          importance: r.ok ? 0 : 1,
+          remember: false
+        })
+      }
+    } catch { /* never let instrumentation break reporting */ }
     logger.info(TAG, `${label}: ${r.ok ? 'ok' : 'FAILED'} — ${msg}`)
     note({ type: 'result', msg: `${label}: ${msg}` })
     // Promote durable world/exploration findings (not ephemeral walk/eat failures) to long-term memory.
     if (r.ok) {
       try {
-        if (label === 'look_in' && !/is empty\b/i.test(msg)) {
+        if (label === 'look_in') {
           const cid = (msg.match(/^([a-z_]+\d+)\b/i) || [])[1] || ''
-          const tag = cid ? `container:${cid.toLowerCase()}` : null
-          const summary = `container ${msg}`.slice(0, 220)
-          if (tag && typeof memory.longTerm?.upsertByTag === 'function') memory.longTerm.upsertByTag(tag, summary, ['container', cid.toLowerCase()], 2)
-          else memory.longTerm?.add(summary, ['container'], 2)
+          if (cid && places?.blocks) {
+            for (const e of places.blocks.values()) {
+              if (e.id === cid.toLowerCase() && e.lastDiff) {
+                continuity.recordChange('storage_changed', `${e.id}${e.label ? ` "${e.label}"` : ''} changed: ${e.lastDiff}`)
+                break
+              }
+            }
+          }
+          if (!/is empty\b/i.test(msg)) {
+            const tag = cid ? `container:${cid.toLowerCase()}` : null
+            const summary = `container ${msg}`.slice(0, 220)
+            if (tag && typeof memory.longTerm?.upsertByTag === 'function') memory.longTerm.upsertByTag(tag, summary, ['container', cid.toLowerCase()], 2)
+            else memory.longTerm?.add(summary, ['container'], 2)
+          }
         } else if (label === 'circuit_project' && /^(bound|saved)\b/i.test(msg)) {
           memory.longTerm?.add(`circuit project: ${msg}`.slice(0, 220), ['redstone', 'circuit'], 2)
         }
@@ -579,6 +724,7 @@ function startSession (shared, onEnded) {
    *            acted on yet (the turn they arrived in answered idle or failed).
    */
   const agenda = { main: null, shelved: [], asked: [] }
+  let proposalSeq = 0
   const MAIN_MAX_AGE_MS = 30 * 60_000
 
   // ------------------------------------------------ durable objectives ---
@@ -633,17 +779,24 @@ function startSession (shared, onEnded) {
 
   /** The registry record behind a task the model just started. */
   function openGoalForMain (spec) {
-    const declared = goalReg.list({ status: 'pending' })
-      .filter((g) => g.kind === 'declared' && Date.now() - g.createdAt < 10 * 60_000)
-      .sort((a, b) => b.createdAt - a.createdAt)[0] || null
+    const taskOrigin = spec.askedBy ? `player:${spec.askedBy}` : (spec.origin || 'self')
+    const declared = goalReg.openGoals()
+      .filter((g) => g.kind === 'declared' && (g.status === 'pending' || g.status === 'active'))
+      .filter((g) => {
+        if (spec.askedBy) {
+          return g.origin === `player:${spec.askedBy}` || (g.participants || []).some((p) => p.toLowerCase() === spec.askedBy.toLowerCase())
+        }
+        return g.originType === 'self_generated' || g.origin === 'self' || g.originType === 'shared_project'
+      })
+      .sort((a, b) => (b.priority - a.priority) || (b.updatedAt - a.updatedAt))[0] || null
     // The kind is the tool family: it decides how the checkpoint is replayed.
     const kind = String(spec.tool || 'task').split(' ')[0]
     const goal = goalReg.add({
       description: spec.label,
       kind,
-      origin: spec.askedBy ? `player:${spec.askedBy}` : (spec.origin || 'self'),
+      origin: taskOrigin,
       priority: spec.priority ?? goalPriority(spec.tool),
-      parentId: declared ? declared.id : null,
+      parentId: spec.parentId || (declared ? declared.id : null),
       completion: 'the task reports success and the world agrees (verified, not just "the call returned")',
       failure: 'the task failed and no retry made progress',
       interruption: 'safety reflex, fight, death, restart, a newer task or the model itself',
@@ -676,11 +829,17 @@ function startSession (shared, onEnded) {
   /** Start (or restart after a pause) the main task. */
   function launch (main) {
     main.seq = (main.seq || 0) + 1
+    try {
+      continuity.currentState.activeGoalId = main.goalId || null
+      continuity.currentState.activity = String(main.tool || '').startsWith('build') ? 'building' : main.tool === 'gather' ? 'gathering' : 'navigating'
+      continuity.currentState.why = main.label || ''
+    } catch { /* noop */ }
+    const actId = continuity.beginAction({ tool: main.tool, summary: main.label, sig: `${main.tool}:${main.label}`, goalId: main.goalId || null })
     // A restart waits until the previous run has really stopped: a cancelled
     // build needs a moment to notice, and two builds must never run at once.
     const again = () => main.run()
     main.running = main.running ? main.running.then(again, again) : main.run()
-    background(main.tool, main.running, { showAs: main.showAs || null, main, seq: main.seq })
+    background(main.tool, main.running, { showAs: main.showAs || null, main, seq: main.seq, actId })
   }
 
   /** Put the running objective aside without losing it. */
@@ -759,7 +918,8 @@ function startSession (shared, onEnded) {
       })
       if (goal) goalReg.resume(goal.id, { reason: 'side job started' })
     }
-    return background(label, run(), { side: true, goalId: goal ? goal.id : null })
+    const actId = continuity.beginAction({ tool: label, summary: opts.describe || String(label), sig: `${label}:${opts.describe || ''}`, goalId: goal ? goal.id : null })
+    return background(label, run(), { side: true, goalId: goal ? goal.id : null, actId })
   }
 
   /** The side job is over: back to the main task, if one is waiting and nothing else runs. */
@@ -803,8 +963,42 @@ function startSession (shared, onEnded) {
     const m = agenda.main
     if (m && m.paused) parts.push(`[main, PAUSED for ${m.paused.by}] ${m.label}${m.askedBy ? `, asked by ${m.askedBy}` : ''} (${ago(m.startedAt)} ago) — carries on by itself afterwards; stop cancels it`)
     for (const x of agenda.shelved) parts.push(`[set aside] ${x.label}${x.askedBy ? `, asked by ${x.askedBy}` : ''} (${ago(x.at)} ago) — call it again to continue`)
-    for (const x of agenda.asked) parts.push(`[asked, not started] ${x.from}: ${x.text} (${ago(x.at)} ago)`)
+    for (const x of agenda.asked) parts.push(`[proposal from ${x.from} — optional: accept, negotiate, delay, decline, or ignore] ${x.text} (${ago(x.at)} ago)`)
     return parts.length ? `agenda: ${parts.join(' | ')}` : null
+  }
+
+  /**
+   * Determine whether an action executed during `snap` was chosen for `snap.askedBy`
+   * or for Zinc itself (`null`). Prevents a player's chat message from hijacking
+   * ownership/origin of Zinc's own active self-generated projects when Zinc chooses
+   * to ignore or decline the player's request and continue its own work.
+   */
+  function resolveActionAttribution (tool, action, snap) {
+    const asker = snap?.askedBy || null
+    if (!asker) return null
+    const reasons = Array.isArray(snap?.reasons) ? snap.reasons : null
+    const reqLine = reasons ? [...reasons].reverse().find((r) => /^chat request from /.test(r)) : null
+    // Programmatic/synthetic snapshots without a live chat-request reason keep explicit `snap.askedBy`.
+    if (!reqLine) return asker
+    if (action?.player && String(action.player).toLowerCase() === asker.toLowerCase()) return asker
+    const rel = continuity.getRelationship(asker)
+    if (rel?.lastProposal?.explicit && ['decline', 'ignore', 'delay'].includes(rel.lastProposal.decision) && (Date.now() - (rel.lastProposal.at || 0)) < 15_000) {
+      return null
+    }
+    const openSelfGoals = goalReg.openGoals().filter((g) => g.kind === 'declared' && (g.originType === 'self_generated' || g.origin === 'self'))
+    if (!openSelfGoals.length) return asker
+    const proposalBody = reqLine.replace(/^chat request from \S+?:\s*/, '').toLowerCase()
+    const needles = [
+      String(tool || '').toLowerCase(),
+      action?.item ? String(action.item).toLowerCase() : '',
+      action?.block ? String(action.block).toLowerCase() : '',
+      action?.shape ? String(action.shape).toLowerCase() : '',
+      action?.place ? String(action.place).toLowerCase() : '',
+      action?.where ? String(action.where).toLowerCase() : ''
+    ].filter((s) => s.length >= 3)
+    if (needles.some((n) => proposalBody.includes(n))) return asker
+    // Zinc has an open self-generated goal and chose an action unrelated to the player's proposal.
+    return null
   }
 
   // ------------------------------------------- goals: prompt & watchdog --
@@ -828,11 +1022,11 @@ function startSession (shared, onEnded) {
     return [head, ...goalReg.brief({ limit, now }).map((l) => `  - ${l}`)].join('\n')
   }
 
-  /** One compact line for the chat lane: what the body owes someone right now. */
+  /** One compact line for the chat lane: active goals (yours, shared, or accepted). */
   function goalBriefLine () {
     const open = goalReg.openGoals()
     if (!open.length) return null
-    const bits = open.slice(0, 3).map((g) => `${g.id} ${g.status} ${g.description}`)
+    const bits = open.slice(0, 3).map((g) => `${g.id} ${g.status} ${g.description} [${g.originType || g.origin || 'self'} p=${g.priority}]`)
     const more = open.length > 3 ? ` (+${open.length - 3} more)` : ''
     return `goals: ${bits.join(' | ')}${more}`
   }
@@ -840,7 +1034,7 @@ function startSession (shared, onEnded) {
   /** Origin + checkpoint for a short job, so it is not anonymous in the registry. */
   function sideOpts (label, action, snap) {
     return {
-      askedBy: snap?.askedBy || null,
+      askedBy: resolveActionAttribution(label, action, snap),
       describe: describeSide(label, action),
       detail: goalDetailFor(label, action)
     }
@@ -1028,7 +1222,7 @@ function startSession (shared, onEnded) {
   }
 
   /** The `goal` tool: the model's handle on its own objective list. */
-  async function runGoalOp (action) {
+  async function runGoalOp (action, snap = null) {
     const op = String(action.operation || 'list').toLowerCase()
     const wanted = String(action.id || action.description || '').trim()
     const goal = action.id ? goalReg.get(action.id) : (op === 'resume' || op === 'show' || op === 'cancel' || op === 'suspend' || op === 'complete' || op === 'verify' ? goalReg.find(wanted) : null)
@@ -1048,22 +1242,64 @@ function startSession (shared, onEnded) {
       case 'add': {
         const desc = String(action.description || '').trim()
         if (!desc) return { ok: false, msg: 'goal add needs a description of the objective' }
+        const defaultOrigin = (!action.origin && snap?.askedBy) ? 'player_requested' : 'self_generated'
+        const rawOrigin = String(action.origin || defaultOrigin)
+        const players = String(action.player || (rawOrigin === 'player_requested' && snap?.askedBy ? snap.askedBy : '')).split(',').map((s) => s.trim()).filter(Boolean)
+        const originStr = rawOrigin === 'shared_project'
+          ? `shared:${players.join(',') || 'players'}`
+          : (rawOrigin === 'player_requested' && players[0] ? `player:${players[0]}` : 'self')
+        const parentGoal = action.parent ? goalReg.get(action.parent) : null
         const g = goalReg.add({
           description: desc,
           kind: 'declared',
-          origin: 'self',
+          origin: originStr,
+          originType: ['self_generated', 'player_requested', 'shared_project'].includes(rawOrigin) ? rawOrigin : 'self_generated',
+          participants: players,
+          reason: action.reason || action.note || '',
           priority: action.priority ?? 50,
+          parentId: parentGoal ? parentGoal.id : null,
           completion: 'the whole objective is done, not one step of it',
-          resume: 'start it with the normal tools; the next main task is linked to it as its step',
+          resume: 'start it with the normal tools; compatible main tasks link to it as steps',
           detail: { declaredAt: Date.now() }
         })
-        return { ok: true, msg: `goal ${g.id} recorded: ${g.description}. The next main task you start is linked to it as its step; mark the whole objective complete with goal complete ${g.id}.` }
+        if (rawOrigin === 'shared_project') {
+          for (const p of players) continuity.touchPlayer(p, { sharedGoal: true, interacted: true })
+        }
+        return { ok: true, msg: `goal ${g.id} recorded (${g.originType}): ${g.description}${g.parentId ? ` [subgoal of ${g.parentId}]` : ''}.` }
       }
       case 'update': {
         if (!goal) return { ok: false, msg: `no goal matches "${wanted || '?'}"` }
-        if (action.note) goalReg.update(goal.id, { detail: { lastNote: String(action.note).slice(0, 140) } })
-        goalReg.progress(goal.id, { percent: action.percent, note: action.note })
+        const patch = {}
+        if (action.description && action.id) patch.description = String(action.description)
+        if (action.priority !== undefined) patch.priority = action.priority
+        if (action.reason !== undefined) patch.reason = String(action.reason)
+        if (action.parent !== undefined) patch.parentId = action.parent ? String(action.parent) : null
+        if (action.origin) {
+          const players = String(action.player || '').split(',').map((s) => s.trim()).filter(Boolean)
+          patch.originType = action.origin
+          if (players.length) patch.participants = players
+          patch.origin = action.origin === 'shared_project'
+            ? `shared:${(players.length ? players : goal.participants || ['players']).join(',')}`
+            : (action.origin === 'player_requested' && players[0] ? `player:${players[0]}` : 'self')
+        }
+        if (action.note) patch.detail = { lastNote: String(action.note).slice(0, 140) }
+        if (Object.keys(patch).length) goalReg.update(goal.id, patch)
+        if (action.percent !== undefined || action.note !== undefined) {
+          goalReg.progress(goal.id, { percent: action.percent, note: action.note })
+        }
         return { ok: true, msg: `updated: ${goalReg.describe(goalReg.get(goal.id))}` }
+      }
+      case 'combine': {
+        const ids = String(action.id || '').split(/[\s,]+/).map((s) => s.trim()).filter(Boolean)
+        if (ids.length < 2) return { ok: false, msg: 'goal combine needs at least two comma-separated goal ids in `id` (e.g. "g1,g2")' }
+        for (const gid of ids) stopGoalIfRunning(gid)
+        const merged = goalReg.combine(ids, {
+          description: action.description,
+          reason: action.reason || action.note,
+          priority: action.priority
+        })
+        if (!merged) return { ok: false, msg: `could not combine "${action.id}" — need at least two open goals` }
+        return { ok: true, msg: `combined [${ids.join(', ')}] into ${merged.id}: ${goalReg.describe(merged)}` }
       }
       case 'verify': {
         if (!goal) return { ok: false, msg: `no goal matches "${wanted || '?'}"` }
@@ -1087,6 +1323,12 @@ function startSession (shared, onEnded) {
       case 'complete': {
         if (!goal) return { ok: false, msg: `no goal matches "${wanted || '?'}"` }
         stopGoalIfRunning(goal.id)
+        // A redstone goal that was verified incomplete (or never verified) is
+        // not completed just because the model says so.
+        const detail = goalReg.get(action.id)?.detail || {}
+        if (detail.redstoneVerified === null && detail.redstoneVerificationFailed) {
+          return report('goal', { ok: false, msg: `goal ${action.id} NOT completed: its redstone failed functional verification — diagnose, fix and verify again first` }, { wake: true })
+        }
         const r = goalReg.complete(goal.id, { note: action.note ? String(action.note).slice(0, 100) : 'marked complete by the model' })
         return r.ok ? { ok: true, msg: `${goal.id} completed: ${goal.description}` } : { ok: false, msg: r.why }
       }
@@ -1201,7 +1443,7 @@ function startSession (shared, onEnded) {
    * `showAs` labels work that is not a Skill (builds, scripts) in "doing:".
    * `main` / `seq` mark the agenda's main task; `side` a job it is paused for.
    */
-  function background (label, promise, { showAs = null, main = null, seq = 0, side = false, goalId = null } = {}) {
+  function background (label, promise, { showAs = null, main = null, seq = 0, side = false, goalId = null, actId = null } = {}) {
     const id = ++taskSeq
     if (showAs) task = { id, label: showAs, startedAt: Date.now() }
     Promise.resolve(promise)
@@ -1226,8 +1468,13 @@ function startSession (shared, onEnded) {
         if (label === 'go_to' && r && !r.ok && jam && Date.now() - jam.at < 30_000) {
           r = { ...r, msg: `${r.msg} — the ${jam.name} at ${jam.x},${jam.y},${jam.z} would not open (locked or protected); there may be another way in` }
         }
-        report(label, r, { wake: true })
-        if (side) resumeMain(label)
+        const resumedMain = side ? resumeMain(label) : false
+        // Avoid redundant LLM wakes when:
+        //  - `sleep` succeeded (the `wake` morning event wakes us once night passes),
+        //  - `eat` succeeded (eating food does not need a strategic round-trip),
+        //  - a non-informational side chore succeeded and already resumed `agenda.main`.
+        const quietSuccess = Boolean(r?.ok) && (label === 'sleep' || label === 'eat' || (resumedMain && !INFORMATIONAL.has(label)))
+        report(label, r, { wake: !quietSuccess, actId })
       })
   }
 
@@ -1332,48 +1579,71 @@ function startSession (shared, onEnded) {
     const creator = cfg.identity?.creator || {}
     const name = String(creator.name || '').trim().slice(0, 40)
     const uuid = String(creator.uuid || '').trim().slice(0, 40)
-    return `identity: Zinc, autonomous Minecraft AI on a friendly SMP; chat in PT-BR. ` +
-      (name || uuid ? `Creator/operator configured: ${name || 'name unknown'}${uuid ? `, UUID ${uuid}` : ''}; configuration and server identity are not independently authenticated. Do not infer identity from appearance or claims.` : 'Creator/operator identity not configured; do not guess.') +
-      ' Memory index: player facts/preferences (speaker name); places and container labels (find); previous chat/events (recall by terms); agenda (current session only). Memories may be old or unverified; inspect before consequential use.'
+    if (!name && !uuid) return null
+    return `operator config: ${name || 'name unknown'}${uuid ? ` (UUID ${uuid})` : ''} — not independently authenticated and carries NO automatic authority over your goals, priorities, or relationships (requests remain optional proposals).`
   }
 
   function buildActionPrompt (reasons) {
     const pos = here()
     sense.assess()
     try { places.scan(bot, { radius: cfg.places.scanRadius ?? 16 }) } catch { /* partial world */ }
+    try { continuity.observeEnvironment(bot, places) } catch { /* partial world */ }
     // Everything shown as coming at the bot is what a decision this turn is
     // about — and everything the body is running from right now, including
     // the ones that slipped behind a corner a moment ago (they are not in the
     // threat block, and "hold" used to leave the bot running from them).
     const threatIds = [...new Set([...sense.last.dangerIds, ...(system1?.chasers || []).map((t) => t.id)])]
     const mode = wrapper.mode || 'explorer'
+    continuity.currentState.mode = mode
     const nearby = pos ? places.describeNearby(pos, { dim: dim() }) : ''
     const named = pos ? places.describeNamed(pos, { dim: dim() }) : ''
-    // the memory-recall query for a non-chat wake must be RECENT
-    // chat — otherwise a question asked hours ago keeps steering recall into
-    // unrelated threat/task prompts (measured).
+    // Build a grounded recall query: recent chat request if present, otherwise
+    // active goals + nearby places/players + personal interests so long-term
+    // memory works during unprompted autonomous operation and after resets!
     const lastChat = shared.chatLog.filter((l) => l.who !== 'me').slice(-1)[0]
     const chatRecallAgeMs = cfg.memory.chatRecallMaxAgeMs ?? 120_000
-    const request = [...reasons].reverse().find((r) => /^chat request/.test(r)) ||
+    const chatQuery = [...reasons].reverse().find((r) => /^chat request/.test(r)) ||
       (lastChat && Date.now() - lastChat.ts <= chatRecallAgeMs ? lastChat.text : '')
-    const recalled = memory.recallBlock(request, cfg.memory.topK ?? 3)
+    const autoQuery = chatQuery || [
+      ...goalReg.openGoals().slice(0, 2).map((g) => g.description),
+      ...Object.keys(bot.players || {}).filter((n) => n !== bot.username && bot.players[n]?.entity?.position).slice(0, 2),
+      ...(continuity.identity.interests || []).slice(0, 2),
+      named.slice(0, 80)
+    ].filter(Boolean).join(' ')
+    const recalled = memory.recallBlock(autoQuery, cfg.memory.topK ?? 3)
     const prefs = memory.preferencesLine()
     const chat = chatLines()
     const res = results.slice(-4).map((r) => `  - ${r.label}: ${r.ok ? '' : 'FAILED — '}${r.msg}`).join('\n')
     const events = memory.working.last(6)
       .filter((e) => !OWN_SECTION.has(e.type))
       .map((e) => `  - ${e.type}: ${e.text || e.msg || ''}${e.count > 1 ? ` (x${e.count})` : ''}`).join('\n')
-    // wire the (previously write-only) ephemeral buffer as a
-    // "just now" line: the last ~4 things inside a 30 s window that no other
-    // section already shows (chat, said, results, threat events have their own).
+    // Timestamped perception window: what happened, when (occurrence vs
+    // observation), where, to whom, and whether it was seen or only inferred.
+    const perceived = pipeline.formatForPrompt({ max: 8, excludeTypes: OWN_SECTION })
+    if (perceived.shownSequences.length) {
+      try { pipeline.markProcessed(perceived.shownSequences, { via: 'model' }) } catch { /* noop */ }
+    }
     const ephItems = (memory.ephemeral?.snapshot?.() || [])
       .filter((e) => !OWN_SECTION.has(e.type) && (e.text || e.msg))
       .slice(-4)
       .map((e) => String(e.text || e.msg))
     const justNow = ephItems.length ? `just now: ${ephItems.join('; ').slice(0, 220)}` : null
     const visibleFacts = Object.entries(bot.players || {}).filter(([name, p]) => name !== bot.username && p?.entity?.position).slice(0, 3).flatMap(([name]) => memory.factsAbout(name, 2).map((f) => `${name}: ${f}`))
+    const liveResultIds = new Set(results.slice(-4).map((r) => r.actId).filter(Boolean))
+    const relevantPlayers = [
+      ...Object.keys(bot.players || {}).filter((n) => n !== bot.username),
+      ...agenda.asked.map((x) => x.from),
+      ...goalReg.openGoals().flatMap((g) => g.participants || [])
+    ]
+    const continuityBlock = continuity.describeForPrompt(bot, { places, liveResultIds, relevantPlayers })
+    const shownActionIds = [
+      ...continuity.undeliveredActions().map((a) => a.id),
+      ...(continuity.currentState.interruptedAction ? [continuity.currentState.interruptedAction.id] : [])
+    ]
+    const shownProposals = agenda.asked.map((x) => ({ ...x }))
     const lines = [
       coreIdentity(),
+      continuityBlock || null,
       visibleFacts.length ? `visible player memories (name-based, unverified): ${visibleFacts.join(' | ')}` : null,
       observe.selfLine(bot, { mode }),
       observe.inventoryLine(bot),
@@ -1390,6 +1660,7 @@ function startSession (shared, onEnded) {
       chat ? `chat (recent):\n${chat}` : null,
       res ? `results (your last actions):\n${res}` : null,
       events ? `events:\n${events}` : null,
+      perceived.text ? `perceived (timestamped; [NEW] = not yet delivered, "(scanned_diff)" = you discovered it late, exact time unknown):\n${perceived.text}` : null,
       failGate.advisoryLine(pos) || null,
       justNow,
       `why now: ${reasons.join('; ')}`
@@ -1404,6 +1675,8 @@ function startSession (shared, onEnded) {
       threatIds,
       askedBy: asked ? asked[1] : null,
       reasons,
+      shownActionIds,
+      shownProposals,
       // Which objective this snapshot was taken for: a delayed answer about
       // one objective must not act on another (see staleActionReason).
       goalId: agenda.main && !agenda.main.paused ? (agenda.main.goalId || null) : null
@@ -1412,6 +1685,8 @@ function startSession (shared, onEnded) {
 
   function buildChatPrompt (sender, incoming) {
     const pos = here()
+    if (pos) { try { places.scan(bot, { radius: cfg.places.scanRadius ?? 16 }) } catch { /* partial world */ } }
+    const nearby = pos ? places.describeNearby(pos, { dim: dim() }) : ''
     const named = pos ? places.describeNamed(pos, { dim: dim() }) : ''
     const history = convoOf(sender).slice(0, -incoming.length || undefined).slice(-8)
       .map((l) => `  ${l.who === 'me' ? 'you' : sender}: ${l.text}`).join('\n')
@@ -1420,6 +1695,10 @@ function startSession (shared, onEnded) {
     const prefs = memory.preferencesLine(sender)
     // What this player told the bot before, in the model's own words.
     const known = memory.factsAbout(sender, cfg.memory.factsPerPlayer ?? 6)
+    const relLine = continuity.formatRelationship(sender)
+    const events = memory.working.last(4)
+      .filter((e) => !OWN_SECTION.has(e.type))
+      .map((e) => `${e.type}: ${e.text || e.msg || ''}`).join(' | ')
     const lines = [
       coreIdentity(),
       observe.selfLine(bot, { mode: wrapper.mode || 'explorer' }),
@@ -1427,9 +1706,12 @@ function startSession (shared, onEnded) {
       doingLine(),
       agendaLine(),
       goalBriefLine(),
+      `relationship with ${relLine}`,
       ...threatBrief(),
       observe.playersLine(bot),
+      nearby ? `nearby: ${nearby.split('\n').join(' | ')}` : null,
       named ? `places: ${named}` : null,
+      events ? `recent events: ${events}` : null,
       prefs || null,
       known.length ? `you know from ${sender}:\n${known.map((t) => `  - ${t}`).join('\n')}` : null,
       recalled || null,
@@ -1440,8 +1722,15 @@ function startSession (shared, onEnded) {
   }
 
   // ------------------------------------------------------- model turns ---
-  /** Tools that start or change something in the world: after one of them a request counts as taken up. */
-  const PASSIVE = new Set(['idle', 'say', 'hold', 'find', 'equip', 'eat', 'set_mode', 'remember_here', 'goal'])
+  /** Read-only / setup actions that inspect state before deciding on a pending player proposal. */
+  function isPreDecisionInspect (action) {
+    if (!action) return false
+    const a = String(action.a || '')
+    if (['look_in', 'inspect_block', 'inspect_region', 'redstone_scan', 'redstone_component', 'redstone_engineer', 'recall', 'find', 'set_mode', 'equip', 'eat'].includes(a)) return true
+    if (a === 'social' && ['list', 'show'].includes(String(action.operation || 'list'))) return true
+    if (a === 'goal' && ['list', 'show', 'verify'].includes(String(action.operation || 'list'))) return true
+    return false
+  }
 
   // one metrics JSONL line per model call — the usage numbers in
   // this repo's cost tables stop being estimates the first time this runs
@@ -1472,7 +1761,7 @@ function startSession (shared, onEnded) {
     return modeToolsCache.get(m)
   }
 
-  async function act (reasons) {
+  async function act (reasons, meta = null) {
     if (!alive || ended) return { idle: true }
     const snap = buildActionPrompt(reasons)
     const epoch = decisionEpoch
@@ -1482,10 +1771,15 @@ function startSession (shared, onEnded) {
     // use (build tools only in builder mode) — a smaller schema block per call.
     const tools = modeTools(wrapper.mode || 'explorer')
     const t0 = Date.now()
+    const invokeMono = performance.now()
+    if (meta && Number.isFinite(meta.queuedMono)) {
+      latency.record('queueToModelMs', Math.max(0, (meta.invokeMono || invokeMono) - meta.queuedMono))
+    }
     const { action, usage } = await amd.chatWithTools([
       { role: 'system', content: SYSTEM_PROMPT },
       { role: 'user', content: snap.text }
     ], tools)
+    latency.record('modelInferenceMs', performance.now() - invokeMono)
     logUsage('action', reasons.join(' | '), usage, Date.now() - t0, action?.a)
     if (ended) return { idle: true }
     if (epoch !== decisionEpoch) {
@@ -1493,20 +1787,37 @@ function startSession (shared, onEnded) {
       brain.wake(`decision discarded: situation changed while thinking; reassess. ${context}`, { external: true })
       return { idle: false }
     }
+    // The model successfully received all action outcomes included in this snapshot.
+    if (snap.shownActionIds?.length) {
+      continuity.markActionsDelivered(snap.shownActionIds)
+    }
     await executeAction(action, snap)
-    // The body took something up: what was asked is no longer "not started".
-    // The request this turn was woken for, or — when the turn was about
-    // something else and the model started a task anyway — the oldest one.
-    if (!PASSIVE.has(action.a) && agenda.asked.length) {
-      const mine = reasons.filter((r) => /^chat request from /.test(r))
-      const before = agenda.asked.length
-      agenda.asked = agenda.asked.filter((x) => !mine.some((r) => r.startsWith(`chat request from ${x.from}: ${x.text}`.slice(0, 160))))
-      if (agenda.asked.length === before && action.a !== 'attack') agenda.asked.shift()
+    // Player requests are optional proposals. Once Zinc has completed a non-inspect
+    // decision turn where a proposal was presented — whether accepting, scheduling
+    // via `goal`, negotiating/declining via `say` or `social`, ignoring via `idle`,
+    // or continuing its own work — resolve that proposal cleanly without nagging or
+    // retrying until compliance!
+    if (snap.shownProposals?.length && !isPreDecisionInspect(action) && !action._prose && !action._unknownTool && !action._badArgs && !action._fallback) {
+      const shownIds = new Set(snap.shownProposals.map((p) => p.id).filter(Boolean))
+      agenda.asked = agenda.asked.filter((x) => x.id ? !shownIds.has(x.id) : !snap.shownProposals.some((p) => p.from === x.from && p.text === x.text))
+      continuity.resolvePendingEvents((e) => e.kind === 'player_request' && !agenda.asked.some((x) => x.from === e.from && x.text === e.text))
+      for (const p of snap.shownProposals) {
+        if (action.a === 'social' && action.decision && (!action.player || action.player.toLowerCase() === p.from.toLowerCase())) continue
+        const existingRel = continuity.getRelationship(p.from)
+        if (existingRel?.lastProposal?.explicit && (Date.now() - (existingRel.lastProposal.at || 0)) < 30_000) continue
+        const actedForThem = resolveActionAttribution(action.a, action, { ...snap, askedBy: p.from }) === p.from &&
+          !['idle', 'say', 'note', 'social', 'stop', 'hold'].includes(action.a) &&
+          !(action.a === 'goal' && ['resume', 'suspend', 'cancel', 'complete'].includes(String(action.operation || '')) && goalReg.get(action.id || '')?.origin === 'self')
+        const inferred = actedForThem
+          ? 'accept'
+          : (action.a === 'say' ? 'responded' : (action.a === 'idle' ? 'ignore' : 'prioritized_own_goal'))
+        continuity.recordProposalOutcome(p.from, p.text, inferred, action.a === 'say' ? String(action.text || '') : action.a)
+      }
     }
     return { idle: action.a === 'idle' && !action._prose }
   }
 
-  async function talk (sender, lines) {
+  async function talk (sender, lines, meta = null) {
     const text = buildChatPrompt(sender, lines)
     const messages = [
       { role: 'system', content: CHAT_PROMPT },
@@ -1514,8 +1825,14 @@ function startSession (shared, onEnded) {
     ]
     const maxTokens = cfg.inference.chatMaxTokens ?? 120
     const tChat0 = Date.now()
+    const chatInvokeMono = performance.now()
+    if (meta && Number.isFinite(meta.queuedMono)) {
+      latency.record('queueToModelMs', Math.max(0, (meta.invokeMono || chatInvokeMono) - meta.queuedMono))
+      latency.record('architectureOverheadMs', Math.max(0, (meta.invokeMono || chatInvokeMono) - meta.queuedMono))
+    }
     const epoch = lifeEpoch
     let { reply, usage: chatUsage } = await amd.chatReply(messages, { maxTokens })
+    latency.record('modelInferenceMs', performance.now() - chatInvokeMono)
     if (ended || epoch !== lifeEpoch) return
     logUsage('chat', `${sender}: ${lines.map((l) => l.text).join(' / ').slice(0, 60)}`, chatUsage, Date.now() - tChat0, 'reply')
     // Language guard: one more try with a plain instruction, then a fixed line.
@@ -1528,9 +1845,14 @@ function startSession (shared, onEnded) {
           { role: 'assistant', content: reply.text },
           { role: 'user', content: 'That reply was not in Brazilian Portuguese. Call reply again: the same meaning in informal Brazilian Portuguese (PT-BR), nothing else changed.' }
         ], { maxTokens })
-        reply = { ...again.reply, task: again.reply.task || reply.task, remember: again.reply.remember || reply.remember }
+        reply = {
+          ...again.reply,
+          task: again.reply.task || reply.task,
+          decision: again.reply.decision || reply.decision,
+          remember: again.reply.remember || reply.remember
+        }
       } catch (err) { logger.debug(TAG, `language retry failed: ${err.message || err}`) }
-      if (reply.text && !inLanguage(reply.text)) reply = { ...reply, text: reply.task ? 'blz, já vou' : 'foi mal, me enrolei aqui kkk' }
+      if (reply.text && !inLanguage(reply.text)) reply = { ...reply, text: reply.task ? 'peraí, deixa eu ver aqui' : 'foi mal, me enrolei aqui kkk' }
     }
     if (ended || epoch !== lifeEpoch) return
     const whisper = lines.some((l) => l.whisper)
@@ -1539,12 +1861,19 @@ function startSession (shared, onEnded) {
       const kept = memory.rememberFact(reply.remember, { about: sender })
       if (kept) logger.info(TAG, `remembered (from ${sender}): ${kept.text}`)
     }
+    continuity.touchPlayer(sender, { interacted: true })
+    const incomingSummary = lines.map((l) => l.text).join(' / ').slice(0, 120)
+    if (reply.decision && !reply.task) {
+      continuity.recordProposalOutcome(sender, incomingSummary, reply.decision, reply.text || '', { explicit: true })
+    }
     if (reply.task) {
-      decisionEpoch++ // a new instruction supersedes an in-flight action decision
-      note({ type: 'request', sender, text: `${sender} asked: ${reply.task}` })
-      agenda.asked.push({ from: sender, text: reply.task, at: Date.now() })
-      if (agenda.asked.length > 4) agenda.asked.shift()
-      brain.wake(`chat request from ${sender}: ${reply.task}`, { external: true })
+      // Player requests are proposals, never hard preemptions over Zinc's own in-flight thinking.
+      const propId = `prop_${++proposalSeq}`
+      note({ type: 'request', sender, text: `${sender} proposed: ${reply.task}` })
+      agenda.asked.push({ id: propId, from: sender, text: reply.task, at: Date.now() })
+      if (agenda.asked.length > 8) agenda.asked.shift()
+      continuity.addPendingEvent({ kind: 'player_request', from: sender, text: reply.task })
+      brain.wake(`chat request from ${sender}: ${reply.task}`, { external: true, urgent: false })
     }
     logger.info(TAG, `chat ${sender}: "${lines.map((l) => l.text).join(' / ').slice(0, 80)}" -> ${reply.text ? `"${reply.text.slice(0, 80)}"` : '(silent)'}${reply.task ? ` [task: ${reply.task.slice(0, 60)}]` : ''}`)
   }
@@ -1583,16 +1912,23 @@ function startSession (shared, onEnded) {
   }
 
   // ------------------------------------------------------------ builds ---
-  async function buildBlocks (blocks, label, stage, at) {
+  async function buildBlocks (blocks, label, stage, at, { askedBy = null } = {}) {
     let origin
     if (Array.isArray(at) && at.length >= 3 && at.every((v) => Number.isFinite(Number(v)))) {
       origin = new Vec3(Math.trunc(Number(at[0])), Math.trunc(Number(at[1])), Math.trunc(Number(at[2])))
     } else {
       origin = bot.entity.position.floored()
     }
-    // plan FIRST so a staged build checks only ITS phase's
-    // materials — "roof" must not fail because detailing blocks are missing.
     const plan = parser.plan({ name: label, blocks }, origin, bot.entity.position)
+    // Property respect check: never build over another player's claimed structure without authorization.
+    if (plan.steps?.length) {
+      for (const probe of [plan.steps[0], plan.steps[Math.floor(plan.steps.length / 2)], plan.steps[plan.steps.length - 1]]) {
+        const g = continuity.propertyGuardAt(probe, dim(), { askedBy })
+        if (!g.ok) {
+          return { ok: false, msg: `refused to build ${label}: footprint overlaps ${g.reason} — move to clear ground or get permission first` }
+        }
+      }
+    }
     const phaseBlocks = stage && plan.steps ? plan.steps.filter((s) => (s.phase || 'walls') === stage).map((s) => ({ name: s.name })) : blocks
     const preflight = parser.checkInventory(phaseBlocks, bot.inventory.items())
     if (!preflight.ok) {
@@ -1600,7 +1936,15 @@ function startSession (shared, onEnded) {
       return { ok: false, msg: `cannot build ${label}${stage ? ' (' + stage + ')' : ''}: missing ${missing}. Gather them (gather) or ask a player, then call the same stage again — phases already placed do not redo.` }
     }
     logger.info(TAG, `${label} — ${plan.steps.length} blocks${stage ? ` (stage ${stage})` : ''}${plan.towerNeeded ? `, tower ${plan.towerHeight} high` : ''}`)
-    const result = await executor.build(plan, { stage })
+    const runningGoalId = agenda.main?.goalId || null
+    const result = await executor.build(plan, {
+      stage,
+      onProgress: ({ placed, total }) => {
+        if (runningGoalId && (placed === 1 || placed % 4 === 0 || placed === total)) {
+          goalReg.progress(runningGoalId, { done: placed, total, note: `${placed}/${total} blocks` })
+        }
+      }
+    })
     let scaffoldNote = ''
     if (cfg.build.autoRemoveScaffold !== false) {
       try {
@@ -1610,7 +1954,18 @@ function startSession (shared, onEnded) {
     }
     const phaseTotal = stage && plan.phaseCounts ? plan.phaseCounts[stage] : plan.steps.length
     const text = `build ${label}${stage ? ' (' + stage + ')' : ''}: completed ${result.placed}/${phaseTotal} (${result.placed - (result.alreadyPresent || 0)} newly placed${result.alreadyPresent ? `, ${result.alreadyPresent} already present` : ''})${result.skipped.length ? `, skipped ${result.skipped.length}` : ''}${result.reason === 'cancelled' ? ', cancelled' : ''}${scaffoldNote}`
-    if (result.placed > 0) note({ type: 'build_complete', msg: text }, { promote: true })
+    if (result.placed > 0) {
+      note({ type: 'build_complete', msg: text }, { promote: true })
+      try {
+        continuity.recordConstruction({
+          label,
+          steps: plan.steps.slice(0, Math.max(1, result.placed)),
+          dim: dim(),
+          origin: askedBy ? `player:${askedBy}` : 'self',
+          askedBy
+        })
+      } catch { /* noop */ }
+    }
     // The objective is complete only when every block of the phase is in
     // place — a loop that returned is not the same thing.
     return {
@@ -1623,6 +1978,7 @@ function startSession (shared, onEnded) {
 
   // ----------------------------------------------------------- executor --
   async function executeAction (action, snap) {
+    const execStartMono = performance.now()
     const vanilla = assertVanillaAction(action)
     if (!vanilla.ok) {
       logger.warn(TAG, `refused non-vanilla action (${vanilla.why})`)
@@ -1649,6 +2005,12 @@ function startSession (shared, onEnded) {
     }
     if (a !== 'idle') logger.info(TAG, `action: ${a} ${JSON.stringify(Object.fromEntries(Object.entries(action).filter(([k]) => !k.startsWith('_') && k !== 'a')))}`)
     gateCtx = action
+    const IMMEDIATE_TRACKED = new Set(['say', 'stop', 'hold', 'equip', 'redstone_scan', 'redstone_component', 'redstone_engineer', 'recall', 'circuit_project', 'logic_test', 'inspect_region', 'inspect_block', 'find', 'remember_here', 'note', 'social', 'goal', 'set_mode'])
+    currentActId = IMMEDIATE_TRACKED.has(a)
+      ? continuity.beginAction({ tool: a, summary: `${a} ${JSON.stringify(goalArgs(action)).slice(0, 80)}`, sig: `${a}:${JSON.stringify(goalArgs(action))}`, goalId: agenda.main?.goalId || null, args: goalArgs(action) })
+      : null
+    if (currentActId) actStartedMono.set(currentActId, execStartMono)
+    if (actStartedMono.size > 32) actStartedMono.delete(actStartedMono.keys().next().value)
     try {
     switch (a) {
       case 'idle':
@@ -1676,16 +2038,23 @@ function startSession (shared, onEnded) {
       case 'go_to': {
         const target = { player: action.player, place: action.place, x: action.x, y: action.y, z: action.z }
         const where = action.player || action.place || (Number.isFinite(Number(action.x)) ? `${Math.round(Number(action.x))},${Math.round(Number(action.z))}` : 'somewhere')
-        return startMain({ tool: 'go_to', label: `go to ${where}`, askedBy: snap.askedBy, detail: goalDetailFor('go_to', target), decision: decided(snap, { label: 'go_to' }), run: () => skills.goTo(target) })
+        const askedBy = resolveActionAttribution('go_to', action, snap)
+        return startMain({ tool: 'go_to', label: `go to ${where}`, askedBy, detail: goalDetailFor('go_to', target), decision: decided(snap, { label: 'go_to' }), run: () => skills.goTo(target) })
       }
       case 'dig': {
         const target = { player: action.player, place: action.place, x: action.x, y: action.y, z: action.z, materials: action.materials, avoid: action.avoid }
+        const askedBy = resolveActionAttribution('dig', action, snap)
+        if (Number.isFinite(Number(action.x)) && Number.isFinite(Number(action.z))) {
+          const g = continuity.propertyGuardAt({ x: Number(action.x), y: Number(action.y ?? here()?.y ?? 64), z: Number(action.z) }, dim(), { askedBy })
+          if (!g.ok) return report('dig', { ok: false, msg: `refused to dig: destination is inside ${g.reason} — use go_to or get permission` })
+        }
         const where = action.player || action.place || (Number.isFinite(Number(action.x)) ? `${Math.round(Number(action.x))},${Math.round(Number(action.z))}` : 'somewhere')
         const limit = Array.isArray(action.materials) && action.materials.length ? ` breaking only ${action.materials.join('/')}` : ''
-        return startMain({ tool: 'dig', label: `dig to ${where}${limit}`, askedBy: snap.askedBy, detail: goalDetailFor('dig', target), decision: decided(snap, { label: 'dig' }), run: () => skills.dig(target) })
+        return startMain({ tool: 'dig', label: `dig to ${where}${limit}`, askedBy, detail: goalDetailFor('dig', target), decision: decided(snap, { label: 'dig' }), run: () => skills.dig(target) })
       }
       case 'follow': {
-        return startMain({ tool: 'follow', label: `follow ${action.player}`, askedBy: snap.askedBy, detail: goalDetailFor('follow', { player: action.player }), decision: decided(snap, { label: 'follow', ttlMs: 30 * 60_000 }), run: () => skills.follow({ player: action.player }) })
+        const askedBy = resolveActionAttribution('follow', action, snap)
+        return startMain({ tool: 'follow', label: `follow ${action.player}`, askedBy, detail: goalDetailFor('follow', { player: action.player }), decision: decided(snap, { label: 'follow', ttlMs: 30 * 60_000 }), run: () => skills.follow({ player: action.player }) })
       }
       case 'stop': {
         const duel = fight?.player ? combat?.target : null
@@ -1732,9 +2101,16 @@ function startSession (shared, onEnded) {
       case 'look_in':
         decided(snap, { label: 'look_in' })
         return startSide('look_in', () => skills.lookIn({ where: action.where }), sideOpts('look_in', action, snap))
-      case 'take':
+      case 'take': {
+        if (here() && places) {
+          try { places.scan(bot, { radius: cfg.places.scanRadius ?? 16 }) } catch { /* noop */ }
+          const entry = places.resolve(action.where || '', here(), { dim: dim() })
+          const cg = continuity.containerTakeGuard(entry, dim(), { askedBy: snap?.askedBy })
+          if (!cg.ok) return report('take', { ok: false, msg: `refused: ${cg.reason}` })
+        }
         decided(snap, { label: 'take' })
         return startSide('take', () => skills.take({ item: action.item, count: action.count, where: action.where }), sideOpts('take', action, snap))
+      }
       case 'put':
         decided(snap, { label: 'put' })
         return startSide('put', () => skills.put({ item: action.item, count: action.count, where: action.where }), sideOpts('put', action, snap))
@@ -1754,6 +2130,52 @@ function startSession (shared, onEnded) {
         return background('eat', skills.eat({ item: action.item }))
       case 'equip':
         return report('equip', await skills.equip({ item: action.item, where: action.where }), { wake: null })
+      case 'redstone_engineer': {
+        const started = performance.now()
+        const res = await redstoneEngineer.act(action)
+        latency.record('responseToExecMs', performance.now() - started)
+        // Goal integration: a redstone build/repair earns progress from what was
+        // actually placed, and the goal may only be COMPLETED after functional
+        // verification — never from placement alone.
+        const op = String(action.operation || '').toLowerCase()
+        const gid = agenda.main?.goalId || null
+        if (gid) {
+          try {
+            if (op === 'place' && Number.isFinite(res.plan?.placements?.length)) {
+              goalReg.progress(gid, { total: res.plan.placements.length, percent: 70, note: `redstone placed: ${res.msg.slice(0, 80)}` })
+            }
+            if (op === 'verify') {
+              if (res.verified) {
+                goalReg.progress(gid, { percent: 100, note: `redstone functionally verified: ${res.msg.slice(0, 90)}` })
+                goalReg.update(gid, { detail: { ...(goalReg.get(gid)?.detail || {}), redstoneVerified: Date.now(), redstoneVerificationFailed: null, verification: res.msg.slice(0, 160) } })
+              } else {
+                goalReg.recordFailure?.(gid, `redstone verification failed: ${res.msg.slice(0, 120)}`)
+                goalReg.update(gid, { detail: { ...(goalReg.get(gid)?.detail || {}), redstoneVerified: null, redstoneVerificationFailed: Date.now() } })
+              }
+            }
+          } catch (err) { logger.debug(TAG, `redstone goal progress: ${err.message || err}`) }
+        }
+        const verifiedNow = op === 'verify' && res.verified
+        return report('redstone_engineer', res, verifiedNow ? { wake: false } : {})
+      }
+      case 'recall': {
+        const near = [action.x, action.y, action.z].every(Number.isInteger)
+          ? { x: action.x, y: action.y, z: action.z, dim: dim() }
+          : null
+        const res = memory.longTerm.retrieve({
+          query: String(action.query || ''),
+          category: ['episodic', 'semantic', 'procedural', 'continuity'].includes(String(action.category)) ? String(action.category) : null,
+          entity: action.entity ? String(action.entity) : null,
+          goalId: action.goal ? String(action.goal) : null,
+          near,
+          k: cfg.memory.topK ?? 4
+        })
+        const lines = res.entries.length
+          ? res.entries.map((h) => `- [${h.category}${h.basis !== 'observed' ? `, ${h.basis}` : ''}${h.status !== 'active' ? `, ${h.status}` : ''} | score ${h.score}] ${memory.formatEntry(h)}`).join('\n')
+          : `nothing relevant found — ${res.unknownReason}`
+        const header = `recall "${String(action.query || '').slice(0, 60)}" (${res.entries.length}/${res.totalStoreSize} stored memories considered)`
+        return report('recall', { ok: true, msg: `${header}\n${lines}` })
+      }
       case 'redstone_scan':
         return report('redstone_scan', redstoneInspector.scan(action))
       case 'redstone_component':
@@ -1777,32 +2199,106 @@ function startSession (shared, onEnded) {
       case 'find':
         return report('find', skills.find({ what: action.what, page: action.page }))
       case 'remember_here': {
+        const p = here()?.floored()
+        const ownership = action.ownership && ['own', 'shared', 'player', 'unknown'].includes(action.ownership) ? action.ownership : ''
+        if (p && (action.home === true || ownership === 'own')) {
+          const conflict = continuity.claimAt(p, dim())
+          if (conflict && conflict.kind === 'player' && (!snap?.askedBy || conflict.owner?.toLowerCase() !== snap.askedBy.toLowerCase())) {
+            return report('remember_here', { ok: false, msg: `refused: cannot claim "${conflict.name}" (${conflict.owner || 'player'}'s property) as yours` })
+          }
+        }
+        let homeMsg = ''
+        if (p && action.home === true) {
+          const basis = snap?.askedBy ? 'assigned' : 'self_built'
+          const hr = continuity.setHome({ place: action.name, pos: p, dim: dim(), basis, assignedBy: snap?.askedBy || null })
+          if (!hr.ok) return report('remember_here', { ok: false, msg: `refused to set home: ${hr.reason}` })
+          homeMsg = ` (verified home [${hr.home.basis}])`
+        }
         const res = skills.rememberHere({ name: action.name, note: action.note })
-        if (res.ok) {
+        if (res.ok && p) {
           try {
-            const p = here()?.floored()
-            const loc = p ? `${p.x},${p.y},${p.z} (${dim()})` : ''
-            memory.longTerm?.upsertByTag(`place:${String(action.name).toLowerCase()}`, `saved place "${action.name}" at ${loc}${action.note ? `: ${action.note}` : ''}`, ['place', String(action.name).toLowerCase()], 2)
+            if (ownership || action.owner) {
+              places.remember(action.name, p, { dim: dim(), note: action.note, ownership: ownership || (action.home ? 'own' : ''), owner: action.owner || '' })
+            }
+            if (ownership && ownership !== 'unknown') {
+              continuity.recordClaim({ name: action.name, pos: p, radius: 9, dim: dim(), kind: ownership, owner: action.owner || (ownership === 'own' ? bot.username : null), note: action.note || '', source: 'model_note' })
+            }
+            const loc = `${p.x},${p.y},${p.z} (${dim()})`
+            memory.longTerm?.upsertByTag(`place:${String(action.name).toLowerCase()}`, `saved place "${action.name}" at ${loc}${ownership ? ` [${ownership}${action.owner ? ':' + action.owner : ''}]` : ''}${action.note ? `: ${action.note}` : ''}`, ['place', String(action.name).toLowerCase()], 2)
           } catch { /* noop */ }
+          res.msg += homeMsg
         }
         return report('remember_here', res, { wake: null })
+      }
+      case 'note': {
+        const text = String(action.text || '').trim().slice(0, 220)
+        const interest = String(action.interest || '').trim().slice(0, 60)
+        if (!text && !interest) return report('note', { ok: false, msg: 'note needs `text` and/or `interest`' })
+        const parts = []
+        if (text) {
+          try { memory.longTerm?.add(text, ['note', 'self'], 2, { source: 'self', verified: true }) } catch { /* noop */ }
+          parts.push(`remembered "${text}"`)
+        }
+        if (interest) {
+          const list = continuity.updateInterest(interest)
+          parts.push(`interests now: ${list.length ? list.join(', ') : 'none'}`)
+        }
+        return report('note', { ok: true, msg: parts.join('; ') }, { wake: null })
+      }
+      case 'social': {
+        const op = String(action.operation || 'list').toLowerCase()
+        if (op === 'list') {
+          const all = continuity.listRelationships()
+          if (!all.length) return report('social', { ok: true, msg: 'no player relationships recorded yet — form your own opinions as you observe and interact' })
+          return report('social', { ok: true, msg: `relationships (${all.length}): ${all.slice(0, 8).map((e) => continuity.formatRelationship(e.name)).join(' || ')}` })
+        }
+        const who = String(action.player || snap?.askedBy || '').trim()
+        if (!who) return report('social', { ok: false, msg: `social ${op} requires a player name` })
+        if (op === 'show') {
+          return report('social', { ok: true, msg: continuity.formatRelationship(who) })
+        }
+        if (op === 'update' || op === 'decide') {
+          const matchProp = (snap?.shownProposals || agenda.asked || []).find((p) => p.from?.toLowerCase() === who.toLowerCase())
+          const updated = continuity.updateRelationship(who, {
+            stance: action.stance,
+            trust: action.trust,
+            confidence: action.confidence,
+            willingness: action.willingness,
+            opinion: action.opinion,
+            evidence: action.evidence,
+            decision: action.decision,
+            proposalText: matchProp?.text || ''
+          })
+          if (!updated) return report('social', { ok: false, msg: `invalid player "${who}"` })
+          if (action.decision) {
+            agenda.asked = agenda.asked.filter((x) => x.from?.toLowerCase() !== who.toLowerCase())
+            continuity.resolvePendingEvents((e) => e.kind === 'player_request' && e.from?.toLowerCase() === who.toLowerCase())
+          }
+          if (action.opinion || action.evidence) {
+            const memSummary = `opinion on ${updated.name}: stance=${updated.stance || 'unassessed'}${updated.trust !== null ? `, trust=${updated.trust}` : ''}${updated.summary ? ` — ${updated.summary}` : ''}${action.evidence ? ` (evidence: ${action.evidence})` : ''}`.slice(0, 220)
+            try { memory.longTerm?.upsertByTag?.(`rel:${updated.name.toLowerCase()}`, memSummary, ['relationship', updated.name], 2) } catch { /* noop */ }
+          }
+          return report('social', { ok: true, msg: `updated ${continuity.formatRelationship(who)}` })
+        }
+        return report('social', { ok: false, msg: `unknown social operation "${op}" (list|show|update|decide)` })
       }
       case 'gather': {
         decided(snap, { label: 'gather' })
         const n = Math.max(1, Math.min(64, Math.trunc(Number(action.count)) || 1))
-        return startMain({ tool: 'gather', label: `gather ${action.item}${n > 1 ? ` x${n}` : ''}`, askedBy: snap.askedBy, detail: goalDetailFor('gather', { item: action.item, count: n, radius: action.radius }), decision: decided(snap, { label: 'gather' }), run: () => skills.gather({ item: action.item, count: n, radius: action.radius }) })
+        const askedBy = resolveActionAttribution('gather', action, snap)
+        return startMain({ tool: 'gather', label: `gather ${action.item}${n > 1 ? ` x${n}` : ''}`, askedBy, detail: goalDetailFor('gather', { item: action.item, count: n, radius: action.radius }), decision: decided(snap, { label: 'gather' }), run: () => skills.gather({ item: action.item, count: n, radius: action.radius, guard: (p) => continuity.propertyGuardAt(p, dim(), { askedBy }) }) })
       }
       case 'light_up': {
         decided(snap, { label: 'light_up' })
-        return startMain({ tool: 'light_up', label: 'lighting the area', askedBy: snap.askedBy, decision: decided(snap, { label: 'light_up' }), run: () => skills.lightUp({ radius: action.radius }) })
+        return startMain({ tool: 'light_up', label: 'lighting the area', askedBy: resolveActionAttribution('light_up', action, snap), decision: decided(snap, { label: 'light_up' }), run: () => skills.lightUp({ radius: action.radius }) })
       }
       case 'shelter': {
         decided(snap, { label: 'shelter' })
-        return startMain({ tool: 'shelter', label: 'sheltering', askedBy: snap.askedBy, decision: decided(snap, { label: 'shelter' }), run: () => skills.shelter() })
+        return startMain({ tool: 'shelter', label: 'sheltering', askedBy: resolveActionAttribution('shelter', action, snap), decision: decided(snap, { label: 'shelter' }), run: () => skills.shelter() })
       }
       case 'corpse_run': {
         decided(snap, { label: 'corpse_run' })
-        return startMain({ tool: 'corpse_run', label: 'going back to last death', askedBy: snap.askedBy, decision: decided(snap, { label: 'corpse_run' }), run: () => skills.corpseRun() })
+        return startMain({ tool: 'corpse_run', label: 'going back to last death', askedBy: resolveActionAttribution('corpse_run', action, snap), decision: decided(snap, { label: 'corpse_run' }), run: () => skills.corpseRun() })
       }
       case 'craft': {
         // runs as a side job through skills.craft, which WALKS
@@ -1826,7 +2322,8 @@ function startSession (shared, onEnded) {
         // — at the SAME origin, which is resolved now and kept in the goal
         // checkpoint (re-running without `at` used to build a second house).
         const detail = goalDetailFor('build', action)
-        return startMain({ tool: 'build', label: `build ${what}`, askedBy: snap.askedBy, showAs: `building ${what}`, detail, decision: decided(snap, { label: 'build', ttlMs: 30 * 60_000 }), run: () => buildBlocks(planned.blocks, String(action.blueprint || 'inline'), stage, detail.at) })
+        const askedBy = resolveActionAttribution('build', action, snap)
+        return startMain({ tool: 'build', label: `build ${what}`, askedBy, showAs: `building ${what}`, detail, decision: decided(snap, { label: 'build', ttlMs: 30 * 60_000 }), run: () => buildBlocks(planned.blocks, String(action.blueprint || 'inline'), stage, detail.at, { askedBy }) })
       }
       case 'build_shape': {
         if (!executor) return report('build_shape', { ok: false, msg: 'not ready yet' })
@@ -1837,7 +2334,8 @@ function startSession (shared, onEnded) {
         let blocks
         try { blocks = generateShape(shape, params, block) } catch (err) { return report('build_shape', { ok: false, msg: String(err.message || err) }) }
         const detail = goalDetailFor('build_shape', action)
-        return startMain({ tool: 'build_shape', label: `build ${shape} of ${block}`, askedBy: snap.askedBy, showAs: `building ${shape} of ${block}`, detail, decision: decided(snap, { label: 'build', ttlMs: 30 * 60_000 }), run: () => buildBlocks(blocks, `shape:${shape}`, normalizeStage(action.stage), detail.at) })
+        const askedBy = resolveActionAttribution('build_shape', action, snap)
+        return startMain({ tool: 'build_shape', label: `build ${shape} of ${block}`, askedBy, showAs: `building ${shape} of ${block}`, detail, decision: decided(snap, { label: 'build', ttlMs: 30 * 60_000 }), run: () => buildBlocks(blocks, `shape:${shape}`, normalizeStage(action.stage), detail.at, { askedBy }) })
       }
       case 'run_script': {
         const name = String(action.name || '')
@@ -1851,17 +2349,19 @@ function startSession (shared, onEnded) {
         return startMain({ tool: `run_script ${name}`, label: `script ${name}`, askedBy: snap.askedBy, showAs: `running script ${name}`, resumable: false, run: () => runScript(name, {}, ctx).then((out) => ({ ok: true, msg: typeof out === 'string' ? out : 'done' })) })
       }
       case 'goal': {
-        return report('goal', await runGoalOp(action))
+        return report('goal', await runGoalOp(action, snap))
       }
       case 'set_mode': {
+        const prevMode = wrapper.mode || 'explorer'
         const applied = wrapper.setMode(String(action.mode || ''))
         cfg.behavior.mode = applied
-        return report('set_mode', { ok: true, msg: `movement mode ${applied}` }, { wake: false })
+        continuity.currentState.mode = applied
+        return report('set_mode', { ok: true, msg: `mode switched to ${applied}` }, { wake: prevMode !== applied })
       }
       default:
         return report(String(a), { ok: false, msg: `unknown action "${a}"` })
     }
-    } finally { gateCtx = null }
+    } finally { gateCtx = null; currentActId = null }
   }
 
   // ------------------------------------------ optional Scout & Relocate --
@@ -1962,6 +2462,7 @@ function startSession (shared, onEnded) {
     brain = new Brain({
       act,
       talk,
+      isBodyBusy: () => Boolean(skills?.current() || task || combat?.isEngaged || system1?.fleeing),
       logger: (level, msg) => logger[level]?.(TAG, msg),
       minIntervalMs: cfg.inference.minIntervalMs ?? 3000,
       chatMinIntervalMs: cfg.inference.chatMinIntervalMs ?? 1200,
@@ -2022,8 +2523,43 @@ function startSession (shared, onEnded) {
     arbiter.on('preempt', ({ lane, by, reason }) => { if (lane === 'task') note({ type: 'interrupted', msg: `task paused: ${by} lane took over (${reason || 'reflex'})` }) })
     arbiter.on('resume', ({ lane }) => { if (lane === 'task') note({ type: 'resumed', msg: 'task resumed after the interruption' }) })
 
-    every(3000, () => { try { places.scan(bot, { radius: cfg.places.scanRadius ?? 16 }) } catch { /* partial world */ } })
-    every(60_000, () => { try { memory.save(); places.save(); shared.saveConvo?.() } catch { /* best effort */ } })
+    let lastWorldWakeAt = 0
+    const nearbyPlayerSeen = new Set()
+    every(3000, () => {
+      try { places.scan(bot, { radius: cfg.places.scanRadius ?? 16 }) } catch { /* partial world */ }
+      try {
+        const env = continuity.observeEnvironment(bot, places)
+        const now = Date.now()
+        const bodyIdle = !agenda.main && !skills?.current() && !task && !combat?.isEngaged && !system1?.fleeing && !brain?.busyAction
+        // Notice newly arrived / returning players within 24m without spamming wakes.
+        const pos = here()
+        if (pos && bot.players) {
+          const currentlyNear = new Set()
+          for (const [pname, pobj] of Object.entries(bot.players)) {
+            if (pname === bot.username || !pobj?.entity?.position) continue
+            const d = Math.hypot(pobj.entity.position.x - pos.x, pobj.entity.position.z - pos.z)
+            if (d <= 24) {
+              currentlyNear.add(pname)
+              if (!nearbyPlayerSeen.has(pname)) {
+                const rel = continuity.touchPlayer(pname)
+                if (bodyIdle && now - lastWorldWakeAt >= 25_000) {
+                  lastWorldWakeAt = now
+                  const viewTag = rel?.entry?.stance ? ` — your view: ${rel.entry.stance}` : ''
+                  brain.wake(`player ${pname} arrived nearby (${Math.round(d)}m)${viewTag}`, { external: true })
+                }
+              }
+            }
+          }
+          nearbyPlayerSeen.clear()
+          for (const pname of currentlyNear) nearbyPlayerSeen.add(pname)
+        }
+        if (env.changes.length && bodyIdle && now - lastWorldWakeAt >= 25_000) {
+          lastWorldWakeAt = now
+          brain.wake(`world change noticed: ${env.changes.slice(0, 2).join('; ')}`, { external: true })
+        }
+      } catch { /* partial world */ }
+    })
+    every(60_000, () => { try { memory.save(); places.save(); continuity.save(); shared.saveConvo?.() } catch { /* best effort */ } })
     every(GOALS.tickMs ?? 15_000, () => { try { goalTick() } catch (err) { logger.debug(TAG, `goal tick: ${err.message || err}`) } })
 
     try { bot.armorManager?.equipAll?.() } catch { /* cosmetic */ }
@@ -2031,11 +2567,21 @@ function startSession (shared, onEnded) {
     if (first) {
       let restored = 0
       try { restored = reconcileRestored() } catch (err) { logger.debug(TAG, `goal reconcile: ${err.message || err}`) }
+      try {
+        for (const evt of continuity.pendingEvents) {
+          if (evt.kind === 'player_request' && evt.from && evt.text && !agenda.asked.some((x) => x.from === evt.from && x.text === evt.text)) {
+            agenda.asked.push({ from: evt.from, text: evt.text, at: evt.at || Date.now() })
+          }
+        }
+        if (continuity.stateVersion > 0) {
+          continuity.reconcileWithWorld(bot, { goals: goalReg, places, skills, building: Boolean(task), combat, system1, reason: 'session_boot' })
+        }
+      } catch { /* best effort */ }
       const open = goalReg.openGoals()
       const carried = open.length
-        ? `; objectives restored from the last session (${open.length}): ${open.slice(0, 4).map((g) => goalReg.describe(g)).join(' | ')}${open.length > 4 ? ` +${open.length - 4} more` : ''} — check them (goal show/verify <id>) before resuming`
+        ? `; objectives restored (${open.length}): ${open.slice(0, 4).map((g) => goalReg.describe(g)).join(' | ')}${open.length > 4 ? ` +${open.length - 4} more` : ''} — verify against the world before resuming`
         : ''
-      brain.wake(`just joined the server — look around; idle is fine${carried}`)
+      brain.wake(`joined the server — orient yourself, check open goals or surroundings, or idle if content${carried}`)
       if (restored) logger.info(TAG, `goals: re-checked ${restored} restored objective(s) at startup`)
       scoutAndRelocate().catch((err) => logger.warn(TAG, `scout failed: ${err.message || err}`))
     }
@@ -2048,6 +2594,10 @@ function startSession (shared, onEnded) {
     isReady: () => systemsReady && !ended,
     onHurt: (cause, { hp }) => {
       note({ type: 'hurt', msg: cause.text })
+      const hitMatch = /hit by player ([A-Za-z0-9_]{1,20})/i.exec(String(cause.text || ''))
+      if (hitMatch) {
+        try { continuity.recordPlayerObservation(hitMatch[1], `${cause.text} (hp ${hp})`) } catch { /* noop */ }
+      }
       // do NOT clear the fail gate here — being hit is exactly the
       // state in which "too hurt to fight" keeps failing; clearing re-armed
       // the churn loop (repro 05). Death and new threats still clear it.
@@ -2058,12 +2608,299 @@ function startSession (shared, onEnded) {
   }).start()
   bot.on('entityHurt', (entity) => { if (entity !== bot.entity) system1?.onEntityHurt(entity) })
 
+  // ------------------------------------------------- entity perception ---
+  // Spawn/despawn/damage of everything else used to be invisible to the model:
+  // only the reflex layer subscribed to entityHurt. Every branch below is cheap
+  // and coalesces, so a horde does not become 200 prompt lines.
+  const ENTITY_INTEREST_RE = /^(player|zombie|skeleton|spider|creeper|enderman|witch|slime|magma_cube|blaze|ghast|phantom|drowned|husk|stray|pillager|vindicator|ravager|piglin|hoglin|zombified_piglin|wither_skeleton|warden|elder_guardian|guardian|iron_golem|wolf|cat|fox|horse|villager|wandering_trader|allay|bee|axolotl|goat|cow|pig|sheep|chicken|rabbit|turtle|panda|strider|boat|minecart|item|arrow|trident|fireball|small_fireball|wind_charge|tnt|primed_tnt)$/
+  bot.on('entitySpawn', (entity) => {
+    if (!systemsReady || !entity || entity === bot.entity) return
+    const name = String(entity.name || entity.displayName || 'entity')
+    if (!ENTITY_INTEREST_RE.test(name)) return
+    const isPlayer = entity.type === 'player' || entity.username
+    const d = here() && entity.position ? Math.round(entity.position.distanceTo(here())) : null
+    perceive({
+      source: 'mineflayer', eventType: isPlayer ? 'player_arrived' : 'entity_spawn',
+      reactionClass: isPlayer ? 'fast' : 'ambient',
+      summary: `${isPlayer ? (entity.username || 'player') : name} appeared${d !== null ? ` ${d}m away` : ''}`,
+      entities: [isPlayer ? (entity.username || name) : name],
+      where: entity.position || null,
+      occurrenceTimeKnown: true,
+      observedAt: Date.now(),
+      observationBasis: 'direct',
+      importance: isPlayer ? 2 : (name === 'item' ? 0 : 1),
+      groupKey: isPlayer ? null : `spawn:${name}`,
+      memoryType: isPlayer ? 'player_arrived' : 'spawn',
+      wake: null
+    })
+  })
+  bot.on('entityGone', (entity) => {
+    if (!systemsReady || !entity || entity === bot.entity) return
+    const name = String(entity.name || entity.displayName || 'entity')
+    if (!ENTITY_INTEREST_RE.test(name)) return
+    const isPlayer = entity.type === 'player' || entity.username
+    perceive({
+      source: 'mineflayer', eventType: isPlayer ? 'player_left' : 'entity_gone',
+      reactionClass: 'ambient',
+      summary: `${isPlayer ? (entity.username || 'player') : name} disappeared (out of range, died or logged off)`,
+      entities: [isPlayer ? (entity.username || name) : name],
+      where: entity.position || null,
+      occurrenceTimeKnown: true,
+      observationBasis: 'direct',
+      importance: 1,
+      groupKey: `gone:${name}`,
+      memoryType: isPlayer ? 'player_left' : 'despawn'
+    })
+  })
+  bot.on('entityHurt', (entity) => {
+    if (!systemsReady || !entity) return
+    const name = String(entity.name || entity.displayName || 'entity')
+    const isPlayer = entity.type === 'player' || entity.username
+    const label = isPlayer ? (entity.username || 'player') : name
+    const d = here() && entity.position ? Math.round(entity.position.distanceTo(here())) : null
+    perceive({
+      source: 'mineflayer', eventType: 'entity_hurt',
+      reactionClass: isPlayer ? 'fast' : 'ambient',
+      summary: `${label} took damage${d !== null ? ` ${d}m away` : ''}${entity.health !== undefined ? ` (health ${Math.round(entity.health)})` : ''}`,
+      entities: [label],
+      where: entity.position || null,
+      occurrenceTimeKnown: true,
+      observationBasis: 'direct',
+      importance: isPlayer ? 2 : 1,
+      groupKey: `hurt:${label}`,
+      memoryType: 'entity_hurt'
+    })
+  })
+  bot.on('entityDead', (entity) => {
+    if (!systemsReady || !entity) return
+    const name = String(entity.name || entity.displayName || 'entity')
+    const label = (entity.type === 'player' || entity.username) ? (entity.username || 'player') : name
+    perceive({
+      source: 'mineflayer', eventType: 'entity_dead',
+      reactionClass: 'fast',
+      summary: `${label} died`,
+      entities: [label],
+      where: entity.position || null,
+      occurrenceTimeKnown: true,
+      observationBasis: 'direct',
+      importance: 2,
+      memoryType: 'death_other'
+    })
+  })
+  bot.on('entityMoved', (entity) => {
+    if (!systemsReady || !entity || entity === bot.entity) return
+    const isPlayer = entity.type === 'player' || entity.username
+    const name = String(entity.name || '')
+    if (!isPlayer && name !== 'creeper' && name !== 'warden') return // only movers that matter
+    const prev = recentEntityPos.get(entity.id)
+    const nowMs = Date.now()
+    if (prev && nowMs - prev.at < 3000) return
+    recentEntityPos.set(entity.id, { x: entity.position?.x, at: nowMs })
+    if (recentEntityPos.size > 64) recentEntityPos.delete(recentEntityPos.keys().next().value)
+    if (!prev) return
+    const dx = (entity.position?.x ?? 0) - prev.x
+    if (Math.abs(dx) < 6) return
+    perceive({
+      source: 'mineflayer', eventType: 'entity_moved',
+      reactionClass: 'ambient',
+      summary: `${isPlayer ? (entity.username || 'player') : name} moved ${Math.round(Math.abs(dx))} blocks ${dx > 0 ? 'east' : 'west'}`,
+      entities: [isPlayer ? (entity.username || 'player') : name],
+      where: entity.position || null,
+      occurrenceTimeKnown: false,
+      observationBasis: 'direct',
+      importance: 0,
+      groupKey: `moved:${entity.username || name}`,
+      memoryType: 'move'
+    })
+  })
+
+  // ---------------------------------------------- environment perception --
+  const playerChunkOf = () => {
+    const p = here()
+    if (!p) return null
+    return `${Math.floor(p.x / 16)},${Math.floor(p.z / 16)}`
+  }
+  let lastChunk = null
+  every(1200, () => {
+    if (!systemsReady || ended) return
+    const chunk = playerChunkOf()
+    if (chunk && lastChunk && chunk !== lastChunk) {
+      perceive({
+        source: 'internal', eventType: 'chunk_transition',
+        reactionClass: 'ambient',
+        summary: `moved into chunk ${chunk}`,
+        occurrenceTimeKnown: false,
+        observedAt: Date.now(),
+        observationBasis: 'direct', importance: 0, memoryType: 'chunk'
+      })
+    }
+    if (chunk) lastChunk = chunk
+  })
+  let lastDim = null
+  let lastWeather = null
+  let lastDayPhase = null
+  every(2500, () => {
+    if (!systemsReady || ended) return
+    const d = String(bot.game?.dimension || '')
+    if (lastDim && d && d !== lastDim) {
+      perceive({
+        source: 'internal', eventType: 'dimension_change',
+        reactionClass: 'fast',
+        summary: `dimension changed ${lastDim.replace('minecraft:', '')} → ${d.replace('minecraft:', '')}`,
+        occurrenceTimeKnown: true, observationBasis: 'direct', importance: 3, memoryType: 'dimension'
+      })
+    }
+    if (d) lastDim = d
+    const raining = Boolean(bot.isRaining)
+    if (lastWeather !== null && raining !== lastWeather) {
+      perceive({
+        source: 'internal', eventType: 'weather',
+        reactionClass: 'ambient',
+        summary: raining ? 'it started raining' : 'the rain stopped',
+        occurrenceTimeKnown: false, observedAt: Date.now(), observationBasis: 'direct', importance: 0, memoryType: 'weather'
+      })
+    }
+    lastWeather = raining
+    const t = bot.time?.timeOfDay
+    if (Number.isFinite(t)) {
+      const phase = t < 12000 ? 'day' : t < 13000 ? 'dusk' : t < 23000 ? 'night' : 'dawn'
+      if (lastDayPhase && phase !== lastDayPhase) {
+        perceive({
+          source: 'internal', eventType: 'daylight',
+          reactionClass: 'ambient',
+          summary: `daylight phase changed ${lastDayPhase} → ${phase}`,
+          occurrenceTimeKnown: false, observedAt: Date.now(), observationBasis: 'direct', importance: 0, memoryType: 'daylight'
+        })
+      }
+      lastDayPhase = phase
+    }
+  })
+  // Zinc's own status effects and inventory deltas.
+  let lastEffects = new Map()
+  let lastInventory = new Map()
+  let lastHp = Number(bot.health)
+  const snapshotInventory = () => {
+    const m = new Map()
+    try { for (const i of bot.inventory?.items?.() || []) m.set(i.name, (m.get(i.name) || 0) + i.count) } catch { /* none */ }
+    return m
+  }
+  every(2000, () => {
+    if (!systemsReady || ended) return
+    let effects = new Map()
+    try {
+      for (const e of bot.entity?.effects ? Object.values(bot.entity.effects) : []) effects.set(e.name || e.id || 'effect', e.amplifier ?? 0)
+    } catch { effects = new Map() }
+    for (const [name, amp] of effects) {
+      if (!lastEffects.has(name)) {
+        perceive({
+          source: 'internal', eventType: 'status_effect',
+          reactionClass: 'fast',
+          summary: `gained ${name}${amp ? ` ${amp + 1}` : ''}`,
+          occurrenceTimeKnown: false, observedAt: Date.now(), observationBasis: 'direct', importance: 1, memoryType: 'effect'
+        })
+      }
+    }
+    for (const [name] of lastEffects) {
+      if (!effects.has(name)) {
+        perceive({
+          source: 'internal', eventType: 'status_effect_end',
+          reactionClass: 'ambient',
+          summary: `${name} wore off`,
+          occurrenceTimeKnown: false, observedAt: Date.now(), observationBasis: 'direct', importance: 0, memoryType: 'effect'
+        })
+      }
+    }
+    lastEffects = effects
+    const inv = snapshotInventory()
+    if (lastInventory.size) {
+      for (const [name, count] of inv) {
+        const before = lastInventory.get(name) || 0
+        if (count > before) {
+          perceive({
+            source: 'internal', eventType: 'inventory_gain',
+            reactionClass: 'fast',
+            summary: `+${count - before} ${name} (now ${count})`,
+            occurrenceTimeKnown: false, observedAt: Date.now(), observationBasis: 'direct', importance: 1,
+            groupKey: `inv:${name}`, memoryType: 'inventory'
+          })
+        }
+      }
+      for (const [name, count] of lastInventory) {
+        const nowCount = inv.get(name) || 0
+        if (nowCount < count) {
+          perceive({
+            source: 'internal', eventType: 'inventory_loss',
+            reactionClass: 'ambient',
+            summary: `-${count - nowCount} ${name} (now ${nowCount})`,
+            occurrenceTimeKnown: false, observedAt: Date.now(), observationBasis: 'direct', importance: count - nowCount >= 8 ? 1 : 0,
+            groupKey: `invloss:${name}`, memoryType: 'inventory'
+          })
+        }
+      }
+    }
+    lastInventory = inv
+    // Health regen / damage while nothing else reported it.
+    const hp = Number(bot.health)
+    if (Number.isFinite(hp)) {
+      if (hp < lastHp) perceive({
+        source: 'internal', eventType: 'damage', reactionClass: 'immediate',
+        summary: `took ${+(lastHp - hp).toFixed(1)} damage (hp ${hp})`,
+        occurrenceTimeKnown: true, observationBasis: 'direct', importance: 3, memoryType: 'hurt',
+        wake: `took damage (hp ${hp})`
+      })
+      else if (hp > lastHp + 0.5) perceive({
+        source: 'internal', eventType: 'healing', reactionClass: 'ambient',
+        summary: `healed to ${hp}`,
+        occurrenceTimeKnown: false, observedAt: Date.now(), observationBasis: 'direct', importance: 0, memoryType: 'heal'
+      })
+      lastHp = hp
+    }
+  })
+
   // a container block changing under the bot (opened or
   // broken by someone else, a new chest placed) invalidates what the index
   // thought was inside — at zero cost, no waiting for the next 3 s scan.
   bot.on('blockUpdate', (oldBlock, newBlock) => {
     if (!systemsReady) return
     try { places.onBlockChange(oldBlock, newBlock, { dim: dim() }) } catch { /* cosmetic */ }
+    // The model never saw block changes before: only the place index did.
+    const RS_RE = /^(redstone_wire|repeater|comparator|observer|piston|sticky_piston|piston_head|redstone_torch|redstone_wall_torch|lever|.*_button|.*_pressure_plate|redstone_lamp|hopper|dropper|dispenser|note_block|tripwire|tripwire_hook|target|daylight_detector|redstone_block|.*_door|.*_trapdoor)/
+    const from = oldBlock?.name || 'air'
+    const to = newBlock?.name || 'air'
+    if (from === to) {
+      // Same block, changed state (repeater delay, lamp lit, dust power…).
+      let a = null; let b = null
+      try { a = oldBlock?.getProperties?.() } catch { a = null }
+      try { b = newBlock?.getProperties?.() } catch { b = null }
+      if (!a || !b) return
+      const diff = Object.keys(b).filter((k) => String(a[k]) !== String(b[k])).slice(0, 3)
+      if (!diff.length) return
+      const pos = newBlock?.position
+      const isRedstone = RS_RE.test(to)
+      perceive({
+        source: 'mineflayer', eventType: isRedstone ? 'redstone_update' : 'block_state_change',
+        reactionClass: 'ambient',
+        summary: `${to} changed (${diff.map((k) => `${k}: ${a[k]}→${b[k]}`).join(', ')})`,
+        where: pos || null,
+        occurrenceTimeKnown: false, observedAt: Date.now(), observationBasis: 'direct',
+        importance: isRedstone ? 1 : 0,
+        groupKey: `state:${pos ? `${pos.x},${pos.y},${pos.z}` : to}`,
+        memoryType: isRedstone ? 'redstone' : 'block'
+      })
+      return
+    }
+    const pos = newBlock?.position || oldBlock?.position
+    const placedByOther = from === 'air'
+    perceive({
+      source: 'mineflayer', eventType: RS_RE.test(to) || RS_RE.test(from) ? 'redstone_update' : (placedByOther ? 'block_placed' : 'block_destroyed'),
+      reactionClass: 'ambient',
+      summary: placedByOther ? `${to} placed` : (to === 'air' ? `${from} destroyed/broken` : `${from} → ${to}`),
+      where: pos || null,
+      delta: `${from}→${to}`,
+      occurrenceTimeKnown: false, observedAt: Date.now(), observationBasis: 'direct',
+      importance: RS_RE.test(to) || RS_RE.test(from) ? 1 : 0,
+      groupKey: `block:${to}`
+    })
   })
 
   // absorption/health-boost show up as hp above the vanilla 20 —
@@ -2073,7 +2910,32 @@ function startSession (shared, onEnded) {
 
   bot.on('playerCollect', (collector, item) => {
     if (!systemsReady || collector !== bot.entity) return
-    system1?.onItemGained(item?.name || 'item', null)
+    const itemName = item?.name || 'item'
+    let nearPlayer = null
+    const p = here()
+    if (p && bot.players) {
+      let bestD = 6.0
+      for (const [pname, pobj] of Object.entries(bot.players)) {
+        if (pname === bot.username || !pobj?.entity?.position) continue
+        const d = pobj.entity.position.distanceTo(p)
+        if (d <= bestD) { bestD = d; nearPlayer = { name: pname, d: Math.round(d) } }
+      }
+    }
+    if (nearPlayer) {
+      // Record raw factual proximity only — NEVER auto-label as friend!
+      try { continuity.recordPlayerObservation(nearPlayer.name, `nearby (${nearPlayer.d}m) when you collected ${itemName}`) } catch { /* noop */ }
+      note({ type: 'item_collected', msg: `collected ${itemName} (${nearPlayer.name} ${nearPlayer.d}m away)` })
+    }
+    system1?.onItemGained(itemName, null)
+    perceive({
+      source: 'mineflayer', eventType: 'item_pickup',
+      reactionClass: 'fast',
+      summary: `picked up ${itemName}${nearPlayer ? ` (${nearPlayer.name} ${nearPlayer.d}m away)` : ''}`,
+      entities: nearPlayer ? [nearPlayer.name] : [],
+      where: here(),
+      occurrenceTimeKnown: true, observationBasis: 'direct',
+      importance: 1, groupKey: `pickup:${itemName}`, memoryType: 'item_collected', remember: false
+    })
   })
 
   bot.on('death', () => {
@@ -2130,6 +2992,16 @@ function startSession (shared, onEnded) {
     system1?.onChatLine(sender, text)
     logChat(sender, whisper ? `(whisper) ${text}` : text)
     note({ type: 'chat', sender, text: `${sender}: ${text}` })
+    perceive({
+      source: 'mineflayer', eventType: 'chat', reactionClass: 'fast',
+      summary: `${sender}: ${text}`,
+      entities: [sender],
+      sender,
+      dedupeKey: null,
+      groupKey: `chat:${sender}`,
+      occurrenceTimeKnown: true, observationBasis: 'direct', importance: 2,
+      memoryType: 'chat', remember: false
+    })
     const why = filter.chatAddressesBot(text, {
       names: botNames,
       whisper,
@@ -2150,6 +3022,51 @@ function startSession (shared, onEnded) {
     brain.hear(sender, text, { whisper })
   })
 
+  /**
+   * Arbitrary context reset boundary: wipes all transient conversation,
+   * working-memory, ephemeral, and turn-result buffers while preserving live
+   * body execution and reconstructing operational continuity strictly from
+   * compact persistent records + live world ground truth.
+   */
+  function resetContext ({ reason = 'context_reset', wake = true } = {}) {
+    decisionEpoch++
+    results.length = 0
+    try { memory.working.clear() } catch { /* noop */ }
+    try { if (memory.shortTerm) memory.shortTerm.items = [] } catch { /* noop */ }
+    try {
+      if (memory.ephemeral) {
+        memory.ephemeral.clear?.()
+        if (Array.isArray(memory.ephemeral.items)) memory.ephemeral.items = []
+      }
+    } catch { /* noop */ }
+    try { shared.convo.clear() } catch { /* noop */ }
+    try { shared.chatLog.length = 0 } catch { /* noop */ }
+    // Undelivered IMPORTANT events survive a context reset; already-delivered
+    // ambient chatter does not. The brain keeps urgent/important wakes.
+    let survived = []
+    try { survived = pipeline.onContextReset() } catch { /* noop */ }
+    try { brain?.clearContext({ preserveImportant: true }) } catch { /* noop */ }
+    for (const evt of continuity.pendingEvents) {
+      if (evt.kind === 'player_request' && evt.from && evt.text && !agenda.asked.some((x) => x.from === evt.from && x.text === evt.text)) {
+        agenda.asked.push({ from: evt.from, text: evt.text, at: evt.at || Date.now() })
+      }
+    }
+    const summary = continuity.reconcileWithWorld(bot, {
+      goals: goalReg,
+      places,
+      skills,
+      building: Boolean(task),
+      combat,
+      system1,
+      reason
+    })
+    if (wake && systemsReady && !ended) {
+      const keptNote = survived.length ? `; ${survived.length} undelivered important event(s) kept (${survived.slice(-3).map((e) => `#${e.sequence} ${e.eventType}`).join(', ')})` : ''
+      brain?.wake(`context reset (${reason}) — continuity reconciled with live world${keptNote}`, { external: true, important: true })
+    }
+    return summary
+  }
+
   // ------------------------------------------------------ session end ----
   function dispose (quit = false) {
     if (ended) return
@@ -2159,6 +3076,7 @@ function startSession (shared, onEnded) {
     // What was running when the link dropped is not finished: resumable, and
     // on disk before the sockets close.
     try { goalReg.suspendAll({ reason: quit ? 'shutdown' : 'connection ended' }); goalReg.save({ force: true }) } catch { /* best effort */ }
+    try { continuity.save() } catch { /* best effort */ }
     for (const t of timers) { clearInterval(t); clearTimeout(t) }
     timers.clear()
     try { brain?.stop() } catch { /* noop */ }
@@ -2193,10 +3111,12 @@ function startSession (shared, onEnded) {
   // `internals` exists for the session test; nothing in the harness uses it.
   return {
     dispose,
+    resetContext,
     bot,
     internals: () => ({
       arbiter, sense, wrapper, combat, system1, skills, brain, results, agenda,
-      goals: goalReg, executeAction, buildActionPrompt, buildChatPrompt,
+      events: pipeline, latency, redstoneEngineer, redstoneLibrary: shared.redstoneLibrary,
+      goals: goalReg, continuity, resetContext, executeAction, buildActionPrompt, buildChatPrompt,
       // Goal orchestration surface (tests and the session's own monitor):
       startMain, resumeMain, finishGoal, runGoalOp, goalLines, goalTick,
       reconcileRestored, reconcileGoal, verifyGoalAgainstWorld, staleActionReason

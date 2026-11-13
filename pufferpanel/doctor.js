@@ -34,6 +34,76 @@ const SOURCE = path.join(__dirname, 'zincai.json')
 /** PufferPanel maps these three names to the same TTY host environment. */
 const HOST_FAMILY = ['host', 'tty', 'standard']
 
+/**
+ * The subset of pufferpanel.Server (server.go) / Execution (server.go) whose
+ * JSON shape the decoder actually enforces. This matters more than any other
+ * check in this file:
+ *
+ *   services/templates.go GetAllFromRepo → readTemplateFromDisk does
+ *     json.NewDecoder(file).Decode(template)
+ *   and on error it logs and `continue`s. The template is not listed at all —
+ *   no greyed-out row, no error in the UI, just nothing. A single JSON string
+ *   where the struct declares a bool (e.g. "autostart": "${autostart}") is
+ *   enough: encoding/json cannot coerce "..." into bool, so the WHOLE template
+ *   is dropped from the panel.
+ *
+ * `any` means the field is an interface{} and accepts anything.
+ */
+const SERVER_FIELDS = {
+  type: 'string',
+  display: 'string',
+  icon: 'string',
+  data: 'object',
+  groups: 'array',
+  install: 'array',
+  uninstall: 'array',
+  run: 'object',
+  environment: 'object',
+  supportedEnvironments: 'array',
+  requirements: 'object',
+  stats: 'object',
+  query: 'object',
+  keepAlive: 'object'
+}
+
+const EXECUTION_FIELDS = {
+  command: 'any',
+  stop: 'string',
+  stopCode: 'integer',
+  pre: 'array',
+  post: 'array',
+  environmentVars: 'object',
+  workingDirectory: 'string',
+  stdin: 'object',
+  autostart: 'boolean',
+  autorecover: 'boolean',
+  autorestart: 'boolean',
+  expectedExitCode: 'integer'
+}
+
+const kindOf = (v) => Array.isArray(v) ? 'array' : v === null ? 'null' : typeof v
+
+function checkShape (object, fields, prefix, errors) {
+  for (const [key, value] of Object.entries(object || {})) {
+    const want = fields[key]
+    if (!want || want === 'any') continue
+    const got = kindOf(value)
+    const ok = want === 'integer' ? got === 'number' && Number.isInteger(value) : got === want
+    if (!ok) errors.push(`${prefix}${key} is ${got} (${JSON.stringify(value)}) but PufferPanel declares ${want}`)
+  }
+}
+
+/**
+ * Every place the panel's decoder would reject this template. Returns [] when
+ * the panel can read it, which is the only way it shows up in the panel at all.
+ */
+function decodeErrors (template) {
+  const errors = []
+  checkShape(template, SERVER_FIELDS, '', errors)
+  checkShape(template.run, EXECUTION_FIELDS, 'run.', errors)
+  return errors
+}
+
 function parseArgs (argv) {
   const out = { env: 'host', os: process.platform === 'linux' ? 'linux' : process.platform, arch: null, json: null, scan: null, refresh: false, help: false }
   for (let i = 0; i < argv.length; i++) {
@@ -116,6 +186,20 @@ function main () {
   console.log(`os:          ${verdict.os.ok ? 'OK' : 'INCOMPATIBLE'}  (template: ${verdict.os.have}; node: ${verdict.os.want})`)
   console.log(`arch:        ${verdict.arch.ok ? 'OK' : 'INCOMPATIBLE'}  (template: ${verdict.arch.have}; node: ${verdict.arch.want})`)
 
+  // A template the panel cannot decode is never listed at all — it is not a
+  // compatibility problem, so say it first and say it plainly.
+  const undecodable = decodeErrors(template)
+  console.log(`decoder:     ${undecodable.length ? 'WOULD BE DROPPED' : 'OK'}  (PufferPanel's json.Decode into pufferpanel.Server)`)
+  if (undecodable.length) {
+    for (const e of undecodable) console.log(`             ${e}`)
+    console.log('\nThe panel skips a template it cannot decode (services/templates.go logs and')
+    console.log('continues), so it never appears: no row, no error, nothing to grey out.')
+    console.log('Fix: give those fields the JSON type the struct declares — run.autostart,')
+    console.log('autorecover and autorestart are Go bools, so they take true/false and never')
+    console.log('a "${...}" token. The same flags are set per server by the panel itself.')
+    return 1
+  }
+
   const ok = verdict.env.ok && verdict.os.ok && verdict.arch.ok
   if (ok) {
     console.log('\nThis template will be offered for that node.')
@@ -184,18 +268,30 @@ function scanMain (args) {
   console.log('(every non-dot top-level folder, every *.json directly inside it, except data.json)')
   console.log('')
   let broken = 0
+  let dropped = 0
   for (const entry of entries) {
     const isTemplate = entry.parsed && (entry.parsed.type || entry.parsed.display || entry.parsed.run || entry.parsed.install)
-    const verdict = entry.parsed ? compatibility(entry.parsed, args) : { env: { ok: false } }
-    const ok = isTemplate && verdict.env.ok && verdict.os.ok && verdict.arch.ok
+    const verdict = entry.parsed ? compatibility(entry.parsed, args) : { env: { ok: false }, os: { ok: false }, arch: { ok: false } }
+    const undecodable = entry.parsed ? decodeErrors(entry.parsed) : []
+    const ok = isTemplate && !undecodable.length && verdict.env.ok && verdict.os.ok && verdict.arch.ok
     if (!isTemplate) broken++
-    console.log(`${ok ? 'OK        ' : 'PHANTOM   '} ${entry.path}`)
+    if (undecodable.length) dropped++
+    console.log(`${ok ? 'OK        ' : undecodable.length ? 'DROPPED   ' : 'PHANTOM   '} ${entry.path}`)
     console.log(`           name="${entry.name}" display=${JSON.stringify((entry.parsed && entry.parsed.display) || '')}`)
     if (entry.error) console.log(`           not valid JSON: ${entry.error}`)
-    else if (!isTemplate) console.log('           not a template: no type/display/install/run. The panel lists it anyway,')
+    else if (undecodable.length) {
+      console.log('           the panel cannot decode this template, so it lists NOTHING for it:')
+      for (const e of undecodable) console.log(`             ${e}`)
+    } else if (!isTemplate) console.log('           not a template: no type/display/install/run. The panel lists it anyway,')
     if (!isTemplate && entry.parsed && !entry.error) console.log('           with no name and no supportedEnvironments, so it can never be used.')
   }
   console.log('')
+  if (dropped) {
+    console.log(`${dropped} template(s) would be silently dropped by the panel's JSON decoder.`)
+    console.log("Fix: a field's JSON type must match PufferPanel's Go struct - run.autostart,")
+    console.log('autorecover and autorestart are booleans, not "${...}" strings. See --help.')
+    return 1
+  }
   if (broken) {
     console.log(`${broken} file(s) would show up as a nameless "incompatible" entry.`)
     console.log('Fix: rename or move them out of the two-level layout the panel scans.')
@@ -218,60 +314,171 @@ function scanMain (args) {
  * Note that the panel clones the URL stored in the repo row — if that is your
  * fork, an upstream merge changes nothing until the fork has the commit.
  */
+/**
+ * Log in and force the panel to re-clone its template repositories.
+ *
+ * PufferPanel does NOT accept HTTP Basic auth on /api/* (middleware/auth.go only
+ * takes `Authorization: Bearer ...` or the puffer_auth cookie), so the only way
+ * in from a script is POST /auth/login, which sets the cookie and returns the
+ * session's scopes. We then send the cookie back — it is the same session the
+ * browser would use, so this adds no privileged path and no stored password.
+ *
+ * What "refresh" really is: PufferPanel keeps the clone under
+ * <data>/cache/template-repos/<repo id> and re-pulls it at most every 5 min
+ * (services/templates.go validateRepoOnDisk). DELETE + POST /api/templates
+ * gives the repo a new id, which guarantees a fresh clone on the next listing —
+ * the same thing the browser does when you remove and re-add the repo.
+ */
 async function refreshMain () {
-  const base = process.env.PUFFER_URL || 'http://127.0.0.1:8080'
+  const base = (process.env.PUFFER_URL || 'http://127.0.0.1:8080').replace(/\/$/, '')
   const user = process.env.PUFFER_USER
   const pass = process.env.PUFFER_PASS
   if (!user || !pass) {
     console.error('Set PUFFER_USER and PUFFER_PASS (a panel admin) — optionally PUFFER_URL.')
     console.error('This logs in, deletes the template repository and re-adds the same URL,')
-    console.error('which clears <data>/cache/template-repos/<id> and forces a fresh clone.')
+    console.error('which gives it a new id and forces a fresh clone on the next listing.')
     return 1
   }
 
-  const auth = 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64')
+  let cookie = null
   const call = async (method, endpoint, body) => {
-    const res = await fetch(base.replace(/\/$/, '') + endpoint, {
+    const headers = { 'Content-Type': 'application/json' }
+    if (cookie) headers.Cookie = cookie
+    const res = await fetch(base + endpoint, {
       method,
-      headers: { Authorization: auth, 'Content-Type': 'application/json' },
-      body: body ? JSON.stringify(body) : undefined
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+      redirect: 'manual'
     })
+    const setCookie = res.headers.getSetCookie ? res.headers.getSetCookie() : []
+    for (const c of setCookie) {
+      if (c.startsWith('puffer_auth=')) cookie = c.split(';')[0]
+    }
     const text = await res.text()
-    return { status: res.status, body: text ? JSON.parse(text) : null }
+    let parsed = null
+    try {
+      parsed = text ? JSON.parse(text) : null
+    } catch {
+      parsed = text
+    }
+    return { status: res.status, body: parsed }
   }
 
   try {
+    // 1. Log in the way the web UI does: same endpoint, same cookie.
+    const login = await call('POST', '/auth/login', { email: user, password: pass })
+    if (login.status !== 200) {
+      console.error(`POST /auth/login -> ${login.status}: ${JSON.stringify(login.body)}`)
+      console.error('PUFFER_USER is the panel account EMAIL, not the username.')
+      return 1
+    }
+    if (login.body && login.body.needsSecondFactor) {
+      console.error('That account has a second factor enabled, which this script cannot answer.')
+      console.error('Nothing was changed. Use a panel admin without 2FA, or clear the cache')
+      console.error('on the node instead (see pufferpanel/README.md).')
+      return 1
+    }
+    if (!cookie) {
+      console.error('Login succeeded but the panel did not set a puffer_auth cookie;')
+      console.error('check that PUFFER_URL points at the panel itself (not a proxy that drops cookies).')
+      return 1
+    }
+
+    // 2. Re-add each git repo, which is what invalidates the clone.
     const repos = await call('GET', '/api/templates')
+    if (repos.status === 401 || repos.status === 403) {
+      console.error(`GET /api/templates -> ${repos.status}: the account lacks templates.view`)
+      return 1
+    }
     if (repos.status !== 200) {
       console.error(`GET /api/templates -> ${repos.status}: ${JSON.stringify(repos.body)}`)
       return 1
     }
     const rows = Array.isArray(repos.body) ? repos.body : []
-    for (const repo of rows) {
-      if (repo.id === 0) {
-        console.log(`repo 0 "${repo.name}" is the local templates table, not a git repo — skipped`)
-        continue
+    const gitRepos = rows.filter((r) => r.id !== 0)
+    if (!gitRepos.length) {
+      console.log('No git template repositories are configured — nothing to refresh.')
+      console.log('Templates that were pasted in the web UI live in the panel database (repo 0)')
+      console.log('and never need a re-clone; re-paste them if the JSON itself changed.')
+      return 0
+    }
+
+    // Before touching anything, find out whether any repo already fails to
+    // list. If one does, the create-server step is blank for EVERY repo, because
+    // SelectTemplate.vue reads `templates.length` on the undefined result — so
+    // say which repo it is instead of re-adding repos blindly.
+    const blanking = []
+    for (const repo of gitRepos) {
+      const listed = await call('GET', `/api/templates/${repo.id}`)
+      if (listed.status !== 200) blanking.push({ repo, status: listed.status, body: listed.body })
+    }
+    if (blanking.length) {
+      console.error('Before refresh: these repositories fail to list. While one of them')
+      console.error('does, the create-server template step shows NO templates at all —')
+      console.error('including those from repos that are fine (SelectTemplate.vue reads')
+      console.error('`templates.length` on the undefined result of the failed repo).')
+      for (const b of blanking) {
+        console.error(`  repo ${b.repo.id} "${b.repo.name}" ${b.repo.url} (branch ${b.repo.branch || 'main'})`)
+        console.error(`    GET /api/templates/${b.repo.id} -> ${b.status}: ${JSON.stringify(b.body)}`)
       }
-      console.log(`refreshing repo ${repo.id} "${repo.name}" ${repo.url} (branch ${repo.branch})`)
+      console.error('Re-cloning below; a stale clone is often all it was.')
+      console.error('')
+    }
+
+    // Only what is still broken AFTER the re-clone counts as a failure.
+    let bad = 0
+    for (const repo of gitRepos) {
+      console.log(`repo ${repo.id} "${repo.name}" ${repo.url} (branch ${repo.branch || 'main'})`)
       const del = await call('DELETE', `/api/templates/${repo.id}`)
       if (del.status >= 300) {
         console.error(`  DELETE -> ${del.status}: ${JSON.stringify(del.body)}`)
-        return 1
+        bad++
+        continue
       }
-      const add = await call('POST', '/api/templates', { name: repo.name, url: repo.url, branch: repo.branch })
+      const add = await call('POST', '/api/templates', { name: repo.name, url: repo.url, branch: repo.branch || 'main' })
       if (add.status >= 300) {
         console.error(`  POST -> ${add.status}: ${JSON.stringify(add.body)}`)
-        return 1
+        console.error('  The repo was removed; re-add it in Templates -> Add repo with the same values.')
+        bad++
+        continue
       }
-      const fresh = await call('GET', `/api/templates/${repo.id}`)
-      const names = Array.isArray(fresh.body) ? fresh.body.map((t) => `${t.name}${t.display ? ` (${t.display})` : ' <-- NO NAME'}`) : []
-      console.log(`  now lists: ${names.length ? names.join(', ') : '(nothing)'}`)
-      if (names.some((n) => n.includes('NO NAME'))) {
-        console.log('  a nameless entry means a non-template *.json still sits in a scanned folder')
-        return 1
+      const newId = add.body && add.body.id !== undefined ? add.body.id : repo.id
+      const fresh = await call('GET', `/api/templates/${newId}`)
+      if (fresh.status !== 200) {
+        console.error(`  GET /api/templates/${newId} -> ${fresh.status}: ${JSON.stringify(fresh.body)}`)
+        console.error('  Still failing after a fresh clone — this is the repo that blanks the')
+        console.error('  create-server template list. Fix its URL/branch/credentials, or remove it.')
+        bad++
+        continue
+      }
+      const list = Array.isArray(fresh.body) ? fresh.body : []
+      console.log(`  now lists: ${list.length ? list.map((t) => t.name).join(', ') : '(nothing)'}`)
+      if (!list.length) {
+        console.error('  The clone worked but contains no template. The panel reads')
+        console.error('  <repo root>/<folder>/<name>.json and ignores files at the root.')
+        console.error('  Also check the branch exists: a wrong branch makes the clone fail.')
+        bad++
+        continue
+      }
+      for (const t of list) {
+        const problems = decodeErrors(t)
+        if (!t.display) problems.push('no display name: the JSON is not a template, or the panel could not read it')
+        if (problems.length) {
+          console.error(`  ${t.name}: NOT USABLE`)
+          for (const p of problems) console.error(`    ${p}`)
+          bad++
+        } else {
+          console.log(`  ${t.name}: "${t.display}" OK`)
+        }
       }
     }
-    console.log('\nDone. The create-server page will now offer these templates.')
+
+    if (bad) {
+      console.error('\nSome entries above would not work in the panel. Fix them and push;')
+      console.error('the panel re-pulls the repository by itself within five minutes.')
+      return 1
+    }
+    console.log('\nDone. Open Templates in the panel to see them.')
     return 0
   } catch (err) {
     console.error(`could not talk to the panel: ${err.message}`)
@@ -279,4 +486,4 @@ async function refreshMain () {
   }
 }
 
-module.exports = { compatibility, parseArgs, scanRepo, refreshMain, HOST_FAMILY }
+module.exports = { compatibility, parseArgs, scanRepo, refreshMain, decodeErrors, HOST_FAMILY, SERVER_FIELDS, EXECUTION_FIELDS }

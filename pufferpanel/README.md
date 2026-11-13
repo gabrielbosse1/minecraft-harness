@@ -85,6 +85,74 @@ node pufferpanel/import.js          # checks the template, prints both paths
 - The branch name in **Add repo** does not exist on the remote.
 - The node has no network/git access to the URL: check the panel log for the
   clone error, and use an SSH URL plus a deploy key for a private repository.
+- The JSON parses but does not **decode** into PufferPanel's structs — the file
+  is skipped silently. See
+  [It does not show up at all](#it-does-not-show-up-at-all-nothing-listed-no-error).
+
+### One bad template does not break the others — one bad *repo* does
+
+These are two different failures and they look identical from the browser.
+
+**A bad file inside a repo is contained.** `GetAllFromRepo` reads each JSON
+independently and `continue`s past one it cannot decode, so the other templates
+in the same repo are still listed. A malformed template costs you that one
+entry, nothing else. (A JSON that does not *parse* is worse: it is still listed,
+as a nameless, permanently incompatible row — that is the "no name" section
+below.)
+
+**A repo that fails to list is not contained.** Look at what the frontend does
+with the per-repo answer (`client/api/src/templates.js`):
+
+```js
+try   { templates = await this.listRepoTemplates(repo.id) }
+catch (e) { error = e ... }            // templates stays undefined
+res.push({ ...repo, templates, error })
+```
+
+and then (`SelectTemplate.vue`, `load()`):
+
+```js
+if (repos[repo].templates.length === 0) return   // no guard for undefined
+```
+
+`undefined.length` throws. That happens **before** any repo is added to the
+list, so the create-server template step renders nothing — including templates
+from repos that are perfectly healthy. The *Templates* page itself shows the
+error per repo and keeps working; it is the **create-server** step that goes
+blank.
+
+`GET /api/templates/{repo}` returns 500 only when it cannot read the clone at
+all: `validateRepoOnDisk` failing to clone or pull (bad branch, unreachable URL,
+missing credentials), or `os.ReadDir` failing. A template that merely fails to
+decode never produces a 500, so this template could not cause it. Check
+**Templates** for a red error row, or run:
+
+```sh
+PUFFER_URL=... PUFFER_USER=... PUFFER_PASS=... node pufferpanel/doctor.js --refresh
+```
+
+It reports the clone error for the repo that is actually broken instead of
+leaving you guessing.
+
+### The panel scans the whole repository you point it at
+
+**Add repo** points the panel at a repository and it scans **everything** in it.
+If you add a repository that is not a template collection (this one, for
+example, if you point at the root), every `*.json` a level inside a folder
+becomes a candidate — some are templates, most are not. That is harmless in
+itself (the bad ones are skipped or shown as nameless rows), but it is noise,
+and it is why `pufferpanel/zincai.json` exists as a template-only subfolder.
+
+The tidy setup is a **dedicated template repository** containing just:
+
+```sh
+node pufferpanel/import.js --dir /srv/zincai-templates --apply
+# /srv/zincai-templates/zincai/zincai.json
+# /srv/zincai-templates/zincai/README.md
+```
+
+Point **Add repo** at that, and nothing else in this repository can ever affect
+the panel's template list.
 
 ### "Incompatible with environment 'host'" (Orange Pi, Raspberry Pi, any node)
 
@@ -118,6 +186,80 @@ If the panel *still* greys the template out:
 | A stale template in the panel | The panel caches the template repository for ~5 minutes; re-add the repo or wait. |
 | `requirements.arch` / `requirements.os` in a **forked** copy | Those are single strings; `arch` cannot list both `x64` and `arm64`, so leave them out. |
 | Node too old / wrong arch | Nothing here is architecture-specific; on a host node `nodejsdl` downloads `linux/arm64` (or `armv7l`) by itself. |
+
+### It does not show up at all (nothing listed, no error)
+
+A template the panel cannot **decode** is not greyed out — it is absent. The
+scanner opens each JSON with `json.NewDecoder(file).Decode(&Template)` and, if
+that returns an error, logs it and `continue`s (`services/templates.go`), so the
+row simply never exists. The browser then shows an empty list, which looks like
+a broken panel rather than a broken template.
+
+The decoder is strict about the JSON type of every field, and several fields in
+`run` are Go scalars rather than strings:
+
+| Field | Go type | So |
+| --- | --- | --- |
+| `run.autostart` | `bool` | `true` / `false` only |
+| `run.autorecover` | `bool` | `true` / `false` only |
+| `run.autorestart` | `bool` | `true` / `false` only |
+| `run.stopCode` | `int` | a number, never `"2"` |
+| `run.stop`, `run.workingDirectory` | `string` | strings |
+
+A `"${autostart}"` token in `run.autostart` is a **string**, so `Decode` fails
+and the whole template disappears. That was a real bug in this template, and it
+is why it is now gone:
+
+- `run.autostart` is literal `true`; `run.autorecover` is literal `false` (see below).
+- The `autostart` / `autorecover` **variables are gone**. There was never a way
+  to forward them: the panel assigns those booleans per server, from the
+  **Edit → flags** endpoint (`GET`/`POST /api/servers/{id}/flags`), not from a
+  template variable. A variable by that name could only ever have been a
+  string in a bool field.
+
+Both checks in this repository now catch the class of bug:
+
+```sh
+node pufferpanel/import.js            # structural + Go-type validation
+node pufferpanel/doctor.js            # adds the `decoder:` line
+node pufferpanel/doctor.js --scan .   # DROPPED = the panel would skip the file
+```
+
+### Why `autorecover` is `false`
+
+`autorecover` is not "keep the bot running". It is "restart after an exit that
+is not the expected one" (`servers/server.go`, `afterExit`):
+
+```go
+graceful := exitCode == p.Execution.ExpectedExitCode
+if p.skipAutoRestart { /* do nothing */ }
+else if graceful && p.Execution.AutoRestartFromGraceful { StartViaService(p) }
+else if !graceful && p.Execution.AutoRestartFromCrash   { StartViaService(p) }
+```
+
+`skipAutoRestart` is set by `/restart` and `/kill`, but **not** by `/stop`
+unless the caller passes `?skipRestart=true` — and the panel's own Stop button
+does not (`client/api/src/servers.js`, `action()` only sends `?wait=`). So a
+plain Stop still reaches `afterExit`.
+
+`stopCode: 2` sends SIGINT, and the bot exits **0** on it. `expectedExitCode` is
+unset, i.e. 0, so that exit *is* graceful: with `autorestart: false` nothing
+restarts. But if the process is killed by the signal instead of catching it,
+Node reports `128 + 2 = 130`, which is not 0 — that is a "crash", and with
+`autorecover: true` the panel restarts the bot seconds after the operator
+pressed Stop. `expectedExitCode` cannot be set to cover both 0 and 130, so the
+only correct value here is `autorecover: false`.
+
+The consequence, stated plainly:
+
+- **Stop really stops.** The process stays down until you press Start.
+- **A genuine crash is not retried by the panel.** The bot already retries
+  *connection* loss itself (`reconnect` / `maxattempts` variables) with
+  back-off, which is the failure that actually happens in practice — a server
+  restart, a lag spike, a kick. A process-level crash left the bot down before
+  this template existed, and it leaves it down now.
+- If you would rather have crash recovery and can accept the Stop-is-a-restart
+  behaviour, set `"autorecover": true` in your fork. Prefer leaving it `false`.
 
 ### It shows up with no name (and stays "incompatible" forever)
 
@@ -159,14 +301,26 @@ PUFFER_URL=http://127.0.0.1:8080 PUFFER_USER=admin PUFFER_PASS=... \
   node pufferpanel/doctor.js --refresh
 ```
 
-It deletes and re-adds each git template repository over the panel's own API
-(`DELETE`/`POST /api/templates`), which wipes `<data>/cache/template-repos/<id>`
-and forces a fresh clone, then prints what the panel now lists — flagging any
-entry with **no display name**. Over SSH on the Pi the equivalent is:
+`PUFFER_USER` is the account **email** (that is what `POST /auth/login` takes);
+`PUFFER_PASS` is its password. It logs in the same way the browser does, then
+deletes and re-adds each git template repository over the panel's own API
+(`DELETE`/`POST /api/templates`). The new row gets a new id, so the panel has no
+cached clone to reuse and the next listing clones from scratch. It then prints
+what the panel really lists and checks each entry the same way the server does
+(missing display name, or a JSON type the decoder rejects). Exit code is
+non-zero if anything is still broken.
+
+Over SSH on the node the equivalent is to delete the clone directory and reload
+the page — but note the location is a **config value**, not a fixed path:
 
 ```sh
-sudo rm -rf /var/lib/pufferpanel/cache/template-repos/*   # then reload the page
+# the cache root is `daemon.data.cache` (default: <data folder>/cache)
+sudo ls -d /var/lib/pufferpanel/cache/template-repos/*   # then remove the ones to refresh
 ```
+
+If you are not sure where the panel keeps its data, check the `dataFolder` /
+`daemon.data.cache` settings in the panel's config rather than assuming
+`/var/lib/pufferpanel`.
 
 Two things to check first, because they account for most of these:
 
@@ -208,7 +362,7 @@ Minecraft Server, Behaviour, Limits, Operator Control and Installation.
 | `log` | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. |
 | `datadir` | `ZINC_DATA_DIR` | `data` | Relative to the server folder, so backups include it. |
 | `repo`, `branch`, `nodeversion` | — | this repo / `main` / `22` | Installation only. |
-| `autostart`, `autorecover` | — | `true` | Panel behaviour. |
+| ~~`autostart`, `autorecover`~~ | — | — | **Removed.** The panel owns these two flags per server; see [It does not show up at all](#it-does-not-show-up-at-all-nothing-listed-no-error). |
 
 Nothing else is needed: no `.env`, no file to edit, no command to type. The
 template passes the values in `run.environmentVars` and the bot reads them

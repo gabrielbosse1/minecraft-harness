@@ -255,6 +255,7 @@ the next start.
 | --- | --- |
 | Repo added, **no template listed** | The JSON sits at the clone root instead of a subfolder, or is named `data.json`. |
 | Repo shows a clone error | Wrong branch name, or the node can't reach the URL (private repo without a deploy key/PAT). |
+| Create-server step shows **no templates at all**, but some are fine | One repo in the list fails to list (500). `SelectTemplate.vue` reads `templates.length` on `undefined` and the step renders nothing. Check **Templates** for the red row, or run `doctor.js --refresh`. |
 | Template list looks stale after a push | The panel caches the clone for ~5 minutes. |
 | Template saves from the UI but is nameless | The pasted JSON had no `name` field — use `import.js --print`. |
 | Install fails at `npm ci` | Node too old on the node, or no network to the npm registry. |
@@ -263,4 +264,6 @@ the next start.
 | Bot can't join | Wrong `host`/`port`, server not in offline mode, or `ZincAI` not whitelisted. |
 | `!zinc status` in chat is ignored | `operators` is empty, or your UUID is wrong — check the `control:` line and `config show control`. |
 | Console commands do nothing | The process isn't running (a stopped server has no stdin). |
-| Bot stops as soon as it starts | `autorestart` is `false` and the process exited; check for a fatal first-join message. |
+| Bot stops as soon as it starts | Both restart flags are `false`, so an exit stays an exit. Read the console: the `--dry-run` preflight prints the invalid variable above the failure. |
+| Bot comes back a few seconds after pressing **Stop** | `run.autorecover` is `true` in your fork. The panel's Stop does not set `skipRestart`, so a signal death (exit 130) is classed as a crash. Set it to `false` — see [the README](../pufferpanel/README.md#why-autorecover-is-false). |
+| **No template listed at all** | The panel could not decode the JSON and skipped the file silently. Run `node pufferpanel/doctor.js` — a `decoder:` line other than `OK` names the field. See [the README](../pufferpanel/README.md#it-does-not-show-up-at-all-nothing-listed-no-error). |

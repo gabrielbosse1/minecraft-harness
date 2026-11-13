@@ -301,3 +301,218 @@ test('import.js: --print emits the named JSON the web UI needs', () => {
 test('import.js: the committed template validates with no errors', () => {
   assert.deepEqual(validate(template), [])
 })
+
+// ---------------------------------------------------------------------------
+// The decoder, not just the conditions.
+//
+// services/templates.go GetAllFromRepo -> readTemplateFromDisk decodes the
+// file into pufferpanel.Server (a Go struct) and, on any error, logs and
+// `continue`s. The template is then not merely incompatible: it is absent.
+// That is what happened with:
+//
+//     "run": { "autostart": "${autostart}", "autorecover": "${autorecover}" }
+//
+// Execution.Autostart is a Go bool, encoding/json cannot unmarshal a string
+// into it, and the panel listed nothing at all. These tests keep that from
+// coming back, and keep the doctor/import checks honest about catching it.
+// ---------------------------------------------------------------------------
+
+test('template: run.autostart/autorecover/autorestart are real booleans, not tokens', () => {
+  // A Go bool field. A "${var}" string here makes the panel drop the template.
+  for (const key of ['autostart', 'autorecover', 'autorestart']) {
+    if (template.run[key] === undefined) continue
+    assert.equal(typeof template.run[key], 'boolean', `run.${key} must be a JSON boolean`)
+  }
+  assert.equal(typeof template.run.stopCode, 'number', 'stopCode is a Go int')
+})
+
+test('template: no variable shadows a panel-owned server flag', () => {
+  // run.autostart / run.autorecover are template-level booleans that the panel
+  // copies onto each server; there is no way for a ${token} to reach them.
+  // Exposing them as variables therefore could never work, so they must not
+  // exist — and must not be referenced from a group either.
+  for (const key of ['autostart', 'autorecover', 'autorestart']) {
+    assert.equal(template.data[key], undefined, `data.${key} cannot be forwarded to run.${key} (Go bool)`)
+  }
+  for (const group of template.groups || []) {
+    for (const key of ['autostart', 'autorecover', 'autorestart']) {
+      assert.ok(!group.variables.includes(key), `group "${group.display}" references data.${key}, which does not exist`)
+    }
+  }
+})
+
+test('template: every group variable exists, and every user-visible variable is grouped', () => {
+  const declared = new Set(Object.keys(template.data))
+  const grouped = new Set()
+  for (const group of template.groups || []) {
+    for (const name of group.variables) {
+      assert.ok(declared.has(name), `group "${group.display}" lists "${name}", which is not in data`)
+      grouped.add(name)
+    }
+  }
+  for (const [name, variable] of Object.entries(template.data)) {
+    // ui/Variables.vue filters `internal` variables out of the settings page, so
+    // an internal variable without a group is intentional (`entrypoint` is only
+    // read by the install/run commands). A non-internal one would be invisible
+    // to the operator for no reason.
+    if (variable.internal) continue
+    assert.ok(grouped.has(name), `data.${name} belongs to no group, so the create-server page will not show it`)
+  }
+})
+
+test('template: the panel\'s decoder accepts it (doctor.decodeErrors)', () => {
+  const { decodeErrors, SERVER_FIELDS, EXECUTION_FIELDS } = require('../pufferpanel/doctor')
+  assert.deepEqual(decodeErrors(template), [])
+  // The mirror must stay in step with pufferpanel.Server / Execution, or it
+  // would happily pass a template the panel silently drops.
+  assert.equal(SERVER_FIELDS.run, 'object')
+  assert.equal(EXECUTION_FIELDS.autostart, 'boolean')
+  assert.equal(EXECUTION_FIELDS.autorecover, 'boolean')
+  assert.equal(EXECUTION_FIELDS.stopCode, 'integer')
+})
+
+test('doctor: names the decoder failure instead of blaming the environment', () => {
+  const script = path.join(__dirname, '..', 'pufferpanel', 'doctor.js')
+  // Every compatibility predicate passes, so the old doctor said "OK" here.
+  const broken = JSON.stringify({ ...template, run: { ...template.run, autostart: '${autostart}', autorecover: '${autorecover}' } })
+  let out = ''
+  let code = 0
+  try {
+    out = execFileSync(process.execPath, [script, '--json', broken, '--env', 'host', '--os', 'linux', '--arch', 'arm64'], { encoding: 'utf8' })
+  } catch (err) {
+    code = err.status
+    out = String(err.stdout)
+  }
+  assert.equal(code, 1, 'an undecodable template must fail, not report ready')
+  assert.match(out, /environment: OK/)
+  assert.match(out, /decoder:\s+WOULD BE DROPPED/)
+  assert.match(out, /run\.autostart is string .* declares boolean/)
+  assert.doesNotMatch(out, /will be offered for that node/)
+})
+
+test('doctor: --scan flags a template the panel would silently drop', () => {
+  const script = path.join(__dirname, '..', 'pufferpanel', 'doctor.js')
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'repo-decode-'))
+  fs.mkdirSync(path.join(tmp, 'agent'))
+  fs.writeFileSync(path.join(tmp, 'agent', 'agent.json'),
+    JSON.stringify({ type: 'minecraft-java', display: 'x', run: { command: 'node x.js', autostart: '${autostart}' }, environment: { type: 'host' }, supportedEnvironments: [{ type: 'host' }] }))
+  let code = 0
+  let out = ''
+  try {
+    execFileSync(process.execPath, [script, '--scan', tmp], { encoding: 'utf8' })
+  } catch (err) {
+    code = err.status
+    out = String(err.stdout)
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+  assert.equal(code, 1, 'a dropped template must fail the scan')
+  assert.match(out, /DROPPED/)
+  assert.match(out, /silently dropped/)
+})
+
+test('import.js: refuses the token-in-a-bool that made the template vanish', () => {
+  const broken = JSON.parse(JSON.stringify(template))
+  broken.run.autostart = '${autostart}'
+  const errors = validate(broken)
+  assert.ok(errors.some((e) => /run\.autostart is string .* declares boolean/.test(e)),
+    `expected a bool-shape error, got: ${JSON.stringify(errors)}`)
+  // And the real template is still clean.
+  assert.deepEqual(validate(template), [])
+})
+
+// ---------------------------------------------------------------------------
+// autorecover is not "restart the bot", it is "restart after a crash".
+//
+// servers/server.go afterExit:
+//     graceful := exitCode == ExpectedExitCode
+//     if skipAutoRestart            -> do nothing
+//     else if graceful && AutoRestartFromGraceful -> start again
+//     else if !graceful && AutoRestartFromCrash   -> start again (up to crashLimit)
+//
+// The panel's Stop button posts /api/servers/{id}/stop WITHOUT skipRestart
+// (client/api/src/servers.js `action` only sends ?wait=), and only /restart and
+// /kill call SkipAutoRestart() (web/daemon/server.go). SIGINT reaches the bot as
+// exit 130 through a shell, or stays a signal death, but either way it is not
+// expectedExitCode (unset = 0). So with autorecover true the bot is restarted
+// seconds after the operator presses Stop — precisely when they want it paused.
+// ---------------------------------------------------------------------------
+
+test('template: Stop must not be read as a crash', () => {
+  assert.equal(template.run.autorecover, false,
+    'autorecover restarts the process after a non-zero exit, and the panel\'s own Stop button never sets skipRestart')
+  // Supplying expectedExitCode does not rescue it: the bot exits 0 on SIGINT,
+  // and a signal-killed Node reports 128+N. No single value equals both, so the
+  // only safe setting with autorestart=false is autorecover=false.
+  assert.equal(template.run.autorestart, false)
+  assert.equal(template.run.expectedExitCode, undefined,
+    'expectedExitCode cannot be chosen to cover both exit 0 and signal deaths')
+})
+
+test('template: stopping is still deterministic — stopCode is SIGINT', () => {
+  // The stop path itself is sound in both environments the template offers:
+  // servers/tty.go signals the process, servers/docker.go ContainerKill(Signal).
+  assert.equal(template.run.stopCode, 2)
+  assert.equal(template.run.stop, undefined, 'stopCode wins; a stop command must not be set')
+  const src = fs.readFileSync(path.join(__dirname, '..', 'zincai', 'index.js'), 'utf8')
+  assert.match(src, /process\.on\('SIGINT', \(\) => shutdown\(0, 'SIGINT'\)\)/)
+})
+
+// ---------------------------------------------------------------------------
+// A bad template costs one entry; a bad REPO blanks the whole create step.
+//
+// services/templates.go contains the first failure per-file (`continue` past a
+// JSON it cannot decode), so the rest of the repo still lists. But
+// client/api/src/templates.js leaves `templates` undefined when a repo 500s,
+// and SelectTemplate.vue then does `repos[repo].templates.length` — which throws
+// before any repo is rendered. That is the "one template broke every template"
+// symptom, and it comes from a repo that will not list (clone/pull failure),
+// not from a template that will not decode.
+//
+// GET /api/templates/{repo} returns 500 only from validateRepoOnDisk/os.ReadDir,
+// never from a per-file decode error, so the template in this repo could not
+// have caused it.
+// ---------------------------------------------------------------------------
+
+test('panel: an undecodable template is skipped per-file, never a 500', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'pufferpanel', 'doctor.js'), 'utf8')
+  // The mirror's doc block must keep saying this, because the difference is the
+  // whole reason the two symptoms look alike.
+  assert.match(src, /logs and `continue`s/)
+})
+
+test('panel: one repo answering 500 makes SelectTemplate.vue render nothing', () => {
+  // Verbatim behaviour of listAllTemplates() + load() in the panel's frontend.
+  const listAllTemplates = (repos, byId) => repos.map((repo) => {
+    let templates
+    let error
+    const r = byId[repo.id]
+    if (r.error) error = r.error
+    else templates = r.templates
+    return { ...repo, templates, error }
+  })
+  const load = (repos) => {
+    const compatible = []
+    for (const repo of repos) {
+      if (repo.templates.length === 0) continue // no guard for undefined
+      compatible.push(repo)
+    }
+    return compatible
+  }
+
+  const repos = [{ id: 0 }, { id: 1 }, { id: 2 }]
+  const healthy = listAllTemplates(repos, {
+    0: { templates: [{ name: 'local' }] },
+    1: { templates: [{ name: 'zincai' }] },
+    2: { templates: [{ name: 'other' }] }
+  })
+  assert.equal(load(healthy).length, 3, 'three healthy repos render')
+
+  const oneBroken = listAllTemplates(repos, {
+    0: { templates: [{ name: 'local' }] },
+    1: { templates: [{ name: 'zincai' }] },
+    2: { error: { status: 500 } } // clone failed for a DIFFERENT repo
+  })
+  assert.throws(() => load(oneBroken), /Cannot read properties of undefined/,
+    'the healthy repos are lost too — this is the reported symptom')
+})

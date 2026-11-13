@@ -30,6 +30,15 @@
  *
  * `--print` is the paste path: the template needs a `name` field there, since
  * the UI takes the name from the JSON and not from the file name.
+ *
+ * WHY VALIDATION IS STRICTER THAN "IT PARSES": the panel does not just read
+ * this JSON, it unmarshals it into pufferpanel.Server/Execution — Go structs
+ * with typed fields. `json.Decode` cannot put "true" (a string) into a bool,
+ * and services/templates.go reacts to any decode error by logging it and
+ * skipping the file. The template then is not "incompatible": it is not listed
+ * at all, with no error anywhere the operator can see. `validate()` therefore
+ * checks the JSON type of the fields a template is able to get wrong, the
+ * scalar ones in `run` above all.
  */
 'use strict'
 
@@ -103,6 +112,31 @@ function validate (template) {
   const ops = [...(run.pre || []), ...(run.post || []), ...(template.install || [])]
   for (const op of ops) {
     need(typeof op.type === 'string', 'an operation is missing its type')
+  }
+
+  // The panel decodes the JSON straight into pufferpanel.Server/Execution (Go
+  // structs). A type mismatch there does not show a warning: services/templates.go
+  // logs it and skips the file, so the template disappears from the panel
+  // entirely. The fields below are the ones a template can get wrong, because
+  // their Go type is a bool/int while the value is usually written as a token.
+  const SHAPES = {
+    'run.autostart': ['boolean', run.autostart, 'set per server by the panel (Edit → flags), never by a variable'],
+    'run.autorecover': ['boolean', run.autorecover, 'set per server by the panel (Edit → flags), never by a variable; keep it false or Stop restarts the bot'],
+    'run.autorestart': ['boolean', run.autorestart, null],
+    'run.stopCode': ['integer', run.stopCode, null],
+    'run.stop': ['string', run.stop, null],
+    'run.workingDirectory': ['string', run.workingDirectory, null]
+  }
+  const kindOf = (v) => Array.isArray(v) ? 'array' : v === null ? 'null' : typeof v
+  for (const [name, [want, value, hint]] of Object.entries(SHAPES)) {
+    if (value === undefined) continue
+    const got = kindOf(value)
+    const ok = want === 'integer' ? got === 'number' && Number.isInteger(value) : got === want
+    if (!ok) {
+      errors.push(`${name} is ${got} (${JSON.stringify(value)}) but PufferPanel declares ${want}` +
+        (hint ? ` — ${hint}` : '') +
+        '. The panel\'s decoder rejects the whole template and the server list shows nothing.')
+    }
   }
   return errors
 }

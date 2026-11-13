@@ -65,7 +65,7 @@ test('settings: an unsupported enum value is reported, never silently coerced', 
     const r = settings.option(['MODE'], 'explorer', ['explorer', 'hunter', 'builder'])
     assert.equal(r.value, 'explorer')
     assert.deepEqual(r.rejected, { name: 'MODE', value: 'pirate', allowed: ['explorer', 'hunter', 'builder'] })
-    assert.deepEqual(validateConfig(loadConfig()).filter((e) => /MODE/.test(e)).length, 0, 'MODE is not a config.json-bound enum')
+    assert.deepEqual(validateConfig(loadConfig()).filter((e) => /MODE/.test(e)).length, 0, 'MODE is not a defaults.json-bound enum')
   })
 })
 
@@ -78,8 +78,8 @@ test('settings: the AMD key is resolved from the panel variable, in every accept
   withEnv({ AMD_API_KEY: '' }, () => assert.equal(settings.apiKey(), null), 'an empty secret is not a secret')
 })
 
-test('config: the shipped config.json is self-contained — no server address, no key', () => {
-  const raw = require('../zincai/config.json')
+test('config: the shipped defaults.json is self-contained — no server address, no key', () => {
+  const raw = require('../zincai/config/defaults.json')
   assert.equal(raw.amd.apiKey, '', 'a key must never be committed')
   assert.equal(raw.server.host, '127.0.0.1', 'a deployment address must never be committed')
   assert.equal(raw.server.username, 'ZincAI')
@@ -136,7 +136,7 @@ test('config: template environment variables drive every documented knob', () =>
   })
 })
 
-test('config: dotted names override the same keys as config.json', () => {
+test('config: dotted names override the same keys as defaults.json', () => {
   withEnv({ 'AMD_API_KEY': 'rc-x', 'server.host': 'dotted.example', 'server.port': '25599', 'amd.model': 'Dotted-Model' }, () => {
     const cfg = loadConfig()
     assert.equal(cfg.server.host, 'dotted.example')

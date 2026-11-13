@@ -193,7 +193,7 @@ atomically; run **one process per data directory** (there is no lock file), and
 keep the directory persistent or every restart forgets. Restart verification
 inspects the first six open objectives; the rest stay flagged `needsVerify` and
 are checked on `goal resume` or `goal verify`. Tunables are the `goals` block in
-`config.json`.
+`defaults.json`.
 
 ## Perception, memory, and execution
 
@@ -496,7 +496,7 @@ stale world (an action planned before a change is refused with the reason).
 
 ## Configuration and operation
 
-[`config.json`](config.json) holds **defaults only**. Everything it contains is
+[`defaults.json`](config/defaults.json) holds **defaults only**. Everything it contains is
 overridden by an environment variable of the same meaning, which is how a
 PufferPanel template configures the bot: template variable -> `${VAR}` in
 `run.environmentVars` -> process env -> `loadConfig()`. There is no `.env` and
@@ -523,14 +523,14 @@ no dotenv; nothing is read from a file the panel does not control.
 | `LOG_LEVEL` | `debug`, `info`, `warn` or `error`. |
 
 Dotted names (`server.host`, `amd.model`, `behavior.allowScaffolding`, ...) are
-accepted as well and mean the same key in `config.json`, so a single default can
+accepted as well and mean the same key in `defaults.json`, so a single default can
 be overridden without inventing a template variable. An empty variable always
 means "not set" — it can never blank a default by accident.
 
 The login name is hard-coded to `ZincAI`; `MC_USERNAME` does not rename it.
 The first join failure is fatal. Once it has spawned, a dropped connection or
 server restart is retried under the same name with backoff (see
-`reconnect` in `config.json`). A whitelist/ban rejection is not retried.
+`reconnect` in `defaults.json`). A whitelist/ban rejection is not retried.
 
 Useful commands:
 

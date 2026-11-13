@@ -35,7 +35,7 @@ const SOURCE = path.join(__dirname, 'zincai.json')
 const HOST_FAMILY = ['host', 'tty', 'standard']
 
 function parseArgs (argv) {
-  const out = { env: 'host', os: process.platform === 'linux' ? 'linux' : process.platform, arch: null, json: null, help: false }
+  const out = { env: 'host', os: process.platform === 'linux' ? 'linux' : process.platform, arch: null, json: null, scan: null, help: false }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (a === '--help' || a === '-h') out.help = true
@@ -46,6 +46,8 @@ function parseArgs (argv) {
     else if (a === '--arch') out.arch = argv[++i]
     else if (a.startsWith('--arch=')) out.arch = a.slice('--arch='.length)
     else if (a === '--json') out.json = argv[++i]
+    else if (a === '--scan') out.scan = argv[++i] || path.join(__dirname, '..')
+    else if (a.startsWith('--scan=')) out.scan = a.slice('--scan='.length)
     else throw new Error(`unknown argument: ${a}`)
   }
   if (!out.arch) out.arch = process.arch
@@ -65,12 +67,42 @@ function compatibility (template, { env, os, arch }) {
   }
 }
 
+/**
+ * Emulate services/templates.go GetAllFromRepo: every NON-DOT top-level directory
+ * is scanned, and every `*.json` directly inside it (except `data.json`) is
+ * loaded as a template named after the file. A file that is not a template still
+ * gets listed — with no display name and no supportedEnvironments, so the panel
+ * shows it as a nameless, permanently incompatible entry.
+ */
+function scanRepo (root) {
+  const found = []
+  for (const dir of fs.readdirSync(root, { withFileTypes: true })) {
+    if (!dir.isDirectory() || dir.name.startsWith('.') || dir.name === 'node_modules') continue
+    const full = path.join(root, dir.name)
+    for (const file of fs.readdirSync(full, { withFileTypes: true })) {
+      if (!file.isFile() || !file.name.endsWith('.json') || file.name === 'data.json') continue
+      const filePath = path.join(full, file.name)
+      let parsed = null
+      let error = null
+      try {
+        parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'))
+      } catch (err) {
+        error = err.message
+      }
+      found.push({ name: file.name.slice(0, -'.json'.length), path: path.relative(root, filePath), parsed, error })
+    }
+  }
+  return found
+}
+
 function main () {
   const args = parseArgs(process.argv.slice(2))
   if (args.help) {
-    console.log('usage: node pufferpanel/doctor.js [--env host|tty|standard|docker] [--os linux] [--arch arm64|x64] [--json <template>]')
+    console.log('usage: node pufferpanel/doctor.js [--env host|tty|standard|docker] [--os linux] [--arch arm64|x64] [--json <template>] [--scan <repo root>]')
     return 0
   }
+
+  if (args.scan) return scanMain(args)
 
   const template = args.json ? JSON.parse(args.json) : JSON.parse(fs.readFileSync(SOURCE, 'utf8'))
   const verdict = compatibility(template, args)
@@ -134,4 +166,32 @@ if (require.main === module) {
   }
 }
 
-module.exports = { compatibility, parseArgs, HOST_FAMILY }
+/** Report every phantom entry the panel would list for a template repo. */
+function scanMain (args) {
+  const entries = scanRepo(path.resolve(args.scan))
+  console.log(`scanning ${path.resolve(args.scan)} the way PufferPanel does`)
+  console.log('(every non-dot top-level folder, every *.json directly inside it, except data.json)')
+  console.log('')
+  let broken = 0
+  for (const entry of entries) {
+    const isTemplate = entry.parsed && (entry.parsed.type || entry.parsed.display || entry.parsed.run || entry.parsed.install)
+    const verdict = entry.parsed ? compatibility(entry.parsed, args) : { env: { ok: false } }
+    const ok = isTemplate && verdict.env.ok && verdict.os.ok && verdict.arch.ok
+    if (!isTemplate) broken++
+    console.log(`${ok ? 'OK        ' : 'PHANTOM   '} ${entry.path}`)
+    console.log(`           name="${entry.name}" display=${JSON.stringify((entry.parsed && entry.parsed.display) || '')}`)
+    if (entry.error) console.log(`           not valid JSON: ${entry.error}`)
+    else if (!isTemplate) console.log('           not a template: no type/display/install/run. The panel lists it anyway,')
+    if (!isTemplate && entry.parsed && !entry.error) console.log('           with no name and no supportedEnvironments, so it can never be used.')
+  }
+  console.log('')
+  if (broken) {
+    console.log(`${broken} file(s) would show up as a nameless "incompatible" entry.`)
+    console.log('Fix: rename or move them out of the two-level layout the panel scans.')
+    return 1
+  }
+  console.log(`${entries.length} template(s), all usable on env=${args.env} os=${args.os} arch=${args.arch}.`)
+  return 0
+}
+
+module.exports = { compatibility, parseArgs, scanRepo, HOST_FAMILY }

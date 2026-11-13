@@ -147,6 +147,67 @@ test('template: host conditions treat host, tty and standard alike', () => {
   assert.match(fallback.if, /tty/)
 })
 
+test('repo layout: the panel scan finds exactly one template, and it is ours', () => {
+  // services/templates.go GetAllFromRepo walks every non-dot top-level folder and
+  // loads every *.json directly inside it (except data.json) as a template named
+  // after the file. A stray JSON becomes a nameless, permanently incompatible
+  // entry in the create-server list — which is what made the panel show a blank
+  // template on top of the real one.
+  const { scanRepo } = require('../pufferpanel/doctor')
+  const root = path.join(__dirname, '..')
+  const entries = scanRepo(root)
+  assert.equal(entries.length, 1, `exactly one scannable JSON is allowed, found: ${entries.map((e) => e.path).join(', ')}`)
+  assert.equal(entries[0].path, path.join('pufferpanel', 'zincai.json'))
+  assert.ok(entries[0].parsed, 'the template parses')
+})
+
+test('repo layout: no other two-level JSON exists that the panel would mis-list', () => {
+  // Belt and braces: even if a future file lands in a scanned position, it must
+  // be a real template (has type/display/install/run), never a config blob.
+  const { scanRepo } = require('../pufferpanel/doctor')
+  const entries = scanRepo(path.join(__dirname, '..'))
+  for (const entry of entries) {
+    assert.ok(entry.parsed, `${entry.path} must be valid JSON`)
+    const looksLikeTemplate = Boolean(entry.parsed.type || entry.parsed.display || entry.parsed.install || entry.parsed.run)
+    assert.ok(looksLikeTemplate, `${entry.path} would be listed by the panel as a nameless template`)
+    assert.ok(Array.isArray(entry.parsed.supportedEnvironments) && entry.parsed.supportedEnvironments.length,
+      `${entry.path} must declare supportedEnvironments or it can never be used`)
+  }
+})
+
+test('doctor: --scan exits non-zero for a repo with a stray JSON, zero for ours', () => {
+  const script = path.join(__dirname, '..', 'pufferpanel', 'doctor.js')
+  const ok = execFileSync(process.execPath, [script, '--scan', path.join(__dirname, '..'), '--env', 'host', '--arch', 'arm64'], { encoding: 'utf8' })
+  assert.match(ok, /1 template\(s\), all usable/)
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'repo-scan-'))
+  fs.mkdirSync(path.join(tmp, 'mod'))
+  fs.writeFileSync(path.join(tmp, 'mod', 'stray.json'), '{"a":1}')
+  let code = 0
+  let out = ''
+  try {
+    execFileSync(process.execPath, [script, '--scan', tmp], { encoding: 'utf8' })
+  } catch (err) {
+    code = err.status
+    out = String(err.stdout)
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+  assert.equal(code, 1, 'a stray JSON must fail the scan')
+  assert.match(out, /PHANTOM/)
+  assert.match(out, /nameless/)
+})
+
+test('config: the shipped defaults live outside the folder the panel scans', () => {
+  // zincai/config/defaults.json is three levels deep on purpose: <folder>/<file>.json
+  // would be picked up as a template by the panel and shown as a blank entry.
+  assert.ok(fs.existsSync(path.join(__dirname, '..', 'zincai', 'config', 'defaults.json')))
+  assert.ok(!fs.existsSync(path.join(__dirname, '..', 'zincai', 'config.json')),
+    'zincai/config.json would be mis-read by PufferPanel as a template')
+  assert.ok(!fs.existsSync(path.join(__dirname, '..', 'zincai', 'defaults.json')),
+    'zincai/defaults.json would also be mis-read (the scanner takes any *.json)')
+})
+
 test('doctor: reports the node it was given, and fails a real incompatibility', () => {
   const script = path.join(__dirname, '..', 'pufferpanel', 'doctor.js')
   const good = execFileSync(process.execPath, [script, '--env', 'tty', '--os', 'linux', '--arch', 'arm64'], { encoding: 'utf8' })

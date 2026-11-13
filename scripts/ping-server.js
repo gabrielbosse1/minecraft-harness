@@ -15,7 +15,7 @@ const fs = require('fs')
 const path = require('path')
 
 const settings = require('../src/settings')
-const defaults = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'zincai', 'config.json'), 'utf8'))
+const defaults = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'zincai', 'config', 'defaults.json'), 'utf8'))
 
 const host = settings.str(['MC_HOST', 'server.host'], defaults.server.host)
 const port = settings.int(['MC_PORT', 'server.port'], defaults.server.port, { min: 1, max: 65535 })

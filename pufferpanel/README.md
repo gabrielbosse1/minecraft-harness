@@ -119,6 +119,31 @@ If the panel *still* greys the template out:
 | `requirements.arch` / `requirements.os` in a **forked** copy | Those are single strings; `arch` cannot list both `x64` and `arm64`, so leave them out. |
 | Node too old / wrong arch | Nothing here is architecture-specific; on a host node `nodejsdl` downloads `linux/arm64` (or `armv7l`) by itself. |
 
+### It shows up with no name (and stays "incompatible" forever)
+
+PufferPanel does **not** look for "the template" in your repo. It scans *every*
+non-dot top-level folder and loads **every `*.json` directly inside it** (except
+`data.json`) as a template, named after the file (`services/templates.go`,
+`GetAllFromRepo`). A stray JSON gets listed too — with **no display name** and no
+`supportedEnvironments`, so it appears blank and can never match any environment.
+
+That is why the same panel could show a nameless, greyed-out entry *and* still
+say "incompatible": there were two entries, and only one of them was ours.
+`zincai/config.json` (the bot's defaults) used to sit exactly in that scanned
+position. It now lives one level deeper, at `zincai/config/defaults.json`, which
+the scanner does not reach.
+
+Check any copy of the repo the same way the panel reads it:
+
+```sh
+node pufferpanel/doctor.js --scan .        # PHANTOM = a file the panel will mis-list
+```
+
+`--scan` exits non-zero if anything in the repo is not a usable template, so it
+also works in CI. Rule of thumb: **a `.json` at `<folder>/<file>.json` is a
+template** unless the file is called `data.json` — no template JSON anywhere
+else in the repo.
+
 ## 2. Create the server
 
 **Servers → New server**, then pick the template — it appears as **zincai**

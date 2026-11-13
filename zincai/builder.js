@@ -478,11 +478,11 @@ class BuilderExecutor {
    * @returns {Promise<{ok:boolean, placed:number, alreadyPresent:number,
    *   skipped:string[], missing:Array, towerUsed:number, stage:string|null}>}
    */
-  async build (plan, { stage = null, onProgress = null } = {}) {
+  async build (plan, { stage = null, onProgress = null, allowScaffold = true } = {}) {
     this.cancelRequested = false
     this.hands?.acquire?.({ reason: 'building' })
     try {
-      return await this._build(plan, { stage, onProgress })
+      return await this._build(plan, { stage, onProgress, allowScaffold })
     } finally {
       this.hands?.setGoal?.(null)
     }
@@ -494,7 +494,7 @@ class BuilderExecutor {
     }
   }
 
-  async _build (plan, { stage = null, onProgress = null } = {}) {
+  async _build (plan, { stage = null, onProgress = null, allowScaffold = true } = {}) {
     const bot = this.bot
     const wanted = normalizeStage(stage)
     let placed = 0
@@ -521,6 +521,9 @@ class BuilderExecutor {
       } catch { /* unloaded cell — fall through to place */ }
       const needed = step.y - Math.floor(bot.entity.position.y)
       if (needed > 4) {
+        // Regional leases do not cover a scaffold at the bot's feet.
+        // Skip rather than mutate an unleased chunk if the bot moved down.
+        if (!allowScaffold) { skipped.push(`needs-scaffold@${step.x},${step.y},${step.z}`); continue }
         await this._waitForHands()
         const before = this._count(this.scaffoldBlocks[0])
         const ok = await this.pillarUpTo(step.y - 3)

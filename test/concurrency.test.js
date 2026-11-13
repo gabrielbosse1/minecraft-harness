@@ -438,3 +438,180 @@ test('C20 the scheduler reports what it is doing (observability)', async () => {
   lease.release()
   assert.equal(lanes.snapshot().byLane.BODY, undefined)
 })
+
+// ---------------------------------------------------------------------------
+// R1–R10: per-region world locks
+//
+// The coarse `world`/`world-read` pair excluded *every* read against *every*
+// build. Regions narrow that to the chunks actually touched — but only if the
+// narrowing is provably safe. These tests pin both halves: the extra
+// parallelism, and the absence of the classic multi-lock deadlock.
+// ---------------------------------------------------------------------------
+
+test('R1 a reader no longer blocks an unrelated build (the whole point)', async () => {
+  const lanes = mkLanes()
+  const read = await lanes.acquire('find', { footprint: { x1: 0, z1: 0, x2: 0, z2: 0 } })
+  const build = lanes.tryAcquire('build', { footprint: { x1: 200, z1: 0, x2: 200, z2: 0 } })
+  assert.ok(build, 'a build 200 blocks away must not queue behind a chest read')
+  read.release()
+  build.release()
+})
+
+test('R2 a reader in the SAME chunk as a build is still excluded', async () => {
+  const lanes = mkLanes()
+  const build = await lanes.acquire('build', { footprint: { x1: 4, z1: 4, x2: 4, z2: 4 } })
+  assert.equal(lanes.tryAcquire('find', { footprint: { x1: 9, z1: 9, x2: 9, z2: 9 } }), null,
+    'same 16x16 chunk means the read could straddle the build')
+  build.release()
+  assert.ok(lanes.tryAcquire('find', { footprint: { x1: 9, z1: 9, x2: 9, z2: 9 } }), 'granted after release')
+})
+
+test('R3 two readers in the same chunk share (reads never exclude reads)', async () => {
+  const lanes = mkLanes()
+  const a = await lanes.acquire('find', { footprint: { x1: 0, z1: 0, x2: 0, z2: 0 } })
+  const b = await lanes.acquire('inspect_region', { footprint: { x1: 0, z1: 0, x2: 0, z2: 0 } })
+  assert.ok(a && b)
+  a.release(); b.release()
+})
+
+test('R4 crossing a chunk border locks every chunk touched', () => {
+  const keys = L.regionsFor({ x1: 14, z1: 14, x2: 18, z2: 18 }).sort()
+  assert.deepEqual(keys, ['world:0,0', 'world:0,1', 'world:1,0', 'world:1,1'])
+})
+
+test('R5 a straddling build excludes a read in ANY of its chunks', async () => {
+  const lanes = mkLanes()
+  const build = await lanes.acquire('build', { footprint: { x1: 14, z1: 14, x2: 18, z2: 18 } })
+  for (const [x, z] of [[0, 0], [16, 0], [0, 16], [16, 16]]) {
+    assert.equal(lanes.tryAcquire('find', { footprint: { x1: x, z1: z, x2: x, z2: z } }), null,
+      `read at ${x},${z} must be excluded`)
+  }
+  assert.ok(lanes.tryAcquire('find', { footprint: { x1: 64, z1: 64, x2: 64, z2: 64 } }), 'far read still allowed')
+  build.release()
+})
+
+test('R6 multi-chunk acquisition is atomic and cannot deadlock', async () => {
+  // The real hazard: build A holds chunks (0,0) and (1,0); build B wants
+  // (1,0) and (0,0). Incremental acquisition deadlocks here forever.
+  const lanes = mkLanes()
+  const a = await lanes.acquire('build', { footprint: { x1: 0, z1: 0, x2: 16, z2: 0 } })
+  let bGranted = false
+  const bPromise = lanes.acquire('build', { footprint: { x1: 16, z1: 0, x2: 0, z2: 0 } }).then((l) => { bGranted = true; return l })
+  await sleep(20)
+  assert.equal(bGranted, false, 'B must wait, holding nothing')
+  assert.equal(lanes.snapshot().byLane.BODY.length, 1, 'B holds no partial lock while waiting')
+  a.release()
+  const b = await bPromise
+  assert.ok(bGranted, 'B proceeds once A is fully released')
+  b.release()
+})
+
+test('R7 a waiting multi-chunk build holds nothing, so nothing can deadlock on it', async () => {
+  const lanes = mkLanes()
+  const holder = await lanes.acquire('build', { footprint: { x1: 0, z1: 0, x2: 32, z2: 32 } })
+  const waiter = lanes.acquire('build', { footprint: { x1: 32, z1: 32, x2: 0, z2: 0 } })
+  await sleep(10)
+  // The queued build must hold NO region while it waits. If it squatted on the
+  // chunks it had already won, a reader of those chunks would block forever on
+  // a build that is itself blocked. (A second *build* cannot run here because
+  // BODY is exclusive — that is a different, correct exclusion.)
+  const waiterHolds = [...lanes.held.values()].filter((i) => i.tool === 'build' && i !== holder.holder && i.holder !== holder.id)
+  assert.equal(waiterHolds.length, 0, 'a queued build must not squat on chunks it was refused')
+  assert.equal(lanes.snapshot().byLane.BODY.length, 1, 'only the running build occupies BODY')
+  // And a read of a chunk the holder does NOT own still goes through.
+  const farRead = lanes.tryAcquire('find', { footprint: { x1: 500, z1: 500, x2: 500, z2: 500 } })
+  assert.ok(farRead, 'a queued build must not block unrelated reads')
+  farRead.release()
+  holder.release()
+  ;(await waiter).release()
+})
+
+test('R8 roamer tools keep the coarse lock and exclude every region', () => {
+  // gather/light_up cannot name a footprint, so they must serialise against
+  // all regional work — otherwise a roamer could dig a held chunk.
+  assert.deepEqual(L.resourcesFor('gather'), ['lane:BODY', 'world'])
+  assert.equal(L.conflicts('world', 'world:0,0'), true)
+  assert.equal(L.conflicts('world', 'world-read:0,0'), true)
+  assert.equal(L.conflicts('world-read', 'world:0,0'), true)
+  assert.equal(L.conflicts('world-read', 'world-read:0,0'), false)
+})
+
+test('R9 a footprint too large falls back to the coarse key instead of 10k locks', () => {
+  const keys = L.regionsFor({ x1: 0, z1: 0, x2: 400, z2: 400 })
+  assert.deepEqual(keys, ['world'])
+})
+
+test('R10 region locks are released on releaseAll (context reset)', async () => {
+  const lanes = mkLanes()
+  await lanes.acquire('build', { footprint: { x1: 0, z1: 0, x2: 32, z2: 32 } })
+  // A reader in a chunk the build does not own, plus a roamer that must queue
+  // behind the coarse key — the reset has to clear both, queued and held.
+  await lanes.acquire('find', { footprint: { x1: 200, z1: 200, x2: 200, z2: 200 } })
+  const queued = lanes.acquire('gather')
+  await sleep(5)
+  assert.equal(lanes.waiters.length, 1, 'the roamer is queued behind the regional build')
+  lanes.releaseAll('context reset')
+  assert.equal(lanes.waiters.length, 0, 'queued work is dropped, not leaked')
+  // The dropped waiter must SETTLE (with null), not hang: an `await` on it
+  // would otherwise suspend the executor forever.
+  const lease = await Promise.race([queued, sleep(200).then(() => 'STILL PENDING')])
+  assert.equal(lease, null, 'a dropped waiter resolves to null instead of hanging')
+  assert.equal(lanes.held.size, 0, 'no exclusive lock survives')
+  assert.equal(lanes.readers.size, 0, 'no shared reader lock survives')
+  assert.ok(lanes.tryAcquire('build', { footprint: { x1: 0, z1: 0, x2: 0, z2: 0 } }), 'usable afterwards')
+})
+
+
+// ---------------------------------------------------------------------------
+// R11: does the BODY lane stay held while a background build is placing
+// blocks? `build_shape` hands the work to startMain, which runs it in the
+// background and returns immediately, so executeAction's finally block runs
+// while the build is still going.
+// ---------------------------------------------------------------------------
+
+test('R11 a background build does not leave the body lane free', async () => {
+  const bot = require('./helpers/session').simulatedBot({ items: [['stone_bricks', 64]] })
+  const s = startTestSession({ bot, actions: () => ({ a: 'idle' }) })
+  try {
+    s.spawn()
+    await sleep(120)
+    const it = s.internals()
+    bot.entity.position.set(0.5, 64, 0.5)
+    await it.executeAction({ a: 'build_shape', shape: 'floor', block: 'stone_bricks', params: { w: 6, d: 6 }, at: [0, 64, 0] }, { text: '' })
+    // Give the background task a moment to actually start placing.
+    await sleep(60)
+    const snap = it.lanes.snapshot()
+    const building = it.agenda.main
+    // Whatever the outcome, the invariant is: if a main build task is running,
+    // the BODY lane must be occupied by it.
+    if (building && building.tool === 'build_shape') {
+      assert.ok(snap.byLane.BODY && snap.byLane.BODY.length === 1,
+        'a physically running build must hold the BODY lane')
+    }
+  } finally { s.stop() }
+})
+
+test('R12 reversed, negative, boundary and oversized footprints stay conservative', () => {
+  assert.deepEqual(L.regionsFor({ x1: 18, z1: 18, x2: 14, z2: 14 }).sort(),
+    ['world:0,0', 'world:0,1', 'world:1,0', 'world:1,1'])
+  assert.deepEqual(L.regionsFor({ x1: -17, z1: -1, x2: 0, z2: 0 }).sort(),
+    ['world:-1,-1', 'world:-1,0', 'world:-2,-1', 'world:-2,0', 'world:0,-1', 'world:0,0'])
+  const points = Array.from({ length: 65 }, (_, i) => ({ x: i * 16, z: 0 }))
+  assert.deepEqual(L.regionsFor(points), ['world'])
+  assert.deepEqual(L.resourcesFor('inspect_region', { footprint: { x1: 0, z1: 0, x2: 400, z2: 400 } }), ['lane:WORLD_INFO', 'world-read'])
+  assert.deepEqual(L.resourcesFor('build', { footprint: [{ x: 0, z: 0 }, { x: NaN, z: 0 }] }), ['lane:BODY', 'world'])
+})
+
+test('R13 a job waits for a conflicting world resource even when BODY is free', async () => {
+  const lanes = mkLanes()
+  const held = await lanes.acquire('inspect_block')
+  const jobs = new L.JobRegistry({ lanes })
+  let started = false
+  const job = jobs.start({ kind: 'build', tool: 'build', run: async () => { started = true; return 'done' } })
+  await sleep(20)
+  assert.equal(started, false)
+  assert.equal(lanes.snapshot().waiting, 1)
+  held.release()
+  assert.equal(await job.promise, 'done')
+  assert.equal(started, true)
+})

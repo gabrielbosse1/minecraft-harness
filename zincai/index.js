@@ -46,6 +46,7 @@
 const fs = require('fs')
 const path = require('path')
 const { performance } = require('node:perf_hooks')
+const { AsyncLocalStorage } = require('node:async_hooks')
 
 // No .env and no dotenv: everything arrives as environment variables, which is
 // exactly what a PufferPanel template's run.environmentVars becomes. Secrets
@@ -614,6 +615,28 @@ function startSession (shared, onEnded) {
   /** The action whose turn is executing right now, for failure attribution. */
   let gateCtx = null
   let currentActId = null
+  /**
+   * Lane-lease handoff.
+   *
+   * Some tools (`build_shape`, `build`, `gather`) do not finish inside
+   * executeAction: they hand the physical work to startMain/startSide, which
+   * run in the background. Releasing the lane lease in executeAction's finally
+   * block therefore freed BODY while blocks were still being placed — a second
+   * physical action could start mid-build. AsyncLocalStorage keeps each
+   * invocation's lease separate when independent actions overlap; a claimed
+   * lease is released when its background work really ends.
+   */
+  const leaseContext = new AsyncLocalStorage()
+
+  /** Transfer a BODY lease from this invocation to its background work. */
+  function adoptLease (promise, why) {
+    const ctx = leaseContext.getStore()
+    if (!ctx || ctx.claimed || ctx.lease?.lane !== LANES.BODY) return promise
+    ctx.claimed = true
+    return Promise.resolve(promise).finally(() => {
+      try { ctx.lease.release(why) } catch { /* noop */ }
+    })
+  }
   /** actId -> monotonic ms when the action started, for exec→confirm latency. */
   const actStartedMono = new Map()
   /**
@@ -844,8 +867,35 @@ function startSession (shared, onEnded) {
     const actId = continuity.beginAction({ tool: main.tool, summary: main.label, sig: `${main.tool}:${main.label}`, goalId: main.goalId || null })
     // A restart waits until the previous run has really stopped: a cancelled
     // build needs a moment to notice, and two builds must never run at once.
-    const again = () => main.run()
-    main.running = main.running ? main.running.then(again, again) : main.run()
+    const ctx = leaseContext.getStore()
+    const inheritedBody = Boolean(ctx && !ctx.claimed && ctx.lease?.lane === LANES.BODY)
+    const previous = main.running
+    const run = async (ctl = null) => {
+      if (previous) { try { await previous } catch { /* previous run failed */ } }
+      let ownLease = null
+      try {
+        // A resumed goal or side-job callback has no BODY lease to hand off.
+        // Acquire one before starting any physical work, never from a caller
+        // that already owns it.
+        if (!inheritedBody) ownLease = await lanes.acquire(main.tool, { goalId: main.goalId })
+        if ((!inheritedBody && !ownLease) || ended || agenda.main !== main || main.paused || ctl?.isCancelled()) {
+          return { ok: false, msg: 'cancelled before starting' }
+        }
+        return await main.run()
+      } finally {
+        if (ownLease) ownLease.release(`${main.tool} finished`)
+      }
+    }
+    let running
+    if (main.tool === 'build' || main.tool === 'build_shape') {
+      const job = jobs.start({ kind: main.tool, goalId: main.goalId, tool: main.tool, lane: false, run })
+      main.jobId = job.id
+      running = job.promise
+    } else {
+      running = run()
+    }
+    // The lane lease follows the WORK, not the call that started it.
+    main.running = adoptLease(running, `${main.tool} finished`)
     background(main.tool, main.running, { showAs: main.showAs || null, main, seq: main.seq, actId })
   }
 
@@ -893,6 +943,7 @@ function startSession (shared, onEnded) {
       if (main.goalId) goalReg.cancel(main.goalId, { reason: `cancelled to make room for ${by}` })
       return false
     }
+    main.pendingInterrupt = false
     main.paused = { by, at: Date.now(), until }
     if (main.goalId) goalReg.suspend(main.goalId, { reason: `paused for ${by}`, by })
     return true
@@ -926,7 +977,17 @@ function startSession (shared, onEnded) {
       if (goal) goalReg.resume(goal.id, { reason: 'side job started' })
     }
     const actId = continuity.beginAction({ tool: label, summary: opts.describe || String(label), sig: `${label}:${opts.describe || ''}`, goalId: goal ? goal.id : null })
-    return background(label, run(), { side: true, goalId: goal ? goal.id : null, actId })
+    const ctx = leaseContext.getStore()
+    const inheritedBody = Boolean(ctx && !ctx.claimed && ctx.lease?.lane === LANES.BODY)
+    const work = (async () => {
+      let lease = null
+      try {
+        if (!inheritedBody) lease = await lanes.acquire(label, { goalId: goal?.id || null })
+        if ((!inheritedBody && !lease) || ended) return { ok: false, msg: 'cancelled before starting' }
+        return await run()
+      } finally { if (lease) lease.release(`${label} finished`) }
+    })()
+    return background(label, adoptLease(work, `${label} finished`), { side: true, goalId: goal ? goal.id : null, actId })
   }
 
   /** The side job is over: back to the main task, if one is waiting and nothing else runs. */
@@ -1376,6 +1437,7 @@ function startSession (shared, onEnded) {
 
   /** Stop the body if this goal is the one running: a cancelled goal must not keep working. */
   function stopGoalIfRunning (goalId) {
+    jobs.cancelForGoal(goalId, 'goal changed')
     if (agenda.main?.goalId === goalId) {
       agenda.main = null
       try { skills?.cancel('goal changed') } catch { /* noop */ }
@@ -1461,7 +1523,7 @@ function startSession (shared, onEnded) {
           // An earlier run of this task, or a task the agenda no longer holds: not news.
           if (agenda.main !== main || main.seq !== seq) return
           // Cancelled to make room for a side job: it will be launched again.
-          if (main.paused) return
+          if (main.paused || main.pendingInterrupt) return
           agenda.main = null
           finishGoal(main.goalId, r)
         } else if (goalId) {
@@ -1919,6 +1981,53 @@ function startSession (shared, onEnded) {
   }
 
   // ------------------------------------------------------------ builds ---
+  /**
+   * Which chunks will this action touch? Returns a footprint the lane
+   * scheduler can turn into per-region locks, or null when the action's reach
+   * is unbounded (`gather`, `light_up` roam) and must keep the coarse key.
+   *
+   * Only shapes whose extent we can compute cheaply are narrowed; anything
+   * uncertain stays coarse, which is always safe — just less parallel.
+   */
+  function footprintOf (action) {
+    const a = action?.a
+    const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : null)
+    if (a === 'inspect_block') {
+      const x = num(action.x ?? action.at?.[0])
+      const z = num(action.z ?? action.at?.[2])
+      if (x == null || z == null) return null
+      return { x1: x, z1: z, x2: x, z2: z }
+    }
+    if (a === 'inspect_region') {
+      const x = action.x; const z = action.z; const r = action.radius ?? 1
+      if (![x, z, r].every(Number.isSafeInteger) || r < 0 || r > 2) return null
+      return { x1: x - r, z1: z - r, x2: x + r, z2: z + r }
+    }
+    if (a === 'build_shape') {
+      const at = action.at
+      const shape = String(action.shape || '')
+      const params = action.params
+      if (!Array.isArray(at) || at.length < 3 || !at.slice(0, 3).every(v => Number.isFinite(Number(v))) || !params) return null
+      try {
+        const blocks = generateShape(shape, params, action.block || 'stone')
+        if (!blocks.length || executor?.placedScaffolds?.length) return null
+        const feetY = Math.floor(bot.entity.position.y)
+        if (blocks.some(b => Math.trunc(Number(at[1])) + (b.dy || 0) - feetY > 4)) return null
+        let x1 = Infinity; let z1 = Infinity; let x2 = -Infinity; let z2 = -Infinity
+        for (const b of blocks) {
+          const x = Math.trunc(Number(at[0])) + (b.dx || 0)
+          const z = Math.trunc(Number(at[2])) + (b.dz || 0)
+          if (x < x1) x1 = x
+          if (x > x2) x2 = x
+          if (z < z1) z1 = z
+          if (z > z2) z2 = z
+        }
+        return { x1, z1, x2, z2 }
+      } catch { return null }
+    }
+    return null
+  }
+
   async function buildBlocks (blocks, label, stage, at, { askedBy = null } = {}) {
     let origin
     if (Array.isArray(at) && at.length >= 3 && at.every((v) => Number.isFinite(Number(v)))) {
@@ -1936,24 +2045,34 @@ function startSession (shared, onEnded) {
         }
       }
     }
-    const phaseBlocks = stage && plan.steps ? plan.steps.filter((s) => (s.phase || 'walls') === stage).map((s) => ({ name: s.name })) : blocks
-    const preflight = parser.checkInventory(phaseBlocks, bot.inventory.items())
+    // A resumed build needs only materials missing from the observed world.
+    // Unknown/unloaded cells count as missing rather than assuming success.
+    const phaseSteps = stage ? plan.steps.filter((s) => (s.phase || 'walls') === stage) : plan.steps
+    const remaining = phaseSteps.filter((step) => {
+      try { return bot.blockAt(new Vec3(step.x, step.y, step.z))?.name !== step.name } catch { return true }
+    })
+    const preflight = parser.checkInventory(remaining, bot.inventory.items())
     if (!preflight.ok) {
       const missing = preflight.missing.map((m) => `${m.name} x${m.need - m.have}`).join(', ')
       return { ok: false, msg: `cannot build ${label}${stage ? ' (' + stage + ')' : ''}: missing ${missing}. Gather them (gather) or ask a player, then call the same stage again — phases already placed do not redo.` }
     }
     logger.info(TAG, `${label} — ${plan.steps.length} blocks${stage ? ` (stage ${stage})` : ''}${plan.towerNeeded ? `, tower ${plan.towerHeight} high` : ''}`)
     const runningGoalId = agenda.main?.goalId || null
+    const runningJob = agenda.main?.jobId ? jobs.jobs.get(agenda.main.jobId) : null
+    const lease = leaseContext.getStore()?.lease
+    const regional = lease?.lane === LANES.BODY && lease.resources.some(r => r.startsWith('world:'))
     const result = await executor.build(plan, {
       stage,
+      allowScaffold: !regional,
       onProgress: ({ placed, total }) => {
+        if (runningJob) runningJob.progress = { done: placed, total }
         if (runningGoalId && (placed === 1 || placed % 4 === 0 || placed === total)) {
           goalReg.progress(runningGoalId, { done: placed, total, note: `${placed}/${total} blocks` })
         }
       }
     })
     let scaffoldNote = ''
-    if (cfg.build.autoRemoveScaffold !== false) {
+    if (!regional && cfg.build.autoRemoveScaffold !== false) {
       try {
         const { removed } = await executor.removeScaffolds()
         if (removed > 0) scaffoldNote = `, scaffold cleared ${removed}`
@@ -2020,12 +2139,25 @@ function startSession (shared, onEnded) {
     let laneLease = null
     try {
       const lane = laneOf(a)
+      // A newer physical decision interrupts the current task before waiting
+      // for its lease; the old task retains its lock until it really exits.
+      if (lane === LANES.BODY && agenda.main && lanes.bodyHolder()) {
+        agenda.main.pendingInterrupt = true
+        replaceTask()
+      }
+      const footprint = footprintOf(action)
+      const meta = { goalId: agenda.main?.goalId || null, footprint }
       if (lane === LANES.WORLD_INFO || lane === LANES.COMPUTATION) {
-        laneLease = lanes.tryAcquire(a, { goalId: agenda.main?.goalId || null })
+        laneLease = lanes.tryAcquire(a, meta)
       } else {
-        laneLease = await lanes.acquire(a, { goalId: agenda.main?.goalId || null })
+        laneLease = await lanes.acquire(a, meta)
       }
     } catch { laneLease = null }
+    if (!laneLease) {
+      if (agenda.main?.pendingInterrupt) { shelfMain(agenda.main, 'interrupted while another action waited'); agenda.main = null }
+      return report(a, { ok: false, msg: 'resource busy or action cancelled before it could start; retry' }, { wake: false })
+    }
+    return leaseContext.run({ lease: laneLease, claimed: false }, async () => {
     gateCtx = action
     const IMMEDIATE_TRACKED = new Set(['say', 'stop', 'hold', 'equip', 'redstone_scan', 'redstone_component', 'redstone_engineer', 'recall', 'circuit_project', 'logic_test', 'inspect_region', 'inspect_block', 'find', 'remember_here', 'note', 'social', 'goal', 'set_mode'])
     currentActId = IMMEDIATE_TRACKED.has(a)
@@ -2149,7 +2281,7 @@ function startSession (shared, onEnded) {
         decided(snap, { label: 'use_block' })
         return startSide('use_block', () => skills.useBlock({ what: action.what }), sideOpts('use_block', action, snap))
       case 'eat':
-        return background('eat', skills.eat({ item: action.item }))
+        return background('eat', adoptLease(skills.eat({ item: action.item }), 'eat finished'))
       case 'equip':
         return report('equip', await skills.equip({ item: action.item, where: action.where }), { wake: null })
       case 'redstone_engineer': {
@@ -2386,10 +2518,13 @@ function startSession (shared, onEnded) {
     } finally {
       gateCtx = null
       currentActId = null
-      // The lane lease is always released here — success, failure, an early
-      // return or a thrown error. A leaked BODY lock would freeze the avatar.
-      try { laneLease?.release('action finished') } catch { /* noop */ }
+      // The lease is released here unless a background task adopted it: that
+      // task owns the lane until its work is genuinely over. A leaked BODY
+      // lock would freeze the avatar, so every path must release exactly once.
+      if (!leaseContext.getStore().claimed) { try { laneLease.release('action finished') } catch { /* noop */ } }
+      if (agenda.main?.pendingInterrupt) { shelfMain(agenda.main, `interrupted by ${a}`); agenda.main = null }
     }
+    })
   }
 
   // ------------------------------------------ optional Scout & Relocate --
@@ -3058,9 +3193,8 @@ function startSession (shared, onEnded) {
    */
   function resetContext ({ reason = 'context_reset', wake = true } = {}) {
     decisionEpoch++
-    // A context reset must not leave a lane locked or a background job running
-    // against a world the model no longer remembers.
-    try { lanes.releaseAll('context reset') } catch { /* noop */ }
+    // A reset drops stale queued decisions, but running work keeps its lease.
+    try { lanes.dropWaiters('context reset') } catch { /* noop */ }
     results.length = 0
     try { memory.working.clear() } catch { /* noop */ }
     try { if (memory.shortTerm) memory.shortTerm.items = [] } catch { /* noop */ }
@@ -3148,7 +3282,7 @@ function startSession (shared, onEnded) {
       arbiter, sense, wrapper, combat, system1, skills, brain, results, agenda,
       events: pipeline, latency, redstoneEngineer, redstoneLibrary: shared.redstoneLibrary,
       goals: goalReg, continuity, resetContext, executeAction, buildActionPrompt, buildChatPrompt,
-      lanes, jobs, laneOf: (tool) => laneOf(tool), LANES,
+      lanes, jobs, laneOf: (tool) => laneOf(tool), LANES, footprintOf,
       // Goal orchestration surface (tests and the session's own monitor):
       startMain, resumeMain, finishGoal, runGoalOp, goalLines, goalTick,
       reconcileRestored, reconcileGoal, verifyGoalAgainstWorld, staleActionReason

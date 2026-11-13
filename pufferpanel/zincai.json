@@ -438,7 +438,7 @@
       "LOG_LEVEL": "${log}"
     },
     "autostart": true,
-    "autorecover": true,
+    "autorecover": false,
     "autorestart": false
   },
   "environment": {

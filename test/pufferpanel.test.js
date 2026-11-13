@@ -420,3 +420,40 @@ test('import.js: refuses the token-in-a-bool that made the template vanish', () 
   // And the real template is still clean.
   assert.deepEqual(validate(template), [])
 })
+
+// ---------------------------------------------------------------------------
+// autorecover is not "restart the bot", it is "restart after a crash".
+//
+// servers/server.go afterExit:
+//     graceful := exitCode == ExpectedExitCode
+//     if skipAutoRestart            -> do nothing
+//     else if graceful && AutoRestartFromGraceful -> start again
+//     else if !graceful && AutoRestartFromCrash   -> start again (up to crashLimit)
+//
+// The panel's Stop button posts /api/servers/{id}/stop WITHOUT skipRestart
+// (client/api/src/servers.js `action` only sends ?wait=), and only /restart and
+// /kill call SkipAutoRestart() (web/daemon/server.go). SIGINT reaches the bot as
+// exit 130 through a shell, or stays a signal death, but either way it is not
+// expectedExitCode (unset = 0). So with autorecover true the bot is restarted
+// seconds after the operator presses Stop — precisely when they want it paused.
+// ---------------------------------------------------------------------------
+
+test('template: Stop must not be read as a crash', () => {
+  assert.equal(template.run.autorecover, false,
+    'autorecover restarts the process after a non-zero exit, and the panel\'s own Stop button never sets skipRestart')
+  // Supplying expectedExitCode does not rescue it: the bot exits 0 on SIGINT,
+  // and a signal-killed Node reports 128+N. No single value equals both, so the
+  // only safe setting with autorestart=false is autorecover=false.
+  assert.equal(template.run.autorestart, false)
+  assert.equal(template.run.expectedExitCode, undefined,
+    'expectedExitCode cannot be chosen to cover both exit 0 and signal deaths')
+})
+
+test('template: stopping is still deterministic — stopCode is SIGINT', () => {
+  // The stop path itself is sound in both environments the template offers:
+  // servers/tty.go signals the process, servers/docker.go ContainerKill(Signal).
+  assert.equal(template.run.stopCode, 2)
+  assert.equal(template.run.stop, undefined, 'stopCode wins; a stop command must not be set')
+  const src = fs.readFileSync(path.join(__dirname, '..', 'zincai', 'index.js'), 'utf8')
+  assert.match(src, /process\.on\('SIGINT', \(\) => shutdown\(0, 'SIGINT'\)\)/)
+})

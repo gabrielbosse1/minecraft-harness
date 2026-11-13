@@ -142,7 +142,7 @@ A `"${autostart}"` token in `run.autostart` is a **string**, so `Decode` fails
 and the whole template disappears. That was a real bug in this template, and it
 is why it is now gone:
 
-- `run.autostart` and `run.autorecover` are literal `true`.
+- `run.autostart` is literal `true`; `run.autorecover` is literal `false` (see below).
 - The `autostart` / `autorecover` **variables are gone**. There was never a way
   to forward them: the panel assigns those booleans per server, from the
   **Edit → flags** endpoint (`GET`/`POST /api/servers/{id}/flags`), not from a
@@ -157,9 +157,41 @@ node pufferpanel/doctor.js            # adds the `decoder:` line
 node pufferpanel/doctor.js --scan .   # DROPPED = the panel would skip the file
 ```
 
-Install-time behaviour is unchanged and still controlled per server:
-`autorecover: true` is what makes the panel restart the process after an
-unexpected exit (up to `daemon.data.crashLimit`, default 3).
+### Why `autorecover` is `false`
+
+`autorecover` is not "keep the bot running". It is "restart after an exit that
+is not the expected one" (`servers/server.go`, `afterExit`):
+
+```go
+graceful := exitCode == p.Execution.ExpectedExitCode
+if p.skipAutoRestart { /* do nothing */ }
+else if graceful && p.Execution.AutoRestartFromGraceful { StartViaService(p) }
+else if !graceful && p.Execution.AutoRestartFromCrash   { StartViaService(p) }
+```
+
+`skipAutoRestart` is set by `/restart` and `/kill`, but **not** by `/stop`
+unless the caller passes `?skipRestart=true` — and the panel's own Stop button
+does not (`client/api/src/servers.js`, `action()` only sends `?wait=`). So a
+plain Stop still reaches `afterExit`.
+
+`stopCode: 2` sends SIGINT, and the bot exits **0** on it. `expectedExitCode` is
+unset, i.e. 0, so that exit *is* graceful: with `autorestart: false` nothing
+restarts. But if the process is killed by the signal instead of catching it,
+Node reports `128 + 2 = 130`, which is not 0 — that is a "crash", and with
+`autorecover: true` the panel restarts the bot seconds after the operator
+pressed Stop. `expectedExitCode` cannot be set to cover both 0 and 130, so the
+only correct value here is `autorecover: false`.
+
+The consequence, stated plainly:
+
+- **Stop really stops.** The process stays down until you press Start.
+- **A genuine crash is not retried by the panel.** The bot already retries
+  *connection* loss itself (`reconnect` / `maxattempts` variables) with
+  back-off, which is the failure that actually happens in practice — a server
+  restart, a lag spike, a kick. A process-level crash left the bot down before
+  this template existed, and it leaves it down now.
+- If you would rather have crash recovery and can accept the Stop-is-a-restart
+  behaviour, set `"autorecover": true` in your fork. Prefer leaving it `false`.
 
 ### It shows up with no name (and stays "incompatible" forever)
 

@@ -121,7 +121,7 @@ function validate (template) {
   // their Go type is a bool/int while the value is usually written as a token.
   const SHAPES = {
     'run.autostart': ['boolean', run.autostart, 'set per server by the panel (Edit → flags), never by a variable'],
-    'run.autorecover': ['boolean', run.autorecover, 'set per server by the panel (Edit → flags), never by a variable'],
+    'run.autorecover': ['boolean', run.autorecover, 'set per server by the panel (Edit → flags), never by a variable; keep it false or Stop restarts the bot'],
     'run.autorestart': ['boolean', run.autorestart, null],
     'run.stopCode': ['integer', run.stopCode, null],
     'run.stop': ['string', run.stop, null],

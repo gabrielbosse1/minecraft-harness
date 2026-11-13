@@ -263,5 +263,6 @@ the next start.
 | Bot can't join | Wrong `host`/`port`, server not in offline mode, or `ZincAI` not whitelisted. |
 | `!zinc status` in chat is ignored | `operators` is empty, or your UUID is wrong — check the `control:` line and `config show control`. |
 | Console commands do nothing | The process isn't running (a stopped server has no stdin). |
-| Bot stops as soon as it starts | `autorestart` is `false` (that flag means "restart after a *clean* exit") and the process exited; check the console for a fatal first-join message. `autorecover` handles crashes. |
+| Bot stops as soon as it starts | Both restart flags are `false`, so an exit stays an exit. Read the console: the `--dry-run` preflight prints the invalid variable above the failure. |
+| Bot comes back a few seconds after pressing **Stop** | `run.autorecover` is `true` in your fork. The panel's Stop does not set `skipRestart`, so a signal death (exit 130) is classed as a crash. Set it to `false` — see [the README](../pufferpanel/README.md#why-autorecover-is-false). |
 | **No template listed at all** | The panel could not decode the JSON and skipped the file silently. Run `node pufferpanel/doctor.js` — a `decoder:` line other than `OK` names the field. See [the README](../pufferpanel/README.md#it-does-not-show-up-at-all-nothing-listed-no-error). |

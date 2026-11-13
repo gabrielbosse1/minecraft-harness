@@ -175,6 +175,42 @@ test('repo layout: no other two-level JSON exists that the panel would mis-list'
   }
 })
 
+test('template: the clone URL is real, not a placeholder, and an operator can change it', () => {
+  // The shipped template used to carry https://github.com/your-name/... with
+  // userEdit:false. Installing it cloned a repository that does not exist, so
+  // GitHub asked for a password and the install died with "Invalid username or
+  // token" — which reads like an auth problem and was really a placeholder
+  // nobody could correct from the panel.
+  const tpl = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'pufferpanel', 'zincai.json'), 'utf8'))
+  const repo = tpl.data.repo
+  assert.equal(repo.userEdit, true, 'an operator must be able to point the template at their own fork')
+  assert.doesNotMatch(repo.value, /your-name|your-org|example\.|CHANGEME/i, 'no placeholder in the clone URL')
+  assert.match(repo.value, /^https:\/\/github\.com\/[^/]+\/[^/]+\.git$/, 'a real HTTPS clone URL: a public repo needs no credentials')
+  // The same URL this repository actually pulls from, when it is ours.
+  const origin = (() => { try { return execFileSync('git', ['remote', 'get-url', 'origin'], { cwd: path.join(__dirname, '..'), encoding: 'utf8' }).trim() } catch { return null } })()
+  if (origin && origin.includes('gabrielbosse1/minecraft-harness')) {
+    assert.equal(repo.value, origin, 'the template clones the repository it ships in')
+  }
+})
+
+test('doctor: a placeholder clone URL is an INSTALL failure, not just a nitpick', () => {
+  const { installErrors, compatibility } = require('../pufferpanel/doctor')
+  const placeholder = { data: { repo: { type: 'string', value: 'https://github.com/your-name/minecraft-harness.git', desc: 'x', userEdit: false } } }
+  const errors = installErrors(placeholder)
+  assert.ok(errors.some((e) => /placeholder/.test(e)), 'the URL itself is reported')
+  assert.ok(errors.some((e) => /userEdit/.test(e)), 'not being editable from the panel is reported too')
+  // Every spelling of a placeholder is caught.
+  for (const bad of ['https://github.com/your-org/x.git', 'https://github.com/your_org/x.git', 'https://example.com/x.git', 'git@github.com:<owner>/x.git']) {
+    assert.ok(installErrors({ data: { repo: { value: bad } } }).length, `${bad} is caught`)
+  }
+  // A real public repo, and an SSH URL that says a deploy key is needed, are fine.
+  assert.deepEqual(installErrors({ data: { repo: { value: 'https://github.com/gabrielbosse1/minecraft-harness.git', desc: 'public' } } }), [])
+  assert.deepEqual(installErrors({ data: { repo: { value: 'git@github.com:me/x.git', desc: 'private — needs a deploy key on the node' } } }), [])
+  // compatibility() surfaces it, so --json and the normal doctor path both fail.
+  const v = compatibility(placeholder, { env: 'host', os: 'linux', arch: 'x64' })
+  assert.ok(v.install.length >= 1)
+})
+
 test('doctor: --scan exits non-zero for a repo with a stray JSON, zero for ours', () => {
   const script = path.join(__dirname, '..', 'pufferpanel', 'doctor.js')
   const ok = execFileSync(process.execPath, [script, '--scan', path.join(__dirname, '..'), '--env', 'host', '--arch', 'arm64'], { encoding: 'utf8' })

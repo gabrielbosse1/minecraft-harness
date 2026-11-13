@@ -104,6 +104,38 @@ function decodeErrors (template) {
   return errors
 }
 
+/**
+ * Install-safety checks for the values baked into a template.
+ *
+ * These are not decode errors — the panel accepts these happily and then the
+ * install fails on the node, which is a far worse place to find out. The one
+ * that bit us: `repo` carried a placeholder (`github.com/your-name/...`), so
+ * `git clone` asked GitHub for a repository that does not exist, GitHub
+ * answered with a credential prompt, and the install died with
+ * "Invalid username or token" — looking like an auth problem when the real
+ * problem was that nobody had ever replaced the placeholder.
+ */
+const PLACEHOLDER_RE = /(your-name|your-org|your_org|yourname|example\.(com|org)|CHANGEME|<[a-z-]+>)/i
+function installErrors (template) {
+  const errors = []
+  // `--json` and the file on disk carry the panel's variable map under `data`;
+  // a template pasted in the web UI keeps the same shape. A bare template with
+  // no `data` simply has nothing to check.
+  const vars = (template && template.data) || {}
+  const repo = vars.repo && vars.repo.value
+  if (typeof repo === 'string' && PLACEHOLDER_RE.test(repo)) {
+    errors.push(`repo is a placeholder (${repo}) — the node will try to clone a repository that does not exist and the panel will prompt for a password. Set it to the real clone URL.`)
+  }
+  // A clone URL nobody can reach without credentials is fine ONLY when it says so.
+  if (typeof repo === 'string' && /^git@github\.com:/.test(repo) && !/private/i.test(String(vars.repo.desc || ''))) {
+    errors.push('repo uses an SSH URL but its description does not say a deploy key is required — a node without one will hang on the host key prompt')
+  }
+  if (vars.repo && vars.repo.userEdit === false && typeof repo === 'string' && PLACEHOLDER_RE.test(repo)) {
+    errors.push('repo is a placeholder AND userEdit is false — nobody can fix it from the panel; the template is unusable as shipped')
+  }
+  return errors
+}
+
 function parseArgs (argv) {
   const out = { env: 'host', os: process.platform === 'linux' ? 'linux' : process.platform, arch: null, json: null, scan: null, refresh: false, help: false }
   for (let i = 0; i < argv.length; i++) {
@@ -134,7 +166,9 @@ function compatibility (template, { env, os, arch }) {
   return {
     env: { ok: supported.some((e) => e && e.type === env), have: supported.map((e) => e && e.type), want: env },
     os: { ok: !requirements.os || requirements.os === os, have: requirements.os || '(any)', want: os },
-    arch: { ok: !requirements.arch || requirements.arch === arch, have: requirements.arch || '(any)', want: arch }
+    arch: { ok: !requirements.arch || requirements.arch === arch, have: requirements.arch || '(any)', want: arch },
+    // Values the panel decodes happily but the node cannot install from.
+    install: installErrors(template)
   }
 }
 
@@ -197,6 +231,15 @@ function main () {
     console.log('Fix: give those fields the JSON type the struct declares — run.autostart,')
     console.log('autorecover and autorestart are Go bools, so they take true/false and never')
     console.log('a "${...}" token. The same flags are set per server by the panel itself.')
+    return 1
+  }
+
+  // Values the panel accepts but the node cannot act on: a placeholder clone URL
+  // fails at INSTALL time, on the node, looking like an auth error.
+  if (verdict.install.length) {
+    console.log('\nThe panel will list this template, but installing it will fail:')
+    for (const e of verdict.install) console.log(`  - ${e}`)
+    console.log('Fix: correct the value in the template JSON before shipping it.')
     return 1
   }
 
@@ -273,15 +316,20 @@ function scanMain (args) {
     const isTemplate = entry.parsed && (entry.parsed.type || entry.parsed.display || entry.parsed.run || entry.parsed.install)
     const verdict = entry.parsed ? compatibility(entry.parsed, args) : { env: { ok: false }, os: { ok: false }, arch: { ok: false } }
     const undecodable = entry.parsed ? decodeErrors(entry.parsed) : []
-    const ok = isTemplate && !undecodable.length && verdict.env.ok && verdict.os.ok && verdict.arch.ok
+    const install = entry.parsed ? installErrors(entry.parsed) : []
+    const ok = isTemplate && !undecodable.length && !install.length && verdict.env.ok && verdict.os.ok && verdict.arch.ok
     if (!isTemplate) broken++
     if (undecodable.length) dropped++
+    if (install.length) broken++
     console.log(`${ok ? 'OK        ' : undecodable.length ? 'DROPPED   ' : 'PHANTOM   '} ${entry.path}`)
     console.log(`           name="${entry.name}" display=${JSON.stringify((entry.parsed && entry.parsed.display) || '')}`)
     if (entry.error) console.log(`           not valid JSON: ${entry.error}`)
     else if (undecodable.length) {
       console.log('           the panel cannot decode this template, so it lists NOTHING for it:')
       for (const e of undecodable) console.log(`             ${e}`)
+    } else if (install.length) {
+      console.log('           the panel lists it, but INSTALL will fail on the node:')
+      for (const e of install) console.log(`             ${e}`)
     } else if (!isTemplate) console.log('           not a template: no type/display/install/run. The panel lists it anyway,')
     if (!isTemplate && entry.parsed && !entry.error) console.log('           with no name and no supportedEnvironments, so it can never be used.')
   }
@@ -486,4 +534,4 @@ async function refreshMain () {
   }
 }
 
-module.exports = { compatibility, parseArgs, scanRepo, refreshMain, decodeErrors, HOST_FAMILY, SERVER_FIELDS, EXECUTION_FIELDS }
+module.exports = { compatibility, parseArgs, scanRepo, refreshMain, decodeErrors, installErrors, PLACEHOLDER_RE, HOST_FAMILY, SERVER_FIELDS, EXECUTION_FIELDS }

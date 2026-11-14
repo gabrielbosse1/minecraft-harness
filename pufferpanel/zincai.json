@@ -46,7 +46,7 @@
     },
     "model": {
       "type": "string",
-      "value": "Qwen3.8-Flash-Next",
+      "value": "Qwen3.8-27B",
       "display": "Model",
       "desc": "Model alias served by the OpenAI-compatible endpoint.",
       "required": true,

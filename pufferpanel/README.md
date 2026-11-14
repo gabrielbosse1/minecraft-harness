@@ -30,7 +30,7 @@ pufferpanel/
 | `nodeversion` | string | No | `""` | — | Optional Node version pin for host env |
 | `dockerimage` | string | No | `node:22-bookworm-slim` | — | Container image for Docker env |
 | `apikey` | string | Yes | `""` | `AMD_API_KEY` | Inference API key (kept in env, never written to disk) |
-| `model` | string | Yes | `Qwen3.8-Flash-Next` | `AMD_MODEL` | Model name |
+| `model` | string | Yes | `Qwen3.8-27B` | `AMD_MODEL` | Model name |
 | `amdurl` | string | Yes | `https://developer.amd.com.cn/radeon/api/v1` | `AMD_API_BASE_URL` | OpenAI-compatible endpoint base URL |
 | `host` | string | Yes | `127.0.0.1` | `MC_HOST` | Minecraft server host |
 | `port` | integer | Yes | `25565` | `MC_PORT` | Minecraft server port |

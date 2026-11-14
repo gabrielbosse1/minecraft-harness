@@ -72,6 +72,7 @@ const SYSTEM_PROMPT = fs.readFileSync(path.join(ZINC_DIR, 'system_prompt.txt'), 
 const CHAT_PROMPT = fs.readFileSync(path.join(ZINC_DIR, 'chat_prompt.txt'), 'utf8').trim()
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const { AmdToolsClient, createZincTools, toolTurnMessages, ACTION_TOOLS } = require('./api_wrapper')
+const { resolveModelLimits } = require('./context_budget')
 const { stamp: ircStamp, ago: ircAgo, formatLine: ircLine, LEGEND: IRC_LEGEND } = require('./irc')
 const { FailGate } = require('./failgate')
 const { ContinuityStore } = require('./continuity')
@@ -127,7 +128,9 @@ function loadConfig () {
       apiKey: settings.apiKey() || raw.amd.apiKey || null,
       baseUrl: settings.str(['AMD_API_BASE_URL', 'amd.baseUrl'], raw.amd.baseUrl).replace(/\/+$/, ''),
       model: settings.str(['AMD_MODEL', 'amd.model'], raw.amd.model),
-      maxTokens: settings.int(['AMD_MAX_TOKENS', 'amd.maxTokens'], raw.amd.maxTokens ?? 1024, { min: 16, max: 8192 }),
+      // Null when unset => omit max_tokens so the endpoint uses the model's standard output limit.
+      maxTokens: settings.int(['AMD_MAX_TOKENS', 'amd.maxTokens'], raw.amd.maxTokens ?? null, { min: 16, max: 262_144 }),
+      contextWindow: settings.int(['AMD_CONTEXT_WINDOW', 'amd.contextWindow'], raw.amd.contextWindow ?? null, { min: 2_048, max: 2_000_000 }),
       temperature: settings.float(['AMD_TEMPERATURE', 'amd.temperature'], raw.amd.temperature ?? 0.25, { min: 0, max: 1.5 }),
       timeoutMs: settings.int(['AMD_API_TIMEOUT_MS', 'amd.timeoutMs'], raw.amd.timeoutMs ?? 120_000, { min: 1_000, max: 600_000 }),
       maxRetries: settings.int(['AMD_API_MAX_RETRIES', 'amd.maxRetries'], raw.amd.maxRetries ?? 2, { min: 0, max: 5 }),
@@ -157,6 +160,7 @@ function loadConfig () {
   cfg.inference.heartbeatMs = settings.int('INFERENCE_HEARTBEAT_MS', cfg.inference.heartbeatMs, { min: 0 })
   cfg.inference.loopMs = settings.int('INFERENCE_LOOP_MS', cfg.inference.loopMs ?? 8000, { min: 0 })
   cfg.inference.chatBatchMs = settings.int('INFERENCE_CHAT_BATCH_MS', cfg.inference.chatBatchMs ?? 6000, { min: 0 })
+  cfg.inference.chatMaxTokens = settings.int(['INFERENCE_CHAT_MAX_TOKENS', 'inference.chatMaxTokens'], cfg.inference.chatMaxTokens ?? null, { min: 64, max: 131_072 })
   cfg.reconnect.maxAttempts = settings.int('RECONNECT_MAX_ATTEMPTS', cfg.reconnect.maxAttempts, { min: 1 })
   cfg.reconnect.keepAliveTimeoutMs = settings.int('KEEPALIVE_TIMEOUT_MS', cfg.reconnect.keepAliveTimeoutMs ?? 60_000, { min: 20_000 })
   cfg.telemetry.flushIntervalMs = settings.int('TELEMETRY_FLUSH_MS', cfg.telemetry.flushIntervalMs ?? 5000, { min: 250, max: 60_000 })
@@ -222,6 +226,9 @@ function makeShared (cfg, { dataDir = DATA_DIR } = {}) {
       maxRetries: cfg.amd.maxRetries,
       temperature: cfg.amd.temperature,
       maxTokens: cfg.amd.maxTokens,
+      contextWindow: cfg.amd.contextWindow,
+      proactiveRatio: cfg.compaction?.proactiveRatio ?? 0.75,
+      reserveOutputRatio: cfg.compaction?.reserveOutputRatio ?? 0.25,
       maxConcurrent: cfg.amd.maxConcurrent ?? 2,
       chatTimeoutMs: cfg.amd.chatTimeoutMs ?? null,
       chatMaxRetries: cfg.amd.chatMaxRetries ?? 1
@@ -281,7 +288,7 @@ function makeShared (cfg, { dataDir = DATA_DIR } = {}) {
  */
 function main () {
   if (process.argv.includes('--check')) {
-    for (const m of ['./api_wrapper', './memory', './perception', './filter', './builder', './continuity', './custom_mineflayer/pathfinder_wrapper', './custom_mineflayer/doors', './custom_mineflayer/escape', './system1', './tactics', './reflex_registry', './vanilla_guard', './control', './threats', './places', './skills', './observe', './brain', './events', './redstone_engine', './runtime_config', './boundary', './connection', './death_recovery', './host', './control_commands', './irc', './telemetry', './updater', './supervisor', './watchdog', './protocol_keepalive', './block_search', './armor', './lanes', './goals']) require(m)
+    for (const m of ['./api_wrapper', './context_budget', './memory', './perception', './filter', './builder', './continuity', './custom_mineflayer/pathfinder_wrapper', './custom_mineflayer/doors', './custom_mineflayer/escape', './system1', './tactics', './reflex_registry', './vanilla_guard', './control', './threats', './places', './skills', './observe', './brain', './events', './redstone_engine', './runtime_config', './boundary', './connection', './death_recovery', './host', './control_commands', './irc', './telemetry', './updater', './supervisor', './watchdog', './protocol_keepalive', './block_search', './armor', './lanes', './goals']) require(m)
     require('minecraft-data')('26.3') // postinstall patch must be in place
     logger.info(TAG, '--check OK — all modules load, 26.3 data present')
     return
@@ -292,7 +299,9 @@ function main () {
   if (process.argv.includes('--dry-run')) {
     const errors = validateConfig(cfg)
     logger.info(TAG, `config: host=${cfg.server.host} port=${cfg.server.port} user=${cfg.server.username} auth=${cfg.server.auth} version=${cfg.server.version || 'auto'}`)
-    logger.info(TAG, `amd: model=${cfg.amd.model} base=${cfg.amd.baseUrl} key=${cfg.amd.apiKey ? 'present' : 'MISSING'}`)
+    const modelSpec = resolveModelLimits(cfg.amd.model)
+    const effCtx = cfg.amd.contextWindow || modelSpec.contextWindow
+    logger.info(TAG, `amd: model=${cfg.amd.model} base=${cfg.amd.baseUrl} key=${cfg.amd.apiKey ? 'present' : 'MISSING'} context=${effCtx} (${cfg.amd.contextWindow ? 'explicit' : modelSpec.source}) maxTokens=${cfg.amd.maxTokens ?? 'model-default'} chatMaxTokens=${cfg.inference.chatMaxTokens ?? 'model-default'}`)
     logger.info(TAG, `data dir: ${DATA_DIR} (sessions telemetry, memories, places, goals, journal, runtime-config)`)
     logger.info(TAG, `agent loop: ${cfg.inference.heartbeatMs > 0 && cfg.inference.loopMs > 0 ? `every ${cfg.inference.loopMs}ms, backing off to ${cfg.inference.heartbeatMs}ms while idle` : 'off (events only)'}; up to ${cfg.inference.maxStepsPerTurn ?? 6} model steps per turn; chat window ${cfg.inference.chatBatchMs}ms`)
     logger.info(TAG, `limits: rpm=${cfg.inference.rpm} minInterval=${cfg.inference.minIntervalMs}ms heartbeat=${cfg.inference.heartbeatMs}ms reconnect=${cfg.reconnect.maxAttempts} attempts serverTrafficTimeout=${cfg.reconnect.keepAliveTimeoutMs}ms`)
@@ -324,7 +333,8 @@ function main () {
   function summary () {
     const s = shared.amd.getStats()
     const hit = s.kvCacheHitRate === null ? 'n/a' : `${(s.kvCacheHitRate * 100).toFixed(1)}%`
-    logger.info(TAG, `amd session: ${s.requests} calls (${s.chatReplies} chat), ${s.failures} failures, avg prompt ${s.avgPromptTokensPerCall} tok, cached ${s.cachedTokens} tok, kv-hit-rate ${hit}, tools ${s.toolCalls}${s.jsonFallbacks ? ` (fallback ${s.jsonFallbacks})` : ''}`)
+    const compactNote = s.compactions ? `, compactions ${s.compactions} (proactive ${s.proactiveCompactions}, reactive ${s.reactiveCompactions}${s.degradedRecoveries ? `, degraded ${s.degradedRecoveries}` : ''})` : ''
+    logger.info(TAG, `amd session: ${s.requests} calls (${s.chatReplies} chat), ${s.failures} failures, avg prompt ${s.avgPromptTokensPerCall} tok, cached ${s.cachedTokens} tok, kv-hit-rate ${hit}, tools ${s.toolCalls}${s.jsonFallbacks ? ` (fallback ${s.jsonFallbacks})` : ''}${compactNote}`)
     logger.info(TAG, `memory: long-term ${shared.memory.longTerm.entries.length} entries saved to ${memoryFile}; places ${shared.places.blocks.size} blocks, ${shared.places.named.size} named`)
   }
 
@@ -2000,7 +2010,8 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     return `operator config: ${name || 'name unknown'}${uuid ? ` (UUID ${uuid})` : ''} — not independently authenticated and carries NO automatic authority over your goals, priorities, or relationships (requests remain optional proposals).`
   }
 
-  function buildActionPrompt (reasons) {
+  function buildActionPrompt (reasons, { compactionLevel = 0, markDelivered = true } = {}) {
+    const level = Math.max(0, Math.min(4, Math.trunc(Number(compactionLevel) || 0)))
     const pos = here()
     sense.assess()
     try { places.scan(bot, { radius: cfg.places.scanRadius ?? 16 }) } catch { /* partial world */ }
@@ -2010,8 +2021,12 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     // the ones that slipped behind a corner a moment ago (they are not in the
     // threat block, and "hold" used to leave the bot running from them).
     const threatIds = [...new Set([...sense.last.dangerIds, ...(system1?.chasers || []).map((t) => t.id)])]
-    const nearby = pos ? places.describeNearby(pos, { dim: dim() }) : ''
-    const named = pos ? places.describeNamed(pos, { dim: dim() }) : ''
+    const rawNearby = level < 2 && pos ? places.describeNearby(pos, { dim: dim() }) : ''
+    const nearby = rawNearby
+      ? (level >= 1 ? rawNearby.split('\n').slice(0, 4).join('\n') : rawNearby)
+      : ''
+    const rawNamed = level < 3 && pos ? places.describeNamed(pos, { dim: dim() }) : ''
+    const named = rawNamed && level >= 2 && rawNamed.length > 160 ? `${rawNamed.slice(0, 159)}…` : rawNamed
     // Build a grounded recall query: recent chat request if present, otherwise
     // active goals + nearby places/players + personal interests so long-term
     // memory works during unprompted autonomous operation and after resets!
@@ -2023,66 +2038,98 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       ...goalReg.openGoals().slice(0, 2).map((g) => g.description),
       ...Object.keys(bot.players || {}).filter((n) => n !== bot.username && bot.players[n]?.entity?.position).slice(0, 2),
       ...(continuity.identity.interests || []).slice(0, 2),
-      named.slice(0, 80)
+      rawNamed.slice(0, 80)
     ].filter(Boolean).join(' ')
-    const recalled = memory.recallBlock(autoQuery, cfg.memory.topK ?? 3)
-    const prefs = memory.preferencesLine()
-    const chat = chatLines(16, { maxAgeMs: cfg.inference?.logMaxAgeMs ?? 15 * 60_000 })
-    const res = results.slice(-4).map((r) => `  - ${r.label}: ${r.ok ? '' : 'FAILED — '}${r.msg}`).join('\n')
+    // Memories are high-priority preserved context across EVERY compaction tier.
+    const recallTopK = level >= 4 ? Math.min(2, cfg.memory.topK ?? 3) : (cfg.memory.topK ?? 3)
+    const recalled = memory.recallBlock(autoQuery, recallTopK)
+    const prefs = level < 4 ? memory.preferencesLine() : ''
+    const chatMax = level >= 4 ? 2 : level === 3 ? 3 : level === 2 ? 6 : level === 1 ? 10 : 16
+    const chat = chatLines(chatMax, { maxAgeMs: cfg.inference?.logMaxAgeMs ?? 15 * 60_000 })
+    const resKeep = level >= 4 ? 1 : level === 3 ? 2 : level === 2 ? 3 : 4
+    const resCap = level >= 4 ? 120 : level === 3 ? 140 : level === 2 ? 180 : 0
+    const res = results.slice(-resKeep).map((r) => {
+      const msg = resCap && String(r.msg || '').length > resCap ? `${String(r.msg).slice(0, resCap - 1)}…` : r.msg
+      return `  - ${r.label}: ${r.ok ? '' : 'FAILED — '}${msg}`
+    }).join('\n')
     // (World events used to be an untimed `events:` list here. They are lines
     // of the IRC log now — `[14:02:07] * hurt: hit by player Steve` — in order
     // with the chat they happened between.)
     // Timestamped perception window: what happened, when (occurrence vs
     // observation), where, to whom, and whether it was seen or only inferred.
-    const perceived = pipeline.formatForPrompt({ max: 8, excludeTypes: OWN_SECTION })
-    if (perceived.shownSequences.length) {
+    const perceivedMax = level >= 3 ? 0 : level === 2 ? 2 : level === 1 ? 4 : 8
+    const perceived = perceivedMax > 0
+      ? pipeline.formatForPrompt({ max: perceivedMax, excludeTypes: OWN_SECTION })
+      : { text: '', shownSequences: [] }
+    if (markDelivered && level === 0 && perceived.shownSequences.length) {
       try { pipeline.markProcessed(perceived.shownSequences, { via: 'model' }) } catch { /* noop */ }
     }
-    const ephItems = (memory.ephemeral?.snapshot?.() || [])
-      .filter((e) => !OWN_SECTION.has(e.type) && (e.text || e.msg))
-      .slice(-4)
-      .map((e) => String(e.text || e.msg))
+    const ephItems = level === 0
+      ? (memory.ephemeral?.snapshot?.() || [])
+        .filter((e) => !OWN_SECTION.has(e.type) && (e.text || e.msg))
+        .slice(-4)
+        .map((e) => String(e.text || e.msg))
+      : []
     const justNow = ephItems.length ? `just now: ${ephItems.join('; ').slice(0, 220)}` : null
-    const visibleFacts = Object.entries(bot.players || {}).filter(([name, p]) => name !== bot.username && p?.entity?.position).slice(0, 3).flatMap(([name]) => memory.factsAbout(name, 2).map((f) => `${name}: ${f}`))
-    const liveResultIds = new Set(results.slice(-4).map((r) => r.actId).filter(Boolean))
+    const visiblePlayersLimit = level >= 4 ? 2 : 3
+    const factsPerVisible = level >= 4 ? 1 : 2
+    const visibleFacts = Object.entries(bot.players || {})
+      .filter(([name, p]) => name !== bot.username && p?.entity?.position)
+      .slice(0, visiblePlayersLimit)
+      .flatMap(([name]) => memory.factsAbout(name, factsPerVisible).map((f) => `${name}: ${f}`))
+    const liveResultIds = new Set(results.slice(-resKeep).map((r) => r.actId).filter(Boolean))
     const relevantPlayers = [
       ...Object.keys(bot.players || {}).filter((n) => n !== bot.username),
       ...agenda.asked.map((x) => x.from),
       ...goalReg.openGoals().flatMap((g) => g.participants || [])
     ]
-    const continuityBlock = continuity.describeForPrompt(bot, { places, liveResultIds, relevantPlayers })
+    let continuityBlock = level < 4 ? continuity.describeForPrompt(bot, { places, liveResultIds, relevantPlayers }) : ''
+    if (continuityBlock && level >= 2) {
+      const maxContLines = level >= 3 ? 2 : 6
+      continuityBlock = continuityBlock.split('\n').slice(0, maxContLines).join('\n')
+    }
     const shownActionIds = [
       ...continuity.undeliveredActions().map((a) => a.id),
       ...(continuity.currentState.interruptedAction ? [continuity.currentState.interruptedAction.id] : [])
     ]
     const shownProposals = agenda.asked.map((x) => ({ ...x }))
+    const invLine = level >= 4
+      ? observe.inventoryLine(bot, { max: 10 })
+      : level === 3
+        ? observe.inventoryLine(bot, { max: 12 })
+        : level === 2
+          ? observe.inventoryLine(bot, { max: 16 })
+          : observe.inventoryLine(bot)
     const lines = [
       coreIdentity(),
       continuityBlock || null,
       visibleFacts.length ? `visible player memories (name-based, unverified): ${visibleFacts.join(' | ')}` : null,
       observe.selfLine(bot),
-      armor.brief() || null,
-      observe.inventoryLine(bot),
+      level < 3 ? (armor.brief() || null) : null,
+      invLine,
       doingLine(),
       agendaLine(),
-      goalLines(),
-      continuationBlock(res ? Math.min(4, results.length) : 0),
+      level >= 4 ? goalBriefLine() : goalLines(),
+      level < 4 ? continuationBlock(res ? Math.min(resKeep, results.length) : 0) : null,
       ...threatLines(),
-      observe.playersLine(bot),
-      observe.mobsLine(bot, { threatIds: sense.last.dangerIds, notes: hostileNotes() }),
-      nearby ? `nearby:\n${nearby.split('\n').map((l) => '  ' + l).join('\n')}` : 'nearby: no chests, furnaces or beds seen within 24 blocks',
+      level < 4 ? observe.playersLine(bot) : null,
+      level < 3 ? observe.mobsLine(bot, { threatIds: sense.last.dangerIds, notes: hostileNotes() }) : null,
+      level < 2
+        ? (nearby ? `nearby:\n${nearby.split('\n').map((l) => '  ' + l).join('\n')}` : 'nearby: no chests, furnaces or beds seen within 24 blocks')
+        : null,
       named ? `places: ${named}` : null,
       prefs || null,
       recalled || null,
       chat ? `${logHeader('log')}:\n${chat}` : null,
       res ? `results (your last actions):\n${res}` : null,
       perceived.text ? `perceived (timestamped; [NEW] = not yet delivered, "(scanned_diff)" = you discovered it late, exact time unknown):\n${perceived.text}` : null,
-      failGate.advisoryLine(pos) || null,
-      boundaryLine(),
+      level < 3 ? (failGate.advisoryLine(pos) || null) : null,
+      level < 4 ? boundaryLine() : null,
       justNow,
       `why now: ${reasons.join('; ')}`
     ]
-    if (holdingBuildMaterials()) {
+    // 3D ASCII grid is the largest transient block — drop first at compaction level >= 1.
+    if (level === 0 && holdingBuildMaterials()) {
       const bRange = Math.max(2, Math.min(12, Math.trunc(Number(cfg.behavior?.perceptionRange)) || 6))
       try {
         lines.push(`grid (legend: ${VISION_LEGEND}):\n${buildVisionBlock(bot, {
@@ -2097,6 +2144,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     const asked = /^chat request from (\S+?):/.exec([...reasons].reverse().find((r) => /^chat request from /.test(r)) || '')
     return {
       text: lines.filter(Boolean).join('\n'),
+      compactionLevel: level,
       threatIds,
       askedBy: asked ? asked[1] : null,
       reasons,
@@ -2131,27 +2179,31 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     return `room: ${names.length} other players online (${names.slice(0, 8).join(', ')}${names.length > 8 ? ', …' : ''}) — public chat may be for any of you`
   }
 
-  function buildChatPrompt (sender, incoming) {
+  function buildChatPrompt (sender, incoming, { compactionLevel = 0, snapshotSeq = null } = {}) {
+    const level = Math.max(0, Math.min(4, Math.trunc(Number(compactionLevel) || 0)))
     const pos = here()
-    if (pos) { try { places.scan(bot, { radius: cfg.places.scanRadius ?? 16 }) } catch { /* partial world */ } }
-    const nearby = pos ? places.describeNearby(pos, { dim: dim() }) : ''
-    const named = pos ? places.describeNamed(pos, { dim: dim() }) : ''
+    if (pos && level === 0) { try { places.scan(bot, { radius: cfg.places.scanRadius ?? 16 }) } catch { /* partial world */ } }
+    const nearby = level === 0 && pos ? places.describeNearby(pos, { dim: dim() }) : ''
+    const named = level === 0 && pos ? places.describeNamed(pos, { dim: dim() }) : ''
     const self = selfNick()
     const latest = incoming.map((l) => l.text).join(' / ')
     const speakers = [...new Set(incoming.map((l) => l.sender).filter(Boolean))]
     const others = speakers.filter((n) => n !== sender)
-    const recalled = memory.recallBlock(latest, cfg.memory.topK ?? 3)
-    const prefs = memory.preferencesLine(sender)
+    // Preserve player memories & recalled long-term facts across all compaction tiers.
+    const recallTopK = level >= 4 ? 1 : level >= 3 ? 2 : (cfg.memory.topK ?? 3)
+    const recalled = memory.recallBlock(latest, recallTopK)
+    const prefs = level < 4 ? memory.preferencesLine(sender) : ''
     // What this player told the bot before, in the model's own words.
-    const known = memory.factsAbout(sender, cfg.memory.factsPerPlayer ?? 6)
-    const relLine = continuity.formatRelationship(sender)
+    const knownMax = level >= 4 ? 2 : level === 3 ? 3 : level === 2 ? Math.min(4, cfg.memory.factsPerPlayer ?? 6) : (cfg.memory.factsPerPlayer ?? 6)
+    const known = memory.factsAbout(sender, knownMax)
+    const relLine = level < 4 ? continuity.formatRelationship(sender) : null
 
     // THE LOG. One IRC-style window: what was already there (chat and events,
     // each with its clock time), a marker, then everything that arrived since
     // the last time this lane answered — the lines to react to, and whatever
     // happened in the world between them.
     const windowMax = cfg.inference?.chatLogLines ?? 16
-    const seenSeq = chatSeenSeq
+    const seenSeq = snapshotSeq !== null ? snapshotSeq : chatSeenSeq
     const all = timeline.tail({ max: 400 })
     const fresh = all.filter((e) => e.seq > seenSeq)
     // A line that reached the brain without passing through the chat handler
@@ -2163,24 +2215,27 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       }
     }
     fresh.sort((x, y) => x.ts - y.ts)
-    const older = all.filter((e) => e.seq <= seenSeq).slice(-Math.max(4, windowMax - Math.min(fresh.length, windowMax - 4)))
-    chatSeenSeq = timeline.seq
+    const olderCap = level >= 3 ? 0 : level === 2 ? 3 : level === 1 ? 6 : Math.max(4, windowMax - Math.min(fresh.length, windowMax - 4))
+    const older = olderCap > 0 ? all.filter((e) => e.seq <= seenSeq).slice(-olderCap) : []
+    if (snapshotSeq === null) chatSeenSeq = timeline.seq
     const fmt = (e) => `  ${ircLine(e, { self })}`
     const newChat = fresh.filter((e) => e.kind === 'chat' || e.kind === 'whisper')
     // Lines from before this process's log (a restart ago): what was said, how long ago.
     const oldestShown = older.length ? older[0].ts : (fresh.length ? fresh[0].ts : Date.now())
-    const earlier = convoOf(sender).filter((l) => l.ts < oldestShown).slice(-4)
-      .map((l) => `  [${ircAgo(Date.now() - l.ts)} ago] <${l.who === 'me' ? self : sender}> ${l.text}`).join('\n')
+    const earlier = level < 2
+      ? convoOf(sender).filter((l) => l.ts < oldestShown).slice(-4)
+        .map((l) => `  [${ircAgo(Date.now() - l.ts)} ago] <${l.who === 'me' ? self : sender}> ${l.text}`).join('\n')
+      : ''
     const lines = [
       coreIdentity(),
       observe.selfLine(bot),
-      observe.inventoryLine(bot, { max: 16 }),
-      doingLine(),
-      agendaLine(),
-      goalBriefLine(),
-      `relationship with ${relLine}`,
-      ...threatBrief(),
-      observe.playersLine(bot),
+      level < 3 ? observe.inventoryLine(bot, { max: level >= 2 ? 10 : 16 }) : null,
+      level < 4 ? doingLine() : null,
+      level < 3 ? agendaLine() : null,
+      level < 4 ? goalBriefLine() : null,
+      relLine ? `relationship with ${relLine}` : null,
+      ...(level < 4 ? threatBrief() : []),
+      level < 3 ? observe.playersLine(bot) : null,
       roomLine(),
       nearby ? `nearby: ${nearby.split('\n').join(' | ')}` : null,
       named ? `places: ${named}` : null,
@@ -2189,7 +2244,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       recalled || null,
       earlier ? `earlier with ${sender} (before this log):\n${earlier}` : null,
       `${logHeader('chat log')}:`,
-      older.length ? older.map(fmt).join('\n') : '  (nothing earlier)',
+      olderCap > 0 ? (older.length ? older.map(fmt).join('\n') : '  (nothing earlier)') : null,
       `  ----- NEW since you last answered: ${newChat.length} chat line${newChat.length === 1 ? '' : 's'} from ${speakers.join(', ') || 'nobody'} (the last few seconds, batched) -----`,
       fresh.map(fmt).join('\n'),
       // One new line: say plainly which one is to be answered.
@@ -2297,21 +2352,70 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
    *     step / rate budget ran out.
    * Between turns the scheduler (brain.js) starts the next one by itself.
    */
+  // Adaptive compaction floors: proactively keep headroom after truncation or
+  // context pressure, then smoothly relax back to Level 0 after clean turns.
+  let actionCompactionFloor = 0
+  let chatCompactionFloor = 0
+  let cleanActionTurns = 0
+  let cleanChatTurns = 0
+  let consecutiveTruncations = 0
+
+  function onCompactionEvent (info) {
+    try { telemetry.record('context_compaction', info) } catch { /* telemetry best effort */ }
+    // Consolidate redundant memories and compact journal entries instead of wiping memory.
+    try { journal.compact() } catch { /* noop */ }
+    try { memory.longTerm?.consolidate?.() } catch { /* noop */ }
+  }
+
+  function compactHistoryForLevel (history, level) {
+    if (!history.length) return []
+    const baseMax = cfg.compaction?.turnMaxChars ?? 6000
+    if (level >= 4) {
+      const summary = history.map((h) => h.calls.map((c) => `${c.name}: ${String(c.result || '').replace(/\s+/g, ' ').slice(0, 60)}`).join('; ')).join(' | ').slice(0, 350)
+      return [{ role: 'user', content: `earlier this turn (compacted): ${summary}` }]
+    }
+    if (level === 3) {
+      const recent = history.slice(-1).map((h) => ({ ...h, images: [] }))
+      const older = history.slice(0, -1)
+      const prefix = older.length
+        ? [{ role: 'user', content: `earlier this turn (${older.length} step${older.length === 1 ? '' : 's'} compacted): ${older.map((h) => h.calls.map((c) => c.name).join('+')).join(' -> ').slice(0, 180)}` }]
+        : []
+      return [
+        ...prefix,
+        ...compactSteps(recent, { maxChars: Math.min(800, baseMax), keepFull: 1, headline: 80 }).flatMap((h) => toolTurnMessages(h.calls, { format: toolResultFormat, content: h.content, images: [] }))
+      ]
+    }
+    const maxChars = level === 2 ? Math.min(1600, baseMax) : level === 1 ? Math.min(3200, baseMax) : baseMax
+    const keepFull = level >= 1 ? 1 : 2
+    const headline = level === 2 ? 100 : level === 1 ? 140 : 180
+    const stripOldImages = level >= 1
+    const src = stripOldImages ? history.map((h, i) => (i < history.length - 1 || level >= 2 ? { ...h, images: [] } : h)) : history
+    return compactSteps(src, { maxChars, keepFull, headline }).flatMap((h) => toolTurnMessages(h.calls, { format: toolResultFormat, content: h.content, images: h.images || [] }))
+  }
+
   async function act (reasons, meta = null) {
     if (!alive || ended) return { idle: true }
-    const snap = buildActionPrompt(reasons)
+    const snap = buildActionPrompt(reasons, { compactionLevel: 0, markDelivered: true })
     const epoch = decisionEpoch
     const life = lifeEpoch
     logger.debug(TAG, `action turn (${reasons.join(' | ')})`)
     const tools = ALL_TOOLS
     const maxSteps = Math.max(1, Math.min(12, Math.trunc(Number(cfg.inference.maxStepsPerTurn ?? 6)) || 1))
-    const head = [
-      { role: 'system', content: SYSTEM_PROMPT },
-      { role: 'user', content: snap.text }
-    ]
+    const promptCache = new Map([[0, snap.text]])
+    const promptTextForLevel = (level) => {
+      const lvl = Math.max(0, Math.min(4, Math.trunc(Number(level) || 0)))
+      if (!promptCache.has(lvl)) {
+        promptCache.set(lvl, buildActionPrompt(reasons, { compactionLevel: lvl, markDelivered: false }).text)
+      }
+      return promptCache.get(lvl)
+    }
     /** What each earlier step of this turn called and got back: [{ calls, content }]. */
     const history = []
-    const buildMessages = () => [...head, ...compactSteps(history, { maxChars: cfg.compaction?.turnMaxChars ?? 6000 }).flatMap((h) => toolTurnMessages(h.calls, { format: toolResultFormat, content: h.content, images: h.images || [] }))]
+    const buildMessages = (level = 0) => [
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'user', content: promptTextForLevel(level) },
+      ...compactHistoryForLevel(history, level)
+    ]
     shotsThisTurn = 0
     /** Every action this turn executed, in order. */
     const executed = []
@@ -2330,7 +2434,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         controller.abort()
         return true
       }
-      const msgs = buildMessages()
+      const msgs = buildMessages(0)
       const posNow = here()
       try {
         telemetry.modelRequest({
@@ -2344,14 +2448,25 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         })
       } catch { /* telemetry best effort */ }
       let result
+      const compactCb = (level) => ({ messages: buildMessages(level) })
       try {
         try {
-          result = await amd.chatWithTools(msgs, tools, { signal: controller.signal })
+          result = await amd.chatWithTools(msgs, tools, {
+            signal: controller.signal,
+            initialLevel: actionCompactionFloor,
+            compact: compactCb,
+            onCompaction: onCompactionEvent
+          })
         } catch (err) {
-          if (step > 1 && toolResultFormat === 'tool' && [400, 404, 415, 422].includes(Number(err?.status))) {
+          if (step > 1 && toolResultFormat === 'tool' && [400, 404, 415, 422].includes(Number(err?.status)) && !err?.contextOverflow) {
             logger.warn(TAG, `endpoint rejected tool-result messages (HTTP ${err.status}); sending tool results as text from now on`)
             toolResultFormat = 'text'
-            result = await amd.chatWithTools(buildMessages(), tools, { signal: controller.signal })
+            result = await amd.chatWithTools(buildMessages(0), tools, {
+              signal: controller.signal,
+              initialLevel: actionCompactionFloor,
+              compact: compactCb,
+              onCompaction: onCompactionEvent
+            })
           } else throw err
         }
       } catch (err) {
@@ -2363,6 +2478,26 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         if (brain) brain.inflightAbort = null
       }
       const actions = Array.isArray(result.actions) && result.actions.length ? result.actions : [result.action]
+      if (actions[0]?._truncated) {
+        consecutiveTruncations += 1
+        actionCompactionFloor = Math.min(2, actionCompactionFloor + 1)
+        cleanActionTurns = 0
+        // Break stuck-truncation feedback loops without touching long-term memories or goals.
+        if (consecutiveTruncations >= 2 && results.length > 2) {
+          results.splice(0, results.length - 2)
+        }
+      } else if (result.degraded) {
+        consecutiveTruncations = 0
+        actionCompactionFloor = Math.min(2, Math.max(actionCompactionFloor, 1))
+        cleanActionTurns = 0
+      } else if (!actions[0]?._interrupted) {
+        consecutiveTruncations = 0
+        cleanActionTurns += 1
+        if (cleanActionTurns >= 2 && actionCompactionFloor > 0) {
+          actionCompactionFloor = Math.max(0, actionCompactionFloor - 1)
+          cleanActionTurns = 0
+        }
+      }
       const elapsedMs = Date.now() - t0
       latency.record('modelInferenceMs', performance.now() - invokeMono)
       try {
@@ -2498,18 +2633,19 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
 
   /** Why a chat window got no line: the model's own choice, or an answer that never arrived whole. */
   function silentWhy (reply) {
-    if (reply._empty === 'cut_off') return '(no answer: the model\'s output was cut off before it finished a reply — raise inference.chatMaxTokens if this repeats)'
+    if (reply._empty === 'cut_off') return '(no answer: the model\'s output was cut off even after compaction and plain-text fallback)'
     if (reply._empty === 'no_call') return '(no answer: the model returned neither a reply call nor text)'
     return `(chose not to answer${reply.decision ? `: ${reply.decision}` : ''})`
   }
 
   async function talk (sender, lines, meta = null) {
-    const text = buildChatPrompt(sender, lines)
+    const seenSeqBefore = chatSeenSeq
+    const text = buildChatPrompt(sender, lines, { compactionLevel: 0 })
     const messages = [
       { role: 'system', content: CHAT_PROMPT },
       { role: 'user', content: text }
     ]
-    const maxTokens = cfg.inference.chatMaxTokens ?? 200
+    const maxTokens = cfg.inference.chatMaxTokens ?? null
     const tChat0 = Date.now()
     const chatInvokeMono = performance.now()
     if (meta && Number.isFinite(meta.queuedMono)) {
@@ -2526,7 +2662,30 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         toolCount: 1
       })
     } catch { /* telemetry best effort */ }
-    const { reply, reasoning: chatReasoning, finishReason: chatFinish, usage: chatUsage } = await amd.chatReply(messages, { maxTokens })
+    const chatCache = new Map([[0, text]])
+    const compactChat = (level) => {
+      const lvl = Math.max(0, Math.min(4, Math.trunc(Number(level) || 0)))
+      if (!chatCache.has(lvl)) {
+        chatCache.set(lvl, buildChatPrompt(sender, lines, { compactionLevel: lvl, snapshotSeq: seenSeqBefore }))
+      }
+      return [{ role: 'system', content: CHAT_PROMPT }, { role: 'user', content: chatCache.get(lvl) }]
+    }
+    const { reply, reasoning: chatReasoning, finishReason: chatFinish, usage: chatUsage, degraded: chatDegraded } = await amd.chatReply(messages, {
+      maxTokens,
+      initialLevel: chatCompactionFloor,
+      compact: compactChat,
+      onCompaction: onCompactionEvent
+    })
+    if (reply._empty === 'cut_off' || chatDegraded) {
+      chatCompactionFloor = Math.min(2, Math.max(chatCompactionFloor + (reply._empty === 'cut_off' ? 1 : 0), 1))
+      cleanChatTurns = 0
+    } else {
+      cleanChatTurns += 1
+      if (cleanChatTurns >= 2 && chatCompactionFloor > 0) {
+        chatCompactionFloor = Math.max(0, chatCompactionFloor - 1)
+        cleanChatTurns = 0
+      }
+    }
     const chatElapsed = Date.now() - tChat0
     latency.record('modelInferenceMs', performance.now() - chatInvokeMono)
     try {
@@ -3164,26 +3323,44 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         }
         let shot
         try {
+          const isPano = /^(panorama|pano|360|around)$/i.test(String(action.view || '').trim())
           shot = await vision.screenshot(bot, {
             view: action.view,
             direction: action.direction,
             at: action.at,
-            width: VISION.width,
-            height: VISION.height,
+            width: isPano ? VISION.panoramaWidth : VISION.width,
+            height: isPano ? VISION.panoramaHeight : VISION.height,
             maxDist: VISION.maxDistance,
             radius: VISION.mapRadius,
             isHostile: (name) => isHostileMob(name, bot)
           })
         } catch (err) { return report('screenshot', { ok: false, msg: `could not render: ${String(err?.message || err).slice(0, 120)}` }) }
         shotsThisTurn++
-        if (VISION.save !== false) {
+        const sendsImage = amd.visionSupported !== false
+        const saveShot = VISION.save !== false
+        let savedRel = null
+        if (telemetry && typeof telemetry.screenshot === 'function') {
+          const rec = telemetry.screenshot(shot, {
+            save: saveShot,
+            sentToModel: sendsImage,
+            direction: action.direction || null,
+            at: action.at || null
+          })
+          savedRel = rec?.relativeFile || null
+          if (rec?.saveError) logger.warn(TAG, `screenshot save failed: ${rec.saveError}`)
+        } else if (saveShot) {
           try {
             const dir = path.join(shared.dataDir || path.dirname(journal.file || '.'), 'screenshots')
             fs.mkdirSync(dir, { recursive: true })
-            fs.writeFileSync(path.join(dir, `last-${shot.view}.png`), shot.png)
-          } catch { /* a debug copy, never required */ }
+            const fp = path.join(dir, `last-${shot.view}.png`)
+            fs.writeFileSync(fp, shot.png)
+            savedRel = fp
+          } catch (err) { logger.warn(TAG, `screenshot save failed: ${err?.message || err}`) }
         }
-        const sendsImage = amd.visionSupported !== false
+        logger.info(
+          TAG,
+          `screenshot (${shot.view} ${shot.width}x${shot.height}, ${(shot.png.length / 1024).toFixed(1)}KB, ${shot.renderMs ?? '?'}ms, chunks=${shot.chunksInView ?? '?'}/${shot.chunksLoaded ?? '?'}, maxDist=${shot.maxDist ?? '?'}m, sent=${sendsImage ? 'yes' : 'no'})${savedRel ? ` saved=${savedRel}` : ''}`
+        )
         if (sendsImage && imageTap) imageTap.push({ url: `data:image/png;base64,${shot.png.toString('base64')}`, caption: `screenshot (${shot.view}, ${shot.width}x${shot.height}) — the picture your screenshot call returned:` })
         return report('screenshot', {
           ok: true,
@@ -4192,6 +4369,11 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     // A reset drops stale queued decisions, but running work keeps its lease.
     try { lanes.dropWaiters('context reset') } catch { /* noop */ }
     results.length = 0
+    actionCompactionFloor = 0
+    chatCompactionFloor = 0
+    cleanActionTurns = 0
+    cleanChatTurns = 0
+    consecutiveTruncations = 0
     try { memory.working.clear() } catch { /* noop */ }
     try { if (memory.shortTerm) memory.shortTerm.items = [] } catch { /* noop */ }
     try {
@@ -4384,6 +4566,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       arbiter, sense, wrapper, combat, system1, skills, brain, results, agenda, telemetry,
       events: pipeline, latency, redstoneEngineer, redstoneLibrary: shared.redstoneLibrary,
       goals: goalReg, continuity, journal, focusGoal, continuationBlock, resetContext, executeAction, buildActionPrompt, buildChatPrompt,
+      compactionState: () => ({ actionCompactionFloor, chatCompactionFloor, consecutiveTruncations, budget: amd.budget.snapshot() }),
       lanes, jobs, laneOf: (tool) => laneOf(tool), LANES, footprintOf,
       // Goal orchestration surface (tests and the session's own monitor):
       startMain, resumeMain, finishGoal, runGoalOp, goalLines, goalTick,

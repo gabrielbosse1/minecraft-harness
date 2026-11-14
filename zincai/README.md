@@ -638,24 +638,47 @@ with backoff between `connection.minRetryDelayMs` and
 `connection.maxRetryDelayMs`, at most `connection.maxRetries` times. Hooks are
 epoch-guarded, so a late callback from an old session can never act on a new one.
 
-**When the link drops with `client timed out`.** That message means no
-keep-alive arrived for `reconnect.keepAliveTimeoutMs` (60 s; env
-`KEEPALIVE_TIMEOUT_MS`). The server sends one every 15 s, so it takes four
-missed in a row — the library default of 30 s dropped the bot after a single
-late one. The message is the same whether the *server* stopped sending or the
-*bot* stopped reading, so `watchdog.js` measures both and the log says which:
+**When the link drops with `client timed out`.** That exact sentence is emitted
+locally by `minecraft-protocol/src/client/keepalive.js`; it is not a kick reason
+sent by the Minecraft server. On each server challenge the library immediately
+echoes the same 64-bit ID, then starts a timer waiting for the *next* challenge.
+If none is decoded before `reconnect.keepAliveTimeoutMs` (60 s; env
+`KEEPALIVE_TIMEOUT_MS`), the client ends the link. A log that still says
+`30000 milliseconds` is therefore either an older checkout or an explicit
+30-second environment override; this checkout passes 60000 to Mineflayer.
 
-- `nothing has arrived from the server for 10s while the bot itself is running
-  normally` — the server (or the network) stalled: a world save, chunk
-  generation after a teleport, a machine short on CPU or memory. Look at the
-  server's own log for "Can't keep up!" at the same time.
-- `the bot's own thread was blocked for 4.2s … It was in: <function> (<file>:<line>) < …`
-  — the bot held its only thread. The line names the code that did it; that
-  stack is what to send with a bug report. If the thread never comes back, the
-  same line is written to stderr by the watchdog's worker.
+The 26.3 packet shape itself has a real TCP regression test: a local 26.3
+`minecraft-protocol` server sends a non-zero 64-bit challenge and the installed
+client decodes and echoes every bit exactly. That rules out the vendored 26.3
+`i64` schema and the normal echo path. It does **not** rule out a process stall:
+localhost removes routers and Internet latency, but the Java server and Node bot
+still have separate event loops competing for the same CPU, memory and disk.
 
-`status` shows the totals on its `health:` line. `ZINCAI_WATCHDOG=0` turns the
-watchdog off; `ZINCAI_WATCHDOG_STACK=0` keeps the measurements without the
+At runtime `watchdog.js` records every packet name, each keep-alive challenge,
+and the exact response queued by Zinc. A timeout now prints one explicit
+`keep-alive diagnosis [...]`:
+
+- `[bot-main-thread]` — Node's thread was blocked across the deadline. The
+  separate worker also prints the function and file/line that held it.
+- `[server-or-tcp-silence]` — no packet arrived for the timeout while Node kept
+  running. On localhost, inspect the Minecraft log for `Can't keep up!`, world
+  saves/chunk generation, an OOM/GC pause, or the server process being paused.
+- `[keepalive-stream-only]` — ordinary server packets continued and Zinc echoed
+  the previous challenge, but no new keep-alive came. The TCP link was alive;
+  this points to the server's keep-alive scheduler or the dependency's policy
+  of timing only keep-alives rather than all traffic.
+- `[client-reply-path]` / `[server-rejected-reply]` — respectively, Zinc did not
+  queue the exact challenge ID (a bot/protocol bug), or it did and the server
+  still rejected it (trace the serverbound packet and server handling).
+- `[mixed-stall-at-deadline]` — Node stalled at the deadline, but the server's
+  challenge was already late before that stall, so both sides contributed.
+
+A whole-link silence is warned after 25 seconds, not 10: vanilla normally sends
+a keep-alive about every 15 seconds, so the old 10-second threshold could label
+a healthy idle link as silent. `status` shows loop stalls, server silences, the
+number of keep-alives received/answered, the widest gap, ID mismatches and the
+last timeout classification on its `health:` line. `ZINCAI_WATCHDOG=0` turns
+the watchdog off; `ZINCAI_WATCHDOG_STACK=0` keeps the measurements without the
 worker thread that reads the stack.
 
 ### Death and respawn

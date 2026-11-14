@@ -519,6 +519,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   }
   const botRef = () => bot
   logger.info(TAG, `connecting to ${cfg.server.host}:${cfg.server.port} as "${cfg.server.username}" (auth=${cfg.server.auth}, version=${cfg.server.version || 'auto'})`)
+  const keepAliveTimeoutMs = Math.max(20_000, Number(cfg.reconnect?.keepAliveTimeoutMs) || 60_000)
   bot = mineflayer.createBot({
     host: cfg.server.host,
     port: cfg.server.port,
@@ -530,16 +531,23 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     // after ONE late keep-alive — a server on a small board that stalls on a
     // world save, or a hitch on our side — and costs a reconnect and whatever
     // the body was doing. 60 s rides through that and still ends a dead link.
-    checkTimeoutInterval: Math.max(20_000, Number(cfg.reconnect?.keepAliveTimeoutMs) || 60_000)
+    checkTimeoutInterval: keepAliveTimeoutMs
   })
-  // Every packet from the server is a sign of life (watchdog.js): silence is
-  // then reported as the server's, a stall of this thread as ours.
+  // Record packet names, keep-alive challenges and the exact IDs written back.
+  // At a timeout watchdog.js can then distinguish our event loop, whole-link
+  // silence and an active link whose keep-alive stream alone stopped.
   try {
     const wd = shared.watchdog
-    if (wd && bot._client?.on) {
-      bot._client.on('packet', () => wd.traffic())
-      bot._client.on('connect', () => wd.linkUp())
-      bot._client.on('end', () => wd.linkDown())
+    const client = bot._client
+    if (wd && client?.on) {
+      client.on('packet', (packet, meta) => wd.packet(meta?.name, packet))
+      client.on('connect', () => wd.linkUp({ timeoutMs: keepAliveTimeoutMs }))
+      client.on('end', (reason) => wd.linkDown(reason))
+      const write = client.write
+      client.write = function monitoredWrite (name, packet) {
+        wd.outbound(name, packet)
+        return write.call(this, name, packet)
+      }
     }
   } catch { /* a simulated bot has no client */ }
   // Runtime vanilla invariant: no slash-command can ever leave this process.
@@ -4149,6 +4157,10 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     if (ended) return
     let text = ''
     try { text = detail && detail.message ? detail.message : reasonToText(detail) } catch { text = String(detail ?? '') }
+    // A timeout reason is evidence: diagnose it while this session's packet
+    // counters still exist. connectionError() may already have done so; the
+    // watchdog de-duplicates the following end event.
+    try { shared.watchdog?.disconnect(kind, text) } catch { /* diagnostics never own the link */ }
     dispose(false)
     try { bot.removeAllListeners('end'); bot.end?.() } catch { /* already gone */ }
     onEnded?.({ kind, text: String(text || '').slice(0, 200), spawned })
@@ -4159,6 +4171,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   onBot('error', (err) => {
     // Before spawn a socket error IS the end of this attempt; afterwards the
     // 'end' event follows and carries the session down.
+    try { shared.watchdog?.connectionError(err) } catch { /* report only */ }
     if (!spawned) over('error', err)
     else logger.error(TAG, `socket error: ${err.message || err}`)
   })

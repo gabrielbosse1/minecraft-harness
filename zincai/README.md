@@ -143,6 +143,40 @@ can resume. Main-hand use is serialized so eating or equipping does not fight
 combat over the same slot. Death, reconnect, task replacement, and shutdown
 release controls.
 
+### Armor
+
+`armor.js` keeps the best armor the bot carries on its body. It replaces the
+`mineflayer-armor-manager` plugin, which read the picked-up item out of the
+item *entity* inside a packet handler and took the process down when that
+entity carried no data. The keeper never looks at an entity: a pickup, a slot
+change, a closed container and a spawn only make it look at the inventory
+again, so armor from a chest, a craft or a gift is worn too, not only armor
+picked up off the ground.
+
+- Pieces are ranked by the game's numbers: armor points, then toughness, then
+  Protection levels (iron above chainmail, netherite above diamond).
+- It never replaces something that is not armor (elytra, carved pumpkin, a
+  head), never puts on Curse of Binding, and only fills an *empty* off hand
+  (shield or totem; a totem replaces a shield).
+- It waits while a container is open or the hands are busy, goes through the
+  same hand lock as eating and fighting, and reports `armor: put on …` only
+  after the inventory shows the piece in its slot.
+
+The model is in charge through `equip`, the tool it already had:
+
+| Call | Effect |
+| --- | --- |
+| `equip {item:"iron_helmet"}` | wear it; armor goes to its own slot |
+| `equip {item:"none", where:"head"}` | take off what is there |
+| `equip {auto:false}` | autopilot off: nothing is put on for it |
+| `equip {auto:true}` | autopilot on, every slot handed back |
+
+A slot the model dresses or empties differently from what the autopilot would
+choose is left as the model set it until `equip {auto:true}`; the same goes
+for the shield combat would otherwise take into an empty off hand. While the
+autopilot is not simply on, the prompt carries an `armor:` line saying so.
+`behavior.useArmorManager` only sets whether it starts on.
+
 ### Objectives that survive interruptions
 
 `goals.js` is a small durable registry behind whatever the bot is doing. Every
@@ -325,6 +359,26 @@ rejects `required`, the client falls back to `"auto"`. If the endpoint ignores
 tools and returns the legacy JSON action as text, a compatibility parser is
 available. Neither path has been verified against AMD's live endpoint in this
 sandbox.
+
+**Failures say what to do next.** `gather` searches the radius it is given (up
+to 64 blocks; a larger ask is cut down and the result says so). When nothing is
+in range it looks once over the loaded world and answers with the nearest one
+and its coordinates, or the other wood that *is* close (`gather
+{item:"birch_log"}`), or a plain "none around here, a bigger radius will not
+help". `craft` names the ingredients of the closest recipe and how many are
+carried, and puts down a crafting table from the inventory when a recipe needs
+one. These searches use `block_search.js` instead of mineflayer's
+`findBlocks`, which reads every block of every uniform (all-air) chunk section
+and held the bot's thread for up to a second looking for a block that was not
+there.
+
+**A chat line that got no answer is logged with the reason:** `(chose not to
+answer: ignore)` is the model's own decision; `(no answer: the model's output
+was cut off before it finished a reply …)` is a model that spent its tokens
+before the reply call (it is asked once more with three times the room, and
+`inference.chatMaxTokens` is 400). With one other player online the chat prompt
+says so (`room: only you and Steve are online`), because every public line is
+then addressed to the bot.
 
 Tool schemas and their argument descriptions are the source of truth in
 [`api_wrapper.js`](api_wrapper.js); the action policy is in
@@ -584,6 +638,26 @@ with backoff between `connection.minRetryDelayMs` and
 `connection.maxRetryDelayMs`, at most `connection.maxRetries` times. Hooks are
 epoch-guarded, so a late callback from an old session can never act on a new one.
 
+**When the link drops with `client timed out`.** That message means no
+keep-alive arrived for `reconnect.keepAliveTimeoutMs` (60 s; env
+`KEEPALIVE_TIMEOUT_MS`). The server sends one every 15 s, so it takes four
+missed in a row — the library default of 30 s dropped the bot after a single
+late one. The message is the same whether the *server* stopped sending or the
+*bot* stopped reading, so `watchdog.js` measures both and the log says which:
+
+- `nothing has arrived from the server for 10s while the bot itself is running
+  normally` — the server (or the network) stalled: a world save, chunk
+  generation after a teleport, a machine short on CPU or memory. Look at the
+  server's own log for "Can't keep up!" at the same time.
+- `the bot's own thread was blocked for 4.2s … It was in: <function> (<file>:<line>) < …`
+  — the bot held its only thread. The line names the code that did it; that
+  stack is what to send with a bug report. If the thread never comes back, the
+  same line is written to stderr by the watchdog's worker.
+
+`status` shows the totals on its `health:` line. `ZINCAI_WATCHDOG=0` turns the
+watchdog off; `ZINCAI_WATCHDOG_STACK=0` keeps the measurements without the
+worker thread that reads the stack.
+
 ### Death and respawn
 
 A death is not a failure of the process. `zincai/death_recovery.js` records what
@@ -626,6 +700,8 @@ no dotenv; nothing is read from a file the panel does not control.
 | `INFERENCE_CHAT_BATCH_MS` | How long chat lines are collected into one chunk (6000). |
 | `ZINCAI_NO_SUPERVISOR` | `1` = run as one process; `update`/`restart` then exit 75 for an outside supervisor. |
 | `RECONNECT`, `RECONNECT_MAX_ATTEMPTS` | Post-spawn reconnection behaviour. |
+| `KEEPALIVE_TIMEOUT_MS` | How long without a keep-alive from the server before the link is given up (60000, minimum 20000). |
+| `ZINCAI_WATCHDOG`, `ZINCAI_WATCHDOG_STACK` | `0` turns off the stall watchdog / only its stack capture (see *Connection lifecycle*). |
 | `ZINC_OPERATORS`, `ZINC_COMMAND_PREFIX` | **Inert.** Control is console-only; there is no chat command interface to configure. |
 | `ZINC_JOIN_ON_START` | Join the server when the process starts (`connection.joinOnStart`); `false` waits for `join`. |
 | `ZINC_DATA_DIR` | Writable data directory (relative to the server folder in the template). |

@@ -119,10 +119,11 @@ const ACTION_TOOLS = [
     count: INT('Amount (default 1).')
   }, ['player', 'item']),
   tool('eat', 'Eat safe food now (empty = best carried).', { item: STR('Food id (optional).') }),
-  tool('equip', 'Equip carried item by name.', {
-    item: STR('Item id.'),
-    where: { type: 'string', enum: ['hand', 'off-hand', 'head', 'torso', 'legs', 'feet'] }
-  }, ['item']),
+  tool('equip', 'Equip a carried item by name (armor goes to its own slot), or take one off. Better armor you carry is put on for you; a slot you dress or empty yourself is then left as you set it.', {
+    item: STR('Item id. "none" + where takes off what is worn there.'),
+    where: { type: 'string', enum: ['hand', 'off-hand', 'head', 'torso', 'legs', 'feet'] },
+    auto: { type: 'boolean', description: 'Armor autopilot: false = never put armor on for you; true = on again, and every slot you set by hand is handed back. May be sent alone.' }
+  }),
   tool('use_block', 'Walk to nearest matching block and right-click it.', { what: STR('Block id.') }, ['what']),
   tool('inspect_block', 'Read one loaded block and state; no power inferred.', { x: INT('X.'), y: INT('Y.'), z: INT('Z.') }, ['x', 'y', 'z']),
   tool('inspect_region', 'Read-only paginated 3D block snapshot around [x,y,z]; no circuit trace.', { x: INT('X.'), y: INT('Y.'), z: INT('Z.'), radius: INT('0–2, default 1.'), page: INT('Page, default 1.') }, ['x', 'y', 'z']),
@@ -154,11 +155,11 @@ const ACTION_TOOLS = [
     evidence: STR('Supporting observation or experience behind this update.'),
     decision: { type: 'string', enum: ['accept', 'decline', 'ignore', 'negotiate', 'delay'] }
   }, ['operation']),
-  tool('craft', 'Craft item (walks to nearby table if needed).', { item: STR('Item id.') }, ['item']),
-  tool('gather', 'Dig named raw logs/ores/soils nearby (avoid unauthorized builds; ores need pickaxe).', {
-    item: STR('Resource id/alias (oak_log, iron, stone…).'),
+  tool('craft', 'Craft item (walks to a nearby table if needed, or puts down one you carry). A failure names the ingredients and how many you have.', { item: STR('Item id.') }, ['item']),
+  tool('gather', 'Dig named raw logs/ores/soils nearby (avoid unauthorized builds; ores need pickaxe). If none is in range the result says where the nearest is, or which other kind is close.', {
+    item: STR('Resource id/alias (oak_log, iron, stone…; "log" = any wood).'),
     count: INT('Count 1–64 (default 1).'),
-    radius: INT('Radius (default 32).')
+    radius: INT('Radius 1–64 (default 32).')
   }, ['item']),
   tool('light_up', 'Place carried torches on dark walkable floors nearby.', {
     radius: INT('Radius 2–16 (default 8).')
@@ -391,7 +392,11 @@ function coerceReply (message) {
       }
     }
   }
-  const content = typeof message?.content === 'string' ? message.content.trim() : ''
+  // Reasoning is never the reply: a closed <think> block is dropped, and an
+  // unclosed one (cut off mid-thought) means there is no reply at all.
+  const content = typeof message?.content === 'string'
+    ? message.content.replace(/<think>[\s\S]*?<\/think>/gi, '').replace(/<think>[\s\S]*$/i, '').trim()
+    : ''
   // Some models wrap the answer in quotes or prefix their own name.
   const text = content.replace(/^["'“”]+|["'“”]+$/g, '').replace(/^(zinc(ai)?|me)\s*:\s*/i, '').split('\n')[0].trim()
   return { text, to: '', do: '', task: '', decision: '', remember: '', _via: 'prose' }
@@ -782,12 +787,33 @@ class AmdToolsClient {
    * @returns {Promise<{reply:{text:string, task:string}, usage:object}>}
    */
   async chatReply (messages, { maxTokens = 120 } = {}) {
-    const { message, usage } = await this._complete({
-      messages, tools: createChatTools(), maxTokens, temperature: Math.max(this.temperature, 0.5),
+    const ask = (budget) => this._complete({
+      messages, tools: createChatTools(), maxTokens: budget, temperature: Math.max(this.temperature, 0.5),
       lane: 'chat', timeoutMs: this._effectiveTimeoutMs(this.chatTimeoutMs, 120_000), maxRetries: this.chatMaxRetries
     })
+    let { message, usage, finishReason } = await ask(maxTokens)
     this.stats.chatReplies += 1
-    return { reply: coerceReply(message), usage }
+    let reply = coerceReply(message)
+    // An answer with no reply call AND no text is not "the model chose to stay
+    // silent" (that is a reply call with empty text): the output was cut off —
+    // a model that reasons first can spend the whole budget before the call —
+    // or the endpoint returned nothing usable. Ask once more with room to
+    // finish, and if that fails too, say which it was instead of "(silent)".
+    if (reply._via !== 'tool' && !reply.text) {
+      const cutOff = finishReason === 'length'
+      try {
+        const again = await ask(Math.max(maxTokens * 3, 480))
+        this.stats.chatRetries = (this.stats.chatRetries || 0) + 1
+        usage = mergeUsage(usage, again.usage)
+        const second = coerceReply(again.message)
+        if (second._via === 'tool' || second.text) reply = second
+        else reply._empty = again.finishReason === 'length' || cutOff ? 'cut_off' : 'no_call'
+      } catch (err) {
+        logger.debug(TAG, `chat retry failed: ${err.message || err}`)
+        reply._empty = cutOff ? 'cut_off' : 'no_call'
+      }
+    }
+    return { reply, usage }
   }
 
   /** Telemetry compatible with the v1 session report + tool metrics. */

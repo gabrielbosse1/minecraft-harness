@@ -25,6 +25,7 @@
  */
 'use strict'
 
+const { findBlocksFast } = require('./block_search')
 const fs = require('fs')
 const path = require('path')
 const { whereIs } = require('./threats')
@@ -214,7 +215,10 @@ class PlaceIndex {
     this._lastScan = { at: this.now(), x: pos.x, y: pos.y, z: pos.z, dim, radius }
 
     let found = []
-    try { found = bot.findBlocks({ matching: this._searchIds(bot), maxDistance: radius, count: max }) } catch { return 0 }
+    // The fast search (block_search.js): this runs while every prompt is
+    // built, and the stock findBlocks took tens of milliseconds of the bot's
+    // only thread each time just to learn there is no chest in the sky.
+    try { found = findBlocksFast(bot, this._searchIds(bot), { maxDistance: radius, count: max, budgetMs: 400 }) } catch { return 0 }
     const seen = new Set()
     const signs = []
     let touched = 0

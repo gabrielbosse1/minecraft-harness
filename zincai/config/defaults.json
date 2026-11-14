@@ -39,7 +39,8 @@
     "timelineMax": 80,
     "_loopNote": "THE AGENT LOOP. A turn is think -> call tools -> read their results -> think again, up to maxStepsPerTurn model calls, ending when the model calls idle or puts the body to work. The next turn then starts by itself loopMs after the last one ended (env INFERENCE_LOOP_MS); while the model keeps answering idle the gap doubles up to heartbeatMs, and anything that happens resets it. While the body is busy with a task the loop looks in every loopBusyMs. loopMs 0 or heartbeatMs 0 turns the loop off (events only). timelineMax is how many lines the IRC-style log (chat + events, each with its clock time) keeps.",
     "maxSelfChain": 12,
-    "chatMaxTokens": 160,
+    "chatMaxTokens": 400,
+    "_chatMaxTokensNote": "Room for the reply call. 160 was enough for the line itself but not for a model that reasons first: the output was cut off before the call and the chat lane logged '(silent)'. An answer that still comes back empty is asked for once more with three times the room, and the log says 'cut off' instead of 'silent'.",
     "failGateAfter": 2,
     "failWindowMs": 120000,
     "_failGateNote": "the same tool call with the same arguments failing failGateAfter times inside failWindowMs is refused locally (no wake) until the world changes (success, movement, hurt, new threat, timeout)."
@@ -69,6 +70,7 @@
     "fovDegrees": 90,
     "perceptionRange": 10,
     "useArmorManager": true,
+    "_armorNote": "useArmorManager: whether the armor autopilot starts ON (zincai/armor.js — the bot's own; the mineflayer-armor-manager plugin is no longer used). On, the best armor carried is put on whenever the inventory changes. The model owns it at run time through the equip tool: equip {auto:false|true}, and a slot it dresses or empties itself is left alone.",
     "perception3D": false,
     "autoElytra": true
   },
@@ -151,7 +153,9 @@
     "enabled": true,
     "baseDelayMs": 5000,
     "maxDelayMs": 120000,
-    "maxAttempts": 40
+    "maxAttempts": 40,
+    "keepAliveTimeoutMs": 60000,
+    "_keepAliveNote": "How long without a keep-alive from the server before the link is given up (the server sends one every 15 s). 30000 dropped the bot after a single late one."
   },
   "goals": {
     "_note": "Durable objectives (goals.js). Every long task becomes a record with an id, origin, priority, checkpoint and lifecycle; it survives deaths, restarts and context resets (goals.json in the data dir). stallMs: an ACTIVE goal whose checkpoint has not moved for this long wakes the model once (remindMs before a second nudge) — waiting on a furnace or the night is legitimate, so only the running goal is nudged and never failed automatically. maxFails: repeated failures plus no progress suspend it as blocked. starveMs/starveRemindMs: an open goal that waits this long while the body is idle is offered back to the model. maxResumes: a main task paused this many times is set aside (not deleted). verifyRadius: a restored build goal within this many blocks of its site is re-checked at startup (farther away it is left resumable+needsVerify; gather goals are always checked, they have no site). staleGuard: refuse quiet actions whose snapshot no longer matches the world (new threat or a different active goal).",

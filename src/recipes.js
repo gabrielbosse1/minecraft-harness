@@ -90,7 +90,54 @@ function resolveRecipe (bot, itemName) {
       return { ok: true, recipe, table, item }
     }
   }
-  return blockedByTable ? { ok: false, why: 'need_crafting_table' } : { ok: false, why: 'missing_materials' }
+  const needs = describeNeeds(bot, candidates)
+  return blockedByTable ? { ok: false, why: 'need_crafting_table', needs } : { ok: false, why: 'missing_materials', needs }
+}
+
+/**
+ * "3 oak_planks (have 0), 2 stick (have 0)" for the recipe the inventory is
+ * closest to completing. '' when the registry cannot name the ingredients.
+ */
+function describeNeeds (bot, candidates) {
+  try {
+    const items = bot.registry?.items || {}
+    let best = null
+    for (const recipe of candidates.slice(0, 40)) {
+      const parts = []
+      let short = 0
+      for (const d of recipe.delta || []) {
+        if (d.count >= 0) continue
+        const have = bot.inventory.count(d.id, d.metadata)
+        const need = -d.count
+        short += Math.max(0, need - have)
+        parts.push(`${need} ${items[d.id]?.name || `item#${d.id}`} (have ${have})`)
+      }
+      if (parts.length && (!best || short < best.short)) best = { short, text: parts.join(', '), recipe }
+    }
+    if (!best) return ''
+    // Many recipes are one recipe per wood (a pickaxe from oak planks, from
+    // birch planks, …). Naming whichever came first reads as "it must be pale
+    // oak"; say "any planks" when the variants differ only in that ingredient.
+    const family = (name) => /_(planks|log|wool|slab|stairs|carpet)$/.exec(String(name || ''))?.[1] || null
+    const kinds = new Map() // family -> Set of item names seen across the recipes
+    for (const recipe of candidates.slice(0, 40)) {
+      for (const d of recipe.delta || []) {
+        const f = d.count < 0 ? family(items[d.id]?.name) : null
+        if (f) { if (!kinds.has(f)) kinds.set(f, new Set()); kinds.get(f).add(items[d.id].name) }
+      }
+    }
+    const parts = []
+    for (const d of best.recipe.delta || []) {
+      if (d.count >= 0) continue
+      const name = items[d.id]?.name || `item#${d.id}`
+      const f = family(name)
+      if (f && kinds.get(f).size > 1) {
+        const have = bot.inventory.items().filter((i) => family(i.name) === f).reduce((n, i) => n + (Number(i.count) || 0), 0)
+        parts.push(`${-d.count} ${f} of one kind, any wood (have ${have} ${f} in all)`)
+      } else parts.push(`${-d.count} ${name} (have ${bot.inventory.count(d.id, d.metadata)})`)
+    }
+    return parts.join(', ')
+  } catch { return '' }
 }
 
 /**

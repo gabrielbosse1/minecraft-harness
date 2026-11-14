@@ -686,11 +686,12 @@ class System1 {
    *
    * The destination comes from the escape planner (escape.js): the reachable
    * cell where the bot arrives well before any mob could, on a branch that
-   * leads out. The pathfinder walks there; the plan is refreshed several
-   * times a second but the goal only moves when the old one stopped being
-   * good, so the run is not chopped up by replans. If A* has no route or the
-   * bot is not making ground, it sprints along the first leg of the plan
-   * instead — after checking there is ground to sprint on.
+   * leads out. The pathfinder walks to that exact cell and keeps the goal while
+   * it remains safe; on arrival, the bot holds there until a threat can reach
+   * it soon. Searches use a fixed node cap rather than a wall-clock cutoff, so
+   * server load cannot make the same flee pick a different partial route. If
+   * A* has no route or the bot is not making ground, it sprints along the first
+   * leg of the plan instead — after checking there is ground to sprint on.
    */
   flee (event) {
     const bot = this.bot
@@ -702,8 +703,31 @@ class System1 {
     const names = [...new Set(threats.map((t) => t.name))].slice(0, 3).join(', ')
     const started = !this._flee
     lane.acquire({ ttlMs: 1500, reason: `fleeing ${names}` })
-    const f = this._flee || (this._flee = { startedAt: now, planAt: -Infinity, direct: false, directUntil: 0, lastPos: { x: pos.x, z: pos.z }, lastMoveAt: now, dir: null, target: null, leadsOut: false, plan: null })
+    const f = this._flee || (this._flee = { startedAt: now, planAt: -Infinity, direct: false, directUntil: 0, lastPos: { x: pos.x, z: pos.z }, lastMoveAt: now, dir: null, target: null, targetSlackAtPlan: null, safeSpot: null, safeHold: false, plan: null })
     if (started) this.logger?.warn?.('reflex', `flee: ${names} (${threats.length})`)
+
+    const distanceToCell = (cell) => Math.hypot(pos.x - (cell.x + 0.5), pos.y - cell.y, pos.z - (cell.z + 0.5))
+
+    // Reaching a safe destination means stop there, not pick another arbitrary
+    // point every few hundred milliseconds. Stay put while the closest threat
+    // still needs at least 1.5 seconds to reach this cell; leave again only if
+    // that safety margin is eroded.
+    if (f.safeHold && f.safeSpot) {
+      if (this._slackAt(f.safeSpot, threats, 0) >= 1.5) {
+        f.direct = false
+        f.directUntil = 0
+        f.target = null
+        f.targetSlackAtPlan = null
+        f.arrived = true
+        lane.setGoal(null)
+        lane.clearControlStates()
+        return 'flee'
+      }
+      f.safeHold = false
+      f.safeSpot = null
+      f.planAt = -Infinity
+      f.lastMoveAt = now
+    }
 
     // Progress check: 600 ms without moving 0.4 blocks → stop trusting the path.
     if (Math.hypot(pos.x - f.lastPos.x, pos.z - f.lastPos.z) >= 0.4) {
@@ -717,6 +741,7 @@ class System1 {
     if (f.direct && !f.directUntil) {
       f.directUntil = now + 1000
       f.target = null
+      f.targetSlackAtPlan = null
       lane.setGoal(null)
     } else if (f.direct && now >= f.directUntil) {
       f.direct = false
@@ -725,7 +750,48 @@ class System1 {
       f.lastMoveAt = now
     }
 
-    if (now - f.planAt >= (f.plan?.cornered ? 500 : 700)) {
+    // A plan names one exact cell. Use vertical distance too: XZ-only arrival
+    // detection used to cancel goals on another floor in the same column.
+    let replanNow = false
+    if (f.target && !f.direct && distanceToCell(f.target) <= 1.5) {
+      const slack = this._slackAt(f.target, threats, 0)
+      f.arrived = true
+      if (f.plan?.safe && slack >= 1.5) {
+        f.safeSpot = { ...f.target }
+        f.safeHold = true
+        f.target = null
+        f.targetSlackAtPlan = null
+        f.direct = false
+        f.directUntil = 0
+        lane.setGoal(null)
+        lane.clearControlStates()
+        const facing = threats[0]?.entity?.position
+        if (facing && f.plan.cornered) { try { Promise.resolve(bot.lookAt(facing.offset ? facing.offset(0, 1.4, 0) : facing, false)).catch(() => {}) } catch { /* mock */ } }
+        return 'flee'
+      }
+      f.target = null
+      f.targetSlackAtPlan = null
+      lane.setGoal(null)
+      lane.clearControlStates()
+      f.planAt = -Infinity
+      replanNow = true
+    }
+
+    const planInterval = f.plan?.cornered ? 500 : 700
+    const targetDistance = f.target ? distanceToCell(f.target) : Infinity
+    const targetSlack = f.target ? this._slackAt(f.target, threats, targetDistance) : -Infinity
+    // A safe plan must keep a positive margin. A best-effort/chased plan may
+    // still be the best route available; keep it unless its margin materially
+    // worsens, rather than swapping directions on every timer tick.
+    const safePlan = f.plan?.safe === true || f.plan?.why === 'vector'
+    const targetStillViable = safePlan
+      ? targetSlack > 0.8
+      : targetSlack >= (Number.isFinite(f.targetSlackAtPlan) ? f.targetSlackAtPlan : 0) - 0.8
+    const committed = Boolean(f.target) && !f.direct && targetDistance > 1.5 && targetStillViable
+    // Do not redraw a destination that remains viable. Replanning on a timer
+    // was shifting the goal under the pathfinder instead of letting it finish
+    // the escape it had already chosen.
+    if (!committed && (replanNow || now - f.planAt >= planInterval || (f.target && !targetStillViable))) {
       f.planAt = now
       const plan = this._planEscape(threats)
       f.plan = plan
@@ -734,37 +800,36 @@ class System1 {
       if (plan?.direction) f.dir = plan.direction
       if (plan?.goal && !f.direct) {
         const t = plan.target
-        const here = Math.hypot(pos.x - (t.x + 0.5), pos.z - (t.z + 0.5))
-        f.arrived = here <= 1.2 || (Boolean(f.target) && Math.hypot(pos.x - (f.target.x + 0.5), pos.z - (f.target.z + 0.5)) < 1.6)
-        if (here <= 1.2) {
-          // Already on the best ground there is (a pocket with nowhere better):
-          // stand, face what is coming, and leave the next move to the model.
-          if (f.target) { f.target = null; lane.setGoal(null); lane.clearControlStates() }
+        const here = distanceToCell(t)
+        f.arrived = here <= 1.5
+        if (f.arrived) {
+          // The new best cell may be where we already stand (a safe pocket).
+          // Hold it only when the current threat clocks still give us room.
+          const slack = plan.safe ? this._slackAt(t, threats, 0) : -Infinity
+          f.target = null
+          f.targetSlackAtPlan = null
+          lane.setGoal(null)
+          lane.clearControlStates()
+          if (plan.safe && slack >= 1.5) {
+            f.safeSpot = { x: t.x, y: t.y, z: t.z }
+            f.safeHold = true
+          }
           const facing = threats[0]?.entity?.position
           if (facing && plan.cornered) { try { Promise.resolve(bot.lookAt(facing.offset ? facing.offset(0, 1.4, 0) : facing, false)).catch(() => {}) } catch { /* mock */ } }
         } else {
-          // Keep the goal while it is still a good one: a replan every 700 ms that
-          // also reset the pathfinder would make the bot stutter instead of run.
-          let keep = false
-          if (f.target && !f.arrived) {
-            const toOld = Math.hypot(pos.x - (f.target.x + 0.5), pos.z - (f.target.z + 0.5))
-            const slack = this._slackAt(f.target, threats, toOld)
-            keep = toOld > 4 && slack > 0.8 && !(plan.leadsOut && !f.leadsOut) && Math.hypot(t.x - f.target.x, t.z - f.target.z) < 12
-          }
-          if (!keep) {
-            // Coming out of a stand (a pocket) the progress clock starts afresh:
-            // the pathfinder gets its 600 ms before the straight sprint takes over.
-            if (!f.target) f.lastMoveAt = now
-            f.target = { x: t.x, y: t.y, z: t.z }
-            f.leadsOut = Boolean(plan.leadsOut)
-            lane.clearControlStates()
-            lane.setGoal(plan.goal, true)
-          }
+          // The pathfinder is allowed to stop only at the evaluated cell; its
+          // goal is not replaced until this one is reached or becomes unsafe.
+          f.lastMoveAt = now
+          f.target = { x: t.x, y: t.y, z: t.z }
+          f.targetSlackAtPlan = this._slackAt(f.target, threats, here)
+          lane.clearControlStates()
+          lane.setGoal(plan.goal, true)
         }
       } else if (!plan?.goal && !f.direct) {
         f.direct = true
         f.directUntil = now + 1000
         f.target = null
+        f.targetSlackAtPlan = null
         lane.setGoal(null)
       }
     }
@@ -789,7 +854,10 @@ class System1 {
     // On an errand: a shorter search, biased toward where the body is headed.
     const tether = this._tether
     const toward = tether?.position && Number.isFinite(tether.position.x) ? { x: tether.position.x, z: tether.position.z } : null
-    const opts = { radius: lit ? 22 : (tether ? 14 : 18), budgetMs: 18, ...(toward ? { toward } : {}) }
+    // `maxNodes` bounds the search. Do not also stop on wall time: a deadline
+    // made the candidate frontier depend on server load, so identical threats
+    // could produce a different escape point on each refresh.
+    const opts = { radius: lit ? 22 : (tether ? 14 : 18), maxNodes: 700, budgetMs: 0, ...(toward ? { toward } : {}) }
     try { plan = this.pathfinder?.escapePlan?.(this._pursuers(threats), opts) || null } catch (err) { this.logger?.debug?.('reflex', `escape plan failed: ${err.message || err}`); plan = null }
     if (plan) return plan
     let old = null

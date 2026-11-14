@@ -59,6 +59,14 @@ coming closer to any pursuer than the bot already is, the plan is `chased`
 even when a few cells beside the bot are still safe — a player who keeps up on
 an open field is not a dead end.
 
+The search is bounded by a fixed node count rather than a wall-clock deadline;
+server load cannot truncate the flood at a different point and send the bot in
+a different direction on each refresh. The pathfinder commits to the selected
+cell instead of redrawing a new destination while it is still safe. Once there,
+ZincAI holds position until a threat could reach that cell within about 1.5
+seconds, then replans. The goal is the exact cell whose safety was evaluated,
+not a neighboring cell that the search never checked.
+
 If A* has no route or the bot stops making ground it sprints along the first
 leg of the plan — after checking there is ground to sprint on (no wall, no drop
 of more than 3, no lava).

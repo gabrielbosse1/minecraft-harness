@@ -848,7 +848,9 @@ function escapePlanWith (bot, movements, pursuers, opts = {}) {
   const plan = planEscape(bot, movements, pursuers, { avoid: floorHazard, ...opts })
   if (!plan) return null
   const { goals } = require('mineflayer-pathfinder')
-  plan.goal = new goals.GoalNear(plan.target.x, plan.target.y, plan.target.z, 1)
+  // The clock proves this exact cell is safe. GoalNear(range=1) could legally
+  // stop on an adjacent cell that was never evaluated by the escape planner.
+  plan.goal = new goals.GoalBlock(plan.target.x, plan.target.y, plan.target.z)
   return plan
 }
 

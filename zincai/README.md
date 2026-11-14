@@ -646,25 +646,36 @@ with backoff between `connection.minRetryDelayMs` and
 `connection.maxRetryDelayMs`, at most `connection.maxRetries` times. Hooks are
 epoch-guarded, so a late callback from an old session can never act on a new one.
 
-**When the link drops with `client timed out`.** That exact sentence is emitted
-locally by `minecraft-protocol/src/client/keepalive.js`; it is not a kick reason
-sent by the Minecraft server. On each server challenge the library immediately
-echoes the same 64-bit ID, then starts a timer waiting for the *next* challenge.
-If none is decoded before `reconnect.keepAliveTimeoutMs` (60 s; env
-`KEEPALIVE_TIMEOUT_MS`), the client ends the link. A log that still says
-`30000 milliseconds` is therefore either an older checkout or an explicit
-30-second environment override; this checkout passes 60000 to Mineflayer.
+**Keep-alive and link liveness.** Zinc disables `minecraft-protocol`'s client
+keep-alive plugin and installs `protocol_keepalive.js` instead. Both immediately
+echo every server challenge with the exact 64-bit ID. The important difference
+is the deadline: the dependency waited only for the *next `keep_alive` packet*;
+Zinc waits for any decoded server packet. `reconnect.keepAliveTimeoutMs` (60 s;
+env `KEEPALIVE_TIMEOUT_MS`) is therefore an all-traffic inactivity limit, not a
+keep-alive-stream limit. A pause in challenges is logged but never destroys a
+session whose ordinary packets are still arriving. After an inactivity timer
+expires, Zinc gives socket I/O one event-loop turn to deliver already-ready data
+before confirming `server traffic timed out` and reconnecting.
 
-The 26.3 packet shape itself has a real TCP regression test: a local 26.3
-`minecraft-protocol` server sends a non-zero 64-bit challenge and the installed
-client decodes and echoes every bit exactly. That rules out the vendored 26.3
-`i64` schema and the normal echo path. It does **not** rule out a process stall:
-localhost removes routers and Internet latency, but the Java server and Node bot
-still have separate event loops competing for the same CPU, memory and disk.
+That policy fixes a measured production failure, not a hypothetical one. At the
+old 60-second deadline Zinc had received **46,029 ordinary packets** after the
+last challenge, including `entity_status` in the timeout millisecond, and had
+echoed the previous ID exactly. Node, TCP, packet decoding and the Minecraft
+session were all live; only the server's keep-alive packet stream had paused.
+The preceding 62-second model request was asynchronous and did not block packet
+handling. Raising the old timeout could only postpone the same false positive;
+it could not make a keep-alive-only deadline mean connection inactivity.
+
+The 26.3 packet shape itself also has a real TCP regression test: a local 26.3
+`minecraft-protocol` server sends `0x0123456789abcdef` and Zinc decodes and
+echoes every bit exactly through its replacement handler. Deterministic tests
+also prove that ordinary traffic extends the deadline, true silence closes the
+link, ready socket I/O wins a timer race, and disposal removes all listeners
+and timers.
 
 At runtime `watchdog.js` records every packet name, each keep-alive challenge,
-and the exact response queued by Zinc. A timeout now prints one explicit
-`keep-alive diagnosis [...]`:
+and the exact response queued by Zinc. If a legacy dependency timeout or a true
+all-traffic timeout occurs, it prints one explicit `keep-alive diagnosis [...]`:
 
 - `[bot-main-thread]` — Node's thread was blocked across the deadline. The
   separate worker also prints the function and file/line that held it.
@@ -672,9 +683,8 @@ and the exact response queued by Zinc. A timeout now prints one explicit
   running. On localhost, inspect the Minecraft log for `Can't keep up!`, world
   saves/chunk generation, an OOM/GC pause, or the server process being paused.
 - `[keepalive-stream-only]` — ordinary server packets continued and Zinc echoed
-  the previous challenge, but no new keep-alive came. The TCP link was alive;
-  this points to the server's keep-alive scheduler or the dependency's policy
-  of timing only keep-alives rather than all traffic.
+  the previous challenge, but no new keep-alive came. This is now a warning and
+  the active link is kept; seeing it as a disconnect means an older checkout.
 - `[client-reply-path]` / `[server-rejected-reply]` — respectively, Zinc did not
   queue the exact challenge ID (a bot/protocol bug), or it did and the server
   still rejected it (trace the serverbound packet and server handling).
@@ -684,10 +694,11 @@ and the exact response queued by Zinc. A timeout now prints one explicit
 A whole-link silence is warned after 25 seconds, not 10: vanilla normally sends
 a keep-alive about every 15 seconds, so the old 10-second threshold could label
 a healthy idle link as silent. `status` shows loop stalls, server silences, the
-number of keep-alives received/answered, the widest gap, ID mismatches and the
-last timeout classification on its `health:` line. `ZINCAI_WATCHDOG=0` turns
-the watchdog off; `ZINCAI_WATCHDOG_STACK=0` keeps the measurements without the
-worker thread that reads the stack.
+number of keep-alives received/answered, keep-alive-only gaps kept connected,
+the widest gap, ID mismatches and the last timeout classification on its
+`health:` line. `ZINCAI_WATCHDOG=0` turns reporting off, but not the mandatory
+challenge echo or all-traffic liveness policy; `ZINCAI_WATCHDOG_STACK=0` keeps
+the measurements without the worker thread that reads the stack.
 
 ### Death and respawn
 
@@ -731,7 +742,7 @@ no dotenv; nothing is read from a file the panel does not control.
 | `INFERENCE_CHAT_BATCH_MS` | How long chat lines are collected into one chunk (6000). |
 | `ZINCAI_NO_SUPERVISOR` | `1` = run as one process; `update`/`restart` then exit 75 for an outside supervisor. |
 | `RECONNECT`, `RECONNECT_MAX_ATTEMPTS` | Post-spawn reconnection behaviour. |
-| `KEEPALIVE_TIMEOUT_MS` | How long without a keep-alive from the server before the link is given up (60000, minimum 20000). |
+| `KEEPALIVE_TIMEOUT_MS` | How long without **any decoded server packet** before the link is given up (60000, minimum 20000). A keep-alive-only pause does not disconnect an active session. |
 | `ZINCAI_WATCHDOG`, `ZINCAI_WATCHDOG_STACK` | `0` turns off the stall watchdog / only its stack capture (see *Connection lifecycle*). |
 | `ZINC_OPERATORS`, `ZINC_COMMAND_PREFIX` | **Inert.** Control is console-only; there is no chat command interface to configure. |
 | `ZINC_JOIN_ON_START` | Join the server when the process starts (`connection.joinOnStart`); `false` waits for `join`. |

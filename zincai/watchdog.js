@@ -48,7 +48,7 @@ function idText (value) {
   } catch { return String(value) }
 }
 
-const TIMEOUT_RE = /client timed out|keepalive(?:error|timeout)|keep-alive|timed? out|disconnect\.timeout/i
+const TIMEOUT_RE = /server traffic timed out|trafficTimeout|client timed out|keepalive(?:error|timeout)|keep-alive|timed? out|disconnect\.timeout/i
 
 // ------------------------------------------------------------ worker side --
 function runWorker () {
@@ -153,6 +153,7 @@ class LoopWatchdog {
       keepAliveReplies: 0,
       replyMismatches: 0,
       worstKeepAliveGapMs: 0,
+      lateKeepAliveStreams: 0,
       timeouts: 0,
       lastTimeoutCause: ''
     }
@@ -207,6 +208,7 @@ class LoopWatchdog {
       return
     }
     this._checkLink(now)
+    this._checkKeepAlive(now)
   }
 
   _report (late) {
@@ -235,6 +237,7 @@ class LoopWatchdog {
       lastKeepAliveId: null,
       lastReplyAt: 0,
       lastReplyId: null,
+      keepAliveLateWarnedAt: 0,
       diagnosed: false
     }
   }
@@ -264,6 +267,11 @@ class LoopWatchdog {
     link.packets++
 
     if (name === 'keep_alive') {
+      const previousAt = link.lastKeepAliveAt || link.since
+      if (link.keepAliveLateWarnedAt) {
+        this.log('info', `server keep-alives resumed after ${((now - previousAt) / 1000).toFixed(1)}s; the link stayed up because ordinary server traffic never stopped`)
+        link.keepAliveLateWarnedAt = 0
+      }
       if (link.lastKeepAliveAt) {
         const gap = now - link.lastKeepAliveAt
         this.stats.worstKeepAliveGapMs = Math.max(this.stats.worstKeepAliveGapMs, gap)
@@ -301,13 +309,31 @@ class LoopWatchdog {
     link.warnedAt = now
     this.stats.silences++
     this.stats.worstSilenceMs = Math.max(this.stats.worstSilenceMs, quiet)
-    this.log('warn', `nothing has arrived from the server for ${Math.round(quiet / 1000)}s while the bot itself is running normally — the server or the connection has stalled (not the bot). The link is dropped if no keep-alive comes in time.`)
+    this.log('warn', `nothing has arrived from the server for ${Math.round(quiet / 1000)}s while the bot itself is running normally — the server or the connection has stalled (not the bot). The link is dropped if all server traffic stays silent.`)
   }
 
-  /** The minecraft-protocol client emitted its own keep-alive timeout error. */
+  /**
+   * A missing keep-alive is now an anomaly, not proof of a dead link. The live
+   * failure delivered 46k ordinary packets during such a gap, so disconnecting
+   * would destroy a demonstrably healthy TCP session.
+   */
+  _checkKeepAlive (now) {
+    const link = this._link
+    if (!link || link.keepAliveLateWarnedAt) return
+    const gap = now - (link.lastKeepAliveAt || link.since)
+    if (gap < link.timeoutMs) return
+    const packetQuiet = now - link.lastPacketAt
+    if (link.packets === 0 || packetQuiet >= this.silentMs) return
+    link.keepAliveLateWarnedAt = now
+    this.stats.lateKeepAliveStreams++
+    this.stats.worstKeepAliveGapMs = Math.max(this.stats.worstKeepAliveGapMs, gap)
+    this.log('warn', `no keep-alive challenge for ${(gap / 1000).toFixed(1)}s, but ${link.packetsSinceKeepAlive || link.packets} ordinary server packet(s) arrived and the last was ${(packetQuiet / 1000).toFixed(1)}s ago — keeping the live link; Zinc now disconnects only when all server traffic stops`)
+  }
+
+  /** Zinc's traffic deadline (or an older dependency) emitted a timeout. */
   connectionError (error) {
     const text = String(error?.message || error || '')
-    if (!TIMEOUT_RE.test(text)) return null
+    if (error?.code !== 'ZINCAI_TRAFFIC_TIMEOUT' && !TIMEOUT_RE.test(text)) return null
     return this._diagnoseTimeout('client', text)
   }
 
@@ -374,6 +400,7 @@ class LoopWatchdog {
     const parts = [s.stalls ? `${s.stalls} stall${s.stalls === 1 ? '' : 's'} of the bot's thread (worst ${(s.worstMs / 1000).toFixed(1)}s)` : 'no stalls of the bot\'s thread']
     parts.push(s.silences ? `${s.silences} server silence${s.silences === 1 ? '' : 's'}${s.worstSilenceMs ? ` (worst ${(s.worstSilenceMs / 1000).toFixed(1)}s)` : ''}` : 'no server silences')
     if (s.keepAlives) parts.push(`keep-alive ${s.keepAlives} received/${s.keepAliveReplies} answered${s.worstKeepAliveGapMs ? ` (widest gap ${(s.worstKeepAliveGapMs / 1000).toFixed(1)}s)` : ''}${s.replyMismatches ? `, ${s.replyMismatches} ID MISMATCH` : ''}`)
+    if (s.lateKeepAliveStreams) parts.push(`${s.lateKeepAliveStreams} keep-alive-only gap${s.lateKeepAliveStreams === 1 ? '' : 's'} kept connected because other packets continued`)
     if (s.timeouts) parts.push(`${s.timeouts} timeout${s.timeouts === 1 ? '' : 's'} (last: ${s.lastTimeoutCause})`)
     return parts.join('; ')
   }

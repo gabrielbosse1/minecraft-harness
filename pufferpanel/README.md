@@ -491,9 +491,11 @@ Two lines are worth checking on the first start:
   a few between versions). `0 primitives gated` means the pause/permission
   barrier is not on the bot at all — that was a bug up to PR #23.
 - after a while, `status` → `health: no stalls of the bot's thread; no server
-  silences`. If the link ever drops with `client timed out`, the lines just
-  before it say whether the server went quiet or the bot's own thread was
-  blocked, and by what (see *Connection lifecycle* in `zincai/README.md`).
+  silences`. Zinc echoes every keep-alive challenge but disconnects only after
+  **all** decoded server traffic has stopped for the configured deadline. A
+  `server traffic timed out` diagnosis says whether the server went quiet or
+  the bot's own thread was blocked, and by what (see *Connection lifecycle* in
+  `zincai/README.md`).
 
 Type an operator command straight into the console (no prefix, one line, press
 enter) to prove the control path end to end:

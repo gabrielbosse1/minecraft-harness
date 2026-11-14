@@ -208,7 +208,7 @@ const ACTION_TOOLS = [
     page: INT('For graph: page, default 1.'),
     note: STR('For bind: note (max 240 chars).')
   }, ['operation']),
-  tool('build', 'Build blueprint or inline grid+palette.', {
+  tool('build', 'Place blocks. A named blueprint, an inline grid+palette, OR one single block: grid [["C"]] + palette {C:"cobblestone"} + at [x,y,z] places exactly that one block there. `at` is the minimum corner; the grid grows toward +x (row), +y (layer), +z (column).', {
     blueprint: STR('Blueprint name in zincai/blueprints/.'),
     grid: { type: 'array', description: '3D bottom-up layers of palette strings ("."/" " = air).', items: { type: 'array', items: { type: 'string' } } },
     palette: { type: 'object', description: 'Char -> block id map.', additionalProperties: { type: 'string' } },

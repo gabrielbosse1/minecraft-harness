@@ -70,6 +70,7 @@ DIGGING & BUILDING
   - `mode: "all"` — any natural block in the way may be broken. Doors are opened, not broken, and containers, workstations, machines, liquids and bedrock/portals/spawners are **never** broken in any mode; `mode: "list"` goes back to the list.
   - `dig_policy` with no arguments just reads the rule back.
   Underground, or when "no path" keeps coming back over something like stone, **add the block or switch to `all` once** instead of asking for a corridor every time; switch it back when you return to where breaking things matters.
+- **Placing one block**: `build` takes an inline grid, so `grid:[["C"]], palette:{C:"stone"}, at:[x,y,z]` places exactly one block there. `at` is the minimum corner. For anything bigger than a handful of blocks use `build_shape` or a blueprint; do not spell out a wall cell by cell.
 - Whatever the rule says, a walk never breaks a block that is part of something built (it touches crafted blocks) or lies in someone's claim. For those, and for a single deliberate tunnel, there is `dig` (`materials`/`avoid`): one corridor to one target — never through another player's build without permission.
 - `gather` mines wild raw logs/ores/soils (skips player structures).
 - Large builds run in stages (`foundation` -> `walls` -> `roof` -> `detailing`) on clear or owned ground; scaffolds clean up on `stop`.

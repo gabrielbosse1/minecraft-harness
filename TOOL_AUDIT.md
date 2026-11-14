@@ -337,7 +337,7 @@ Each row was checked against the schema list and the dispatch switch:
 | Capability | Status | Evidence |
 | --- | --- | --- |
 | Use a carried item by hand — bucket, ender pearl, boat, firework, potion, totem, wind charge | **no tool** | No `use_item` verb. `activateItem` appears only in the wind-charge path, the bow path and two reflexes (`system1.js`, `pathfinder_wrapper.js:679`). |
-| Place a single block at chosen coordinates | **no tool** | `place` exists in `TOOL_CAPS`, `lanes.js` and `boundary.js` and is **not in `ACTION_TOOLS`**. Only `build`/`build_shape`/`redstone_engineer place`. |
+| Place a single block at chosen coordinates | **works, but was undocumented** | No `place` verb (`place` exists in `TOOL_CAPS`/`lanes.js`/`boundary.js` and is not in `ACTION_TOOLS`). But `build {grid:[["C"]], palette:{C:"stone"}, at:[x,y,z]}` generates a **1-step plan** and places exactly one block — verified. Nothing in the prompt or the schema said so, so the model had to guess. Fixed by documenting it in both; the verb still does not exist. |
 | Choose a hotbar slot / use a specific inventory slot | **no tool** | `setQuickBarSlot` is gated in `boundary.js:123` and called **nowhere**. |
 | Enchant, repair, brew, trade with a villager | **no tool** | `enchanting_table`, `anvil`, `brewing_stand` are indexed as places (`places.js STATION_KINDS`) and can be walked to, but no verb uses them. |
 | Shear, milk, tame, ride, leash, fish, ignite, set spawn | **no tool** | none. |
@@ -350,11 +350,16 @@ the whole repo (in `boundary.js`'s capability table) and is never called;
 those 10 items (the 32 it does list match the game data on points *and*
 saturation).
 
-This is the biggest *capability* cluster. Armor, tools, weapons and building
-blocks are fine. Consumables and utility items are, in practice, not part of the
-game for this agent: it can carry a water bucket but cannot pour it, cannot
-pearl, cannot boat, cannot potion, cannot totem-swap deliberately, and cannot
-place one block where it wants without going through a build plan.
+Armor, tools, weapons and building blocks are fine, and **placement is fine** —
+a 1×1 `build` grid puts one block at an exact coordinate, so the model can
+build anything it can describe. It just was never told, which is why this row
+was filed as "no tool".
+
+Consumables and utility items are the real gap. In practice they are not part of
+the game for this agent: it can carry a water bucket but cannot pour it, cannot
+pearl, cannot boat, cannot potion, and cannot totem-swap deliberately. Everything
+that does use an item is the harness acting on its own (the MLG bucket, the
+elytra reflex, the bow release in combat), not the model choosing to.
 
 The prompt's "Every tool is available on every turn" is true. "You have your own
 body" is about two-thirds true.
@@ -546,13 +551,17 @@ fine as about what is broken.
 5. ~~**§5** `hold` cannot accept `ids`~~ — fixed, and the ids are now honoured.
 6. ~~**§6** enum strictness discards whole answers~~ — fixed for text enums;
    closed verb lists are explicitly marked `strict`.
-7. **§8** no `use_item`, no `place`, no slot control — **still open on purpose.**
-   This is the one finding left, and it is not a bug: it is a missing feature
-   area. Adding `use_item`/`place`/hotbar control means new verbs, new schema
-   text on every call, and new failure modes to guard (placing a block where the
-   model cannot stand, drinking a potion mid-fight). It should be a deliberate
-   product decision with its own tests, not a drive-by patch at the end of an
-   audit. Everything it would add is listed in the §8 table, ready to pick up.
+7. **§8** — partly open, and the framing here was wrong the first time.
+   *Placement* turns out to **work**: a 1×1 `build` grid places one block at an
+   exact coordinate. The defect was discoverability, not capability, and it is
+   now documented in the schema and the prompt.
+   What is genuinely missing is narrower than the table implies: there is **no
+   authoritative way to use a carried item** (water bucket, ender pearl, boat,
+   potion, firework). Every path that exists is either automatic or incidental —
+   the harness's own water-bucket MLG reflex, its own elytra reflex, its own bow
+   release in combat — and the model cannot ask for any of them. Nor can it pick
+   a hotbar slot. That is a real feature area and needs its own design, not a
+   drive-by patch.
 8. ~~**§9** `build_shape` origin conventions and `arch` height~~ — fixed.
 9. ~~**§7** "semantic" naming on a keyword search~~ — fixed by making the claim
    true (synonym table) rather than weakening the word.

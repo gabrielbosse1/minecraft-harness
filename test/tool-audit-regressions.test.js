@@ -303,3 +303,27 @@ test('scout.relocateTimeoutMs and scout.deathAvoidRadius are actually read', () 
   assert.match(src, /sc\.relocateTimeoutMs/)
   assert.match(src, /sc\.deathAvoidRadius/)
 })
+
+// ---------------------------------------------------------------------------
+// §8 — the model's answer to "place one block there" is `build` with a 1x1 grid
+// ---------------------------------------------------------------------------
+
+test('§8 a 1x1 build grid places exactly one block at the coordinate the model gave', () => {
+  const { BlueprintParser } = require('../zincai/builder')
+  const parser = new BlueprintParser({})
+  const parsed = parser.parseInline({ grid: [['C']], palette: { C: 'cobblestone' }, name: 'one' })
+  const planned = parser.plan(parsed, { x: 100, y: 70, z: -40 }, { x: 0, y: 64, z: 0 })
+  assert.equal(planned.steps.length, 1, 'one cell in, one step out')
+  assert.deepEqual(
+    { x: planned.steps[0].x, y: planned.steps[0].y, z: planned.steps[0].z, name: planned.steps[0].name },
+    { x: 100, y: 70, z: -40, name: 'cobblestone' }
+  )
+})
+
+test('§8 the model can find out that single-block placement exists', () => {
+  // The capability existed but nothing advertised it, so it was invisible.
+  const build = createZincTools().find((t) => t.function.name === 'build')
+  assert.match(build.function.description, /one single block|exactly that one block/i, 'the schema says so')
+  const prompt = require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'zincai', 'system_prompt.txt'), 'utf8')
+  assert.match(prompt, /Placing one block/i, 'and the prompt says so')
+})

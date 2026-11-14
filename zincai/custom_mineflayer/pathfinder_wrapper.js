@@ -48,6 +48,7 @@ const TICK_MS = 50
 
 const { Vec3 } = require('vec3')
 const doors = require('./doors')
+const { NEVER_DIG: NEVER_DIG_NAMES } = require('../dig_policy')
 const { planEscape } = require('./escape')
 
 const isDoorOrTrapdoorName = (name) => (/_door$/i.test(name) || /_trapdoor$/i.test(name)) && !/iron/i.test(name)
@@ -1530,21 +1531,34 @@ class PathfinderWrapper {
   }
 
   /**
-   * A soft block is not fair game when it is part of something built: the dirt
-   * a wall stands on, the sand under somebody's rails. Under the STANDING
-   * policy (not an explicit `dig` corridor, which the model aimed itself) a
-   * block that touches crafted blocks, or lies inside a known build/claim, is
-   * priced out of the route.
+   * Two different questions live here, and only one of them may be waived by
+   * the model's own `dig` corridor.
+   *
+   *   1. "Is this block part of something somebody built?" — a heuristic over
+   *      neighbouring block names. The model aiming a corridor at a wall of
+   *      stone is making a deliberate choice, so `dig` is allowed to suspend
+   *      this and tunnel through what it was pointed at.
+   *   2. "Is this block inside a claim that is not ours?" — not a heuristic,
+   *      and not the model's to override. A claim is another player's property;
+   *      the corridor is where the model wants to go, not a licence to cut
+   *      through somebody's house. This check therefore runs in EVERY mode,
+   *      including an open dig window.
+   *
+   * Conflating the two was the bug: one early return disabled both.
    */
   _configureBreakGuard (movements) {
     if (!Array.isArray(movements.exclusionAreasBreak) || movements.exclusionAreasBreak.some((f) => f && f._zincaiBreakGuard)) return
     const bot = this.bot
     const guard = (block) => {
       if (!block?.position) return 0
+      // Claim first, unconditionally: no dig window, no policy switch, nothing
+      // the model can say makes another player's property fair game.
+      try {
+        if (this.isProtected && this.isProtected(block.position)) return 100
+      } catch { /* a broken claim lookup must not turn into a free pass */ return 100 }
       if (this._digWindow && Date.now() <= this._digWindow.expiresAt) return 0
       if (!this._passivePolicy()) return 0
       try {
-        if (this.isProtected && this.isProtected(block.position)) return 100
         for (const [dx, dy, dz] of NEIGHBOURS) {
           const nb = bot.blockAt(block.position.offset(dx, dy, dz), false)
           if (nb && BUILT_NEIGHBOUR.test(nb.name || '')) return 100
@@ -1600,6 +1614,18 @@ class PathfinderWrapper {
     // Doors and gates are opened, never broken — in every window.
     for (const id of this._doorBlockIds()) set.add(id)
     const cant = (id) => { if (id !== undefined && id !== null) set.add(id) }
+
+    // The never-break list applies in EVERY mode: standing policy, `all`, and
+    // an open `dig` corridor. A corridor used to be narrowed to five names
+    // (bedrock and friends), which meant the one call the prompt recommends
+    // "when go_to reports no path" could tunnel straight through a barrel or a
+    // furnace. Whatever the model aims at, it is not aiming at somebody's
+    // storage.
+    {
+      const registry = this.bot?.registry
+      for (const name of NEVER_DIG_NAMES) cant(registry?.blocksByName?.[name]?.id)
+    }
+
     if (policy) {
       const registry = this.bot?.registry
       // The list is an allowlist: everything not on it is unbreakable. In mode
@@ -1612,9 +1638,6 @@ class PathfinderWrapper {
       if (w.canDig) {
         // An allowlist: everything not named is unbreakable.
         if (registry?.blocksArray) for (const b of registry.blocksArray) if (!w.canDig.has(b.id)) cant(b.id)
-      } else if (registry?.blocksByName) {
-        // No allowlist: anything goes except the world itself.
-        for (const name of ['bedrock', 'barrier', 'command_block', 'end_portal_frame', 'spawner']) cant(registry.blocksByName[name]?.id)
       }
       for (const id of w.cantDig) cant(id)
     }

@@ -38,8 +38,41 @@ const DEFAULT_SOFT_BLOCKS = Object.freeze([
   'soul_sand', 'soul_soil'
 ])
 
-/** Never breakable by walking, whatever the mode or the list says. */
-const NEVER_DIG = Object.freeze(['bedrock', 'barrier', 'command_block', 'chain_command_block', 'repeating_command_block', 'structure_block', 'jigsaw', 'end_portal_frame', 'end_portal', 'nether_portal', 'spawner', 'trial_spawner', 'vault', 'reinforced_deepslate'])
+/**
+ * Never breakable by walking, whatever the mode or the list says.
+ *
+ * The second group is not terrain at all: it is other people's *stuff*. The
+ * prompt, the schema and the runtime message all promise "doors, containers and
+ * bedrock are never broken", and for a long time only doors and bedrock were
+ * actually in here — so `mode: "all"` quietly priced a barrel, a furnace and an
+ * ender chest as ordinary obstacles. Every one of these is either a container
+ * (its contents are lost), a workstation (somebody's project) or a machine that
+ * holds state. A corridor through a storage room is not a shortcut.
+ */
+const NEVER_DIG = Object.freeze([
+  // world structure
+  'bedrock', 'barrier', 'command_block', 'chain_command_block', 'repeating_command_block',
+  'structure_block', 'jigsaw', 'end_portal_frame', 'end_portal', 'nether_portal',
+  'spawner', 'trial_spawner', 'vault', 'reinforced_deepslate',
+  // containers — breaking them destroys whatever they hold
+  'chest', 'trapped_chest', 'ender_chest', 'barrel', 'shulker_box', 'white_shulker_box',
+  'orange_shulker_box', 'magenta_shulker_box', 'light_blue_shulker_box', 'yellow_shulker_box',
+  'lime_shulker_box', 'pink_shulker_box', 'gray_shulker_box', 'light_gray_shulker_box',
+  'cyan_shulker_box', 'purple_shulker_box', 'blue_shulker_box', 'brown_shulker_box',
+  'green_shulker_box', 'red_shulker_box', 'black_shulker_box',
+  'furnace', 'blast_furnace', 'smoker', 'hopper', 'dropper', 'dispenser', 'crafter',
+  'brewing_stand', 'decorated_pot', 'lectern',
+  // workstations and fixtures — somebody's project, not terrain
+  'crafting_table', 'anvil', 'chipped_anvil', 'damaged_anvil', 'enchanting_table', 'beacon',
+  'bookshelf', 'chiseled_bookshelf', 'cartography_table', 'fletching_table', 'smithing_table',
+  'loom', 'stonecutter', 'grindstone', 'composter', 'cauldron', 'water_cauldron',
+  'lava_cauldron', 'powder_snow_cauldron', 'respawn_anchor', 'conduit', 'bell',
+  // stateful machines and hazards
+  'observer', 'piston', 'sticky_piston', 'note_block', 'jukebox', 'tnt'
+])
+
+/** Flowing blocks: never "broken", only released — see allows(). */
+const LIQUIDS = new Set(['water', 'flowing_water', 'lava', 'flowing_lava', 'bubble_column'])
 
 const MODES = Object.freeze(['list', 'all'])
 const MAX_LIST = 96
@@ -131,6 +164,11 @@ class DigPolicy {
   allows (name) {
     const n = normName(name)
     if (!this.enabled || NEVER_DIG.includes(n)) return false
+    // Liquids are not broken by a hand, they flow: "breakable" here would tell
+    // the model a corridor can remove a pool, when what really happens is the
+    // pool spilling into the corridor. The pathfinder refuses to dig into a
+    // liquid wall (dontCreateFlow), so this must say the same thing.
+    if (LIQUIDS.has(n)) return false
     if (this.mode === 'all') return true
     for (const p of this.allow) if (p === n || (p.includes('*') && patternToRegExp(p).test(n))) return true
     return false
@@ -212,7 +250,7 @@ class DigPolicy {
   /** One line for the prompt / the tool result. */
   describe ({ full = false, max = 14 } = {}) {
     if (!this.enabled) return 'walking never breaks blocks (can_dig OFF) — dig_policy {can_dig:true} turns it on; the dig tool still opens one corridor'
-    if (this.mode === 'all') return 'walking may break ANY block in the way (mode all; doors, containers and bedrock are never broken) — dig_policy {mode:"list"} goes back to the list'
+    if (this.mode === 'all') return 'walking may break any natural block in the way (mode all; doors are opened, and containers, workstations, machines, liquids and bedrock are never broken) — dig_policy {mode:"list"} goes back to the list'
     const list = this.list()
     const shown = full ? list : list.slice(0, max)
     const more = list.length - shown.length
@@ -220,4 +258,4 @@ class DigPolicy {
   }
 }
 
-module.exports = { DigPolicy, DEFAULT_SOFT_BLOCKS, NEVER_DIG, MODES, resolveNames, patternToRegExp }
+module.exports = { DigPolicy, DEFAULT_SOFT_BLOCKS, NEVER_DIG, LIQUIDS, MODES, resolveNames, patternToRegExp }

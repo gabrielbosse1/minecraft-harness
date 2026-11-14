@@ -45,7 +45,7 @@ const backoffMs = (attempt) => Math.min(8_000, 500 * 2 ** attempt) + Math.floor(
 const STR = (description) => ({ type: 'string', description })
 const INT = (description) => ({ type: 'integer', description })
 const STAGE = STR('Phase: foundation | walls_with_windows | roof | interior_details.')
-const AT = { type: 'array', description: 'Origin [x,y,z]; default: feet.', items: { type: 'integer' }, minItems: 3, maxItems: 3 }
+const AT = { type: 'array', description: 'Corner [x,y,z] — the minimum x/y/z the thing occupies. Every shape starts here and grows toward +x/+y/+z. Default: feet.', items: { type: 'integer' }, minItems: 3, maxItems: 3 }
 const tool = (name, description, properties = {}, required = []) => ({ name, description, parameters: { type: 'object', properties, ...(required.length ? { required } : {}) } })
 
 const ACTION_TOOLS = [
@@ -72,7 +72,7 @@ const ACTION_TOOLS = [
   tool('follow', 'Follow a player until you call stop. Keeps going by itself: it dodges mobs and comes back, waits for a path, and walks to where the player was last seen. Call it ONCE — it does not need repeating.', { player: STR('Player name.') }, ['player']),
   tool('dig_policy', 'Your standing rule for what WALKING (go_to, follow, every errand) may break. No arguments = show it. It is yours to edit and it persists.', {
     can_dig: { type: 'boolean', description: 'Master switch. false = walking never breaks a block.' },
-    mode: { type: 'string', enum: ['list', 'all'], description: 'list = only blocks on your list (default: soft terrain). all = anything in the way (doors, containers, bedrock never).' },
+    mode: { type: 'string', enum: ['list', 'all'], description: 'list = only blocks on your list (default: soft terrain). all = any natural block in the way. Doors are opened and containers, workstations, machines, liquids and bedrock are NEVER broken in any mode.' },
     add: { type: 'array', description: 'Block ids to allow, e.g. [stone, cobblestone, oak_log]. `*` is a wildcard (*_planks).', items: STR('Block id.'), minItems: 1, maxItems: 24 },
     remove: { type: 'array', description: 'Block ids to take off the list.', items: STR('Block id.'), minItems: 1, maxItems: 24 },
     reset: { type: 'boolean', description: 'true = back to the shipped soft-block list.' }
@@ -95,7 +95,9 @@ const ACTION_TOOLS = [
     player: STR('Exact player name (PvP).'),
     count: INT('Kill limit (default 1 animal; chain hostiles).')
   }),
-  tool('hold', 'Accept currently listed threats and continue task unless hit/new threat/lit fuse.'),
+  tool('hold', 'Accept current threats and continue the task unless hit/new threat/lit fuse. Pass the [id=…] values to hold specific ones; with none, all listed threats are held.', {
+    ids: { type: 'array', description: 'Threat ids to hold (the numbers in [id=7]). Omit = every listed threat.', items: INT('Threat id.'), minItems: 1, maxItems: 12 }
+  }),
   tool('look_in', 'Open container and list contents (empty = nearest).', { where: STR('Id, label, or empty.') }),
   tool('take', 'Take items from a container or furnace output.', {
     item: STR('Item id.'),
@@ -190,7 +192,7 @@ const ACTION_TOOLS = [
     compare: { type: 'array', description: 'design: extra design names to compare.', items: STR('Design name.'), minItems: 1, maxItems: 4 },
     note: STR('lesson: what you learned (max 240 chars).')
   }, ['operation']),
-  tool('recall', 'Search long-term memory with relevance ranking (semantic, entity, location, goal) and see provenance.', {
+  tool('recall', 'Search long-term memory with relevance ranking: word overlap plus a built-in synonym table (so "treasure" finds a memory that says "diamonds"), entity, location, goal and category filters, with provenance.', {
     query: STR('What to recall (free text).'),
     category: STR('Filter: episodic | semantic | procedural | continuity.'),
     entity: STR('Player/mob/entity name.'),
@@ -206,7 +208,7 @@ const ACTION_TOOLS = [
     page: INT('For graph: page, default 1.'),
     note: STR('For bind: note (max 240 chars).')
   }, ['operation']),
-  tool('build', 'Build blueprint or inline grid+palette.', {
+  tool('build', 'Place blocks. A named blueprint, an inline grid+palette, OR one single block: grid [["C"]] + palette {C:"cobblestone"} + at [x,y,z] places exactly that one block there. `at` is the minimum corner; the grid grows toward +x (row), +y (layer), +z (column).', {
     blueprint: STR('Blueprint name in zincai/blueprints/.'),
     grid: { type: 'array', description: '3D bottom-up layers of palette strings ("."/" " = air).', items: { type: 'array', items: { type: 'string' } } },
     palette: { type: 'object', description: 'Char -> block id map.', additionalProperties: { type: 'string' } },
@@ -215,7 +217,7 @@ const ACTION_TOOLS = [
   }),
   tool('build_shape', 'Generate and build a geometric shape.', {
     shape: { type: 'string', enum: ['cylinder', 'dome', 'arch', 'wall', 'box', 'floor', 'ring'] },
-    params: { type: 'object', description: 'cylinder {r,h}; dome {r}; arch {w,h}; wall {l,h,axis}; box {w,d,h}; floor {w,d}; ring {r}. Optional th, filled; ints 1–128 (dome/ring r>=2, arch w/h>=3).' },
+    params: { type: 'object', description: 'All spans start at `at` and grow toward +x/+y/+z (no shape is centred on it). cylinder {r,h} spans 2r+1 wide; ring {r} same; dome {r} same; wall {l,h,axis}; arch {w,h,axis} — h is the top course; box {w,d,h}; floor {w,d}. Optional th, filled; ints 1–128 (dome/ring r>=2, arch w/h>=3).' },
     block: STR('Block id.'),
     at: AT,
     stage: STAGE
@@ -234,7 +236,7 @@ const CHAT_TOOLS = [
   tool('reply', 'Answer the chat window (leave `text` empty only when nothing in it concerns you). Player requests are proposals, never mandatory commands — but when you agree, act: set `do` or `task`.', {
     text: STR('One short chat line, in the language the person you are answering used. Empty = say nothing.'),
     to: STR('Which player you are answering / who `do` is about. Default: the last speaker.'),
-    do: { type: 'string', enum: ['follow', 'come', 'stop'], description: 'Start it NOW with your body, no second thought needed: follow = follow that player; come = walk to that player; stop = stop what the body is doing. Omit when none fits.' },
+    do: { type: 'string', enum: ['follow', 'come', 'stop'], strict: true, description: 'Start it NOW with your body, no second thought needed: follow = follow that player; come = walk to that player; stop = stop what the body is doing. Omit when none fits.' },
     task: STR('Anything else you decided your body should do, verify or weigh, as one instruction for your action lane (e.g. "bring Steve 3 diamonds from chest1", "verify chest1 contents after Ely claim"). Omit when declining, ignoring, or only chatting.'),
     decision: { type: 'string', enum: ['accept', 'decline', 'ignore', 'negotiate', 'delay'], description: 'Optional stance when the player asked you to do something.' },
     remember: STR('Only when the player told you something worth knowing later (where a thing is, whose it is, a plan, a date, what they like): that fact as one short sentence naming the player, e.g. "Steve keeps his diamonds in the chest on the second floor". Otherwise omit.')
@@ -270,6 +272,31 @@ function createChatTools () { return toOpenAi(CHAT_TOOLS) }
  * Map tool args -> the harness's internal action shape. Arguments keep their
  * own names; the single-letter fields are legacy aliases for older call sites.
  */
+/**
+ * Map a value onto a declared enum member: exact, then case-insensitive, then a
+ * unique prefix / underscore-insensitive match. `"self"` -> `self_generated`,
+ * `"Add"` -> `add`. Returns undefined when nothing plausible matches, so the
+ * handler still gets to explain what it wanted.
+ */
+function coerceEnum (value, options, { prefix = true } = {}) {
+  if (typeof value !== 'string') return undefined
+  if (options.includes(value)) return value
+  const norm = (v) => v.toLowerCase().replace(/[\s-]+/g, '_')
+  const n = norm(value)
+  const ci = options.find((o) => norm(o) === n)
+  if (ci) return ci
+  // Prefix matching is for free-text-ish value sets (an operation, an origin).
+  // It must NOT apply to a closed verb list: `do: "attack"` on the chat lane
+  // prefix-matches nothing, but a typo like `do: "fol"` must still not become
+  // an action the chat lane was never allowed to start.
+  if (!prefix) return undefined
+  const pref = options.filter((o) => norm(o).startsWith(n))
+  if (pref.length === 1) return pref[0]
+  const suf = options.filter((o) => norm(o).endsWith('_' + n))
+  if (suf.length === 1) return suf[0]
+  return undefined
+}
+
 const ARG_LEGACY = {
   say: (a) => ({ ...a, t: a.text }),
   craft: (a) => ({ ...a, i: a.item }),
@@ -299,7 +326,22 @@ function parseToolCall (call, known) {
       if (spec.type === 'array' && (!Array.isArray(value) || (spec.minItems != null && value.length < spec.minItems) || (spec.maxItems != null && value.length > spec.maxItems))) return { error: 'args', name }
       if (spec.type === 'array' && spec.items?.type === 'string' && value.some((v) => typeof v !== 'string')) return { error: 'args', name }
       if (spec.type === 'object' && (!value || typeof value !== 'object' || Array.isArray(value))) return { error: 'args', name }
-      if (spec.enum && !spec.enum.includes(value)) return { error: 'args', name }
+      if (spec.enum) {
+        // `strict: true` marks a closed verb list (the chat lane's `do`): an
+        // out-of-enum value there must fail the call, never be approximated.
+        if (spec.strict) {
+          if (!spec.enum.includes(value)) return { error: 'args', name }
+          continue
+        }
+        const fixed = coerceEnum(value, spec.enum)
+        if (fixed !== undefined) { args[key] = fixed; continue }
+      }
+      // An out-of-enum value is deliberately NOT rejected here. Every handler
+      // that takes an enum already validates it and says what it wanted
+      // ("operation must be one of analyze|diagnose|…"); throwing away the
+      // whole call first meant the model got "arguments failed schema
+      // validation" with no hint, and lost the description/id/priority it had
+      // also sent. The value is passed through and the handler explains.
     }
     return { name, args }
   } catch (err) {

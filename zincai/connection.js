@@ -203,10 +203,22 @@ class ConnectionManager extends EventEmitter {
     return this.join({ reason, manual: true })
   }
 
-  /** Drop and rebuild the link without touching the Node.js process. */
+  /**
+   * Drop and rebuild the link without touching the Node.js process.
+   *
+   * Also the recovery path for a manager parked in RECONNECTING with no timer:
+   * that state used to refuse every join with "an attempt is already in flight"
+   * even though nothing was in flight, so nothing could ever retry it. A restart
+   * clears the state first — that is what "restart" means.
+   */
   restart ({ reason = 'restart-connection' } = {}) {
     this.detached = false
     this._cancelRetry()
+    // A pending retry that was cancelled leaves the state machine parked in
+    // RECONNECTING. There is no attempt in flight, so do not claim there is one.
+    if (this.state === STATES.RECONNECTING && this.retryTimer === null) {
+      this._transition(STATES.DISCONNECTED, `${reason}: clearing a parked retry`)
+    }
     if (this.session) {
       this._transition(STATES.DISCONNECTING, reason)
       const session = this.session
@@ -217,7 +229,7 @@ class ConnectionManager extends EventEmitter {
       this._transition(STATES.DISCONNECTED, reason)
     }
     this.attempts = 0
-    return this.join({ reason })
+    return this.join({ reason, manual: true })
   }
 
   // ------------------------------------------------------------- failures --

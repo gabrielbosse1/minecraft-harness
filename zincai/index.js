@@ -281,6 +281,11 @@ function main () {
     try {
       const rc = new (require('./runtime_config').RuntimeConfig)({ file: path.join(DATA_DIR, 'runtime-config.json') })
       logger.info(TAG, `control: console=${rc.get('control.allowConsole') ? 'stdin' : 'off'} (no chat commands; no prefix) joinOnStart=${rc.get('connection.joinOnStart') ? 'yes' : 'no'}`)
+      // The two numbers that decide whether a quiet moment is a kick: the
+      // keepalive deadline our client enforces, and whether anything is watching
+      // the link. Both are now operator-facing, so print them at preflight.
+      logger.info(TAG, `supervision: keepalive deadline=${Math.round((Number(rc.get('connection.checkTimeoutMs')) || 30_000) / 1000)}s agentLoop=${rc.get('agent.enabled') ? `every ${Math.round((Number(rc.get('agent.intervalMs')) || 15_000) / 1000)}s, survivesKicks=${rc.get('agent.surviveKicks') ? 'yes' : 'no'}` : 'off'} (commands: link, watchdog)`)
+      logger.info(TAG, `update: branch=${rc.get('update.branch') || 'main'} allowDirty=${rc.get('update.allowDirty') ? 'yes' : 'no'} supervisor=${process.env.ZINC_SUPERVISED ? 'yes' : 'no — update spawns its own restart child'}`)
     } catch (err) { logger.warn(TAG, `control: could not read the runtime config: ${err?.message || err}`) }
     for (const e of errors) logger.error(TAG, e)
     process.exitCode = errors.length ? 1 : 0
@@ -342,6 +347,21 @@ function main () {
   // even stop/resume work while the link is still CONNECTING.
   host.attachStdin()
   logger.info(TAG, 'control: console commands ready (no prefix: pause, shutdown, status). In-game chat is a conversation, never a command channel.')
+
+  // The watchdog starts measuring before the first join, so a stall during
+  // startup is in the record when the first kick arrives. The agent loop can
+  // then tell "the server dropped us" from "this process could not keep up".
+  host.startSupervision()
+  if (host.watchdog) {
+    logger.info(TAG, `link watchdog: keepalive deadline ${Math.round(host.watchdog.checkTimeoutMs() / 1000)}s (connection.checkTimeoutMs), stall sampling every ${host.watchdog.sampleMs}ms`)
+  }
+  // A fresh link is a fresh measurement: stale counters from the previous
+  // connection would make the next drop impossible to attribute.
+  host.connection.on('state', (entry) => {
+    if (entry.to === 'CONNECTING' && host.watchdog) host.watchdog.reset()
+    host._lastTickAt = Date.now()
+  })
+
   host.boot()
 }
 
@@ -473,7 +493,13 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     username: cfg.server.username, // always ZincAI — enforced in loadConfig()
     version: cfg.server.version || false,
     auth: cfg.server.auth,
-    checkTimeoutInterval: 30_000
+    // THE keepalive deadline, not an arbitrary number. minecraft-protocol arms a
+    // wall-clock timer on every keep_alive and ends the connection itself if the
+    // next one does not arrive in time (src/client/keepalive.js). 30s is both the
+    // library default and vanilla's own kick threshold; a slow node, a paused VM
+    // or a server whose tick is stalling needs a wider window, and now the
+    // operator can widen it from the console (`config set connection.checkTimeoutMs`).
+    checkTimeoutInterval: Number(config.get('connection.checkTimeoutMs')) || 30_000
   })
   // Runtime vanilla invariant: no slash-command can ever leave this process.
   const guard = installVanillaGuard(bot, { logger })
@@ -3603,10 +3629,33 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     if (ended) return
     let text = ''
     try { text = detail && detail.message ? detail.message : reasonToText(detail) } catch { text = String(detail ?? '') }
+    const capped = String(text || '').slice(0, 200)
+    // Diagnose BEFORE tearing down, so the evidence (stall, silence, counters)
+    // still describes the link that just died. `over()` can be called for a kick,
+    // a clean end or a socket error, and those are three different problems.
+    try {
+      const w = owner?.watchdog
+      if (w) {
+        const record = w.noteEnd({ kind, text: capped })
+        logger.warn(TAG, `link ended (${kind}): ${record.cause} — ${record.why}`)
+        if (record.maxStallMs >= 250) logger.warn(TAG, `  the event loop was blocked for ${record.maxStallMs}ms — that alone can look like a timeout`)
+      }
+    } catch (err) { logger.debug(TAG, `watchdog end record failed: ${err?.message || err}`) }
     dispose(false)
     try { bot.removeAllListeners('end'); bot.end?.() } catch { /* already gone */ }
-    onEnded?.({ kind, text: String(text || '').slice(0, 200), spawned })
+    onEnded?.({ kind, text: capped, spawned })
   }
+
+  // Keepalive accounting: the watchdog needs to know the link is alive even when
+  // nothing else is happening, and how long the gap between two packets was when
+  // it is not. `keep_alive` is the protocol's own liveness signal — the packet
+  // minecraft-protocol answers, and the one whose absence ends the connection.
+  onBot('keep_alive', (packet) => {
+    const w = owner?.watchdog
+    if (!w) return
+    w.noteRecv()
+    w.noteSent() // our reply leaves immediately below; the library writes it
+  })
 
   onBot('kicked', (reason) => over('kicked', reason))
   onBot('end', (reason) => over('end', reason))

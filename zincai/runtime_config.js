@@ -403,6 +403,112 @@ const SCHEMA = Object.freeze([
     default: true,
     apply: 'immediate',
     describe: 'write every console command to the log'
+  },
+
+  // ------------------------------------------------------------ connection --
+  // The keepalive deadline. minecraft-protocol arms a wall-clock timer on every
+  // keep_alive (src/client/keepalive.js) and ends the connection itself if the
+  // next one does not arrive in time — so this number, not the server's, is what
+  // decides whether a quiet moment becomes a "timeout". 30s is the library
+  // default and the vanilla server's own kick threshold; a slow or suspended
+  // node/host needs more.
+  {
+    name: 'connection.checkTimeoutMs',
+    group: 'connection',
+    type: 'integer',
+    default: 30_000,
+    min: 5_000,
+    max: 120_000,
+    apply: 'immediate',
+    describe: 'how long our client waits for the next keep_alive before ending the link itself (minecraft-protocol checkTimeoutInterval). Raise it on a slow node or a paused VM. Stored at once; a socket already open keeps the deadline it was created with until the next join'
+  },
+
+  // ---------------------------------------------------------------- agent --
+  // The always-running loop that keeps the agent alive. It is a supervisor: it
+  // only ever performs actions the operator could type.
+  {
+    name: 'agent.enabled',
+    group: 'agent',
+    type: 'boolean',
+    default: true,
+    apply: 'immediate',
+    describe: 'run the agent loop: notice a dead link, a crash loop or a stalling process and act on it'
+  },
+  {
+    name: 'agent.intervalMs',
+    group: 'agent',
+    type: 'integer',
+    default: 15_000,
+    min: 1_000,
+    max: 300_000,
+    apply: 'immediate',
+    describe: 'how often the agent loop looks at the link'
+  },
+  {
+    name: 'agent.surviveKicks',
+    group: 'agent',
+    type: 'boolean',
+    default: true,
+    apply: 'immediate',
+    describe: 'let the agent loop re-arm a dead link by itself. Off leaves every reconnect to connection.autoReconnect and the operator'
+  },
+  {
+    name: 'agent.forceRestartAfterMs',
+    group: 'agent',
+    type: 'integer',
+    default: 180_000,
+    min: 10_000,
+    max: 3_600_000,
+    apply: 'immediate',
+    describe: 'link down this long → force a fresh connection instead of waiting out the back-off'
+  },
+  {
+    name: 'agent.crashLoopDrops',
+    group: 'agent',
+    type: 'integer',
+    default: 6,
+    min: 2,
+    max: 100,
+    apply: 'immediate',
+    describe: 'this many drops inside agent.crashLoopWindowMs means a crash loop: stop reconnecting and say so'
+  },
+  {
+    name: 'agent.crashLoopWindowMs',
+    group: 'agent',
+    type: 'integer',
+    default: 300_000,
+    min: 30_000,
+    max: 3_600_000,
+    apply: 'immediate',
+    describe: 'window for counting drops toward a crash loop'
+  },
+  {
+    name: 'agent.stallStormMs',
+    group: 'agent',
+    type: 'integer',
+    default: 1_000,
+    min: 100,
+    max: 60_000,
+    apply: 'immediate',
+    describe: 'an event-loop stall at least this long is worth reporting: it is long enough to miss a keepalive'
+  },
+
+  // --------------------------------------------------------------- update --
+  {
+    name: 'update.branch',
+    group: 'update',
+    type: 'string',
+    default: 'main',
+    apply: 'immediate',
+    describe: 'branch `update` fetches and checks out'
+  },
+  {
+    name: 'update.allowDirty',
+    group: 'update',
+    type: 'boolean',
+    default: false,
+    apply: 'immediate',
+    describe: 'allow `update` to reset a working tree with local changes. Off means local edits always win over an update'
   }
 ])
 

@@ -85,6 +85,24 @@ const COMMANDS = Object.freeze([
     detail: 'One generic, validated, persistent store. `config` lists everything with defaults; `config show <group>` narrows it; `config set` prints the old and the new value.'
   },
   {
+    name: 'update',
+    args: '[--now]',
+    summary: 'stop the bot, pull the code from GitHub, start it again',
+    detail: 'Saves state, pauses the body, then exits with code 75 after a `git fetch` proves the remote is reachable. The supervisor (scripts/update.js, or the child this command spawns when there is none) checks the branch out and starts the process again, so the NEW code runs — a pull inside a live process would only reload the old modules. Refuses when the tree is dirty, git is missing, or the checkout is not a git repository; nothing is ever discarded.'
+  },
+  {
+    name: 'link',
+    args: '[explain]',
+    summary: 'why the last disconnect happened, and what to do about it',
+    detail: 'The watchdog\'s evidence, not a guess: keepalives sent/received, how long the server had been silent, the worst event-loop stall, the deadline in force, and the classified cause (server silent, our own keepalive deadline, socket error, or a genuine kick). `link explain` reprints the last one.'
+  },
+  {
+    name: 'watchdog',
+    args: '[on|off]',
+    summary: 'the link watchdog and the agent loop: counters, stalls, drop history',
+    detail: 'Every drop with its cause, the loop stalls that could have caused one, and what the agent loop has done on its own (revived a dead link, forced a restart, stopped for a crash loop). `watchdog off` stops the supervisor from acting; the measurements keep running.'
+  },
+  {
     name: 'shutdown',
     args: '[exit-code]',
     summary: 'stop the whole process now: body, model, everything',

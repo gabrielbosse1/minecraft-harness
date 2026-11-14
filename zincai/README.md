@@ -349,7 +349,37 @@ command, for anyone.
 | `jobs` | background jobs, their resources and cancellation state |
 | `cancel <goal-id>` | cancel exactly one goal and the jobs that belong to it |
 | `config` | `config show [group\|name]`, `config set <name> <value>`, `config reset <name>` |
+| `update` | stop, pull the code from GitHub, start again. Exits **75** (restart me) after proving the remote is reachable; `scripts/update.js` — or the panel — does the checkout. Refuses on a dirty tree |
+| `link [explain]` | the watchdog's evidence for the last disconnect: keepalives sent/received, how long the server was silent, the worst event-loop stall, the deadline in force, and the classified cause |
+| `watchdog [on\|off]` | the agent loop's counters, stall history and every action it took on its own |
 | `help` | the list above |
+
+### The agent loop and the link watchdog
+
+`agent_loop.js` is a supervisor, not a planner: it never decides what the agent
+wants, only that the agent is still *able* to want it. It only performs actions
+the operator could type, never reconnects a paused body, and stops entirely on a
+crash loop.
+
+`watchdog.js` measures the two things that explain a "timeout":
+`minecraft-protocol` arms a wall-clock timer on every `keep_alive`
+(`checkTimeoutInterval`) and ends the connection itself if the next one does not
+arrive. Identical timeout text therefore means either *the server went quiet* or
+*this process was blocked past the deadline* — and the worst event-loop stall
+separates them.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `connection.checkTimeoutMs` | `30000` | the keepalive deadline our client enforces; raise it on a slow node or a paused VM |
+| `agent.enabled` | `true` | run the loop |
+| `agent.intervalMs` | `15000` | how often it looks |
+| `agent.surviveKicks` | `true` | let it re-arm a dead link by itself |
+| `agent.forceRestartAfterMs` | `180000` | down this long → force a fresh connection |
+| `agent.crashLoopDrops` | `6` | drops inside the window that mean "stop reconnecting" |
+| `agent.crashLoopWindowMs` | `300000` | the window |
+| `agent.stallStormMs` | `1000` | a stall at least this long is worth reporting |
+| `update.branch` | `main` | what `update` checks out |
+| `update.allowDirty` | `false` | allow `update` to reset a tree with local changes |
 
 `pause` and `leave` are different on purpose: a paused bot is still standing in
 the world and can still talk; a bot that has left is not in the world at all.

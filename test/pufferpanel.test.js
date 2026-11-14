@@ -55,14 +55,24 @@ test('template: conditions only use CEL-safe syntax and known variables', () => 
   }
 })
 
-test('template: the run command is plain node on every environment', () => {
+test('template: the run command starts the supervisor, on every environment', () => {
   const cmds = template.run.command
   assert.ok(Array.isArray(cmds))
-  assert.deepEqual(cmds, [{ command: 'node ${entrypoint}' }],
-    'node is node: no per-environment binary aliases, no branches to drift apart')
-  // The pre-flight uses the same binary the real run does.
+  // The panel starts ONE process, so that process has to outlive an `update`.
+  // Starting the bot directly would mean an update typed in the panel console
+  // exits the server and nothing pulls or restarts it.
+  assert.deepEqual(cmds, [{ command: 'node scripts/update.js ${entrypoint}' }],
+    'the supervisor runs the bot, so exit 75 can be turned into a pull + restart')
+  // The pre-flight runs the bot itself, not the supervisor: it must fail the
+  // install/start fast, not enter a supervision loop.
   const pre = template.run.pre.flatMap((op) => op.commands || [])
   assert.deepEqual(pre, ['node ${entrypoint} --dry-run'])
+})
+
+test('template: the supervisor is told it is supervised', () => {
+  // Without this the bot thinks it is unsupervised and spawns its own restart
+  // child inside a process the panel already controls.
+  assert.equal(template.run.environmentVars.ZINC_SUPERVISED, '1')
 })
 
 test('template: stop is a signal code, and the bot handles SIGINT/SIGTERM', () => {

@@ -435,6 +435,9 @@ goals / jobs                what is running, what is waiting
 cancel g7                   cancel one goal and its jobs
 config show boundary        every boundary limit, with defaults
 config set boundary.radius 48
+update                      stop, pull from GitHub, start again (exit 75)
+link                        why the last disconnect happened
+watchdog                    what the supervisor did on its own
 pause                       # emergency handbrake: stop the body, delete nothing
 shutdown 0                  # emergency stop: save state and exit the process
 help

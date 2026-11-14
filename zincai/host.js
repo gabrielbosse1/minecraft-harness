@@ -37,12 +37,16 @@
 'use strict'
 
 const { EventEmitter } = require('events')
+const path = require('path')
 const { PhysicalBoundary } = require('./boundary')
 const { ConnectionManager, STATES } = require('./connection')
 const { DeathRecovery, respawnSummary } = require('./death_recovery')
 const { RuntimeConfig } = require('./runtime_config')
 const { STATUS } = require('./goals')
 const { COMMANDS } = require('./control_commands')
+const { LinkWatchdog } = require('./watchdog')
+const { AgentLoop } = require('./agent_loop')
+const updater = require('./updater')
 
 /**
  * Split one console line into a command and its arguments. There is no prefix.
@@ -165,6 +169,33 @@ class Host extends EventEmitter {
       this.emit('connection', entry)
       if (entry.to === STATES.DISCONNECTED) this.needsReconcile = true
     })
+
+    // The link watchdog measures the two things that explain a "timeout": how
+    // long the server has been silent, and how long THIS process blocked the
+    // event loop. Both are needed, because minecraft-protocol arms a wall-clock
+    // keepalive deadline that a stalled loop cannot honour.
+    this.watchdog = new LinkWatchdog({
+      config: this.config,
+      logger: (level, msg) => this.log(level, msg),
+      now
+    })
+
+    // The agent loop is the supervisor that turns those measurements into one
+    // safe action. It only ever does what the operator could have typed.
+    this.agentLoop = new AgentLoop({
+      config: this.config,
+      connection: this.connection,
+      watchdog: this.watchdog,
+      logger: (level, msg) => this.log(level, msg),
+      now,
+      isProcessHealthy: () => this._heartbeatHealthy(),
+      onCrashLoop: (info) => {
+        this.log('error', `agent loop: crash loop detected (${info.drops} drops) — staying down until the cause is fixed`)
+      }
+    })
+
+    /** Advanced once per agent-loop tick: lets the watchdog tell "blocked" from "idle". */
+    this._lastTickAt = now()
 
     /** Command history for `status`/audit: { at, by, name, ok }. */
     this.commandLog = []
@@ -501,6 +532,33 @@ class Host extends EventEmitter {
   }
 
   /** Run one already-authorised command. */
+  /**
+   * Is the process itself responsive? The agent loop uses this to avoid blaming
+   * the network for a blocked event loop: a tick that should have run
+   * agent.intervalMs ago and did not means the loop is wedged, and touching the
+   * link from inside a wedged loop makes it worse.
+   */
+  _heartbeatHealthy () {
+    const budget = Math.max(5_000, this.agentLoop ? this.agentLoop.intervalMs() * 4 : 60_000)
+    return this.now() - this._lastTickAt <= budget
+  }
+
+  /** Start the link watchdog and the agent loop (idempotent). */
+  startSupervision () {
+    let started = false
+    try { started = this.watchdog.start() || started } catch (err) { this.log('warn', `watchdog did not start: ${err?.message || err}`) }
+    if (this.config.get('agent.enabled') !== false) {
+      try { started = this.agentLoop.start() || started } catch (err) { this.log('warn', `agent loop did not start: ${err?.message || err}`) }
+    }
+    return started
+  }
+
+  /** Stop both. The measurements stop; nothing on disk is touched. */
+  stopSupervision () {
+    try { this.watchdog.stop() } catch { /* noop */ }
+    try { this.agentLoop.stop() } catch { /* noop */ }
+  }
+
   async dispatch (name, args = [], who = { source: 'internal' }) {
     switch (name) {
       case 'status': return this.commandStatus()
@@ -531,6 +589,13 @@ class Host extends EventEmitter {
       case 'jobs': return this.commandJobs()
       case 'cancel': return this.commandCancel(args[0])
       case 'config': return this.commandConfig(args)
+      // `update`: stop, pull, restart. The pull itself cannot happen in this
+      // process (the modules are already loaded), so this exits with a distinct
+      // code and the supervisor — or a detached child — does the checkout and
+      // starts the new code.
+      case 'update': return this.commandUpdate(args)
+      case 'link': return this.commandLink(args)
+      case 'watchdog': return this.commandWatchdog(args)
       // The emergency stop: not a policy change, the end of the process. State
       // is saved by the session's shutdown() before the exit, so a later start
       // resumes from disk; `pause` is the reversible version.
@@ -549,6 +614,91 @@ class Host extends EventEmitter {
       case 'help': return { ok: true, reply: helpText(this) }
       default: return { ok: false, reply: `unknown command "${name}" — try: help` }
     }
+  }
+
+  // --------------------------------------------------------------- update --
+
+  /**
+   * `update`: stop the body, pull, restart on the new code.
+   *
+   * Order matters. The body is paused and the state saved BEFORE git runs, so a
+   * failure to fetch leaves a paused, consistent bot rather than a half-stopped
+   * one — and the refusal cases (dirty tree, no git) are decided before anything
+   * is touched at all.
+   */
+  async commandUpdate (args = []) {
+    // The repository root is this file's parent: zincai/host.js → <repo>.
+    const cwd = this.rootDir || path.join(__dirname, '..')
+    // A supervisor (scripts/update.js, or the panel) restarts us after the exit.
+    // Without one, updater spawns a detached child to do the checkout instead.
+    const hasSupervisor = Boolean(process.env.ZINC_SUPERVISED)
+    // 1. Stop cleanly first: no writes racing the checkout, no goal mid-action.
+    try { this.stop({ reason: 'update', by: 'update' }) } catch { /* best effort */ }
+    try { this.config.save() } catch { /* best effort */ }
+
+    const result = await updater.performUpdate({
+      cwd,
+      config: this.config,
+      logger: (level, msg) => this.log(level, msg),
+      supervisor: hasSupervisor,
+      spawn: hasSupervisor ? null : undefined
+    })
+    if (!result.ok) {
+      // Nothing was pulled and the process is still here. Say why, and leave the
+      // body paused: an operator who asked for an update does not want it acting
+      // on stale code while they read the error.
+      this.log('error', result.reply)
+      return { ok: false, reply: result.reply, data: { steps: result.steps || [] } }
+    }
+    return { ok: true, reply: result.reply, data: { steps: result.steps || [] } }
+  }
+
+  // ----------------------------------------------------------------- link --
+
+  /** `link [explain]`: the watchdog's evidence for the last disconnect. */
+  commandLink (args = []) {
+    const w = this.watchdog
+    const snap = w.snapshot()
+    const wantExplain = String(args[0] || '').toLowerCase() === 'explain'
+    const lines = []
+    lines.push(`link: ${this.connection.state}${snap.silentForMs !== null ? `, last packet ${Math.round(snap.silentForMs / 1000)}s ago` : ''}`)
+    lines.push(`  keepalives: ${snap.sent} sent, ${snap.recv} received`)
+    lines.push(`  deadline: ${Math.round(snap.checkTimeoutMs / 1000)}s (connection.checkTimeoutMs) — the client ends the link itself if a keep_alive does not arrive in that window`)
+    lines.push(`  worst event-loop stall: ${snap.maxStallMs}ms${snap.maxStallMs >= 250 ? ' ← long enough to miss a keepalive' : ''}`)
+    if (wantExplain || this.connection.state !== STATES.CONNECTED) lines.push(w.explain())
+    lines.push('  recent drops:')
+    if (!snap.ends.length) lines.push('    none since this link started')
+    for (const e of snap.ends) {
+      lines.push(`    ${new Date(e.at).toISOString()}  ${e.cause}  (${e.kind}${e.text ? `: ${e.text.slice(0, 60)}` : ''})`)
+    }
+    return { ok: true, reply: lines.join('\n'), data: snap }
+  }
+
+  // ------------------------------------------------------------- watchdog --
+
+  /** `watchdog [on|off]`: the supervisor's counters and what it has done. */
+  commandWatchdog (args = []) {
+    const verb = String(args[0] || '').toLowerCase()
+    if (verb === 'on' || verb === 'off') {
+      const value = verb === 'on'
+      const verdict = this.config.set ? this.config.set('agent.surviveKicks', value) : null
+      if (verdict && verdict.ok === false) return { ok: false, reply: `could not change agent.surviveKicks: ${verdict.why || 'rejected'}` }
+      if (value && !this.agentLoop.running && this.config.get('agent.enabled') !== false) this.agentLoop.start()
+      return { ok: true, reply: `agent loop survival is now ${value ? 'on' : 'off'}${value ? '' : ' — the link will only be re-armed by connection.autoReconnect and by you'}` }
+    }
+    const a = this.agentLoop.snapshot()
+    const w = this.watchdog.snapshot()
+    const lines = [
+      `agent loop: ${a.running ? 'running' : 'stopped'}, every ${Math.round(a.intervalMs / 1000)}s, survival ${a.enabled ? 'on' : 'off'}`,
+      `  ${this.agentLoop.summary()}`,
+      `  worst stall: ${w.maxStallMs}ms across ${w.stalls.length} recorded stall(s)`,
+      'recent actions:'
+    ]
+    if (!a.actions.length) lines.push('    none — nothing has needed fixing')
+    for (const act of a.actions) {
+      lines.push(`    ${new Date(act.at).toISOString()}  ${act.what}${act.detail ? ` (${act.detail})` : ''}`)
+    }
+    return { ok: true, reply: lines.join('\n'), data: { agent: a, watchdog: w } }
   }
 
   describeServer () {
@@ -592,7 +742,17 @@ class Host extends EventEmitter {
       boundary,
       death: this.death.snapshot(),
       pendingConfig: this.config.pendingChanges().map((p) => p.name),
-      commands: this.commandLog.length
+      commands: this.commandLog.length,
+      // The two answers to "why does it keep getting kicked": what the link has
+      // been doing, and whether this process is capable of keeping up with it.
+      link: {
+        lastCause: this.watchdog.ends.length ? this.watchdog.ends[this.watchdog.ends.length - 1].cause : null,
+        silentForMs: this.watchdog.snapshot().silentForMs,
+        checkTimeoutMs: this.watchdog.checkTimeoutMs(),
+        maxStallMs: this.watchdog.snapshot().maxStallMs,
+        drops: this.watchdog.ends.length
+      },
+      agent: this.agentLoop.snapshot()
     }
   }
 

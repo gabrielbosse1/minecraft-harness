@@ -125,7 +125,9 @@ No restart is needed to stop, pause or reconfigure the bot.
 **The console is the only control surface, and there is no prefix.** Type the
 command alone — `status`, `pause`, `stop`, `resume`, `leave`, `join`,
 `restart-connection`, `goals`, `jobs`, `cancel <goal-id>`,
-`config show boundary`, `config set boundary.radius 48`, `help` — and the two
+`config show boundary`, `config set boundary.radius 48`, `help` — plus
+`update` (stop, pull from GitHub, start again), `link` (why the last disconnect
+happened) and `watchdog` (the supervisor's own counters) — and the two
 emergency ones: `pause` (stop the body, keep everything) and `shutdown`
 (save state, leave the server, exit the process).
 
@@ -133,6 +135,73 @@ Nothing typed in **game chat** is a command, for anyone: not with a `!prefix`,
 not from a server operator, not from the account's creator. Chat is conversation
 and reaches the model like any other line. There is no UUID allow-list and no
 command prefix to configure, because there is nothing in chat to authorise.
+
+### Updating in place
+
+`update` stops the bot, pulls the code, and starts it again — from the console,
+without touching the panel:
+
+```
+update
+```
+
+It cannot do the pull in the process it is about to replace: Node.js has already
+loaded every module, so "pull then restart" in one process would run the **old**
+code and call it success. `update` therefore pauses the body, saves state, proves
+the remote is reachable with a `git fetch`, and exits with code **75** — the one
+code that means "start me again". `scripts/update.js` (or the panel) does the
+`git checkout`/`reset --hard` and starts the new process. Run
+`npm run start:supervised` to use it outside the panel.
+
+It refuses rather than risks your work: a dirty working tree, a missing `git` or
+a checkout that is not a git repository stops the update before anything is
+touched. `config set update.allowDirty true` is the only way to override that.
+
+### Why it keeps getting kicked
+
+`link` prints the evidence for the last disconnect, and the four causes it
+separates look identical in the console otherwise:
+
+```
+link
+cause: server-silent (best inference)
+  our keepalive deadline (30s) expired with the loop healthy, so the server
+  stopped sending keep_alive (or the packets stopped arriving)
+  last packet from the server: 31s before the drop
+  keepalives this link: 12 sent, 12 received
+  worst loop stall: 40ms (healthy)
+  deadline in force: 30s (connection.checkTimeoutMs)
+what to do: raise connection.checkTimeoutMs, or fix the server/network ...
+```
+
+The distinction that matters: minecraft-protocol arms a **wall-clock** timer on
+every `keep_alive` and ends the connection itself if the next one does not
+arrive (`checkTimeoutInterval`, default 30s — the same threshold vanilla kicks
+at). Identical timeout messages are therefore either *the server went quiet* or
+*this process was blocked past the deadline*, and the worst event-loop stall is
+what tells them apart. On a localhost server a network cause is implausible, so
+a stall is the first thing to look at.
+
+`connection.checkTimeoutMs` widens the deadline (`config set`), and the agent
+loop reports a stall long enough to matter instead of letting it surface as a
+mysterious kick.
+
+### The agent loop
+
+An always-running supervisor that keeps the agent able to work:
+
+| Situation | What it does |
+| --- | --- |
+| link down with no retry scheduled | re-arms it (`revive`) |
+| link down past `agent.forceRestartAfterMs` | forces a fresh connection rather than waiting out the back-off |
+| process wedged (heartbeat stopped) | reports it and **does not** touch the socket |
+| loop stalling repeatedly | one warning explaining that this will be seen as a keepalive timeout |
+| `agent.crashLoopDrops` drops in `agent.crashLoopWindowMs` | stops reconnecting and says so — hammering a server that rejects you hides the cause |
+
+It only ever performs actions you could type yourself (`join`,
+`restart-connection`, `pause`), it never reconnects a paused body, and
+`watchdog off` turns its survival behaviour off while keeping the measurements.
+`watchdog` prints what it has done.
 
 - `pause` (alias `stop`) stops the body and suspends — never deletes — open
   goals; `resume`
@@ -200,7 +269,7 @@ vendor/            vendored Minecraft 26.3 data, installed by `npm ci`
 ## Checks and tests
 
 ```sh
-npm test              # 341 tests: mock bots + a scripted local model
+npm test              # 396 tests: mock bots + a scripted local model
 npm run check         # syntax-check every module
 npm run dry-run       # resolve config, print it, no network
 npm run ping          # server reachability/version, no join, no model call

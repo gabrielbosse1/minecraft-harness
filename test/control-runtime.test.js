@@ -511,7 +511,7 @@ test('host: a chat-shaped command cannot pause the body', async () => {
 test('host: a console command needs no prefix; help lists the whole surface', async () => {
   const { host, dir } = hostFor()
   const help = await consoleCmd(host, 'help')
-  for (const name of ['status', 'pause', 'stop', 'shutdown', 'resume', 'leave', 'join', 'restart-connection', 'goals', 'jobs', 'cancel', 'config', 'help']) {
+  for (const name of ['status', 'pause', 'stop', 'shutdown', 'resume', 'leave', 'join', 'restart-connection', 'goals', 'jobs', 'cancel', 'config', 'update', 'link', 'watchdog', 'help']) {
     assert.match(help.reply, new RegExp(`\\b${name}\\b`))
   }
   assert.match(help.reply, /console only, no prefix/)
@@ -1014,4 +1014,108 @@ test('stale world: a snapshot token debounce prevents acting on the old head aft
     assert.equal(goals.get(g.id).status, 'suspended', 'a paused goal stays parked')
     assert.equal(s.internals().skills.current(), null)
   } finally { s.stop() }
+})
+
+// ============================================================== supervision ==
+
+test('host: `link` explains the last disconnect instead of guessing', async () => {
+  const { host, dir } = hostFor()
+  // Simulate the sequence a real timeout produces: keepalives flowing, then
+  // silence, then the client's own deadline expiring.
+  host.watchdog.noteRecv(); host.watchdog.noteSent()
+  const record = host.watchdog.noteEnd({ kind: 'end', text: 'client timed out after 30000 milliseconds' })
+  assert.equal(record.cause, 'server-silent', 'a healthy loop means the server went quiet')
+
+  const r = await consoleCmd(host, 'link')
+  assert.equal(r.ok, true)
+  assert.match(r.reply, /cause: server-silent/)
+  assert.match(r.reply, /keepalives: 1 sent, 1 received/)
+  assert.match(r.reply, /deadline: 30s/)
+  assert.match(r.reply, /what to do:/)
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('host: the same timeout is blamed on the loop when the loop was blocked', async () => {
+  const { host, dir } = hostFor()
+  // One line of evidence flips the diagnosis, which is the entire point.
+  host.watchdog.maxStallMs = 31_000
+  host.watchdog.noteRecv()
+  const record = host.watchdog.noteEnd({ kind: 'end', text: 'client timed out after 30000 milliseconds' })
+  assert.equal(record.cause, 'loop-stall')
+  const r = await consoleCmd(host, 'link explain')
+  assert.match(r.reply, /cause: loop-stall/)
+  assert.match(r.reply, /blocked for 31000ms|blocked the loop/)
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('host: `watchdog off` stops the supervisor without stopping the measurements', async () => {
+  const { host, dir } = hostFor()
+  const off = await consoleCmd(host, 'watchdog off')
+  assert.equal(off.ok, true)
+  assert.equal(host.config.get('agent.surviveKicks'), false)
+  assert.match(off.reply, /survival is now off/)
+  const on = await consoleCmd(host, 'watchdog on')
+  assert.equal(on.ok, true)
+  assert.equal(host.config.get('agent.surviveKicks'), true)
+
+  const shown = await consoleCmd(host, 'watchdog')
+  assert.match(shown.reply, /agent loop:/)
+  assert.match(shown.reply, /worst stall:/)
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('host: status reports the link evidence and the agent loop together', async () => {
+  const { host, dir } = hostFor()
+  host.watchdog.noteRecv()
+  host.watchdog.noteEnd({ kind: 'kicked', text: 'KeepAliveTimeout' })
+  const st = host.status()
+  assert.equal(st.link.lastCause, 'server-keepalive-timeout')
+  assert.equal(st.link.drops, 1)
+  assert.equal(st.link.checkTimeoutMs, 30_000)
+  assert.equal(typeof st.link.maxStallMs, 'number')
+  assert.ok(st.agent && typeof st.agent.ticks === 'number')
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('host: `update` reports the refusal and stays alive when the tree is dirty', async () => {
+  const { host, dir } = hostFor()
+  // The real repository is dirty while this branch is being written, so this is
+  // the honest integration case: the command must refuse and NOT exit.
+  const r = await consoleCmd(host, 'update')
+  // Either it refuses (dirty tree) or, in a clean checkout, it plans the update —
+  // but it must never claim success without a fetch.
+  assert.equal(typeof r.ok, 'boolean')
+  if (!r.ok) {
+    assert.match(r.reply, /update refused:/)
+    assert.match(r.reply, /local changes|not a git checkout|git is not installed/)
+  } else {
+    assert.match(r.reply, /updating: stopping now/)
+  }
+  // Crucially: the body was paused first in both cases.
+  assert.equal(host.paused, true, 'an update stops the body before it touches git')
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('host: supervision starts idempotently and stops cleanly', () => {
+  const { host, dir } = hostFor()
+  assert.equal(host.watchdog.running, false)
+  host.startSupervision()
+  assert.equal(host.watchdog.running, true)
+  assert.equal(host.agentLoop.running, true)
+  host.startSupervision()
+  assert.equal(host.watchdog.running, true, 'starting twice is not an error')
+  host.stopSupervision()
+  assert.equal(host.watchdog.running, false)
+  assert.equal(host.agentLoop.running, false)
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('host: supervision does not run when agent.enabled is off', async () => {
+  const { host, dir } = hostFor()
+  host.config.set('agent.enabled', false)
+  host.startSupervision()
+  assert.equal(host.agentLoop.running, false, 'the operator asked for no supervisor')
+  assert.equal(host.watchdog.running, true, 'but the measurements still run: they are what explains a kick')
+  host.stopSupervision()
+  fs.rmSync(dir, { recursive: true, force: true })
 })

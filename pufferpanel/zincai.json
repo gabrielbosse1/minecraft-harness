@@ -324,7 +324,7 @@
     ],
     "command": [
       {
-        "command": "node ${entrypoint}"
+        "command": "node scripts/update.js ${entrypoint}"
       }
     ],
     "stopCode": 2,
@@ -349,7 +349,8 @@
       "RECONNECT_MAX_ATTEMPTS": "${maxattempts}",
       "ZINC_JOIN_ON_START": "${joinonstart}",
       "ZINC_DATA_DIR": "${datadir}",
-      "LOG_LEVEL": "${log}"
+      "LOG_LEVEL": "${log}",
+      "ZINC_SUPERVISED": "1"
     },
     "autostart": true,
     "autorecover": false,

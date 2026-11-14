@@ -81,6 +81,7 @@ const TOOL_LANES = Object.freeze({
   note: LANES.INTERACTION,
   remember_here: LANES.INTERACTION,
   goal: LANES.INTERACTION,
+  dig_policy: LANES.INTERACTION,
   idle: LANES.INTERACTION
 })
 

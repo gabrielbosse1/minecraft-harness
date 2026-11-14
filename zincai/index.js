@@ -36,12 +36,23 @@
  *   node zincai/index.js             start the bot
  *   node zincai/index.js --dry-run   validate config + prompts, no network
  *   node zincai/index.js --check     require-check every module, no bot
+ *   node zincai/index.js --no-supervisor   one process; `update` then exits 75
+ *                                    for an outer supervisor to restart
  *
  * Config: zincai/defaults.json (+ env overrides: MC_HOST, MC_PORT, MC_VERSION,
  *   MC_AUTH, AMD_API_BASE_URL, AMD_MODEL, AMD_API_KEY/API_KEY, ZINC_DATA_DIR,
  *   LOG_LEVEL). AMD key resolution order: env -> defaults.json.
  */
 'use strict'
+
+// `node zincai/index.js` is two processes: a tiny parent that only restarts
+// the bot when it asks (the `update` / `restart` console commands), and the bot
+// itself. The parent returns here, before anything heavy is loaded. Tests and
+// `--check` / `--dry-run` never take this branch (see supervisor.js).
+if (require.main === module && require('./supervisor').shouldSupervise(process.argv, process.env)) {
+  require('./supervisor').supervise({ script: __filename })
+  return
+}
 
 const fs = require('fs')
 const path = require('path')
@@ -60,7 +71,8 @@ const DATA_DIR = settings.str('ZINC_DATA_DIR', path.join(ROOT, 'zincai-data'))
 const SYSTEM_PROMPT = fs.readFileSync(path.join(ZINC_DIR, 'system_prompt.txt'), 'utf8').trim()
 const CHAT_PROMPT = fs.readFileSync(path.join(ZINC_DIR, 'chat_prompt.txt'), 'utf8').trim()
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
-const { AmdToolsClient, createZincTools } = require('./api_wrapper')
+const { AmdToolsClient, createZincTools, toolTurnMessages, ACTION_TOOLS } = require('./api_wrapper')
+const { stamp: ircStamp, ago: ircAgo, formatLine: ircLine, LEGEND: IRC_LEGEND } = require('./irc')
 const { FailGate } = require('./failgate')
 const { ContinuityStore } = require('./continuity')
 const { LaneScheduler, JobRegistry, laneOf, LANES } = require('./lanes')
@@ -144,6 +156,8 @@ function loadConfig () {
   cfg.inference.rpm = settings.int('INFERENCE_RPM', cfg.inference.rpm, { min: 1, max: 600 })
   cfg.inference.minIntervalMs = settings.int('INFERENCE_MIN_INTERVAL_MS', cfg.inference.minIntervalMs, { min: 0 })
   cfg.inference.heartbeatMs = settings.int('INFERENCE_HEARTBEAT_MS', cfg.inference.heartbeatMs, { min: 0 })
+  cfg.inference.loopMs = settings.int('INFERENCE_LOOP_MS', cfg.inference.loopMs ?? 8000, { min: 0 })
+  cfg.inference.chatBatchMs = settings.int('INFERENCE_CHAT_BATCH_MS', cfg.inference.chatBatchMs ?? 6000, { min: 0 })
   cfg.reconnect.enabled = settings.bool('RECONNECT', cfg.reconnect.enabled ?? true)
   cfg.reconnect.maxAttempts = settings.int('RECONNECT_MAX_ATTEMPTS', cfg.reconnect.maxAttempts, { min: 1 })
 
@@ -222,6 +236,16 @@ function makeShared (cfg, { dataDir = DATA_DIR } = {}) {
     convo: new Map(),
     /** everything said in public recently, both sides */
     chatLog: [],
+    /** chat AND events as one timestamped IRC-style log (irc.js) — what the prompts show */
+    timeline: new (require('./irc').Timeline)({ max: cfg.inference?.timelineMax ?? 80 }),
+    /** the model's standing rule for what a walk may break (dig_policy.js); persisted */
+    digPolicy: new (require('./dig_policy').DigPolicy)({
+      file: path.join(dataDir, 'dig-policy.json'),
+      enabled: cfg.behavior?.digging?.enabled !== false,
+      mode: cfg.behavior?.digging?.mode || 'list',
+      allow: Array.isArray(cfg.behavior?.digging?.allow) ? cfg.behavior.digging.allow : null,
+      logger: (level, msg) => logger[level]?.(TAG, msg)
+    }),
     shuttingDown: false,
     everSpawned: false,
     attempts: 0,
@@ -259,7 +283,7 @@ function makeShared (cfg, { dataDir = DATA_DIR } = {}) {
  */
 function main () {
   if (process.argv.includes('--check')) {
-    for (const m of ['./api_wrapper', './memory', './perception', './filter', './builder', './continuity', './custom_mineflayer/pathfinder_wrapper', './custom_mineflayer/doors', './custom_mineflayer/escape', './system1', './tactics', './reflex_registry', './vanilla_guard', './control', './threats', './places', './skills', './observe', './brain', './events', './redstone_engine', './runtime_config', './boundary', './connection', './death_recovery', './host', './control_commands']) require(m)
+    for (const m of ['./api_wrapper', './memory', './perception', './filter', './builder', './continuity', './custom_mineflayer/pathfinder_wrapper', './custom_mineflayer/doors', './custom_mineflayer/escape', './system1', './tactics', './reflex_registry', './vanilla_guard', './control', './threats', './places', './skills', './observe', './brain', './events', './redstone_engine', './runtime_config', './boundary', './connection', './death_recovery', './host', './control_commands', './irc', './dig_policy', './updater', './supervisor', './lanes', './goals']) require(m)
     require('minecraft-data')('26.3') // postinstall patch must be in place
     logger.info(TAG, '--check OK — all modules load, 26.3 data present')
     return
@@ -273,6 +297,7 @@ function main () {
     logger.info(TAG, `amd: model=${cfg.amd.model} base=${cfg.amd.baseUrl} key=${cfg.amd.apiKey ? 'present' : 'MISSING'}`)
     logger.info(TAG, `data dir: ${DATA_DIR} (memories, places, goals, metrics, runtime-config)`)
     logger.info(TAG, `behaviour: elytra=${cfg.behavior.autoElytra ? 'yes' : 'no'} limits=${cfg.inference.rpm}/min`)
+    logger.info(TAG, `agent loop: ${cfg.inference.heartbeatMs > 0 && cfg.inference.loopMs > 0 ? `every ${cfg.inference.loopMs}ms, backing off to ${cfg.inference.heartbeatMs}ms while idle` : 'off (events only)'}; up to ${cfg.inference.maxStepsPerTurn ?? 6} model steps per turn; chat window ${cfg.inference.chatBatchMs}ms`)
     logger.info(TAG, `limits: rpm=${cfg.inference.rpm} minInterval=${cfg.inference.minIntervalMs}ms heartbeat=${cfg.inference.heartbeatMs}ms reconnect=${cfg.reconnect.enabled ? `${cfg.reconnect.maxAttempts} attempts` : 'off'}`)
     logger.info(TAG, `prompts: action ${SYSTEM_PROMPT.split(/\s+/).length} words, chat ${CHAT_PROMPT.split(/\s+/).length} words (static), ${ZINC_TOOLS.length} tools`)
     logger.info(TAG, 'policy: flee from real threats until the model decides; no PvP unless the model names a player; no friend list')
@@ -336,7 +361,15 @@ function main () {
   process.on('SIGINT', () => shutdown(0, 'SIGINT'))
   process.on('SIGTERM', () => shutdown(0, 'SIGTERM'))
   process.on('unhandledRejection', (err) => logger.error(TAG, `unhandled rejection: ${err?.message || err}`))
-  process.on('exit', (code) => { try { shared.memory.save() } catch { /* best effort */ }; if (code !== 0) logger.error(TAG, `exit code ${code}`) })
+  process.on('exit', (code) => {
+    try { shared.memory.save() } catch { /* best effort */ }
+    // 75 is not a failure: it is `update` / `restart` asking the supervisor for a fresh process.
+    if (code === require('./supervisor').RESTART_CODE) logger.info(TAG, 'exiting to restart on the source on disk')
+    else if (code !== 0) logger.error(TAG, `exit code ${code}`)
+  })
+  // `update` / `restart` leave through the same door as every other exit:
+  // save everything, leave the server, then exit with the restart code.
+  host.exitProcess = (code, reason) => shutdown(code, reason)
 
   // The control interface is up before the first join: status, config, help and
   // even stop/resume work while the link is still CONNECTING.
@@ -394,6 +427,10 @@ function createHost (shared, cfg, { dataDir = null } = {}) {
  */
 function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   const { cfg, memory, places, amd, parser } = shared
+  // One timestamped IRC-style log of chat and events (irc.js), and the model's
+  // standing dig policy. Both live on `shared` so they outlive a reconnect.
+  const timeline = shared.timeline || (shared.timeline = new (require('./irc').Timeline)())
+  const digPolicy = shared.digPolicy || (shared.digPolicy = new (require('./dig_policy').DigPolicy)({ file: null }))
   // The host is the process-level shell. When a session is started directly
   // (the test harness), a minimal one is created so the boundary, the control
   // interface and the pause flag behave exactly as in production.
@@ -505,7 +542,13 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     threat: { ...(cfg.threat || {}), entityFilter: (e) => sense.isThreat(e) },
     isUrgent: () => arbiter.owner() === 'survival' || arbiter.owner() === 'combat',
     enableWindCharge: cfg.traversal?.windCharge !== false,
-    windCharge: cfg.traversal || {}
+    windCharge: cfg.traversal || {},
+    // What an ordinary walk may break: the model's standing policy, under the
+    // operator's switch, and never inside somebody else's build.
+    digPolicy,
+    digAllowed: () => config.get('actions.allowDig') !== false && config.get('actions.allowMovement') !== false,
+    isProtected: (pos) => { try { return !continuity.propertyGuardAt(pos, dim(), {}).ok } catch { return false } },
+    policyDigCost: cfg.behavior?.digging?.cost
   })
 
   let spawned = false
@@ -570,7 +613,16 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   // their own in the prompt; they stay out of the five-line event window so
   // they cannot push a real event ("hit by player Steve") out of it.
   const OWN_SECTION = new Set(['chat', 'said', 'result', 'request', 'threat', 'safe', 'fled'])
-  const note = (evt, opts = {}) => { try { memory.addEvent(evt, { window: !OWN_SECTION.has(evt?.type), ...opts }) } catch { /* never let memory break the loop */ } }
+  // Event types that are already lines of the IRC log in their own right
+  // (chat as <nick>, the bot's own lines as <Zinc>), or too noisy to be worth one.
+  const TIMELINE_SKIP = new Set(['chat', 'said', 'request'])
+  const note = (evt, opts = {}) => {
+    try { memory.addEvent(evt, { window: !OWN_SECTION.has(evt?.type), ...opts }) } catch { /* never let memory break the loop */ }
+    try {
+      const text = evt?.msg || evt?.text
+      if (text && !TIMELINE_SKIP.has(evt.type)) timeline.event(evt.type && !['result', 'threat', 'safe', 'fled'].includes(evt.type) ? `${evt.type}: ${text}` : String(text))
+    } catch { /* the log is a view; never let it break the loop */ }
+  }
 
   // ------------------------------------------------- event perception ----
   // `perceive()` is the single funnel from a raw Mineflayer/internal event to
@@ -680,6 +732,8 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     shared.chatLog.push({ who, text, ts: Date.now() })
     if (shared.chatLog.length > 12) shared.chatLog.splice(0, shared.chatLog.length - 12)
   }
+  /** The bot's own nick in the IRC log. */
+  const selfNick = () => bot.username || cfg.server?.username || 'Zinc'
   /**
    * Communication permissions. These are permission checks, not instructions:
    * they do not tell Zinc what to say or whom to trust — they decide only
@@ -736,6 +790,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       }
       if (!to) bot.chat(text)
       logChat('me', whispered ? `(to ${to}) ${text}` : text)
+      timeline.said(text, { to: whispered ? to : null })
       if (to || about) pushConvo(to || about, 'me', text)
       note({ type: 'said', msg: `I said${whispered ? ` to ${to}` : ''}: ${text}` })
     } catch (err) { logger.debug(TAG, `chat failed: ${err.message || err}`) }
@@ -743,7 +798,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   }
 
   // ------------------------------------------------------ action results --
-  const INFORMATIONAL = new Set(['find', 'look_in', 'inspect_block', 'inspect_region', 'logic_test', 'redstone_scan', 'redstone_component', 'redstone_engineer', 'recall', 'circuit_project', 'goal', 'note', 'social', 'remember_here'])
+  const INFORMATIONAL = new Set(['find', 'look_in', 'inspect_block', 'inspect_region', 'logic_test', 'redstone_scan', 'redstone_component', 'redstone_engineer', 'recall', 'circuit_project', 'goal', 'note', 'social', 'remember_here', 'dig_policy'])
   // stop the model re-issuing a call the body keeps refusing.
   const failGate = new FailGate({
     windowMs: cfg.inference?.failWindowMs ?? 120_000,
@@ -751,6 +806,12 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   })
   /** The action whose turn is executing right now, for failure attribution. */
   let gateCtx = null
+  /**
+   * While a turn executes one of its tool calls, every result reported lands
+   * here too, so the turn can hand it straight back to the model as that call's
+   * output and continue (see act()).
+   */
+  let resultTap = null
   let currentActId = null
   /**
    * Lane-lease handoff.
@@ -844,7 +905,9 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       } catch { /* never let memory persistence break reporting */ }
     }
     const shouldWake = wake === null ? (!r.ok || INFORMATIONAL.has(label)) : wake
-    if (shouldWake) brain?.wake(`${label} ${r.ok ? 'done' : 'failed'}: ${msg}`, { external: false })
+    const wakeText = `${label} ${r.ok ? 'done' : 'failed'}: ${msg}`
+    if (resultTap) resultTap.push({ label, ok: Boolean(r.ok), msg, wakeText: shouldWake ? wakeText : null })
+    if (shouldWake) brain?.wake(wakeText, { external: false })
   }
 
   // ------------------------------------------------------------ trust ----
@@ -875,6 +938,8 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
    */
   const agenda = { main: null, shelved: [], asked: [] }
   let proposalSeq = 0
+  /** Timeline sequence number the chat lane has already been shown (everything after it is "new"). */
+  let chatSeenSeq = 0
   const MAIN_MAX_AGE_MS = 30 * 60_000
 
   // ------------------------------------------------ durable objectives ---
@@ -1761,7 +1826,12 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     const [head, ...rest] = tactics.describeSituation(picture, { route: routeNow() })
     const lines = [`threats: ${head}`, ...rest.map((l) => '  ' + l)]
     if (reflex) lines.push(`  reflex: ${reflex}`)
-    if (system1?.fleeing) lines.push('  decide: idle = keep fleeing | attack = fight | go_to / follow = go there instead | hold = stop running, they are harmless or accepted')
+    if (system1?.fleeing) {
+      const errand = system1.dodgingFor
+      lines.push(errand
+        ? `  decide: idle = let the body dodge and go back to "${errand}" by itself | attack = fight | hold = stop dodging, they are harmless or accepted | stop = give up "${errand}"`
+        : '  decide: idle = keep fleeing | attack = fight | go_to / follow = go there instead | hold = stop running, they are harmless or accepted')
+    }
     else if (combat?.isEngaged) lines.push('  you chose to fight.')
     else {
       const d = system1?.decisionLine()
@@ -1788,8 +1858,23 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     return notes
   }
 
-  function chatLines (max = 6) {
-    return shared.chatLog.slice(-max).map((l) => `  ${l.who === 'me' ? 'you' : l.who}: ${l.text}`).join('\n')
+  /**
+   * The recent log, IRC style: every line with its clock time, chat and events
+   * in the one order they happened. `kinds` narrows it (the action prompt has
+   * its own sections for results and threats, so it shows chat + world events).
+   */
+  function chatLines (max = 10, opts = {}) {
+    return timeline.format({ max, self: selfNick(), ...opts })
+  }
+  /** The header that tells the model how to read the log and what time it is. */
+  function logHeader (label = 'log') {
+    return `${label} (IRC style, oldest first; it is now ${ircStamp(Date.now())}; ${IRC_LEGEND}; you are <${selfNick()}>)`
+  }
+
+  /** What a walk may break right now — the model's own standing rule. */
+  function diggingLine () {
+    if (config.get('actions.allowDig') === false) return 'digging: OFF by the operator (actions.allowDig) — nothing can be broken'
+    return `digging: ${digPolicy.describe()}`
   }
 
   /**
@@ -1844,11 +1929,11 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     ].filter(Boolean).join(' ')
     const recalled = memory.recallBlock(autoQuery, cfg.memory.topK ?? 3)
     const prefs = memory.preferencesLine()
-    const chat = chatLines()
+    const chat = chatLines(16, { maxAgeMs: cfg.inference?.logMaxAgeMs ?? 15 * 60_000 })
     const res = results.slice(-4).map((r) => `  - ${r.label}: ${r.ok ? '' : 'FAILED — '}${r.msg}`).join('\n')
-    const events = memory.working.last(6)
-      .filter((e) => !OWN_SECTION.has(e.type))
-      .map((e) => `  - ${e.type}: ${e.text || e.msg || ''}${e.count > 1 ? ` (x${e.count})` : ''}`).join('\n')
+    // (World events used to be an untimed `events:` list here. They are lines
+    // of the IRC log now — `[14:02:07] * hurt: hit by player Steve` — in order
+    // with the chat they happened between.)
     // Timestamped perception window: what happened, when (occurrence vs
     // observation), where, to whom, and whether it was seen or only inferred.
     const perceived = pipeline.formatForPrompt({ max: 8, excludeTypes: OWN_SECTION })
@@ -1889,9 +1974,9 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       named ? `places: ${named}` : null,
       prefs || null,
       recalled || null,
-      chat ? `chat (recent):\n${chat}` : null,
+      diggingLine(),
+      chat ? `${logHeader('log')}:\n${chat}` : null,
       res ? `results (your last actions):\n${res}` : null,
-      events ? `events:\n${events}` : null,
       perceived.text ? `perceived (timestamped; [NEW] = not yet delivered, "(scanned_diff)" = you discovered it late, exact time unknown):\n${perceived.text}` : null,
       failGate.advisoryLine(pos) || null,
       boundaryLine(),
@@ -1934,11 +2019,8 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     if (pos) { try { places.scan(bot, { radius: cfg.places.scanRadius ?? 16 }) } catch { /* partial world */ } }
     const nearby = pos ? places.describeNearby(pos, { dim: dim() }) : ''
     const named = pos ? places.describeNamed(pos, { dim: dim() }) : ''
-    // Per-speaker history. `sender` is the newest speaker; the others in the
-    // chunk get no extra history — their lines are in the chunk itself.
-    const history = convoOf(sender).slice(0, -incoming.filter((l) => l.sender === sender || !l.sender).length || undefined).slice(-8)
-      .map((l) => `  ${l.who === 'me' ? 'you' : sender}: ${l.text}`).join('\n')
-    const latest = incoming.map((l) => `${l.whisper ? '(whisper from ' + l.sender + ') ' : (incoming.length > 1 ? `${l.sender}: ` : '')}${l.text}`).join(' / ')
+    const self = selfNick()
+    const latest = incoming.map((l) => l.text).join(' / ')
     const speakers = [...new Set(incoming.map((l) => l.sender).filter(Boolean))]
     const others = speakers.filter((n) => n !== sender)
     const recalled = memory.recallBlock(latest, cfg.memory.topK ?? 3)
@@ -1946,9 +2028,32 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     // What this player told the bot before, in the model's own words.
     const known = memory.factsAbout(sender, cfg.memory.factsPerPlayer ?? 6)
     const relLine = continuity.formatRelationship(sender)
-    const events = memory.working.last(4)
-      .filter((e) => !OWN_SECTION.has(e.type))
-      .map((e) => `${e.type}: ${e.text || e.msg || ''}`).join(' | ')
+
+    // THE LOG. One IRC-style window: what was already there (chat and events,
+    // each with its clock time), a marker, then everything that arrived since
+    // the last time this lane answered — the lines to react to, and whatever
+    // happened in the world between them.
+    const windowMax = cfg.inference?.chatLogLines ?? 16
+    const seenSeq = chatSeenSeq
+    const all = timeline.tail({ max: 400 })
+    const fresh = all.filter((e) => e.seq > seenSeq)
+    // A line that reached the brain without passing through the chat handler
+    // (a test, a replay) is still part of the window.
+    for (const l of incoming) {
+      const kind = l.whisper ? 'whisper' : 'chat'
+      if (!fresh.some((e) => e.kind === kind && e.who === l.sender && e.text === String(l.text).replace(/\s+/g, ' ').trim().slice(0, 240))) {
+        fresh.push({ seq: Infinity, ts: l.at ?? Date.now(), kind, who: l.sender, text: l.text })
+      }
+    }
+    fresh.sort((x, y) => x.ts - y.ts)
+    const older = all.filter((e) => e.seq <= seenSeq).slice(-Math.max(4, windowMax - Math.min(fresh.length, windowMax - 4)))
+    chatSeenSeq = timeline.seq
+    const fmt = (e) => `  ${ircLine(e, { self })}`
+    const newChat = fresh.filter((e) => e.kind === 'chat' || e.kind === 'whisper')
+    // Lines from before this process's log (a restart ago): what was said, how long ago.
+    const oldestShown = older.length ? older[0].ts : (fresh.length ? fresh[0].ts : Date.now())
+    const earlier = convoOf(sender).filter((l) => l.ts < oldestShown).slice(-4)
+      .map((l) => `  [${ircAgo(Date.now() - l.ts)} ago] <${l.who === 'me' ? self : sender}> ${l.text}`).join('\n')
     const lines = [
       coreIdentity(),
       observe.selfLine(bot),
@@ -1961,17 +2066,18 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       observe.playersLine(bot),
       nearby ? `nearby: ${nearby.split('\n').join(' | ')}` : null,
       named ? `places: ${named}` : null,
-      events ? `recent events: ${events}` : null,
       prefs || null,
       known.length ? `you know from ${sender}:\n${known.map((t) => `  - ${t}`).join('\n')}` : null,
       recalled || null,
-      history ? `conversation with ${sender} so far:\n${history}` : null,
-      incoming.length > 1
-        ? `the last few seconds of chat (${incoming.length} lines from ${speakers.join(', ')}; in arrival order, "you" is you):\n` +
-          incoming.map((l) => `  ${l.sender}: ${l.whisper ? '(whisper) ' : ''}${l.text}`).join('\n')
-        : `${sender} says: ${latest}`,
+      earlier ? `earlier with ${sender} (before this log):\n${earlier}` : null,
+      `${logHeader('chat log')}:`,
+      older.length ? older.map(fmt).join('\n') : '  (nothing earlier)',
+      `  ----- NEW since you last answered: ${newChat.length} chat line${newChat.length === 1 ? '' : 's'} from ${speakers.join(', ') || 'nobody'} (the last few seconds, batched) -----`,
+      fresh.map(fmt).join('\n'),
+      // One new line: say plainly which one is to be answered.
+      newChat.length === 1 ? `${newChat[0].who} says: ${newChat[0].text}` : null,
       others.length
-        ? `more than one person is talking; decide for yourself who (if anyone) you are answering, and say it if it is unclear.`
+        ? 'more than one person is talking; decide for yourself who you are answering (set `to`), and name them in your line if it is unclear.'
         : null
     ]
     return lines.filter(Boolean).join('\n')
@@ -2012,6 +2118,59 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   // what prefix caching needs, and it never shrinks: there is no mode to be in.
   const ALL_TOOLS = createZincTools()
 
+  // ------------------------------------------------------ the agent turn --
+  /** Declared argument names per tool, to echo a call back to the model exactly as it made it. */
+  const TOOL_PROPS = new Map(ACTION_TOOLS.map((t) => [t.name, new Set(Object.keys(t.parameters?.properties || {}))]))
+  function publicArgs (action) {
+    const props = TOOL_PROPS.get(action.a)
+    const out = {}
+    for (const [k, v] of Object.entries(action || {})) {
+      if (k === 'a' || k.startsWith('_') || v === undefined) continue
+      if (props && !props.has(k)) continue
+      out[k] = v
+    }
+    return out
+  }
+  /** An answer that called nothing usable (prose, an invented tool, broken arguments). */
+  const isBrokenCall = (action) => Boolean(action && (action._prose || action._unknownTool || action._badArgs || action._fallback))
+  /** Is the body in the middle of something a tool started? (A reflex running is not a task.) */
+  const bodyWorking = () => Boolean(skills?.current() || task || combat?.isEngaged)
+  /**
+   * Does this call leave the model with something to react to in the SAME turn?
+   * A failure does (fix it now). Anything that returns information does (that
+   * is why it was asked). Talking and note-taking do not: they are done when
+   * they are sent, and a second model call just to hear "ok" would be waste.
+   */
+  const FIRE_AND_FORGET = new Set(['say', 'note', 'remember_here'])
+  function wantsFollowUp (action, outputs) {
+    if (outputs.some((o) => !o.ok)) return true
+    const a = action.a
+    if (FIRE_AND_FORGET.has(a)) return false
+    if (a === 'goal') return ['list', 'show', 'verify'].includes(String(action.operation || 'list'))
+    if (a === 'social') return ['list', 'show'].includes(String(action.operation || 'list'))
+    return true
+  }
+  /** `tool` = OpenAI tool messages; `text` = the same content as plain messages (set once an endpoint rejects the former). */
+  let toolResultFormat = cfg.inference?.toolResultFormat === 'text' ? 'text' : 'tool'
+
+  /**
+   * ONE TURN OF THE AGENT LOOP.
+   *
+   * A turn used to be one model call and one tool call: "answer Steve AND
+   * start following him" was two turns, and a `find` could not be acted on
+   * until some later event woke the model again. A turn is now a loop:
+   *
+   *   think → call any number of tools → read what they returned → think …
+   *
+   * It keeps going while the model has something to react to, and ends when
+   *   - the model calls `idle` (nothing more to do right now),
+   *   - a tool put the body to work (go_to, follow, build…): that work runs in
+   *     the background and its result starts the next turn,
+   *   - every call was fire-and-forget (say, note) and succeeded,
+   *   - a player's request preempted it, the world changed under it, or the
+   *     step / rate budget ran out.
+   * Between turns the scheduler (brain.js) starts the next one by itself.
+   */
   async function act (reasons, meta = null) {
     if (!alive || ended) return { idle: true }
     const snap = buildActionPrompt(reasons)
@@ -2019,60 +2178,139 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     const life = lifeEpoch
     logger.debug(TAG, `action turn (${reasons.join(' | ')})`)
     const tools = ALL_TOOLS
-    const t0 = Date.now()
-    const invokeMono = performance.now()
-    if (meta && Number.isFinite(meta.queuedMono)) {
-      latency.record('queueToModelMs', Math.max(0, (meta.invokeMono || invokeMono) - meta.queuedMono))
+    const maxSteps = Math.max(1, Math.min(12, Math.trunc(Number(cfg.inference.maxStepsPerTurn ?? 6)) || 1))
+    const head = [
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'user', content: snap.text }
+    ]
+    /** What each earlier step of this turn called and got back: [{ calls, content }]. */
+    const history = []
+    const buildMessages = () => [...head, ...history.flatMap((h) => toolTurnMessages(h.calls, { format: toolResultFormat, content: h.content }))]
+    /** Every action this turn executed, in order. */
+    const executed = []
+    let step = 0
+    for (;;) {
+      step++
+      const t0 = Date.now()
+      const invokeMono = performance.now()
+      if (step === 1 && meta && Number.isFinite(meta.queuedMono)) {
+        latency.record('queueToModelMs', Math.max(0, (meta.invokeMono || invokeMono) - meta.queuedMono))
+      }
+      // The call is abortable — but not by ordinary chat any more (the chat lane
+      // answers on its own). It is cancelled when a player's request has just
+      // been handed to the body (brain.preempt): what this thought is deciding
+      // is then already out of date.
+      const controller = new AbortController()
+      brain.inflightAbort = (why) => {
+        if (controller.signal.aborted) return false
+        logger.info(TAG, `interrupting action turn (${why})`)
+        controller.abort()
+        return true
+      }
+      let result
+      try {
+        try {
+          result = await amd.chatWithTools(buildMessages(), tools, { signal: controller.signal })
+        } catch (err) {
+          // An endpoint whose chat template rejects tool messages: say the same
+          // thing in plain text, for the rest of the session.
+          if (step > 1 && toolResultFormat === 'tool' && [400, 404, 415, 422].includes(Number(err?.status))) {
+            logger.warn(TAG, `endpoint rejected tool-result messages (HTTP ${err.status}); sending tool results as text from now on`)
+            toolResultFormat = 'text'
+            result = await amd.chatWithTools(buildMessages(), tools, { signal: controller.signal })
+          } else throw err
+        }
+      } catch (err) {
+        if (step === 1) throw err
+        // What already ran, ran. Its results are still queued as wake-ups.
+        logger.warn(TAG, `turn step ${step} failed (${err?.message || err}); the turn ends here`)
+        break
+      } finally {
+        if (brain) brain.inflightAbort = null
+      }
+      const actions = Array.isArray(result.actions) && result.actions.length ? result.actions : [result.action]
+      latency.record('modelInferenceMs', performance.now() - invokeMono)
+      logUsage('action', `${step > 1 ? `step ${step}: ` : ''}${reasons.join(' | ')}`, result.usage, Date.now() - t0, actions.map((x) => x?.a).join('+'))
+      if (ended) return { idle: true }
+      // A turn cancelled mid-thought is not a failure and not an idle: nothing
+      // it "decided" may run. On the first step, ask again; on a later one the
+      // request that preempted it is already queued.
+      if (actions[0] && actions[0]._interrupted) {
+        if (step === 1) brain.wake(`reassess: your previous thinking was interrupted because a player's request came first. ${reasons.join('; ')}`, { external: true, fast: true })
+        return { idle: false }
+      }
+      if (epoch !== decisionEpoch) {
+        if (step === 1) {
+          const context = life === lifeEpoch ? reasons.join('; ') : 'previous life ended; reassess after respawn'
+          brain.wake(`decision discarded: situation changed while thinking; reassess. ${context}`, { external: true })
+        }
+        return { idle: false }
+      }
+      // The model successfully received all action outcomes included in this snapshot.
+      if (step === 1 && snap.shownActionIds?.length) continuity.markActionsDelivered(snap.shownActionIds)
+
+      // ---- run every call of this answer, in order ----
+      const calls = []
+      const consumedWakes = []
+      let wantsEnd = false
+      let bodyStarted = null
+      let followUp = false
+      for (const action of actions) {
+        if (ended || !alive) break
+        const callName = action._unknownTool || action._badArgs || action.a
+        const plainIdle = action.a === 'idle' && !isBrokenCall(action)
+        if (plainIdle) wantsEnd = true
+        // The body does one thing at a time. A second physical call in the same
+        // answer would cancel the first before it took a step.
+        if (bodyStarted && laneOf(action.a) === LANES.BODY) {
+          const text = `NOT RUN: ${bodyStarted} was started by this same answer and the body does one thing at a time. Wait for its result (you will be woken), then call ${action.a}.`
+          calls.push({ id: action._callId, name: callName, args: publicArgs(action), result: text })
+          logger.info(TAG, `${action.a} skipped: ${bodyStarted} already started in this answer`)
+          continue
+        }
+        const tap = []
+        resultTap = tap
+        try {
+          await executeAction(action, snap)
+        } finally {
+          if (resultTap === tap) resultTap = null
+        }
+        executed.push(action)
+        const own = tap.filter((r) => r.label === action.a || (action.a === 'idle' && r.label === 'reply'))
+        const startedBody = !plainIdle && !own.length && laneOf(action.a) === LANES.BODY && bodyWorking()
+        let text
+        if (startedBody) {
+          bodyStarted = action.a
+          text = `started — ${doingLine().replace(/^doing: /, '')}. It runs by itself; its result starts your next turn. Do not call it again.`
+        } else if (tap.length) {
+          text = tap.map((r) => `${r.label === action.a ? '' : `${r.label}: `}${r.ok ? '' : 'FAILED — '}${r.msg}`).join(' | ')
+        } else {
+          text = plainIdle ? 'ok' : (action.a === 'say' ? 'sent' : 'done')
+        }
+        calls.push({ id: action._callId, name: callName, args: publicArgs(action), result: text })
+        for (const r of tap) if (r.wakeText) consumedWakes.push(r.wakeText)
+        // A broken answer (prose, an invented tool) ends the turn and is told
+        // about it at the start of the next one, with a fresh snapshot.
+        if (!plainIdle && !isBrokenCall(action) && !startedBody && wantsFollowUp(action, tap)) followUp = true
+      }
+
+      if (!followUp || wantsEnd || bodyStarted || ended || !alive) break
+      if (step >= maxSteps) { logger.info(TAG, `turn reached its step limit (${maxSteps}); the next turn continues`); break }
+      if (brain.preempted || epoch !== decisionEpoch || life !== lifeEpoch) break
+      if (!brain.takeCall('action')) { logger.debug(TAG, 'turn paused: model budget for this minute is spent'); break }
+      // These results are handed back right now, as tool output: they must not
+      // also wake a second turn about the same thing.
+      brain.unwake(consumedWakes)
+      history.push({ calls, content: result.content || '' })
     }
-    // This turn is abortable. `brain` calls it when a chat chunk is waiting and
-    // this thought has been running long enough to be worth interrupting: the
-    // HTTPS request is cancelled, the tokens are never generated, and the turn
-    // is retried with the conversation in front of it. Being interruptible is
-    // the difference between "the model thinks" and "the model thinks and can
-    // be told something new".
-    const controller = new AbortController()
-    brain.inflightAbort = (why) => {
-      if (controller.signal.aborted) return false
-      logger.info(TAG, `interrupting action turn (${why}); the chat chunk goes first`)
-      controller.abort()
-      return true
-    }
-    let result
-    try {
-      result = await amd.chatWithTools([
-        { role: 'system', content: SYSTEM_PROMPT },
-        { role: 'user', content: snap.text }
-      ], tools, { signal: controller.signal })
-    } finally {
-      if (brain) brain.inflightAbort = null
-    }
-    const { action, usage } = result
-    latency.record('modelInferenceMs', performance.now() - invokeMono)
-    logUsage('action', reasons.join(' | '), usage, Date.now() - t0, action?.a)
-    if (ended) return { idle: true }
-    // A turn killed by a chat chunk is not a failure and not an idle: the
-    // situation is about to change under it, so ask again once the players have
-    // been answered. Nothing the model "decided" mid-abort may be executed.
-    if (action && action._interrupted) {
-      brain.wake(`reassess: your previous thinking was interrupted so a player's message could go first. ${reasons.join('; ')}`, { external: true, fast: true })
-      return { idle: false }
-    }
-    if (epoch !== decisionEpoch) {
-      const context = life === lifeEpoch ? reasons.join('; ') : 'previous life ended; reassess after respawn'
-      brain.wake(`decision discarded: situation changed while thinking; reassess. ${context}`, { external: true })
-      return { idle: false }
-    }
-    // The model successfully received all action outcomes included in this snapshot.
-    if (snap.shownActionIds?.length) {
-      continuity.markActionsDelivered(snap.shownActionIds)
-    }
-    await executeAction(action, snap)
+
     // Player requests are optional proposals. Once Zinc has completed a non-inspect
     // decision turn where a proposal was presented — whether accepting, scheduling
     // via `goal`, negotiating/declining via `say` or `social`, ignoring via `idle`,
     // or continuing its own work — resolve that proposal cleanly without nagging or
     // retrying until compliance!
-    if (snap.shownProposals?.length && !isPreDecisionInspect(action) && !action._prose && !action._unknownTool && !action._badArgs && !action._fallback) {
+    const action = executed.find((x) => x.a !== 'idle' && !isPreDecisionInspect(x)) || executed[0] || { a: 'idle' }
+    if (snap.shownProposals?.length && executed.length && !isPreDecisionInspect(action) && !isBrokenCall(action)) {
       const shownIds = new Set(snap.shownProposals.map((p) => p.id).filter(Boolean))
       agenda.asked = agenda.asked.filter((x) => x.id ? !shownIds.has(x.id) : !snap.shownProposals.some((p) => p.from === x.from && p.text === x.text))
       continuity.resolvePendingEvents((e) => e.kind === 'player_request' && !agenda.asked.some((x) => x.from === e.from && x.text === e.text))
@@ -2089,7 +2327,22 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         continuity.recordProposalOutcome(p.from, p.text, inferred, action.a === 'say' ? String(action.text || '') : action.a)
       }
     }
-    return { idle: action.a === 'idle' && !action._prose }
+    return { idle: executed.length === 0 || executed.every((x) => x.a === 'idle' && !x._prose) }
+  }
+
+  /** Which player a chat reply is about: the one it names, if they are in the window or online; else the last speaker. */
+  function replyTarget (reply, sender, lines) {
+    const wanted = String(reply?.to || '').trim().toLowerCase()
+    if (!wanted) return sender
+    const known = [...new Set([...lines.map((l) => l.sender), ...Object.keys(bot.players || {})].filter(Boolean))].filter((n) => n !== bot.username)
+    return known.find((n) => n.toLowerCase() === wanted) || known.find((n) => n.toLowerCase().startsWith(wanted)) || sender
+  }
+
+  /** The body actions the chat lane may start by itself (`reply.do`). */
+  const CHAT_DO = {
+    follow: (who) => ({ a: 'follow', player: who }),
+    come: (who) => ({ a: 'go_to', player: who }),
+    stop: () => ({ a: 'stop' })
   }
 
   async function talk (sender, lines, meta = null) {
@@ -2098,7 +2351,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       { role: 'system', content: CHAT_PROMPT },
       { role: 'user', content: text }
     ]
-    const maxTokens = cfg.inference.chatMaxTokens ?? 120
+    const maxTokens = cfg.inference.chatMaxTokens ?? 200
     const tChat0 = Date.now()
     const chatInvokeMono = performance.now()
     if (meta && Number.isFinite(meta.queuedMono)) {
@@ -2111,33 +2364,68 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     if (ended || epoch !== lifeEpoch) return
     logUsage('chat', `${sender}: ${lines.map((l) => l.text).join(' / ').slice(0, 60)}`, chatUsage, Date.now() - tChat0, 'reply')
     if (ended || epoch !== lifeEpoch) return
+    // Who this answer is for: the player the model named, else the last speaker.
+    const target = replyTarget(reply, sender, lines)
     // A chunk may mix whispers and public lines. Answer the loudest constraint:
     // if any line in it was whispered to the bot, the reply stays private, so a
     // private question is never answered in public just because someone else
-    // said something in the same five seconds.
+    // said something in the same few seconds.
     const whisper = lines.some((l) => l.whisper)
+    const whisperTo = whisper ? (lines.some((l) => l.whisper && l.sender === target) ? target : lines.find((l) => l.whisper).sender) : null
     if (reply.text && !canReplyToChat()) {
-      logger.warn(TAG, `chat reply to ${sender} not sent: communication.replyToChat is off`)
-    } else if (reply.text) speak(reply.text, { to: whisper ? sender : null, about: sender })
-    if (reply.remember) {
-      const kept = memory.rememberFact(reply.remember, { about: sender })
-      if (kept) logger.info(TAG, `remembered (from ${sender}): ${kept.text}`)
+      logger.warn(TAG, `chat reply to ${target} not sent: communication.replyToChat is off`)
+    } else if (reply.text) {
+      // The answer itself is not "new" to the next window — unless someone
+      // spoke while it was being written, in which case their line stays new.
+      const unseen = timeline.tail({ max: 400, afterSeq: chatSeenSeq }).some((e) => e.kind === 'chat' || e.kind === 'whisper')
+      speak(reply.text, { to: whisperTo, about: target })
+      if (!unseen) chatSeenSeq = timeline.seq
     }
-    continuity.touchPlayer(sender, { interacted: true })
+    if (reply.remember) {
+      const kept = memory.rememberFact(reply.remember, { about: target })
+      if (kept) logger.info(TAG, `remembered (from ${target}): ${kept.text}`)
+    }
+    for (const who of new Set([sender, target])) continuity.touchPlayer(who, { interacted: true })
     const incomingSummary = lines.map((l) => l.text).join(' / ').slice(0, 120)
-    if (reply.decision && !reply.task) {
-      continuity.recordProposalOutcome(sender, incomingSummary, reply.decision, reply.text || '', { explicit: true })
+    if (reply.decision && !reply.task && !reply.do) {
+      continuity.recordProposalOutcome(target, incomingSummary, reply.decision, reply.text || '', { explicit: true })
+    }
+    // `do`: the chat lane decided the body should act, and the act is one of
+    // the three that need no planning. It starts NOW — while the line is still
+    // being typed out — instead of waiting for an action-lane thought that can
+    // take a minute. The body's own lane is told through the usual result.
+    const doIt = reply.do && CHAT_DO[reply.do] ? CHAT_DO[reply.do](target) : null
+    if (doIt && alive && !ended) {
+      note({ type: 'request', sender: target, text: `${target} asked: ${reply.do}${reply.do === 'stop' ? '' : ` ${target}`} — started from chat` })
+      continuity.recordProposalOutcome(target, incomingSummary, 'accept', reply.text || reply.do, { explicit: true })
+      // Whatever the action lane is thinking right now was decided before this.
+      brain.preempt(`chat started ${reply.do}`)
+      const chatSnap = {
+        text: '',
+        threatIds: [...new Set([...(sense.last?.dangerIds || []), ...(system1?.chasers || []).map((t) => t.id)])],
+        askedBy: target,
+        reasons: [`chat request from ${target}: ${reply.do}`],
+        shownActionIds: [],
+        shownProposals: [],
+        goalId: agenda.main && !agenda.main.paused ? (agenda.main.goalId || null) : null
+      }
+      try {
+        await executeAction({ ...doIt, _via: 'chat' }, chatSnap)
+      } catch (err) { logger.warn(TAG, `chat-started ${reply.do} failed: ${err?.message || err}`) }
     }
     if (reply.task) {
-      // Player requests are proposals, never hard preemptions over Zinc's own in-flight thinking.
+      // The chat lane decided the body should do this. It goes to the action
+      // lane at once, ahead of whatever that lane was thinking about: it is
+      // still Zinc's own decision (the action lane may weigh it against its
+      // goals), but it must not sit behind a minute-long stale thought.
       const propId = `prop_${++proposalSeq}`
-      note({ type: 'request', sender, text: `${sender} proposed: ${reply.task}` })
-      agenda.asked.push({ id: propId, from: sender, text: reply.task, at: Date.now() })
+      note({ type: 'request', sender: target, text: `${target} proposed: ${reply.task}` })
+      agenda.asked.push({ id: propId, from: target, text: reply.task, at: Date.now() })
       if (agenda.asked.length > 8) agenda.asked.shift()
-      continuity.addPendingEvent({ kind: 'player_request', from: sender, text: reply.task })
-      brain.wake(`chat request from ${sender}: ${reply.task}`, { external: true, urgent: false })
+      continuity.addPendingEvent({ kind: 'player_request', from: target, text: reply.task })
+      brain.wake(`chat request from ${target}: ${reply.task}`, { external: true, fast: true, important: true, preempt: true })
     }
-    logger.info(TAG, `chat ${sender}: "${lines.map((l) => l.text).join(' / ').slice(0, 80)}" -> ${reply.text ? `"${reply.text.slice(0, 80)}"` : '(silent)'}${reply.task ? ` [task: ${reply.task.slice(0, 60)}]` : ''}`)
+    logger.info(TAG, `chat ${sender}: "${lines.map((l) => l.text).join(' / ').slice(0, 80)}" -> ${reply.text ? `"${reply.text.slice(0, 80)}"` : '(silent)'}${reply.do ? ` [do: ${reply.do} ${target}]` : ''}${reply.task ? ` [task: ${reply.task.slice(0, 60)}]` : ''}`)
   }
 
   // ------------------------------------------------------------ fights ---
@@ -2319,6 +2607,24 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     }
   }
 
+  /**
+   * Is `action` the task the body is running right now? Returns its label
+   * ("following Steve (41s)") when it is, else null. Only for the two tools
+   * that mean "keep doing this": follow, and go_to a player.
+   */
+  function sameAsRunning (action) {
+    const main = agenda.main
+    const cur = skills?.current()
+    if (!main || main.paused || !cur || main.tool !== action?.a) return null
+    const norm = (v) => String(v || '').trim().toLowerCase()
+    if (action.a === 'follow' && action.player) {
+      if (norm(main.label) !== norm(`follow ${action.player}`)) return null
+    } else if (action.a === 'go_to' && action.player && !action.place && action.x === undefined) {
+      if (norm(main.label) !== norm(`go to ${action.player}`)) return null
+    } else return null
+    return `${cur.label} (${cur.seconds}s)`
+  }
+
   // ----------------------------------------------------------- executor --
   async function executeAction (action, snap) {
     const execStartMono = performance.now()
@@ -2356,6 +2662,11 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       logger.info(TAG, `stale ${a} refused: ${stale.slice(0, 120)}`)
       return report(a, { ok: false, msg: stale }, { wake: false })
     }
+    // Asking for what the body is ALREADY doing must not restart it: the loop
+    // looks in on a long follow every half minute, and a model that answers
+    // "follow Steve" again used to cancel the walk and start it over.
+    const running = sameAsRunning(action)
+    if (running) return report(a, { ok: true, msg: `already ${running} — still going, not restarted. Call stop to end it, or idle to let it continue.` }, { wake: false })
     if (a !== 'idle') logger.info(TAG, `action: ${a} ${JSON.stringify(Object.fromEntries(Object.entries(action).filter(([k]) => !k.startsWith('_') && k !== 'a')))}`)
     // Take the lane this tool belongs to. BODY is exclusive, so a second
     // physical action cannot start while one is in flight; COMPUTATION,
@@ -2390,7 +2701,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     }
     return leaseContext.run({ lease: laneLease, claimed: false }, async () => {
     gateCtx = action
-    const IMMEDIATE_TRACKED = new Set(['say', 'stop', 'hold', 'equip', 'redstone_scan', 'redstone_component', 'redstone_engineer', 'recall', 'circuit_project', 'logic_test', 'inspect_region', 'inspect_block', 'find', 'remember_here', 'note', 'social', 'goal'])
+    const IMMEDIATE_TRACKED = new Set(['say', 'stop', 'hold', 'equip', 'dig_policy', 'redstone_scan', 'redstone_component', 'redstone_engineer', 'recall', 'circuit_project', 'logic_test', 'inspect_region', 'inspect_block', 'find', 'remember_here', 'note', 'social', 'goal'])
     currentActId = IMMEDIATE_TRACKED.has(a)
       ? continuity.beginAction({ tool: a, summary: `${a} ${JSON.stringify(goalArgs(action)).slice(0, 80)}`, sig: `${a}:${JSON.stringify(goalArgs(action))}`, goalId: agenda.main?.goalId || null, args: goalArgs(action) })
       : null
@@ -2403,7 +2714,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         if (action._prose) report('reply', { ok: false, msg: 'you answered in prose without calling a tool, so nothing happened — call a tool (say to talk)' })
         else if (action._unknownTool) report('reply', { ok: false, msg: `there is no tool "${action._unknownTool}"` })
         else if (action._badArgs) report('reply', { ok: false, msg: `arguments for ${action._badArgs} failed schema validation` })
-        else if (action._fallback) report('reply', { ok: false, msg: 'you returned no tool call, so nothing happened — call exactly ONE listed tool (or idle to wait)' })
+        else if (action._fallback) report('reply', { ok: false, msg: 'you returned no tool call, so nothing happened — call a listed tool (say to talk, idle to wait)' })
         return
       case 'say': {
         const text = String(action.t ?? action.text ?? '')
@@ -2431,6 +2742,18 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         const where = action.player || action.place || (Number.isFinite(Number(action.x)) ? `${Math.round(Number(action.x))},${Math.round(Number(action.z))}` : 'somewhere')
         const limit = Array.isArray(action.materials) && action.materials.length ? ` breaking only ${action.materials.join('/')}` : ''
         return startMain({ tool: 'dig', label: `dig to ${where}${limit}`, askedBy, detail: goalDetailFor('dig', target), decision: decided(snap, { label: 'dig' }), run: () => skills.dig(target) })
+      }
+      case 'dig_policy': {
+        // The model's own standing rule for what a walk may break. Read it,
+        // switch it, edit the list — and the route in progress re-plans with it.
+        const change = { can_dig: action.can_dig, mode: action.mode, add: action.add, remove: action.remove, reset: action.reset }
+        const r = digPolicy.apply(change, { registry: bot.registry })
+        if (r.changed) {
+          try { wrapper.refreshDigPolicy() } catch { /* next plan picks it up */ }
+          note({ type: 'dig_policy', msg: r.msg.slice(0, 160) })
+        }
+        const gated = config.get('actions.allowDig') === false ? ' (NOTE: the operator has digging switched off — actions.allowDig — so nothing is broken until that changes)' : ''
+        return report('dig_policy', { ok: r.ok, msg: `${r.msg}${gated}` }, { wake: false })
       }
       case 'follow': {
         const askedBy = resolveActionAttribution('follow', action, snap)
@@ -2938,11 +3261,16 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       chatMinIntervalMs: cfg.inference.chatMinIntervalMs ?? 1200,
       // The IRC window: chat is handed over in chunks this long, not one wake
       // per line. 0 disables batching (each line is its own chunk).
-      chatBatchMs: cfg.inference.chatBatchMs ?? 5000,
+      chatBatchMs: cfg.inference.chatBatchMs ?? 6000,
       rpm: cfg.inference.rpm ?? 18,
       chatReserve: cfg.inference.chatReserve ?? 4,
       urgentMinIntervalMs: cfg.inference.urgentMinIntervalMs ?? 1000,
+      // THE AGENT LOOP: the next turn starts `loopMs` after the last one ended,
+      // backing off to `heartbeatMs` while the model keeps answering idle, and
+      // looking in on a busy body every `loopBusyMs`. heartbeatMs 0 = off.
       heartbeatMs: cfg.inference.heartbeatMs ?? 90_000,
+      loopMs: cfg.inference.loopMs ?? 8000,
+      loopBusyMs: cfg.inference.loopBusyMs ?? 30_000,
       maxSelfChain: cfg.inference.maxSelfChain ?? 12
     })
 
@@ -2961,6 +3289,12 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       fleeDistance: cfg.system1.fleeDistance ?? 14,
       releaseRadius: cfg.system1.releaseRadius ?? 22,
       calmMs: cfg.system1.calmMs ?? 4000,
+      // With a walk under way (follow, go_to, any errand) an escape is a short
+      // dodge that comes back, not a retreat that abandons it.
+      tether: () => (cfg.system1.tether === false ? null : (skills?.tether?.() || null)),
+      tetherTriggerRadius: cfg.system1.tetherTriggerRadius ?? 6,
+      tetherReleaseRadius: cfg.system1.tetherReleaseRadius ?? 9,
+      tetherCalmMs: cfg.system1.tetherCalmMs ?? 1200,
       reportGapMs: cfg.system1.reportGapMs ?? 6000,
       stillFleeingMs: cfg.system1.stillFleeingMs ?? 30_000,
       recallMs: cfg.system1.recallMs ?? 180_000,
@@ -3498,6 +3832,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     if (pref) logger.debug(TAG, `preference learned from ${sender} (${pref.polarity}): ${pref.text}`)
     system1?.onChatLine(sender, text)
     logChat(sender, whisper ? `(whisper) ${text}` : text)
+    timeline.chat(sender, text, { whisper })
     note({ type: 'chat', sender, text: `${sender}: ${text}` })
     perceive({
       source: 'mineflayer', eventType: 'chat', reactionClass: 'fast',
@@ -3536,6 +3871,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     } catch { /* noop */ }
     try { shared.convo.clear() } catch { /* noop */ }
     try { shared.chatLog.length = 0 } catch { /* noop */ }
+    try { timeline.clear(); chatSeenSeq = timeline.seq } catch { /* noop */ }
     // Undelivered IMPORTANT events survive a context reset; already-delivered
     // ambient chatter does not. The brain keeps urgent/important wakes.
     let survived = []

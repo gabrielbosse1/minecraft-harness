@@ -190,7 +190,10 @@ function addPlayer (bot, id, username, x, z, held = null) {
  * @param {{ chat?: Function|Array, actions?: Function|Array, bot?: object, cfg?: (cfg:object)=>void }} script
  *   actions: a policy `(prompt) => ({ a:'go_to', player:'x' })` — it reads the
  *   prompt like a model would (falsy = idle; `{ prose:'…' }` = text without a
- *   tool call). chat: `(prompt) => ({ text, task })`. Arrays are also accepted
+ *   tool call; an ARRAY returned by the policy = several tool calls in one
+ *   answer). On a follow-up step of a multi-step turn the policy is handed the
+ *   same snapshot with `tool results (this turn):` appended.
+ *   chat: `(prompt) => ({ text, task })`. Arrays are also accepted
  *   and consumed in order.
  */
 function startTestSession ({ chat = [], actions = [], bot = simulatedBot(), cfg: tweak = null, dataDir: sharedDir = null, host: wantHost = false } = {}) {
@@ -206,12 +209,30 @@ function startTestSession ({ chat = [], actions = [], bot = simulatedBot(), cfg:
   require.cache[mfPath] = { id: mfPath, filename: mfPath, loaded: true, exports: { createBot: () => bot } }
 
   // 2. fetch → scripted model.
-  const prompts = { chat: [], action: [] }
+  // `action` holds what every action-lane model call was shown; `steps` only
+  // the follow-up calls of a multi-step turn (they are in `action` too);
+  // `requests` the raw request bodies, for tests about the wire format.
+  const prompts = { chat: [], action: [], steps: [], requests: [] }
   const realFetch = globalThis.fetch
+  let callSeq = 0
   globalThis.fetch = async (_url, opts) => {
     const body = JSON.parse(opts.body)
-    const user = body.messages[body.messages.length - 1].content
     const isChat = body.tools?.[0]?.function?.name === 'reply'
+    // A follow-up step of a turn: the snapshot is still the first user message,
+    // followed by what the model called and what each call returned. A scripted
+    // policy reads it as one text — the snapshot, then this turn's tool results
+    // in the same `  - tool: result` shape the next snapshot would show them.
+    const firstUser = body.messages.findIndex((m) => m.role === 'user')
+    const later = body.messages.slice(firstUser + 1)
+    const names = new Map()
+    for (const m of later) for (const c of m.tool_calls || []) names.set(c.id, c.function?.name)
+    const outputs = later.filter((m) => m.role === 'tool').map((m) => `  - ${names.get(m.tool_call_id) || 'tool'}: ${m.content}`)
+    const textOutputs = later.filter((m) => m.role === 'user').map((m) => String(m.content))
+    const followUp = outputs.length > 0 || textOutputs.length > 0
+    const user = followUp
+      ? `${body.messages[firstUser].content}\ntool results (this turn):\n${[...outputs, ...textOutputs].join('\n')}`
+      : body.messages[body.messages.length - 1].content
+    prompts.requests.push(body)
     let message
     if (isChat) {
       prompts.chat.push(user)
@@ -220,12 +241,17 @@ function startTestSession ({ chat = [], actions = [], bot = simulatedBot(), cfg:
       message = { content: null, tool_calls: [{ function: { name: 'reply', arguments: JSON.stringify(args) } }] }
     } else {
       prompts.action.push(user)
+      if (followUp) prompts.steps.push(user)
       const next = typeof actions === 'function' ? actions : (actions.length ? actions.shift() : { a: 'idle' })
       const act = (typeof next === 'function' ? next(user) : next) || { a: 'idle' }
       if (act.prose) message = { content: act.prose }
       else {
-        const { a, ...args } = act
-        message = { content: null, tool_calls: [{ function: { name: a, arguments: JSON.stringify(args) } }] }
+        // An array = several tool calls in ONE answer.
+        const list = Array.isArray(act) ? act : [act]
+        message = {
+          content: null,
+          tool_calls: list.map(({ a, ...args }) => ({ id: `call_t${++callSeq}`, type: 'function', function: { name: a, arguments: JSON.stringify(args) } }))
+        }
       }
     }
     return { ok: true, status: 200, json: async () => ({ choices: [{ message }], usage: { prompt_tokens: 100, completion_tokens: 10 } }), text: async () => '' }
@@ -233,7 +259,9 @@ function startTestSession ({ chat = [], actions = [], bot = simulatedBot(), cfg:
 
   const index = require('../../zincai/index.js')
   const cfg = index.loadConfig()
-  // Test pace: no 3 s spacing, no heartbeat, no reconnect.
+  // Test pace: no 3 s spacing, no self-started loop turns (heartbeatMs 0 — a
+  // scripted model would be asked forever; test/agent-loop.test.js turns the
+  // loop on explicitly), no reconnect.
   // Tests keep the IRC batching window short: the production 5 s is a real
   // behaviour, exercised explicitly in test/brain-chat-batch.test.js, but a
   // suite that waited five seconds per chat chunk would take minutes.

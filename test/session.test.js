@@ -112,7 +112,7 @@ test('a player hits the bot: it backs off and talks; PvP happens only when the m
     actions: (p) => {
       if (!/hit by player Steve/.test(p)) return null
       const failed = (p.match(/attack: FAILED/g) || []).length
-      if (!/you: \(to Steve\)/.test(p)) return { a: 'say', text: 'ei Steve, para com isso', to: 'Steve' }
+      if (!/>Steve< ei Steve/.test(p)) return { a: 'say', text: 'ei Steve, para com isso', to: 'Steve' }
       if (failed === 0) return { a: 'attack', target: 'player' } // refused: no name
       if (failed === 1) return { a: 'attack', target: 'any' } // refused: "any" is never a player
       return /fighting Steve/.test(p) ? null : { a: 'attack', player: 'Steve' } // the explicit decision

@@ -53,14 +53,14 @@ const ACTION_TOOLS = [
     text: STR('The line, max 200 chars. In the language of the conversation.'),
     to: STR('Recipient player (optional).')
   }, ['text']),
-  tool('go_to', 'Walk to a player, saved place, nearby id (chest2, bed1), or [x,y,z].', {
+  tool('go_to', 'Walk to a player, saved place, nearby id (chest2, bed1), or [x,y,z]. Routes around mobs and hazards; may break blocks your dig_policy allows.', {
     player: STR('Player name.'),
     place: STR('Saved place or nearby id.'),
     x: INT('X.'),
     y: INT('Y (optional).'),
     z: INT('Z.')
   }),
-  tool('dig', 'Break blocks to open a way: walks to [x,y,z] (or a player/place), breaking only what stands in the path. You decide; nothing is broken without this call.', {
+  tool('dig', 'ONE deliberate corridor: walks to [x,y,z] (or a player/place) breaking what stands in the path, including blocks your dig_policy does not allow (stone, wood…). Use it when go_to reports no path.', {
     player: STR('Target player name.'),
     place: STR('Saved place or nearby id.'),
     x: INT('X of the destination.'),
@@ -69,7 +69,14 @@ const ACTION_TOOLS = [
     materials: { type: 'array', description: 'Only these block ids may be broken (e.g. [oak_log, dirt]); default: whatever is in the way, within reach.', items: STR('Block id.'), minItems: 1, maxItems: 16 },
     avoid: { type: 'array', description: 'Never break these block ids.', items: STR('Block id.'), minItems: 1, maxItems: 16 }
   }),
-  tool('follow', 'Follow a player until stopped.', { player: STR('Player name.') }, ['player']),
+  tool('follow', 'Follow a player until you call stop. Keeps going by itself: it dodges mobs and comes back, waits for a path, and walks to where the player was last seen. Call it ONCE — it does not need repeating.', { player: STR('Player name.') }, ['player']),
+  tool('dig_policy', 'Your standing rule for what WALKING (go_to, follow, every errand) may break. No arguments = show it. It is yours to edit and it persists.', {
+    can_dig: { type: 'boolean', description: 'Master switch. false = walking never breaks a block.' },
+    mode: { type: 'string', enum: ['list', 'all'], description: 'list = only blocks on your list (default: soft terrain). all = anything in the way (doors, containers, bedrock never).' },
+    add: { type: 'array', description: 'Block ids to allow, e.g. [stone, cobblestone, oak_log]. `*` is a wildcard (*_planks).', items: STR('Block id.'), minItems: 1, maxItems: 24 },
+    remove: { type: 'array', description: 'Block ids to take off the list.', items: STR('Block id.'), minItems: 1, maxItems: 24 },
+    reset: { type: 'boolean', description: 'true = back to the shipped soft-block list.' }
+  }),
   tool('stop', 'Cancel current task, follow, fight and paused tasks.'),
   tool('goal', 'Manage persistent objectives (survive death/restart/context reset): list|show|add|resume|suspend|cancel|complete|update|combine|verify.', {
     operation: { type: 'string', enum: ['list', 'show', 'add', 'resume', 'suspend', 'cancel', 'complete', 'update', 'combine', 'verify'] },
@@ -213,14 +220,21 @@ const ACTION_TOOLS = [
     stage: STAGE
   }, ['shape', 'block']),
   tool('run_script', 'Run saved script in zincai/scripts/.', { name: STR('Script name.') }, ['name']),
-  tool('idle', 'Wait this turn (while fleeing: keep fleeing).')
+  tool('idle', 'End your turn with nothing more to do: the body carries on with what it is doing (while fleeing: keep fleeing). Call it alone.')
 ]
 
-/** The chat lane has one tool: respond (or stay silent), evaluate proposals, and optionally forward a proposal to the action lane. */
+/**
+ * The chat lane has one tool: answer the people in the window, and — when the
+ * answer is to DO something — start it. `do` covers the requests that should
+ * not wait for a second model call (follow me, come here, stop); `task` hands
+ * anything else to the action lane, which is woken at once.
+ */
 const CHAT_TOOLS = [
-  tool('reply', 'Respond to the player (or leave `text` empty to ignore/stay silent). Player requests are proposals, never mandatory commands.', {
+  tool('reply', 'Answer the chat window (leave `text` empty only when nothing in it concerns you). Player requests are proposals, never mandatory commands — but when you agree, act: set `do` or `task`.', {
     text: STR('One short chat line, in the language the person you are answering used. Empty = say nothing.'),
-    task: STR('Optional proposal for your action lane ONLY when you want your body to act, verify a claim in the world, or weigh goals (e.g. "go to Steve", "verify chest1 contents after Ely claim"). Omit when declining, ignoring, or only chatting.'),
+    to: STR('Which player you are answering / who `do` is about. Default: the last speaker.'),
+    do: { type: 'string', enum: ['follow', 'come', 'stop'], description: 'Start it NOW with your body, no second thought needed: follow = follow that player; come = walk to that player; stop = stop what the body is doing. Omit when none fits.' },
+    task: STR('Anything else you decided your body should do, verify or weigh, as one instruction for your action lane (e.g. "bring Steve 3 diamonds from chest1", "verify chest1 contents after Ely claim"). Omit when declining, ignoring, or only chatting.'),
     decision: { type: 'string', enum: ['accept', 'decline', 'ignore', 'negotiate', 'delay'], description: 'Optional stance when the player asked you to do something.' },
     remember: STR('Only when the player told you something worth knowing later (where a thing is, whose it is, a plan, a date, what they like): that fact as one short sentence naming the player, e.g. "Steve keeps his diamonds in the chest on the second floor". Otherwise omit.')
   }, ['text'])
@@ -368,6 +382,8 @@ function coerceReply (message) {
     if (!parsed.error) {
       return {
         text: String(parsed.args.text ?? '').trim(),
+        to: String(parsed.args.to ?? '').trim(),
+        do: parsed.args.do ? String(parsed.args.do).trim() : '',
         task: String(parsed.args.task ?? '').trim(),
         decision: parsed.args.decision ? String(parsed.args.decision).trim() : '',
         remember: String(parsed.args.remember ?? '').trim(),
@@ -378,7 +394,57 @@ function coerceReply (message) {
   const content = typeof message?.content === 'string' ? message.content.trim() : ''
   // Some models wrap the answer in quotes or prefix their own name.
   const text = content.replace(/^["'“”]+|["'“”]+$/g, '').replace(/^(zinc(ai)?|me)\s*:\s*/i, '').split('\n')[0].trim()
-  return { text, task: '', decision: '', remember: '', _via: 'prose' }
+  return { text, to: '', do: '', task: '', decision: '', remember: '', _via: 'prose' }
+}
+
+/**
+ * Every tool call of one model message, in order, as internal actions.
+ *
+ * A turn is no longer one call: the model may ask for several things at once
+ * ("say I'm coming" + "follow Steve") and they all run. A call that is broken
+ * (unknown name, bad arguments) keeps its place as an `idle` with the marker
+ * that says why, so the model is told about that one without losing the rest.
+ * A message with no tool call at all falls back to coerceAction's recovery
+ * (leaked <tool_call> tags, the legacy one-line JSON, prose).
+ * @returns {object[]} at least one action; each carries `_callId` when the
+ *   endpoint gave the call an id
+ */
+function coerceActions (message, { max = 6 } = {}) {
+  const toolCalls = Array.isArray(message?.tool_calls) ? message.tool_calls : []
+  if (!toolCalls.length) return [coerceAction(message)]
+  const out = []
+  for (const call of toolCalls.slice(0, Math.max(1, max))) {
+    const one = coerceAction({ tool_calls: [call] })
+    if (call?.id) one._callId = String(call.id)
+    out.push(one)
+  }
+  if (toolCalls.length > out.length) out.dropped = toolCalls.length - out.length
+  return out
+}
+
+/**
+ * The messages that continue a turn after its tool calls ran: what the model
+ * asked for, and what each call returned.
+ *
+ * `format: 'tool'` is the OpenAI tool protocol (an assistant message carrying
+ * `tool_calls`, then one `tool` message per call). `format: 'text'` says the
+ * same thing in plain assistant/user messages, for endpoints whose chat
+ * template rejects tool messages.
+ * @param {Array<{ id?:string, name:string, args?:object, result:string }>} calls
+ */
+function toolTurnMessages (calls, { format = 'tool', content = '' } = {}) {
+  const list = (calls || []).map((c, i) => ({ id: c.id || `call_${i + 1}`, name: String(c.name), args: c.args || {}, result: String(c.result ?? 'done') }))
+  if (!list.length) return []
+  if (format === 'text') {
+    return [
+      { role: 'assistant', content: `[called: ${list.map((c) => `${c.name}(${JSON.stringify(c.args)})`).join('; ')}]` },
+      { role: 'user', content: `tool results:\n${list.map((c) => `- ${c.name}: ${c.result}`).join('\n')}\nContinue: call the next tool(s), or idle when there is nothing more to do right now.` }
+    ]
+  }
+  return [
+    { role: 'assistant', content: typeof content === 'string' ? content : '', tool_calls: list.map((c) => ({ id: c.id, type: 'function', function: { name: c.name, arguments: JSON.stringify(c.args) } })) },
+    ...list.map((c) => ({ role: 'tool', tool_call_id: c.id, content: c.result }))
+  ]
 }
 
 /**
@@ -388,7 +454,7 @@ function coerceReply (message) {
  * prose produced an idle turn and nobody was told. Endpoints that reject
  * "required" are handled in the client (it falls back to "auto" once).
  */
-function buildToolsPayload ({ model, messages, temperature, maxTokens, tools, toolChoice = 'required' }) {
+function buildToolsPayload ({ model, messages, temperature, maxTokens, tools, toolChoice = 'required', parallelToolCalls = true }) {
   return {
     model,
     messages,
@@ -397,7 +463,9 @@ function buildToolsPayload ({ model, messages, temperature, maxTokens, tools, to
     stream: false,
     tools,
     tool_choice: toolChoice,
-    parallel_tool_calls: false
+    // Several calls in one answer are allowed (and executed in order): the
+    // one-call-per-turn limit made "answer AND act" take two model calls.
+    parallel_tool_calls: parallelToolCalls !== false
   }
 }
 
@@ -449,6 +517,10 @@ class AmdToolsClient {
       chatReplies: 0
     }
     this.toolChoice = toolChoice
+    // Several tool calls per answer: true = ask for them, null = the endpoint
+    // rejected the field (it is then left out). At most this many are executed.
+    this.parallelToolCalls = true
+    this.maxToolCalls = 6
     // 2 = one call per lane at a time. 1 = strictly one call at a time (for an
     // endpoint that refuses parallel requests); chat still jumps the queue.
     this.maxConcurrent = Math.max(1, Math.trunc(Number(maxConcurrent)) || 1)
@@ -504,9 +576,9 @@ class AmdToolsClient {
    * `maxConcurrent`), and a waiting chat call is always started first.
    * @returns {Promise<{message:object, usage:object, raw:object}>}
    */
-  _complete ({ messages, tools, maxTokens = this.maxTokens, temperature = this.temperature, lane = 'action', timeoutMs = this.timeoutMs, maxRetries = this.maxRetries, signal = null }) {
+  _complete ({ messages, tools, maxTokens = this.maxTokens, temperature = this.temperature, lane = 'action', timeoutMs = this.timeoutMs, maxRetries = this.maxRetries, signal = null, parallel = lane !== 'chat' }) {
     return new Promise((resolve, reject) => {
-      this._queue.push({ lane, resolve, reject, run: () => this._completeNow({ messages, tools, maxTokens, temperature, timeoutMs, maxRetries, signal }) })
+      this._queue.push({ lane, resolve, reject, run: () => this._completeNow({ messages, tools, maxTokens, temperature, timeoutMs, maxRetries, signal, parallel }) })
       this._pump()
     })
   }
@@ -526,7 +598,7 @@ class AmdToolsClient {
     }
   }
 
-  async _completeNow ({ messages, tools, maxTokens, temperature, timeoutMs = this.timeoutMs, maxRetries = this.maxRetries, signal = null }) {
+  async _completeNow ({ messages, tools, maxTokens, temperature, timeoutMs = this.timeoutMs, maxRetries = this.maxRetries, signal = null, parallel = true }) {
     const url = `${this.baseUrl}/chat/completions`
     const headers = {
       Authorization: `Bearer ${this._apiKey}`,
@@ -543,7 +615,8 @@ class AmdToolsClient {
       }
       attempt += 1
       this.stats.requests += 1
-      const payload = buildToolsPayload({ model: this.model, messages, temperature, maxTokens, tools, toolChoice: this.toolChoice })
+      const payload = buildToolsPayload({ model: this.model, messages, temperature, maxTokens, tools, toolChoice: this.toolChoice, parallelToolCalls: parallel && this.parallelToolCalls !== false })
+      if (this.parallelToolCalls === null) delete payload.parallel_tool_calls // endpoint does not know the field
       const startedAt = Date.now()
       try {
         // An aborted call is a decision, not a failure: it must not be retried.
@@ -567,8 +640,18 @@ class AmdToolsClient {
             attempt -= 1 // not the model's fault: do not burn a retry
             continue
           }
+          // Same for parallel_tool_calls: an endpoint that rejects the field
+          // gets requests without it from then on.
+          if (res.status === 400 && 'parallel_tool_calls' in payload && /parallel_tool_calls|parallel/i.test(snippet)) {
+            if (this.parallelToolCalls !== null) logger.warn(TAG, 'endpoint rejected parallel_tool_calls — omitting the field for this session')
+            this.parallelToolCalls = null
+            attempt -= 1
+            continue
+          }
           this.stats.failures += 1
-          throw new Error(`HTTP ${res.status}: ${snippet}`)
+          const failure = new Error(`HTTP ${res.status}: ${snippet}`)
+          failure.status = res.status
+          throw failure
         }
 
         const data = await res.json()
@@ -619,11 +702,17 @@ class AmdToolsClient {
     } catch (err) {
       if (err && (err.name === 'AbortError' || /abort/i.test(String(err.message)))) {
         this.stats.aborted = (this.stats.aborted || 0) + 1
-        return { action: { a: 'idle', _interrupted: true }, content: '', usage: null, raw: null }
+        const interrupted = { a: 'idle', _interrupted: true }
+        return { action: interrupted, actions: [interrupted], message: null, content: '', usage: null, raw: null }
       }
       throw err
     }
-    let action = coerceAction(first.message)
+    // Every call of the answer, in order. `action` (the first) is what the
+    // rescue logic below judges: an answer whose FIRST call is broken is retried
+    // with feedback; later broken calls are simply reported to the model.
+    const offeredNames = new Set(tools.map((t) => t.function?.name))
+    const all = coerceActions(first.message, { max: this.maxToolCalls }).map((a) => (a._via && !offeredNames.has(a.a) ? { a: 'idle', _unknownTool: a.a, _callId: a._callId } : a))
+    let action = all[0]
     const offered = new Set(tools.map((t) => t.function?.name))
     if (action._via && !offered.has(action.a)) action = { a: 'idle', _unknownTool: action.a }
     // An answer that executed NOTHING in a broken way — an invented tool
@@ -669,7 +758,8 @@ class AmdToolsClient {
             this.stats.rescuedToolCalls = (this.stats.rescuedToolCalls || 0) + 1
             if (retry._via === 'tool') this.stats.toolCalls += 1
             else this.stats.jsonFallbacks += 1
-            return { action, content: typeof next.message.content === 'string' ? next.message.content.trim() : '', usage: totalUsage, raw: next.raw }
+            const rescued = coerceActions(next.message, { max: this.maxToolCalls }).map((a) => (a._via && !offered.has(a.a) ? { a: 'idle', _unknownTool: a.a, _callId: a._callId } : a))
+            return { action, actions: rescued.length ? rescued : [action], message: next.message, content: typeof next.message.content === 'string' ? next.message.content.trim() : '', usage: totalUsage, raw: next.raw }
           }
         } catch (err) {
           logger.debug(TAG, `action retry ${attempt} failed: ${err.message || err}`)
@@ -681,7 +771,9 @@ class AmdToolsClient {
     if (action._via === 'tool') this.stats.toolCalls += 1
     else if (action._fallback || action._badArgs) this.stats.jsonFallbacks += 1
     if (action._unknownTool) this.stats.unknownToolCalls += 1
-    return { action, content: typeof current.message.content === 'string' ? current.message.content.trim() : '', usage: totalUsage, raw: current.raw }
+    const actions = current === first ? all : [action]
+    if (actions.length > 1) this.stats.multiToolAnswers = (this.stats.multiToolAnswers || 0) + 1
+    return { action, actions, message: current.message, content: typeof current.message.content === 'string' ? current.message.content.trim() : '', usage: totalUsage, raw: current.raw }
   }
 
   /**
@@ -714,4 +806,4 @@ class AmdToolsClient {
   _startedAt = Date.now()
 }
 
-module.exports = { AmdToolsClient, createZincTools, createChatTools, coerceAction, coerceReply, buildToolsPayload, ACTION_TOOLS, CHAT_TOOLS }
+module.exports = { AmdToolsClient, createZincTools, createChatTools, coerceAction, coerceActions, coerceReply, buildToolsPayload, toolTurnMessages, ACTION_TOOLS, CHAT_TOOLS }

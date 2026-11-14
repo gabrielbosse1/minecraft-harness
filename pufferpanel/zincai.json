@@ -137,8 +137,8 @@
     "heartbeat": {
       "type": "integer",
       "value": 90000,
-      "display": "Heartbeat (ms)",
-      "desc": "Self-prompt when nothing happens. 0 turns it off: the bot then only thinks when someone talks to it or the world changes.",
+      "display": "Longest idle gap (ms)",
+      "desc": "The bot runs in a loop: after each turn the next one starts by itself a few seconds later (8 s), and while it keeps choosing to do nothing that gap doubles up to this value. 0 turns the loop off: the bot then only thinks when someone talks to it or the world changes.",
       "required": true,
       "userEdit": true
     },
@@ -255,7 +255,7 @@
     },
     {
       "display": "Operator Control",
-      "description": "Who may control the running bot. Console only, no prefix: pause, stop, shutdown, status, config. Nothing typed in game chat is a command.",
+      "description": "Who may control the running bot. Console only, no prefix: pause, stop, shutdown, status, config — and `update`, which pulls the newest source from GitHub and restarts the bot on it (no reinstall needed). Nothing typed in game chat is a command.",
       "variables": [
         "joinonstart"
       ],

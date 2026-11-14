@@ -107,7 +107,7 @@ test('many lines in one window do not each cost a model call, and none are dropp
     await sleep(120)
     const chunk = s.prompts.chat[0]
     for (let i = 0; i < 8; i++) assert.match(chunk, new RegExp(`linha ${i}`), `line ${i} survived the window`)
-    assert.match(chunk, /8 lines from Steve/, 'all eight arrived in ONE chunk')
+    assert.match(chunk, /8 chat lines from Steve/, 'all eight arrived in ONE chunk')
     assert.equal(s.prompts.chat.length, 1, 'one model call for the burst, not eight')
   } finally { s.stop() }
 })
@@ -122,7 +122,7 @@ test('a player spamming does not get their lines dropped by the harness', async 
     assert.ok(await s.until(() => s.prompts.chat.length > 0, 4000), 'the model was handed the burst')
     const chunk = s.prompts.chat[0]
     assert.match(chunk, /spam 19/, 'the newest line is there — nothing was dropped for volume')
-    assert.match(chunk, /20 lines from Steve/)
+    assert.match(chunk, /20 chat lines from Steve/)
   } finally { s.stop() }
 })
 
@@ -196,9 +196,15 @@ test('a quiet stretch with no data never calls the model', async () => {
   } finally { brain.stop?.() }
 })
 
-test('a waiting chunk breaks an in-flight action thought', async () => {
+test('chat is answered WHILE the body thinks: a chunk no longer cancels the action thought', async () => {
+  // The old rule ("a waiting chunk breaks an in-flight action thought") made
+  // every line of small talk throw away the body's reasoning and start it
+  // again — on a slow model the bot never finished a thought while anyone
+  // talked. The two lanes run side by side now.
   let aborted = false
   let actionTurns = 0
+  let chatTurns = 0
+  let release = null
   const brain = new Brain({
     chatBatchMs: 10,
     chatMinIntervalMs: 0,
@@ -208,34 +214,40 @@ test('a waiting chunk breaks an in-flight action thought', async () => {
     act: async () => {
       actionTurns++
       if (actionTurns > 1) return { idle: true }
-      // Simulate a long thought that only ends when the harness aborts it.
       await new Promise((resolve) => {
+        release = resolve
         brain.inflightAbort = () => { aborted = true; resolve(); return true }
       })
       return { idle: false }
     },
-    talk: async () => {}
+    talk: async () => { chatTurns++ }
   })
   try {
     brain.start(20)
     brain.wake('think about a staircase')
     await sleep(30)
     assert.ok(actionTurns >= 1, 'the action thought started')
-    brain.hear('Steve', 'zinc, vem aqui')
-    assert.ok(await sleep(120).then(() => aborted), 'the chunk preempted the thought')
-  } finally { brain.stop?.() }
+    brain.hear('Steve', 'zinc, tudo bem?')
+    await sleep(120)
+    assert.equal(chatTurns, 1, 'the chat lane answered while the action thought was still running')
+    assert.equal(aborted, false, 'and the thought was left alone')
+    assert.equal(brain.busyAction, true)
+  } finally { release?.(); brain.stop?.() }
 })
 
-test('the first line of a chunk interrupts immediately, without waiting for a tick', async () => {
-  let aborted = false
+test('a request handed to the body DOES preempt the thought in flight', async () => {
+  let aborted = null
+  const seen = []
   const brain = new Brain({
-    chatBatchMs: 5000, // a long window: the abort must not depend on it
+    chatBatchMs: 5000,
     minIntervalMs: 0,
     rpm: 1000,
     heartbeatMs: 0,
-    act: async () => {
+    act: async (reasons) => {
+      seen.push(reasons.join(' | '))
+      if (seen.length > 1) return { idle: true }
       await new Promise((resolve) => {
-        brain.inflightAbort = () => { aborted = true; resolve(); return true }
+        brain.inflightAbort = (why) => { aborted = why; resolve(); return true }
       })
       return { idle: false }
     },
@@ -245,8 +257,13 @@ test('the first line of a chunk interrupts immediately, without waiting for a ti
     brain.start(60_000) // a very slow ticker: no scheduler slot comes to help
     brain.wake('think hard', { external: true })
     await sleep(40)
-    brain.hear('Steve', 'espera')
-    assert.ok(await sleep(40).then(() => aborted), 'the in-flight thought was cancelled on arrival')
+    assert.equal(brain.preempted, false)
+    brain.wake('chat request from Steve: follow me', { external: true, fast: true, preempt: true })
+    assert.match(String(aborted), /chat request from Steve/, 'cancelled on arrival, without waiting for a tick')
+    assert.equal(brain.preempted, true, 'a multi-step turn sees it between steps')
+    assert.equal(brain.stats.preempts, 1)
+    assert.ok(await sleep(80).then(() => seen.length === 2), 'the request gets its own turn straight away')
+    assert.match(seen[1], /chat request from Steve: follow me/)
   } finally { brain.stop() }
 })
 

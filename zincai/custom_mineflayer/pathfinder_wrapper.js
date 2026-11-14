@@ -109,6 +109,60 @@ function pointSegmentDistance (p, a, b) {
  * Sampling is throttled to `sampleMs` (200 ms default) so 20 Hz physics ticks
  * never pay for it, and entries expire so a despawned mob stops scaring A*.
  */
+const isPlayerEntity = (e) => Boolean(e) && (e.type === 'player' || e.name === 'player')
+
+/**
+ * STANDOFF: how far a route should stay from each kind of mob, in blocks.
+ *
+ * The field used to be one 2-block sphere at the spot a mob would reach in two
+ * seconds. A creeper standing still was therefore "safe" from 2.1 blocks —
+ * inside its 3-block fuse range — and a route happily brushed past a zombie at
+ * arm's length, which is what triggered the escape reflex in the middle of
+ * every walk. The standoff ring is what a player keeps by instinct: wide for
+ * what explodes or shoots, a few blocks for what has to reach you.
+ */
+const STANDOFF = Object.freeze({
+  creeper: 7,
+  warden: 14,
+  ravager: 8,
+  wither: 12,
+  ender_dragon: 12,
+  ghast: 10,
+  blaze: 9,
+  breeze: 8,
+  witch: 8,
+  skeleton: 8,
+  stray: 8,
+  bogged: 8,
+  parched: 8,
+  pillager: 8,
+  illusioner: 8,
+  evoker: 9,
+  shulker: 8,
+  guardian: 8,
+  elder_guardian: 10,
+  piglin_brute: 7,
+  vindicator: 7,
+  wither_skeleton: 6,
+  hoglin: 6,
+  zoglin: 6,
+  enderman: 5,
+  spider: 6,
+  cave_spider: 6,
+  phantom: 6,
+  vex: 6,
+  slime: 5,
+  magma_cube: 5,
+  player: 5
+})
+const DEFAULT_STANDOFF = 5
+
+/** Standoff ring (blocks) for an entity name. */
+function standoffFor (name, table = STANDOFF, fallback = DEFAULT_STANDOFF) {
+  const key = String(name || '').toLowerCase().replace(/^minecraft:/, '')
+  return Number.isFinite(table[key]) ? table[key] : fallback
+}
+
 class PredictiveThreatMap {
   /**
    * @param {{
@@ -146,6 +200,14 @@ class PredictiveThreatMap {
     // Every corridor ends ON the bot, so without the cut the cells around the
     // bot were the most expensive on the map and A* refused to leave them.
     this.corridorClear = Number.isFinite(opts.corridorClear) ? opts.corridorClear : 3
+    // The standoff ring (see STANDOFF). `standoff: false` restores the old
+    // field (one small sphere at the projected position); a number scales the
+    // table; an object overrides entries by mob name.
+    this.standoff = opts.standoff !== false
+    this.standoffScale = Number.isFinite(opts.standoffScale) && opts.standoffScale > 0 ? opts.standoffScale : 1
+    this.standoffTable = opts.standoff && typeof opts.standoff === 'object' ? { ...STANDOFF, ...opts.standoff } : STANDOFF
+    // How strongly the ring counts next to the kill sphere (0..1 at its centre).
+    this.standoffWeight = Number.isFinite(opts.standoffWeight) ? opts.standoffWeight : 0.6
     // Optional predicate: which entities are real threats (line of sight,
     // reachability, recent attackers). Default: hostile names (+ opt-in players).
     this.entityFilter = typeof opts.entityFilter === 'function' ? opts.entityFilter : null
@@ -289,6 +351,9 @@ class PredictiveThreatMap {
         speed: Math.hypot(velocity.x, velocity.z),
         weight: this._weight(entity, pos, velocity, botPos),
         radius: this.futureRadius,
+        // How far a route keeps away from this mob, from where it is to where
+        // it will be (0 = no ring).
+        standoff: this.standoff ? standoffFor(isPlayerEntity(entity) ? 'player' : entity.name, this.standoffTable) * this.standoffScale : 0,
         corridorRadius: this.corridorRadius,
         corridorEnd,
         sampledAt: now,
@@ -319,6 +384,18 @@ class PredictiveThreatMap {
       if (!t || t.expiresAt <= this.now()) continue
       const df = Math.hypot(point.x - t.future.x, (point.y - t.future.y) * yWeight, point.z - t.future.z)
       if (df < t.radius) score += (1 - df / t.radius) * t.weight
+      if (t.standoff > 0) {
+        // The standoff ring: measured from the whole stretch the mob covers in
+        // the next two seconds, falling off with the square of the distance —
+        // steep next to the mob, almost free at the rim, so a route bends
+        // around it without the far side of the ring looking like a wall.
+        const flat = pointSegmentDistance({ x: point.x, y: 0, z: point.z }, { x: t.position.x, y: 0, z: t.position.z }, { x: t.future.x, y: 0, z: t.future.z })
+        const ds = Math.hypot(flat, (point.y - t.position.y) * yWeight)
+        if (ds < t.standoff) {
+          const k = 1 - ds / t.standoff
+          score += k * k * t.weight * this.standoffWeight
+        }
+      }
       if (t.corridorEnd) {
         const dLine = pointSegmentDistance(point, t.position, t.corridorEnd)
         if (dLine < t.corridorRadius) score += (1 - dLine / t.corridorRadius) * t.weight * 0.75
@@ -673,6 +750,10 @@ function findGroundY (bot, x, z, { up = 3, down = 6 } = {}) {
 }
 
 const HAZARD_NAMES = /lava|fire|magma|cactus|sweet_berry|powder_snow|wither_rose|campfire/
+/** The six face neighbours. */
+const NEIGHBOURS = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]
+/** Crafted blocks: terrain that touches one of these is part of a build. */
+const BUILT_NEIGHBOUR = /(_planks$|_bricks$|^bricks$|_door$|_trapdoor$|glass|^chest$|^trapped_chest$|^barrel$|shulker_box$|_bed$|furnace$|^smoker$|^crafting_table$|_sign$|_stairs$|_slab$|_fence$|_fence_gate$|_wall$|^repeater$|^comparator$|piston|^redstone_wire$|^rail$|_rail$|lantern$|^bookshelf$|^torch$|_torch$|_concrete$|_terracotta$|_wool$|_carpet$|^hopper$|^dispenser$|^dropper$|^observer$|^lever$|_button$|_pressure_plate$|^farmland$|^anvil$|^beacon$|^ladder$|^scaffolding$)/
 /** Blocks that burn whoever stands on them. */
 const FLOOR_HAZARD = /^(magma_block|campfire|soul_campfire)$/
 /** Blocks a player must not walk INTO (upstream already avoids fire, lava and cobwebs). */
@@ -973,6 +1054,18 @@ class PathfinderWrapper {
     // { canDig: Set<blockId|null>, cantDig: Set<blockId|null>, expiresAt } | null
     this._digWindow = null
     this._digTimer = null
+    // The STANDING rule for ordinary walks (dig_policy.js): the model's own
+    // can-dig switch and block list. A `dig` corridor, while open, replaces it.
+    //   digPolicy     { resolve(registry) → null | { all, names, never }, version }
+    //   digAllowed    () => boolean — the operator's switch (actions.allowDig)
+    //   isProtected   (pos) => boolean — a cell inside somebody's build/claim
+    this.digPolicy = opts.digPolicy || null
+    this.digAllowed = typeof opts.digAllowed === 'function' ? opts.digAllowed : () => true
+    this.isProtected = typeof opts.isProtected === 'function' ? opts.isProtected : null
+    // Breaking costs more than walking around: a detour of a few blocks beats
+    // a hole in the ground. (The explicit corridor keeps upstream's price.)
+    this.policyDigCost = Number.isFinite(opts.policyDigCost) ? Math.max(1, opts.policyDigCost) : 2
+    this._policyCache = null // { version, registry, all, ids:Set, never:Set }
     // Pillaring up and bridging with dirt/cobblestone is upstream's default.
     // Around other people's builds that is griefing, so it is OFF unless the
     // operator opts in (behavior.allowScaffolding) for wilderness travel.
@@ -1023,6 +1116,17 @@ class PathfinderWrapper {
       : new WindChargeTraversal(bot, { enabled: opts.enableWindCharge !== false, logger: this.log, ...(opts.windCharge || {}) })
     this.enableWindCharge = opts.enableWindCharge !== false
     this._threatTimer = null
+    // Route watcher (see _watchRoute): re-plan when the steps ahead cost at
+    // least `routeReplanCost` AND `routeReplanRise` more than at planning time.
+    const tcfg = (opts.threat && !(opts.threat instanceof PredictiveThreatMap)) ? opts.threat : {}
+    this.routeReplanMs = Number.isFinite(tcfg.routeReplanMs) ? tcfg.routeReplanMs : 1200
+    this.routeReplanCost = Number.isFinite(tcfg.routeReplanCost) ? tcfg.routeReplanCost : 12
+    this.routeReplanRise = Number.isFinite(tcfg.routeReplanRise) ? tcfg.routeReplanRise : 8
+    this._routeBaseline = 0
+    this._routeBaselineAt = 0
+    this._lastRouteReplanAt = 0
+    /** How many times a route was planned again because of what walked onto it. */
+    this.threatReplans = 0
     this._windBusy = false
     this._windAttempts = 0
     this._onPathUpdate = null
@@ -1093,6 +1197,7 @@ class PathfinderWrapper {
     // The prototype patch calls this after every collision-index rebuild.
     movements._zincaiAfterCollisionIndex = () => this._applyBreakPolicy(movements)
     this._applyBreakPolicy(movements)
+    this._configureBreakGuard(movements)
     this._configureScaffolding(movements)
     this._configureDoors(movements)
     this._configureWalkableSurfaces(movements)
@@ -1119,7 +1224,14 @@ class PathfinderWrapper {
     this._appliedOnce = true
     this._patchCollisionIndex()
     this._patchStairClearance()
-    this._onPathSeen = (result) => { if (result && Array.isArray(result.path)) this._path = result.path }
+    this._onPathSeen = (result) => {
+      if (!result || !Array.isArray(result.path)) return
+      this._path = result.path
+      // What this route cost in threat when it was planned: the baseline the
+      // route watcher compares against (see _watchRoute).
+      this._routeBaseline = this.routeThreat().worst
+      this._routeBaselineAt = Date.now()
+    }
     this.bot.on('path_update', this._onPathSeen)
     this._onTick(this._doorTick.bind(this))
     this._startHumanizer()
@@ -1127,11 +1239,71 @@ class PathfinderWrapper {
     return this._applied
   }
 
-  /** 200 ms threat sampling + wind-charge recovery after noPath. */
+  /**
+   * Threat cost of the route still ahead: the next `nodes` steps of the path
+   * the pathfinder is walking, from the node nearest the bot onward.
+   * @returns {{ worst:number, sum:number, at:{x:number,y:number,z:number}|null, nodes:number }}
+   */
+  routeThreat ({ nodes = 14 } = {}) {
+    const out = { worst: 0, sum: 0, at: null, nodes: 0 }
+    const path = this._path
+    const me = this.bot?.entity?.position
+    if (!Array.isArray(path) || !path.length || !me || !this.threat.threats.length) return out
+    let start = 0
+    let best = Infinity
+    for (let i = 0; i < path.length; i++) {
+      const n = path[i]
+      const d = (n.x + 0.5 - me.x) ** 2 + (n.y - me.y) ** 2 + (n.z + 0.5 - me.z) ** 2
+      if (d < best) { best = d; start = i }
+    }
+    // The cells right around the bot are what they are — the bot is already
+    // standing there. What matters is what the route walks INTO.
+    for (let i = start + 1; i < path.length && out.nodes < nodes; i++) {
+      const n = path[i]
+      const cost = this.threat.costAt({ x: n.x + 0.5, y: n.y, z: n.z + 0.5 })
+      out.nodes++
+      out.sum += cost
+      if (cost > out.worst) { out.worst = cost; out.at = { x: n.x, y: n.y, z: n.z } }
+    }
+    return out
+  }
+
+  /**
+   * THE ROUTE WATCHER. A path is planned once, against the mobs as they stood
+   * at that moment; upstream only plans again when a block changes or the bot
+   * gets stuck. So a zombie that walked onto the route after it was planned
+   * was simply walked into — and the escape reflex then tore the walk down.
+   *
+   * Every threat sample this looks at the next steps of the route. When they
+   * have become clearly more dangerous than when the route was planned, the
+   * route is planned again (with the field as it is now), at most once every
+   * `routeReplanMs`. If no better route exists the new plan carries the new
+   * baseline, so this does not spin.
+   * @returns {boolean} true when a re-plan was requested
+   */
+  _watchRoute (now = Date.now()) {
+    if (this.routeReplanMs <= 0) return false
+    const pf = this.bot?.pathfinder
+    if (!pf || !pf.goal || (typeof pf.isMoving === 'function' && !pf.isMoving())) return false
+    if (now - (this._lastRouteReplanAt || 0) < this.routeReplanMs) return false
+    // A fresh plan gets a moment before it is second-guessed.
+    if (now - (this._routeBaselineAt || 0) < 400) return false
+    const ahead = this.routeThreat()
+    if (ahead.worst < this.routeReplanCost) return false
+    if (ahead.worst < (this._routeBaseline || 0) + this.routeReplanRise) return false
+    this._lastRouteReplanAt = now
+    this.threatReplans++
+    this.log('debug', `route re-planned: threat ahead rose to ${ahead.worst} (was ${this._routeBaseline || 0}) near ${ahead.at ? `${ahead.at.x},${ahead.at.y},${ahead.at.z}` : '?'}`)
+    try { pf.setMovements(pf.movements) } catch { return false }
+    return true
+  }
+
+  /** 200 ms threat sampling + route watcher + wind-charge recovery after noPath. */
   _startThreatMap () {
     clearInterval(this._threatTimer)
     this._threatTimer = setInterval(() => {
       try { this.threat.sample(this.bot) } catch (err) { this.log('debug', `threat sample failed: ${err.message || err}`) }
+      try { this._watchRoute() } catch (err) { this.log('debug', `route watch failed: ${err.message || err}`) }
     }, this.threat.sampleMs)
     // Sample immediately so the first path is already threat-aware.
     try { this.threat.sample(this.bot, true) } catch { /* no entity yet */ }
@@ -1307,6 +1479,83 @@ class PathfinderWrapper {
     return { canDig: w.canDig ? [...w.canDig] : null, cantDig: [...w.cantDig], expiresAt: w.expiresAt }
   }
 
+  /**
+   * The standing dig policy, resolved to block ids for this registry — or null
+   * when an ordinary walk may not break anything (policy off, the operator's
+   * switch off, or no policy at all). Cached per policy version.
+   */
+  _passivePolicy () {
+    const policy = this.digPolicy
+    if (!policy) return null
+    let allowed = true
+    try { allowed = this.digAllowed() !== false } catch { allowed = true }
+    if (!allowed) return null
+    const registry = this.bot?.registry
+    const c = this._policyCache
+    if (c && c.version === policy.version && c.registry === registry) return c.value
+    let value = null
+    try {
+      const r = policy.resolve(registry)
+      if (r) {
+        const idOf = (name) => registry?.blocksByName?.[name]?.id
+        const ids = new Set()
+        for (const n of r.names || []) { const id = idOf(n); if (id !== undefined) ids.add(id) }
+        const never = new Set()
+        for (const n of r.never || []) { const id = idOf(n); if (id !== undefined) never.add(id) }
+        value = { all: Boolean(r.all), ids, never }
+      }
+    } catch (err) { this.log('debug', `dig policy unreadable: ${err.message || err}`); value = null }
+    this._policyCache = { version: policy.version, registry, value }
+    return value
+  }
+
+  /** The model edited its dig policy: plan the next step with the new rule. */
+  refreshDigPolicy () {
+    this._policyCache = null
+    const movements = this._movements()
+    if (movements) this._applyBreakPolicy(movements)
+    // A route that is being walked right now was planned under the old rule.
+    try {
+      const pf = this.bot?.pathfinder
+      if (movements && pf?.goal && typeof pf.isMoving === 'function' && pf.isMoving() && pf.movements === movements) pf.setMovements(movements)
+    } catch { /* the next plan picks it up */ }
+    return this._passivePolicy()
+  }
+
+  /** What an ordinary walk may break right now, for prompts and tests. */
+  get passiveDigging () {
+    if (this._digWindow && Date.now() <= this._digWindow.expiresAt) return null
+    const p = this._passivePolicy()
+    return p ? { all: p.all, ids: [...p.ids] } : null
+  }
+
+  /**
+   * A soft block is not fair game when it is part of something built: the dirt
+   * a wall stands on, the sand under somebody's rails. Under the STANDING
+   * policy (not an explicit `dig` corridor, which the model aimed itself) a
+   * block that touches crafted blocks, or lies inside a known build/claim, is
+   * priced out of the route.
+   */
+  _configureBreakGuard (movements) {
+    if (!Array.isArray(movements.exclusionAreasBreak) || movements.exclusionAreasBreak.some((f) => f && f._zincaiBreakGuard)) return
+    const bot = this.bot
+    const guard = (block) => {
+      if (!block?.position) return 0
+      if (this._digWindow && Date.now() <= this._digWindow.expiresAt) return 0
+      if (!this._passivePolicy()) return 0
+      try {
+        if (this.isProtected && this.isProtected(block.position)) return 100
+        for (const [dx, dy, dz] of NEIGHBOURS) {
+          const nb = bot.blockAt(block.position.offset(dx, dy, dz), false)
+          if (nb && BUILT_NEIGHBOUR.test(nb.name || '')) return 100
+        }
+      } catch { return 0 }
+      return 0
+    }
+    guard._zincaiBreakGuard = true
+    movements.exclusionAreasBreak.push(guard)
+  }
+
   /** Block ids that are never breakable, whatever the window says. */
   _doorBlockIds () {
     const registry = this.bot?.registry
@@ -1324,15 +1573,19 @@ class PathfinderWrapper {
    * beginDigging/endDigging call it directly.
    */
   _applyBreakPolicy (movements) {
-    const w = this._digWindow
-    const allowed = Boolean(w) && Date.now() <= w.expiresAt
+    const open = Boolean(this._digWindow) && Date.now() <= this._digWindow.expiresAt
+    const w = open ? this._digWindow : null
+    // No corridor open: the standing policy decides (the model's switch + list).
+    const policy = w ? null : this._passivePolicy()
+    const allowed = Boolean(w || policy)
     // Upstream's own digCost (1) prices a break by its dig time, and its
     // per-move cost cap (100) is what stops a very hard block from being an
-    // option at all. Raising digCost here would make a two-block-high tunnel
-    // through stone unaffordable, so the window keeps the default and the
-    // closed window is what makes breaking impossible.
+    // option at all. Raising digCost much would make a two-block-high tunnel
+    // through stone unaffordable, so the corridor keeps the default, the
+    // standing policy pays a little more (walk around when it is close), and
+    // "nothing allowed" is what makes breaking impossible.
     movements.canDig = allowed
-    movements.digCost = allowed ? 1 : 1000
+    movements.digCost = w ? 1 : (policy ? this.policyDigCost : 1000)
     // Never carve into a liquid wall, never mine what holds gravel or a mob up.
     movements.dontCreateFlow = true
     movements.dontMineUnderFallingBlock = true
@@ -1347,7 +1600,14 @@ class PathfinderWrapper {
     // Doors and gates are opened, never broken — in every window.
     for (const id of this._doorBlockIds()) set.add(id)
     const cant = (id) => { if (id !== undefined && id !== null) set.add(id) }
-    if (allowed) {
+    if (policy) {
+      const registry = this.bot?.registry
+      // The list is an allowlist: everything not on it is unbreakable. In mode
+      // "all" only the never-broken blocks are.
+      if (!policy.all && registry?.blocksArray) for (const b of registry.blocksArray) if (!policy.ids.has(b.id)) cant(b.id)
+      for (const id of policy.never) cant(id)
+    }
+    if (w) {
       const registry = this.bot?.registry
       if (w.canDig) {
         // An allowlist: everything not named is unbreakable.
@@ -1730,6 +1990,8 @@ module.exports = {
   projectFuture,
   pointSegmentDistance,
   isHostileName,
+  STANDOFF,
+  standoffFor,
   isDoorOrTrapdoorName,
   HOSTILE_RE,
   WIND_CHARGE_ITEM

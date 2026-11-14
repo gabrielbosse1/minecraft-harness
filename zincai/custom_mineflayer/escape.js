@@ -125,6 +125,16 @@ function planEscape (bot, movements, pursuers, opts = {}) {
   const graceSec = opts.graceSec ?? 0.55
   const minRun = opts.minRun ?? 5
   const avoid = typeof opts.avoid === 'function' ? opts.avoid : null
+  // `toward`: somewhere the body has business (the player it follows, the
+  // place it was walking to). Among cells that are equally safe, prefer the
+  // ones that do not carry it further from there — a dodge, not a retreat.
+  const toward = opts.toward && Number.isFinite(opts.toward.x) && Number.isFinite(opts.toward.z) ? opts.toward : null
+  const towardFrom = toward ? Math.hypot(toward.x - pos.x, toward.z - pos.z) : 0
+  const towardBonus = (node) => {
+    if (!toward) return 0
+    const gain = towardFrom - Math.hypot(toward.x - (node.x + 0.5), toward.z - (node.z + 0.5))
+    return Math.max(-5, Math.min(5, gain * 0.4))
+  }
   const clock = typeof opts.now === 'function' ? opts.now : () => performance.now()
   const started = clock()
 
@@ -195,7 +205,7 @@ function planEscape (bot, movements, pursuers, opts = {}) {
     safeCells++
     if (node.g < minRun) continue
     // Time in hand on arrival, capped so "far enough" does not always mean "as far as possible".
-    consider(node, Math.min(node.margin, 12) + (node.leadsOut ? 6 : 0) + Math.min(node.g, 16) * 0.05)
+    consider(node, Math.min(node.margin, 12) + (node.leadsOut ? 6 : 0) + Math.min(node.g, 16) * 0.05 + towardBonus(node))
   }
   let why = best ? (best.leadsOut ? 'open' : 'pocket') : ''
   let chased = false

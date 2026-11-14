@@ -24,17 +24,22 @@
     "_lanesNote": "maxConcurrent 2 = the chat lane and the action lane each have one call in flight, so a slow action call never holds a chat reply (set 1 if the endpoint refuses parallel requests; chat still goes first). chatTimeoutMs 90000 accommodates Qwen3.8-27B latency (~47s p50) while remaining shorter than action timeoutMs (120000); adaptive p90 scaling lifts slow calls automatically."
   },
   "inference": {
-    "_note": "Two lanes: chat (reads people) and action (drives the body). Wake-ups are queued, never dropped. rpm is the shared calls-per-minute budget — the API's pacing, which is the only budget that still limits the model; chatReserve of those are for the chat lane alone. chatBatchMs is the IRC window: chat lines are collected this long and handed over as ONE chunk (several speakers, in order) instead of one model call per line; 0 turns batching off. urgentMinIntervalMs: the start of an escape or being cornered may be thought about this soon after the last call. heartbeatMs is the self-prompt when nothing happens (0 = off).",
+    "_note": "Two lanes: chat (reads people) and action (drives the body). Wake-ups are queued, never dropped. rpm is the shared calls-per-minute budget — the API's pacing, which is the only budget that still limits the model; chatReserve of those are for the chat lane alone. chatBatchMs is the IRC window: chat lines are collected this long and handed over as ONE chunk (several speakers, in order) instead of one model call per line; 0 turns batching off. urgentMinIntervalMs: the start of an escape or being cornered may be thought about this soon after the last call. heartbeatMs is the longest the agent loop ever waits between turns when nothing happens (0 = loop off); see _loopNote.",
     "minIntervalMs": 3000,
     "urgentMinIntervalMs": 1000,
     "chatMinIntervalMs": 1200,
-    "chatBatchMs": 5000,
-    "_chatBatchNote": "chat is delivered in 5 s chunks, IRC-style, and only when there is data: the first line of a quiet stretch opens the window, everything said inside it joins the same chunk. A waiting chunk also preempts an in-flight action call, so a player can break the model's thinking.",
+    "chatBatchMs": 6000,
+    "_chatBatchNote": "chat is delivered in 6 s chunks, IRC-style, and only when there is data: the first line of a quiet stretch opens the window, everything said inside it joins the same chunk. Chat is answered by its own lane WHILE the body works: it does not cancel the action thought. Only a request the chat lane hands to the body (reply.do / reply.task) preempts that thought.",
     "rpm": 18,
     "chatReserve": 4,
     "heartbeatMs": 90000,
+    "loopMs": 8000,
+    "loopBusyMs": 30000,
+    "maxStepsPerTurn": 6,
+    "timelineMax": 80,
+    "_loopNote": "THE AGENT LOOP. A turn is think -> call tools -> read their results -> think again, up to maxStepsPerTurn model calls, ending when the model calls idle or puts the body to work. The next turn then starts by itself loopMs after the last one ended (env INFERENCE_LOOP_MS); while the model keeps answering idle the gap doubles up to heartbeatMs, and anything that happens resets it. While the body is busy with a task the loop looks in every loopBusyMs. loopMs 0 or heartbeatMs 0 turns the loop off (events only). timelineMax is how many lines the IRC-style log (chat + events, each with its clock time) keeps.",
     "maxSelfChain": 12,
-    "chatMaxTokens": 120,
+    "chatMaxTokens": 160,
     "failGateAfter": 2,
     "failWindowMs": 120000,
     "_failGateNote": "the same tool call with the same arguments failing failGateAfter times inside failWindowMs is refused locally (no wake) until the world changes (success, movement, hurt, new threat, timeout)."
@@ -51,8 +56,15 @@
     "_chatRecallNote": "Memory recall on non-chat wakes uses the last chat line only while it is this fresh : hours-old chat stopped steering recall into flee/task prompts."
   },
   "behavior": {
-    "_note": "No modes, no friend list, no PvP switch, no digging switch, no language: the model has every tool on every turn and decides for itself what to do, whom to answer and in which language. Its reflex toward a real threat is to flee until it decides otherwise, and pathfinding never breaks blocks on its own (the model asks with the `dig` tool).",
+    "_note": "No modes, no friend list, no PvP switch, no language: the model has every tool on every turn and decides for itself what to do, whom to answer and in which language. Its reflex toward a real threat is to flee until it decides otherwise, and what a walk may break on its own is the model's own standing rule (`digging` below, the `dig_policy` tool); anything else it breaks on purpose with `dig`.",
     "allowScaffolding": false,
+    "digging": {
+      "_note": "What a WALK may break on its own. The model owns this at run time through the dig_policy tool (switch, mode, list) and its edits are saved in <data dir>/dig-policy.json, which then wins over these values; these are only the first-run defaults. enabled: the can-dig flag. mode list = only blocks on the list, all = anything except the never-break set (bedrock, portals, spawners...). allow: null = the built-in soft-terrain list (dirt, grass, sand, gravel, snow, leaves; no stone, ore or wood); or your own array of block ids, * is a wildcard. cost: path cost added per broken block, so a route around is preferred when it is short. Whatever the policy says, a walk never breaks a block that touches a crafted block (a build) or lies inside someone's claim, and the operator switch actions.allowDig turns all of it off.",
+      "enabled": true,
+      "mode": "list",
+      "allow": null,
+      "cost": 2
+    },
     "engageRadius": 24,
     "fovDegrees": 90,
     "perceptionRange": 10,
@@ -81,6 +93,11 @@
     "reportGapMs": 6000,
     "stillFleeingMs": 30000,
     "recallMs": 180000,
+    "tether": true,
+    "tetherTriggerRadius": 6,
+    "tetherReleaseRadius": 9,
+    "tetherCalmMs": 1200,
+    "_tetherNote": "With a walk under way (follow, go_to, any errand) an escape is a short DODGE, not a retreat: it starts only when something hostile is inside tetherTriggerRadius, is planned toward where the walk was heading, ends after tetherCalmMs with nothing inside tetherReleaseRadius, and the walk then carries on by itself. At lowHealth or below the full escape applies again. tether false restores the old behaviour.",
     "tickMs": 200
   },
   "combat": {
@@ -92,7 +109,7 @@
     "maxChainKills": 6
   },
   "threat": {
-    "_note": "What counts as a threat (threats.js) and how A* avoids it (PredictiveThreatMap). radius/rangedRadius: the trigger ring - how close a hostile mob (melee / ranged) must be to start an escape. Further out, up to 32 blocks, hostiles in the open are watched: counted for the model and used to decide when an escape is over. attackerMemoryMs: how long something that hit the bot stays a threat. Players are never threats unless they hit the bot.",
+    "_note": "What counts as a threat (threats.js) and how A* avoids it (PredictiveThreatMap): every path step pays for coming near a hostile - inside its standoff ring (creeper 7 blocks, shooters 8, melee 5; standoffScale multiplies the table, standoff:false switches the ring off), at the spot it will reach in two seconds, and on its line to the bot. A route already being walked is planned AGAIN when a mob moves onto it: routeReplanCost is how costly a step ahead must have become, routeReplanRise how much worse than when the route was planned, routeReplanMs the least time between two re-plans (0 = never re-plan). radius/rangedRadius: the trigger ring - how close a hostile mob (melee / ranged) must be to start an escape. Further out, up to 32 blocks, hostiles in the open are watched: counted for the model and used to decide when an escape is over. attackerMemoryMs: how long something that hit the bot stays a threat. Players are never threats unless they hit the bot.",
     "horizonTicks": 40,
     "sampleMs": 200,
     "maxRadius": 24,
@@ -103,7 +120,11 @@
     "rangedRadius": 18,
     "attackerMemoryMs": 15000,
     "maxThreats": 48,
-    "corridorClear": 3
+    "corridorClear": 3,
+    "standoffScale": 1,
+    "routeReplanMs": 1200,
+    "routeReplanCost": 12,
+    "routeReplanRise": 8
   },
   "traversal": {
     "_note": "Wind-charge traversal. Used only when A* reports noPath across a 3-5 wide gap or <=4 high wall.",

@@ -185,6 +185,23 @@ class System1 {
     // when nothing has followed inside this wider ring for `calmMs`.
     this.releaseRadius = opts.releaseRadius ?? 22
     this.calmMs = opts.calmMs ?? 4000
+    // THE TETHER. While the body has an errand that is a walk (following
+    // someone, going somewhere), an escape is a DODGE, not a retreat:
+    //   - it starts later (a mob inside `tetherTriggerRadius`, or one that
+    //     already hurt us / is lit / is "hard"), because the route itself
+    //     already steers around mobs;
+    //   - it ends sooner (nothing inside `tetherReleaseRadius` for
+    //     `tetherCalmMs`), so the errand resumes while it is still possible;
+    //   - it prefers ground that does not lead away from the errand.
+    // Without this, "follow me" ended at the first zombie: the body ran until
+    // nothing hostile was within 22 blocks, by which time the player was gone.
+    // `tether()` returns { label, position } or null; at low health it is
+    // ignored and the full escape runs.
+    this.tether = typeof opts.tether === 'function' ? opts.tether : () => null
+    this.tetherTriggerRadius = opts.tetherTriggerRadius ?? 6
+    this.tetherReleaseRadius = opts.tetherReleaseRadius ?? 9
+    this.tetherCalmMs = opts.tetherCalmMs ?? 1200
+    this._tether = null
     // While an escape lasts: at most one report per `reportGapMs` for changes,
     // and one "still fleeing" every `stillFleeingMs` (0 = never).
     this.reportGapMs = opts.reportGapMs ?? 6000
@@ -396,14 +413,42 @@ class System1 {
    * of sight but not out of range (a zombie around the corner is still
    * coming). An escape is over when this is empty for `calmMs`.
    */
-  _chasers (now = this.now()) {
+  _chasers (now = this.now(), tether = null) {
     const last = this.sense.last
+    if (tether) {
+      // On an errand: only what is actually on top of the body keeps it away.
+      const R = this.tetherReleaseRadius
+      const near = (t) => t.hard || t.lit || t.distance <= R
+      const out = this.live.filter(near)
+      for (const t of last.watch || []) if (t.distance <= R && this._isLive(t, now)) out.push(t)
+      const ep = this._episode
+      if (ep) for (const t of last.hidden || []) if (t.distance <= Math.min(R, 5) && !t.caged && ep.ids.has(t.id) && this._isLive(t, now)) out.push(t)
+      return out.sort(byDistance)
+    }
     const out = [...this.live]
     const R = this.releaseRadius
     for (const t of last.watch || []) if ((t.distance <= R || t.closing > 0.5) && this._isLive(t, now)) out.push(t)
     const ep = this._episode
     if (ep) for (const t of last.hidden || []) if (t.distance <= R && !t.caged && ep.ids.has(t.id) && this._isLive(t, now)) out.push(t)
     return out.sort(byDistance)
+  }
+
+  /**
+   * The errand the body should come back to, if any: `{ label, position }`.
+   * Ignored when the body is badly hurt — then getting away is the errand.
+   */
+  /** The errand the current escape will hand the body back to (its label), or null. */
+  get dodgingFor () { return this._flee && this._tether ? this._tether.label : null }
+
+  _tetherNow () {
+    let t = null
+    try { t = this.tether() || null } catch { t = null }
+    if (t) {
+      const hp = Number(this.bot.health)
+      if (Number.isFinite(hp) && hp <= this.lowHealth) t = null
+    }
+    this._tether = t
+    return t
   }
 
   // ------------------------------------------------------------- the tick
@@ -425,7 +470,14 @@ class System1 {
     //    the 12-block line and wake the model at every flip.
     this.sense.assess()
     const live = this._refreshLive()
-    const from = (this._flee || live.length) ? this._chasers(now) : []
+    const tether = this._tetherNow()
+    // With an errand under way, a mob at the edge of the ring is the route's
+    // problem (it is priced into the path); the reflex takes over only when one
+    // is close, has hurt the body, or cannot be argued with.
+    const starters = tether && !this._flee
+      ? live.filter((t) => t.hard || t.lit || t.attacker || t.distance <= this.tetherTriggerRadius)
+      : live
+    const from = (this._flee || starters.length) ? this._chasers(now, tether) : []
     if (from.length) {
       this.chasers = from
       // Back from a look-back pause: the "not making ground" clock starts afresh.
@@ -446,7 +498,7 @@ class System1 {
         this.hands.setGoal(null)
         this.hands.clearControlStates()
       }
-      if (now - this._calmSince >= this.calmMs) this._endFlee('safe')
+      if (now - this._calmSince >= (tether ? this.tetherCalmMs : this.calmMs)) this._endFlee('safe')
       else this.hands.touch(1500)
     } else {
       this.chasers = []
@@ -524,9 +576,12 @@ class System1 {
       const expired = this._expired && now - this._expired.endedAt <= 10_000 ? this._expired : null
       this._expired = null
       const why = expired ? ` (your "${expired.label}" decision from ${Math.round((now - expired.at) / 1000)}s ago ran out)` : ''
-      const text = `reflex: started FLEEING — ${this._kinds(from, { counts: false })} came close (${from[0].where})${why}${ep.cornered ? `; ${cornerText(ep.corneredWhy)}` : ''}`
+      // On an errand this is a dodge: say so, and say that the errand resumes
+      // by itself, so the answer to this wake is not to start it all over.
+      const errand = this._tether && !ep.cornered ? `; dodging — "${this._tether.label}" is only paused and resumes by itself when clear (idle keeps both)` : ''
+      const text = `reflex: started FLEEING — ${this._kinds(from, { counts: false })} came close (${from[0].where})${why}${ep.cornered ? `; ${cornerText(ep.corneredWhy)}` : ''}${errand}`
       this.logger?.info?.('reflex', text)
-      this.onEvent({ type: 'threat', text, wake: true, urgent: true, threatIds: [...ep.ids] })
+      this.onEvent({ type: 'threat', text, wake: true, urgent: !errand, threatIds: [...ep.ids] })
       return
     }
     for (const t of from) ep.ids.add(t.id)
@@ -573,6 +628,11 @@ class System1 {
       const secs = Math.max(1, Math.round((now - ep.startedAt) / 1000))
       const lost = Math.round(ep.hpStart - Number(this.bot.health ?? ep.hpStart))
       const state = ep.cornered ? `; ${cornerText(ep.corneredWhy).split(' — ')[0]}` : ''
+      // A dodge with an errand to come back to reads differently: nothing here
+      // should make the model think its task is over and must be asked again.
+      const errand = this._tether?.label
+      if (errand && brief) return `DODGING by reflex ${secs}s (ran ${Math.round(ep.run)}m${lost > 0 ? `, lost ${lost} hp` : ''}${state}) — "${errand}" resumes by itself`
+      if (errand) return `DODGING ${this._kinds(ep.kinds)} for ${secs}s — ran ${Math.round(ep.run)}m from ${at(ep.start)}${lost > 0 ? `, lost ${lost} hp` : ''}${state}. The body did this by itself and goes straight back to "${errand}" when there is room; idle keeps both, do not start it again.`
       if (brief) return `FLEEING by reflex ${secs}s, ran ${Math.round(ep.run)}m${lost > 0 ? `, lost ${lost} hp` : ''}${state}`
       return `FLEEING for ${secs}s from ${this._kinds(ep.kinds)} — ran ${Math.round(ep.run)}m from ${at(ep.start)}${lost > 0 ? `, lost ${lost} hp` : ''}${state}. The body did this by itself; idle keeps it running.`
     }
@@ -726,7 +786,11 @@ class System1 {
   _planEscape (threats) {
     const lit = threats.some((t) => t.lit)
     let plan = null
-    try { plan = this.pathfinder?.escapePlan?.(this._pursuers(threats), { radius: lit ? 22 : 18, budgetMs: 18 }) || null } catch (err) { this.logger?.debug?.('reflex', `escape plan failed: ${err.message || err}`); plan = null }
+    // On an errand: a shorter search, biased toward where the body is headed.
+    const tether = this._tether
+    const toward = tether?.position && Number.isFinite(tether.position.x) ? { x: tether.position.x, z: tether.position.z } : null
+    const opts = { radius: lit ? 22 : (tether ? 14 : 18), budgetMs: 18, ...(toward ? { toward } : {}) }
+    try { plan = this.pathfinder?.escapePlan?.(this._pursuers(threats), opts) || null } catch (err) { this.logger?.debug?.('reflex', `escape plan failed: ${err.message || err}`); plan = null }
     if (plan) return plan
     let old = null
     try { old = this.pathfinder?.fleePlan?.({ distance: lit ? this.fleeDistance + 4 : this.fleeDistance }) } catch { old = null }
@@ -809,9 +873,13 @@ class System1 {
     this.lastEpisode = summary
     const cost = summary.lost > 0 ? `, lost ${summary.lost} hp` : ''
     if (why === 'safe') {
-      const text = `reflex: safe again — fled ${secs}s from ${summary.from} (ran ${summary.ran}m${cost}); nothing hostile follows within ${this.releaseRadius}m`
+      const tether = this._tether
+      const text = tether
+        ? `reflex: dodged ${summary.from} for ${secs}s (ran ${summary.ran}m${cost}); nothing hostile within ${this.tetherReleaseRadius}m — back to "${tether.label}"`
+        : `reflex: safe again — fled ${secs}s from ${summary.from} (ran ${summary.ran}m${cost}); nothing hostile follows within ${this.releaseRadius}m`
       this.logger?.info?.('reflex', text)
-      this.onEvent({ type: 'safe', text, wake: true, episode: summary })
+      // A dodge that ends with the errand resuming needs no decision.
+      this.onEvent({ type: 'safe', text, wake: !tether, episode: summary })
     } else {
       // The model ended it; it does not need waking, but the escape is still part of what happened.
       this.onEvent({ type: 'fled', text: `fled ${secs}s from ${summary.from} (ran ${summary.ran}m${cost}), then chose ${label || 'to stop'}`, wake: false, episode: summary })

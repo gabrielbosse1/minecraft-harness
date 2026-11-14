@@ -209,14 +209,47 @@ are checked on `goal resume` or `goal verify`. Tunables are the `goals` block in
   resumes in the morning). `stop` cancels everything. The `agenda:` line shows
   a paused task, a build that a newer task set aside, and requests from chat
   that the body has not started yet.
-- **Chat is a window, not a summons.** Lines are batched for ~5 s
-  (`inference.chatBatchMs`) and handed to the model as one chunk — every
-  speaker, in arrival order, whispers marked — and only when there is data.
+- **The agent loop** (`brain.js`, `act()` in `index.js`). One turn is
+  *think → tool calls → their results → think again*:
+  - an answer may carry several tool calls; they run in order
+    (`parallel_tool_calls: true`; an endpoint that rejects the flag is retried
+    without it and remembered);
+  - what each call returned is sent straight back as OpenAI `tool` messages
+    (or as plain text for an endpoint whose chat template rejects them) and the
+    model is asked again, up to `inference.maxStepsPerTurn` (6) calls per turn,
+    each counted against `inference.rpm`;
+  - the turn ends when the model calls `idle`, when a call put the body to work
+    (`go_to`, `follow`, `build`… — that work runs in the background and its
+    result starts the next turn), when every call was fire-and-forget (`say`,
+    `note`) and succeeded, or when a player's request preempted it;
+  - one body task per answer: a second physical call in the same answer is
+    returned as `NOT RUN` instead of cancelling the first; asking for the
+    `follow` that is already running does not restart it;
+  - between turns the scheduler starts the next one by itself: `loopMs` (8 s)
+    after the last one ended, doubling while the model idles up to
+    `heartbeatMs` (90 s), back to `loopMs` on any event; every `loopBusyMs`
+    (30 s) while the body is busy. `heartbeatMs: 0` or `loopMs: 0` turns the
+    loop off (events only).
+- **Chat is a window, not a summons — and it never waits for the body.** Lines
+  are batched for ~6 s (`inference.chatBatchMs`) and handed to the model as one
+  chunk — every speaker, in arrival order — and only when there is data.
   There is **no relevance filter**: nothing checks the bot's name, counts how
   many players are online, or drops a line because the player has spoken too
-  often. The model reads the window and decides who, if anyone, it is answering.
-  A waiting chunk also preempts an in-flight action call, so a player can break
-  the model's thinking instead of waiting for it to finish.
+  often. The model reads the window and decides who, if anyone, it is answering
+  (`reply.to`). The chat lane runs beside the action lane: it answers while the
+  body walks or builds, and answering cancels nothing. When the reply agrees to
+  one of the three things that need no planning it starts it at once —
+  `reply.do: follow | come | stop` — and anything else (`reply.task`) is handed
+  to the action lane ahead of whatever it was thinking about (that, and only
+  that, preempts an in-flight action call).
+- **One log, IRC style, with times** (`irc.js`). Chat and events share one
+  timeline and both prompts show it oldest-first, every line stamped:
+  `[14:02:07] <Steve> text` public, `[14:02:09] -Steve- text` a whisper to the
+  bot, `<ZincAI>` its own lines, `>Steve< text` its whisper out,
+  `[14:02:15] * hurt: …` an event (world, reflex, own action result); repeats
+  collapse to `(x3)`. The header carries the time *now*. The chat prompt puts a
+  `----- NEW since you last answered -----` marker where the unread lines begin,
+  so the model reads what it has not seen in the context it already had.
 - **Language is the model's.** There is no language check on the way out, no
   retry and no replacement line: it answers in the language the person it is
   talking to used, and the words it chose are the words that go out.
@@ -271,7 +304,8 @@ The complete action tool list is:
 `smelt`, `sleep`, `give`, `eat`, `equip`, `use_block`, `inspect_block`,
 `inspect_region`, `redstone_scan`, `redstone_component`, `find`, `remember_here`,
 `craft`, `gather`, `light_up`, `shelter`, `corpse_run`, `logic_test`,
-`circuit_project`, `build`, `build_shape`, `run_script`, `goal`, `idle`.
+`redstone_engineer`, `circuit_project`, `build`, `build_shape`, `run_script`,
+`goal`, `dig`, `dig_policy`, `note`, `social`, `recall`, `idle`.
 
 **That is the whole list, on every turn.** There is no mode, no `set_mode` and
 no per-mode subset: the schema is byte-identical from call to call (which also
@@ -280,9 +314,11 @@ was hidden by a persona it picked ten minutes ago. Shape floors use `{w,d}` and
 boxes `{w,d,h}`; unsupported parameters and oversized plans are refused rather
 than guessed.
 
-The separate chat lane has one `reply(text, task, remember)` tool. `task` is
-optional and is used only when the player asks ZincAI to do something in the
-world; `remember` is optional and holds a fact worth keeping. Chat and action
+The separate chat lane has one `reply(text, to, do, task, decision, remember)`
+tool. `to` names the player being answered when several are talking; `do`
+(`follow` / `come` / `stop`) starts that body action immediately; `task` is
+anything else the model wants its action lane to do or verify; `remember` holds
+a fact worth keeping. Chat and action
 calls share one rate limit, with a reserved share for chat. Requests ask for a
 tool call with `tool_choice: "required"`; if an OpenAI-compatible endpoint
 rejects `required`, the client falls back to `"auto"`. If the endpoint ignores
@@ -297,30 +333,81 @@ Tool schemas and their argument descriptions are the source of truth in
 
 ## Digging is the model's decision
 
-There is no digging switch: not an operator variable, not a config flag. A
-route is always planned through the world as it is — doors and gates are
-opened, hazards are avoided, and if there is no way through the walk reports
-"no path" instead of tunnelling.
+Two tools, both the model's:
 
-Breaking is a request. The model calls the `dig` tool with a destination
-(player, saved place or `[x,y,z]`) and optionally:
+**`dig_policy` — the standing rule for what a WALK may break**
+(`dig_policy.js`). It is a persistent flag plus an editable list, not a
+per-walk permission:
 
-- `materials` — a list of block ids it may break (`[oak_log]`, `[dirt, stone]`);
-  everything else becomes unbreakable for that trip;
-- `avoid` — block ids it must never break, whatever else is allowed.
+| Argument | Effect |
+| --- | --- |
+| `can_dig: true \| false` | the switch. Off = walking never breaks a block |
+| `mode: "list" \| "all"` | `list` = only blocks on the list; `all` = anything in the way, except the never-break set (bedrock, barriers, portals and frames, spawners, vaults, command/structure blocks, reinforced deepslate) |
+| `add: [...]`, `remove: [...]` | edit the list; ids or `*` wildcards (`*_leaves`) |
+| `reset: true` | back to the starting list |
+| *(none)* | read the rule back |
 
-That permission is a *window*, not a setting: it opens for one walk, closes
-when the walk ends (success, no-path, cancellation or a safety preemption), and
-expires on its own after at most two minutes. Escapes, `follow` and every other
-route keep the strict no-dig geometry. Doors, gates and trapdoors are never
-breakable in any window, and a route never carves into liquid or mines what
-holds up gravel or a mob.
+The starting list is soft, common, cheap-to-replace terrain — dirt, grass,
+sand, gravel, clay, snow, leaves, vines, moss, plants, soul sand — and
+deliberately no stone, ore or wood: breaking those is a decision, so the model
+makes it once (`add: ["stone", "deepslate"]` before going underground) rather
+than hitting "no path" at every block. The rule is shown on every action turn
+as the `digging:` line, applies to every route (`go_to`, `follow`, errands), is
+saved in `<data dir>/dig-policy.json` and survives restarts;
+`behavior.digging` in `config/defaults.json` only sets the first-run values.
+
+Whatever the policy says, a walk never breaks:
+
+- a block that touches a crafted block, or lies inside a claimed/owned area —
+  other players' builds are not terrain;
+- doors, gates, trapdoors (they are opened), containers, anything that holds
+  back liquid, or what supports gravel or a mob;
+- anything at all while the operator switch `actions.allowDig` is off.
+
+Each broken block costs extra path cost (`behavior.digging.cost`), so a short
+way around is still preferred over tunnelling.
+
+**`dig` — one deliberate corridor.** A destination (player, saved place or
+`[x,y,z]`) and optionally `materials` (the only ids it may break) and `avoid`
+(ids it must never break). That permission is a *window*: it opens for one
+walk, closes when the walk ends (success, no-path, cancellation or a safety
+preemption), and expires on its own after at most two minutes. It is how the
+model breaks what its standing rule does not cover — on purpose, once.
+
+## Follow, flee, and routes around mobs
+
+- **`follow` is a loop, not one walk** (`skills.js`). It re-reads the player
+  every pass, waits while a reflex has the controls and then carries on, walks
+  to the last-seen position when the player leaves entity range, and keeps
+  retrying an unreachable stretch. It ends by itself only when the player
+  leaves the game, has been out of sight for 45 s, or has been unreachable for
+  60 s — and reports which. `stop` (or a new body task) ends it.
+- **A scare is a dodge when there is a walk to come back to** (`system1.js`).
+  With an errand under way the escape reflex starts only when something hostile
+  is within `tetherTriggerRadius` (6), plans the dodge *toward* where the walk
+  was heading (`escape.js`), and ends after `tetherCalmMs` (1.2 s) with nothing
+  within `tetherReleaseRadius` (9) — instead of running until nothing hostile
+  is within 22 blocks. The paused task resumes by itself; the model is told
+  `dodging — "following Steve" is only paused and resumes by itself`, and the
+  end of the dodge does not wake it. At `lowHealth` or below the full escape
+  applies. `system1.tether: false` restores the old behaviour.
+- **Routes keep away from mobs** (`PredictiveThreatMap` in
+  `custom_mineflayer/pathfinder_wrapper.js`). Every A* step pays a threat cost:
+  a *standoff ring* per mob type (creeper 7 blocks, ranged mobs 8, melee 5,
+  warden 14…) measured from the whole stretch the mob will cover in the next
+  two seconds, its projected position, and its line to the bot. The cost is
+  quadratic — steep next to the mob, nearly free at the rim — and capped below
+  the pathfinder's "impossible" line, so it bends routes without walling the
+  bot in. A **route watcher** re-plans a route that is already being walked
+  when the steps ahead have become clearly more dangerous than when it was
+  planned (`threat.routeReplanCost` 12, `routeReplanRise` 8, at most every
+  `routeReplanMs` 1.2 s).
 
 ## Operator control (runtime, no restart)
 
 Zinc keeps its identity, its goals and its own decisions; what an operator gets
-is a **control plane**, not a personality. Nothing here kills the Node.js
-process, restarts the bot, or switches it into a different "mode" — there is no
+is a **control plane**, not a personality. Apart from `shutdown`, `update` and
+`restart`, nothing here kills the Node.js process, and nothing switches it into a different "mode" — there is no
 autonomous/safe/building/restricted switch anywhere in this code. There are
 parameters, permissions and limits, each of which can be read and changed while
 the bot is running.
@@ -341,6 +428,8 @@ command, for anyone.
 | `status` | connection state, life, pause, activity, open goals, running jobs, effective limits |
 | `pause` (alias `stop`) | the emergency handbrake: no new physical action, cancellable work interrupted, open goals **suspended — never deleted**, memory/identity/process untouched. Changes no policy: everything the model may do, it may still do |
 | `shutdown [code]` | the other half of the emergency stop: save memory/places/goals, leave the server, exit the process. `pause` is the reversible one |
+| `update [check \| force]` | pull the newest source from GitHub and restart on it (below) |
+| `restart` | restart the whole process on the source that is on disk, without pulling |
 | `resume` | inspect the real world and inventory first, then hand back only the goals that still make sense |
 | `leave` | disconnect Mineflayer; the process, memory, goals, reasoning and this interface stay up |
 | `join` | reconnect the existing process to the configured server |
@@ -350,6 +439,32 @@ command, for anyone.
 | `cancel <goal-id>` | cancel exactly one goal and the jobs that belong to it |
 | `config` | `config show [group\|name]`, `config set <name> <value>`, `config reset <name>` |
 | `help` | the list above |
+
+**`update`** is the quick test loop — push to GitHub, type `update`, the bot
+comes back on the new code (`updater.js`):
+
+1. refuses if tracked files have local edits (unless `update force`);
+2. `git fetch origin <current branch>` (a shallow panel checkout stays shallow);
+3. nothing new → says so and stops; `update check` stops here either way;
+4. fast-forwards (`merge --ff-only`; a shallow or forced update resets to the
+   fetched commit);
+5. runs `npm ci` only if `package.json`, the lockfile or an install script
+   changed (`--omit=dev` under `NODE_ENV=production`);
+6. runs `node zincai/index.js --check` on the new source;
+7. on any failure in 5–6 resets the checkout to where it was and reports — the
+   running bot is untouched;
+8. on success saves state, leaves the server and exits with code **75**.
+
+Exit code 75 is the restart request. `node zincai/index.js` starts a small
+supervisor (`supervisor.js`) that runs the bot as a child sharing its console;
+on 75 it starts a fresh child, on any other code it exits with that code. It
+forwards the panel's stop signal and gives up if the bot asks to restart three
+times within ten seconds of starting. If the supervisor itself is killed
+outright (the panel's Kill, `kill -9`, the OOM killer) the bot notices over the
+IPC channel it holds to it, saves its state and leaves, so it is never left
+running with nothing that can stop it. `ZINCAI_NO_SUPERVISOR=1` or
+`--no-supervisor` runs the bot as a single process for setups where systemd or
+Docker already restarts it. `--check` and `--dry-run` never start a supervisor.
 
 `pause` and `leave` are different on purpose: a paused bot is still standing in
 the world and can still talk; a bot that has left is not in the world at all.
@@ -506,7 +621,10 @@ no dotenv; nothing is read from a file the panel does not control.
 | `AMD_API_BASE_URL`, `AMD_MODEL` | Endpoint base URL and model alias. |
 | `AMD_MAX_TOKENS`, `AMD_TEMPERATURE`, `AMD_API_TIMEOUT_MS`, `AMD_CHAT_TIMEOUT_MS`, `AMD_MAX_CONCURRENT` | Model-call shape and lane concurrency. |
 | `BOT_MODE`, `BOT_ALIASES`, `BOT_LANGUAGE` | **Inert.** There are no modes, no name gating and no language check. A template that still sets them keeps booting. |
-| `INFERENCE_RPM`, `INFERENCE_MIN_INTERVAL_MS`, `INFERENCE_HEARTBEAT_MS` | Call budget, spacing and self-prompt. |
+| `INFERENCE_RPM`, `INFERENCE_MIN_INTERVAL_MS` | Call budget and spacing. |
+| `INFERENCE_LOOP_MS`, `INFERENCE_HEARTBEAT_MS` | The agent loop: pause after a turn (8000) and the longest it backs off to while idle (90000). `0` in either turns the loop off. |
+| `INFERENCE_CHAT_BATCH_MS` | How long chat lines are collected into one chunk (6000). |
+| `ZINCAI_NO_SUPERVISOR` | `1` = run as one process; `update`/`restart` then exit 75 for an outside supervisor. |
 | `RECONNECT`, `RECONNECT_MAX_ATTEMPTS` | Post-spawn reconnection behaviour. |
 | `ZINC_OPERATORS`, `ZINC_COMMAND_PREFIX` | **Inert.** Control is console-only; there is no chat command interface to configure. |
 | `ZINC_JOIN_ON_START` | Join the server when the process starts (`connection.joinOnStart`); `false` waits for `join`. |

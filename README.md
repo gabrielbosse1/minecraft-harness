@@ -30,15 +30,31 @@ The model is not steered by the harness. Concretely:
   the bot's name, whether a question “must” be for it, or whether that player
   has spoken too often. Every attributable line is logged, remembered and given
   to the model, which decides what concerns it.
-- **IRC-style chat.** Lines are collected in a ~5 s window
+- **A real agent loop.** A turn is *think → call tools → read what they
+  returned → think again*, not one model call and one tool call. An answer may
+  carry several calls (`say` + `follow`), each result goes straight back to
+  the model as tool output, and the turn ends when the model calls `idle` or
+  has put the body to work — at most `inference.maxStepsPerTurn` (6) model
+  calls. The next turn then starts **by itself** `inference.loopMs` (8 s) after
+  the last one ended; while the model keeps idling the gap doubles up to
+  `heartbeatMs`, and anything that happens resets it. While the body is busy
+  the loop looks in every `loopBusyMs` (30 s).
+- **Talking never waits for the body.** Chat has its own lane and is answered
+  while the body walks, builds or follows; `say` is not a body action and does
+  not interrupt one. When the chat lane agrees to "follow me", "come here" or
+  "stop", it starts that itself (`reply.do`) the moment it answers; any other
+  request (`reply.task`) goes to the action lane ahead of whatever that lane was
+  thinking about. Ordinary chat no longer cancels the action thought — only a
+  request handed to the body does.
+- **IRC-style log.** Lines are collected in a ~6 s window
   (`inference.chatBatchMs`) and delivered as **one chunk**: several speakers, in
-  arrival order, whispers marked. A burst of eight lines is one model call, not
-  eight, and nothing in the window is dropped for volume.
-- **Interruptible thinking.** A chunk that is waiting cancels an in-flight
-  action call at the socket (`AbortController`), so a player can break the
-  model's train of thought instead of waiting for it to finish. An interrupted
-  turn executes nothing it half-decided and re-plans with the conversation in
-  front of it.
+  arrival order. Both prompts show the same timestamped log, chat and events
+  interleaved in the order they happened —
+  `[14:02:07] <Steve> zinc vem aqui`, `[14:02:09] -Steve- a whisper`,
+  `[14:02:11] <ZincAI> to indo`, `[14:02:15] * hurt: hit by a zombie` — with
+  the time *now* in the header and a marker where the unread lines begin. A
+  burst of eight lines is one model call, not eight, and nothing in the window
+  is dropped for volume.
 - **Language is free.** There is no language guard, no retry, and no canned
   replacement line. The model answers in whatever language the person it is
   talking to is using, and the words it chooses are the words that go out.
@@ -129,6 +145,22 @@ command alone — `status`, `pause`, `stop`, `resume`, `leave`, `join`,
 emergency ones: `pause` (stop the body, keep everything) and `shutdown`
 (save state, leave the server, exit the process).
 
+**`update` — push, type one word, test.** `update` fetches the branch the
+checkout is on from GitHub, fast-forwards to it, runs `npm ci` only if
+`package.json` / the lockfile / an install script changed, proves the new
+source loads (`--check`), and only then saves state, leaves the server and
+restarts the process on the new code. If any step fails the checkout is rolled
+back and the running bot is not touched. `update check` only reports whether
+there is something to pull; `update force` discards local edits to tracked
+files; `restart` restarts on the source that is on disk without pulling.
+Memory, goals, places and the dig policy are on disk and are picked up again.
+
+The restart works because `node zincai/index.js` is two processes: a tiny
+supervisor (`zincai/supervisor.js`, no state) and the bot as its child; the
+child exits with code 75 and the supervisor starts a fresh one. If systemd or
+Docker already restarts the process, set `ZINCAI_NO_SUPERVISOR=1` (or pass
+`--no-supervisor`) and let that do it.
+
 Nothing typed in **game chat** is a command, for anyone: not with a `!prefix`,
 not from a server operator, not from the account's creator. Chat is conversation
 and reaches the model like any other line. There is no UUID allow-list and no
@@ -172,11 +204,32 @@ Details: [`zincai/README.md#operator-control-runtime-no-restart`](zincai/README.
 - **Vanilla-only operation.** No RCON, no server console commands, no
   teleporting. The operator interface is the panel's own stdin — it needs no
   admin rights on the Minecraft server, and nothing in game chat can reach it.
-- **Digging is the model's call.** Pathfinding never breaks blocks on its own:
-  it opens doors, routes around, or reports no path. The model asks with the
-  `dig` tool, optionally restricting which block ids it may break
-  (`materials`) or protecting others (`avoid`). The permission covers one walk
-  and lapses when it ends; doors are never broken.
+- **A follow survives a scare.** With a walk under way (`follow`, `go_to`, any
+  errand) the escape reflex only *dodges*: it starts when something hostile is
+  within 6 blocks, sidesteps toward where the walk was heading, ends as soon as
+  nothing is within 9, and the same walk carries on — the model does not have to
+  ask again, and is told the task is paused, not over. `follow` itself keeps
+  going through lost sight (it walks to where the player was last seen, up to
+  45 s) and unreachable stretches (it retries for 60 s), and only ends by
+  itself when the player leaves the game. At low health the full escape applies.
+- **Routes keep away from mobs.** Every path step pays for coming near a
+  hostile: inside its standoff ring (creeper 7 blocks, shooters 8, melee 5), at
+  the spot it will reach in the next two seconds, and on its line to the bot. A
+  route that is already being walked is planned again when a mob moves onto it
+  (`threat.routeReplan*`). It is a cost, never a wall: a boxed-in bot still
+  gets out.
+- **Digging is the model's standing rule.** What a walk may break on its own
+  is a persistent flag and a list the model edits with the `dig_policy` tool:
+  `can_dig` on/off, `mode` `list` or `all`, `add` / `remove` block ids
+  (`*_leaves` wildcards), `reset`. It starts with soft terrain only — dirt,
+  grass, sand, gravel, snow, leaves — so one block of dirt is no longer "no
+  path", while stone, ores and wood are broken only once the model adds them.
+  The rule is shown on every turn (`digging: …`), saved in
+  `<data dir>/dig-policy.json`, and survives restarts. Whatever it says, a walk
+  never breaks a block that touches a crafted block (someone's build) or lies in
+  a claim, doors are never broken, and the operator switch `actions.allowDig`
+  turns all of it off. The `dig` tool remains for one deliberate corridor
+  (`materials` / `avoid`).
 - **Reconnects.** A failed first join (including a whitelist rejection) is
   fatal. After a successful spawn, a dropped connection or server restart is
   retried with backoff under the same name.
@@ -200,7 +253,7 @@ vendor/            vendored Minecraft 26.3 data, installed by `npm ci`
 ## Checks and tests
 
 ```sh
-npm test              # 341 tests: mock bots + a scripted local model
+npm test              # 381 tests: mock bots + a scripted local model
 npm run check         # syntax-check every module
 npm run dry-run       # resolve config, print it, no network
 npm run ping          # server reachability/version, no join, no model call

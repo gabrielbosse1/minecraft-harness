@@ -546,9 +546,64 @@ class Host extends EventEmitter {
         })
         return { ok: true, reply, data: { exitCode: code } }
       }
+      // Quick testing loop: push to GitHub, type `update`, the bot comes back
+      // on the new code. The pull happens while the bot keeps running; only a
+      // source that loads replaces it.
+      case 'update': return this.commandUpdate(args, who)
+      case 'restart': return this.restartProcess({ reason: `restart by ${who.name || who.source}` })
       case 'help': return { ok: true, reply: helpText(this) }
       default: return { ok: false, reply: `unknown command "${name}" — try: help` }
     }
+  }
+
+  /**
+   * `update [check|force]` — see updater.js for the steps and what each one
+   * refuses. Only a successful update that changed something restarts.
+   */
+  async commandUpdate (args = [], who = { source: 'internal' }) {
+    if (this._updating) return { ok: false, reply: 'an update is already running' }
+    const mode = String(args[0] || '').toLowerCase()
+    if (mode && !['check', 'force'].includes(mode)) return { ok: false, reply: `unknown option "${args[0]}" — usage: update [check | force]` }
+    this._updating = true
+    let result
+    try {
+      const run = this.updater || require('./updater').runUpdate
+      result = await run({
+        force: mode === 'force',
+        checkOnly: mode === 'check',
+        log: (msg) => this.log('info', `update: ${msg}`)
+      })
+    } catch (err) {
+      result = { ok: false, changed: false, summary: `update failed: ${err?.message || err}` }
+    } finally {
+      this._updating = false
+    }
+    if (!result.ok || !result.changed) return { ok: Boolean(result.ok), reply: result.summary, data: result }
+    const restart = this.restartProcess({ reason: `update by ${who.name || who.source}` })
+    return { ok: true, reply: `${result.summary}\n${restart.reply}`, data: { ...result, restart: restart.data } }
+  }
+
+  /**
+   * Restart the whole process on the source that is on disk. State is saved by
+   * the ordinary shutdown path; the process then exits with RESTART_CODE and
+   * the supervising parent (supervisor.js) starts it again. Without a
+   * supervisor the exit is the same and whatever runs the bot must restart it.
+   */
+  restartProcess ({ reason = 'restart' } = {}) {
+    const { RESTART_CODE, isSupervised } = require('./supervisor')
+    const supervised = (this.isSupervised || isSupervised)()
+    const reply = supervised
+      ? 'restarting now: saving state, leaving the server, starting again on the source on disk'
+      : `exiting with code ${RESTART_CODE} so the process manager restarts it (no built-in supervisor: ZINCAI_NO_SUPERVISOR / --no-supervisor is set). If nothing restarts it, start it again by hand.`
+    // Deferred so the reply reaches the console before the process dies.
+    const exit = this.exitProcess || ((code) => {
+      try {
+        if (this.session?.shutdown) this.session.shutdown(code, reason)
+        else { this.shutdown({ reason }); setTimeout(() => process.exit(code), 250) }
+      } catch { process.exit(code) }
+    })
+    setImmediate(() => exit(RESTART_CODE, reason))
+    return { ok: true, reply, data: { exitCode: RESTART_CODE, supervised } }
   }
 
   describeServer () {

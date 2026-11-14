@@ -23,6 +23,24 @@
  *   - An URGENT wake (the body just started running for its life, or is
  *     cornered) may run sooner than the normal spacing.
  *
+ * THE AGENT LOOP
+ *   Events are no longer the only thing that starts a turn. When a turn ends
+ *   and nothing is queued, the next one starts by itself `loopMs` later: look
+ *   at the world, continue the goal, check on the running task. While the model
+ *   keeps answering "idle" the gap doubles, up to `heartbeatMs` (the slowest the
+ *   loop ever gets); anything that happens brings it back to `loopMs`. While
+ *   the body is busy with a task the loop still runs, at `loopBusyMs`, so a
+ *   long walk is supervised instead of forgotten. `heartbeatMs: 0` (or
+ *   `loopMs: 0`) turns the loop off: events only.
+ *
+ * CHAT AND THE BODY DO NOT INTERRUPT EACH OTHER
+ *   A chat line used to abort the action lane's thought the moment it arrived,
+ *   so every "lol" cost the body a minute of thinking. Chat is now answered by
+ *   its own lane while the body's thought carries on. Only a wake that says
+ *   `preempt: true` (the chat lane handing the body a new job) cancels a
+ *   thought in flight — the one case where what it is deciding is already
+ *   out of date.
+ *
  * No Minecraft code here: everything world-specific is injected.
  */
 'use strict'
@@ -54,7 +72,9 @@ class Brain {
     heartbeatMs = 90_000,
     maxSelfChain = 12,
     selfChainPauseMs = 30_000,
-    chatBatchMs = 5000,
+    chatBatchMs = 6000,
+    loopMs = null,
+    loopBusyMs = null,
     now = () => Date.now()
   }) {
     this.act = act
@@ -71,6 +91,16 @@ class Brain {
     this.chatReserve = Math.max(0, Math.min(Math.trunc(chatReserve) || 0, Math.floor(rpm / 3)))
     this.urgentMinIntervalMs = Math.min(urgentMinIntervalMs, this.fastMinIntervalMs)
     this.heartbeatMs = heartbeatMs
+    // The IRC window. (This assignment was missing: the option was accepted and
+    // never stored, so every line of a quiet stretch became its own model call.)
+    this.chatBatchMs = Number.isFinite(chatBatchMs) ? Math.max(0, chatBatchMs) : 6000
+    // The agent loop: gap between self-started turns. Without `loopMs` the loop
+    // runs at the heartbeat, i.e. exactly the old check-in.
+    this.loopMs = Number.isFinite(loopMs) ? Math.max(0, loopMs) : heartbeatMs
+    this._legacyLoop = !Number.isFinite(loopMs)
+    // While the body is busy: how often the loop looks in. null = never (the
+    // task's own result wakes the model), which is the old behaviour.
+    this.loopBusyMs = Number.isFinite(loopBusyMs) && loopBusyMs > 0 ? loopBusyMs : null
     this.maxSelfChain = maxSelfChain
     this.selfChainPauseMs = selfChainPauseMs
     this.now = now
@@ -83,13 +113,15 @@ class Brain {
     this.busyChat = false
     this.paused = false
     this.lastActionAt = -Infinity
+    this.lastActionEndAt = -Infinity
     this.lastChatAt = -Infinity
+    this.chatWindowAt = 0 // when the open batching window closes (0 = none open)
     this.idleStreak = 0
     this.failStreak = 0
     this.selfChain = 0
     this.selfChainUntil = 0
     this.calls = [] // { at, lane } of the last minute (shared rate limit)
-    this.stats = { actionTurns: 0, chatTurns: 0, heartbeats: 0, queuedPeak: 0, fastTurns: 0, urgentTurns: 0 }
+    this.stats = { actionTurns: 0, chatTurns: 0, heartbeats: 0, loopTurns: 0, queuedPeak: 0, fastTurns: 0, urgentTurns: 0, preempts: 0, extraCalls: 0 }
     this._timer = null
     this._kickScheduled = false
   }
@@ -114,6 +146,9 @@ class Brain {
     clearInterval(this._timer)
     this._timer = null
     this._kickScheduled = false
+    clearTimeout(this._chatTimer)
+    this._chatTimer = null
+    this.chatWindowAt = 0
   }
 
   /**
@@ -135,8 +170,11 @@ class Brain {
    * (chat task, threat, damage, death). `false` = the bot's own action
    * reported back; a long run of only those is rate-capped (self-chain).
    * `fast: true` uses `fastMinIntervalMs` for time-sensitive non-emergency events.
+   * `preempt: true` also cancels the action thought that is in flight right
+   * now: what it is deciding was overtaken by this (a player just handed the
+   * body a job). Ordinary chat never does that.
    */
-  wake (text, { external = true, urgent = false, fast = false, important = false } = {}) {
+  wake (text, { external = true, urgent = false, fast = false, important = false, preempt = false } = {}) {
     const reason = String(text || 'event').replace(/\s+/g, ' ').trim().slice(0, 200)
     const same = this.pending.find((p) => p.text === reason)
     if (same) {
@@ -160,9 +198,46 @@ class Brain {
         else this.pending.shift()
       }
     }
-    if (external) { this.selfChain = 0; this.selfChainUntil = 0 }
+    if (external) { this.selfChain = 0; this.selfChainUntil = 0; this.idleStreak = 0 }
     this.stats.queuedPeak = Math.max(this.stats.queuedPeak, this.pending.length)
+    if (preempt) this.preempt(reason)
     this._kick()
+  }
+
+  /**
+   * Drop queued wake-ups by their text: the turn that is running has already
+   * been handed those results (as tool output), so waking for them again would
+   * be a second model call about the same thing.
+   */
+  unwake (texts = []) {
+    const norm = (t) => String(t || 'event').replace(/\s+/g, ' ').trim().slice(0, 200)
+    const drop = new Set([].concat(texts).map(norm))
+    if (!drop.size) return 0
+    const before = this.pending.length
+    this.pending = this.pending.filter((p) => !drop.has(p.text))
+    return before - this.pending.length
+  }
+
+  /** Cancel the action thought in flight (if any). @returns true when one was cancelled */
+  preempt (why = 'preempted') {
+    this.preempted = true // a multi-step turn checks this between steps
+    if (!this.busyAction || typeof this.inflightAbort !== 'function') return false
+    let done = false
+    try { done = Boolean(this.inflightAbort(why)) } catch { done = false }
+    if (done) this.stats.preempts++
+    return done
+  }
+
+  /**
+   * May the turn that is running make ONE MORE model call (a further step of
+   * the same turn)? Counts it against the shared budget when it may.
+   */
+  takeCall (lane = 'action') {
+    const now = this.now()
+    if (!this._rateOk(now, lane)) return false
+    this.calls.push({ at: now, lane })
+    this.stats.extraCalls++
+    return true
   }
 
   /** True while either lane has a model call in flight. */
@@ -193,10 +268,8 @@ class Brain {
       mono: performance.now()
     })
     if (this.chatQueue.length > 64) this.chatQueue.splice(0, this.chatQueue.length - 64)
-    // A thought in flight is interruptible the moment the first line lands, not
-    // at the next tick: a player typing should not wait for a 250 ms scheduler
-    // slot to be noticed.
-    if (this.busyAction && this.inflightAbort) this.inflightAbort('chat arrived')
+    // No abort here any more: the chat lane answers on its own while the body's
+    // thought carries on. If the reply hands the body a job, THAT preempts.
     this._scheduleChat()
   }
 
@@ -207,9 +280,13 @@ class Brain {
    */
   _scheduleChat () {
     if (this._chatTimer) return
-    if (!(this.chatBatchMs > 0)) { this._kick(); return }
+    if (!(this.chatBatchMs > 0)) { this.chatWindowAt = 0; this._kick(); return }
+    // The window is measured on the real clock (a timer), and remembered as a
+    // deadline so a scheduler tick inside it cannot hand the chunk over early.
+    this.chatWindowAt = Date.now() + this.chatBatchMs
     this._chatTimer = setTimeout(() => {
       this._chatTimer = null
+      this.chatWindowAt = 0
       this._kick()
     }, this.chatBatchMs)
     if (typeof this._chatTimer.unref === 'function') this._chatTimer.unref()
@@ -229,21 +306,34 @@ class Brain {
     return this.failStreak ? Math.min(60_000, 3000 * 2 ** (this.failStreak - 1)) : 0
   }
 
-  /** Heartbeat spacing grows while the model keeps answering "idle". */
-  _heartbeatEvery () {
-    if (!(this.heartbeatMs > 0)) return Infinity
-    return this.heartbeatMs * Math.min(4, 1 + this.idleStreak)
+  /**
+   * The agent loop's gap: how long after a turn ENDS the next self-started one
+   * begins. `loopMs` while there is something going on; doubling while the
+   * model keeps answering "idle", never slower than `heartbeatMs`. While the
+   * body is busy the loop looks in every `loopBusyMs` (never, when unset).
+   */
+  _loopEvery () {
+    if (!(this.heartbeatMs > 0) || !(this.loopMs > 0)) return Infinity
+    let base = this.loopMs
+    if (this.isBodyBusy()) {
+      if (!this.loopBusyMs) return Infinity
+      base = Math.max(base, this.loopBusyMs)
+    }
+    // No `loopMs`: the old check-in, which grew linearly to four heartbeats.
+    if (this._legacyLoop) return base * Math.min(4, 1 + this.idleStreak)
+    const ceiling = Math.max(base, this.heartbeatMs)
+    return Math.min(ceiling, base * 2 ** Math.min(8, this.idleStreak))
   }
+
+  /** Back-compat name. */
+  _heartbeatEvery () { return this._loopEvery() }
 
   /** One scheduling step. Starts at most one call per lane; the lanes do not wait for each other. */
   async tick () {
     if (this.paused) return
-    // People break thoughts. This check belongs HERE, not in _actionStep: that
-    // step is skipped while an action call is in flight, which is exactly the
-    // moment there is something worth interrupting. A chat chunk that is
-    // waiting — and past its window — cancels the in-flight completion, and the
-    // action lane re-plans once the players have been answered.
-    if (this.busyAction && this.chatQueue.length && this.inflightAbort) this.inflightAbort('chat chunk waiting')
+    // The two lanes are independent: a chat chunk is answered while the action
+    // lane keeps thinking and the body keeps working. (A waiting chunk used to
+    // cancel the in-flight action call here.)
     const jobs = []
     if (!this.busyChat) { const job = this._chatStep(); if (job) jobs.push(job) }
     if (!this.busyAction) { const job = this._actionStep(); if (job) jobs.push(job) }
@@ -254,11 +344,18 @@ class Brain {
   _chatStep () {
     const now = this.now()
     if (!this.chatQueue.length || now - this.lastChatAt < this.chatMinIntervalMs) return null
+    // Still inside the batching window: keep collecting. Lines that arrive
+    // while a chat call is in flight pile up too, and all of them go out as ONE
+    // chunk when it returns — more text in the next request, not more requests.
+    if (this.chatWindowAt && Date.now() < this.chatWindowAt) return null
     if (!this._rateOk(now, 'chat')) return null
     // The whole window goes to the model as one chunk — every speaker, in order,
     // with replies to each other intact. `sender` is the most recent speaker
     // (the model gets all of them in the prompt, and picks its own addressee).
     const lines = this.chatQueue.splice(0, this.chatQueue.length)
+    clearTimeout(this._chatTimer)
+    this._chatTimer = null
+    this.chatWindowAt = 0
     const sender = lines[lines.length - 1].sender
     const earliestMono = lines.reduce((m, l) => Number.isFinite(l.mono) ? Math.min(m, l.mono) : m, Infinity)
     const invokeMono = performance.now()
@@ -286,12 +383,23 @@ class Brain {
     const baseSpacing = urgent ? this.urgentMinIntervalMs : (fast ? this.fastMinIntervalMs : this.minIntervalMs)
     const spacing = Math.max(baseSpacing, this._failWait())
     if (now - this.lastActionAt < spacing) return null
+    let loopTurn = false
     if (!this.pending.length) {
-      if (this.isBodyBusy()) return null
-      if (now - this.lastActionAt < this._heartbeatEvery()) return null
+      // THE AGENT LOOP: nothing happened, so the next turn starts by itself.
+      const every = this._loopEvery()
+      if (!(every < Infinity)) return null
+      if (now - Math.max(this.lastActionAt, this.lastActionEndAt) < every) return null
       if (!this._rateOk(now, 'action')) return null
-      this.pending.push({ text: 'autonomous check-in (pursue an open/new goal, explore, or idle if content)', external: true, urgent: false, fast: false, important: false, at: now, mono: performance.now() })
+      const busy = this.isBodyBusy()
+      this.pending.push({
+        text: busy
+          ? 'autonomous check-in (your body is still busy — see `doing`; idle lets it carry on, or adjust/stop it if it is going wrong)'
+          : 'autonomous check-in (pursue an open/new goal, explore, or idle if content)',
+        external: true, urgent: false, fast: false, important: false, at: now, mono: performance.now()
+      })
       this.stats.heartbeats++
+      this.stats.loopTurns++
+      loopTurn = true
     } else if (!this._rateOk(now, 'action')) return null
     const onlySelf = this.pending.every((p) => !p.external)
     if (onlySelf && now < this.selfChainUntil) return null
@@ -306,6 +414,7 @@ class Brain {
     const reactionClass = urgent ? 'immediate' : (fast ? 'fast' : 'deliberate')
     this.pending = []
     this.busyAction = true
+    this.preempted = false
     this.lastActionAt = now
     this.calls.push({ at: now, lane: 'action' })
     this.stats.actionTurns++
@@ -319,7 +428,10 @@ class Brain {
       }))
       .then(({ idle }) => {
         this.failStreak = 0
-        this.idleStreak = idle ? this.idleStreak + 1 : 0
+        // Only the loop's own turns back the loop off: an idle answer to an
+        // event says nothing about how often to look around.
+        if (!idle) this.idleStreak = 0
+        else if (loopTurn) this.idleStreak++
         if (idle || !onlySelf) this.selfChain = 0
         else if (++this.selfChain >= this.maxSelfChain) {
           this.selfChain = 0
@@ -339,6 +451,7 @@ class Brain {
       })
       .finally(() => {
         this.busyAction = false
+        this.lastActionEndAt = this.now()
         if (this.pending.length) this._kick()
       })
   }

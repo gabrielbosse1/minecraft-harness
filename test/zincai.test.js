@@ -261,11 +261,12 @@ test('createZincTools emits OpenAI-format schemas with the full action set', () 
   assert.ok(/ONLY way a fight ever starts/.test(attack.function.description))
 })
 
-test('buildToolsPayload enforces a single REQUIRED tool call (prose used to vanish)', () => {
+test('buildToolsPayload REQUIRES a tool call (prose used to vanish) and allows several in one answer', () => {
   const tools = createZincTools()
   const payload = buildToolsPayload({ model: 'Qwen3.8-Flash-Next', messages: [{ role: 'user', content: 'hi' }], temperature: 0.25, maxTokens: 256, tools })
   assert.equal(payload.tool_choice, 'required')
-  assert.equal(payload.parallel_tool_calls, false)
+  assert.equal(payload.parallel_tool_calls, true, 'the agent loop: answer AND act in one model call')
+  assert.equal(buildToolsPayload({ model: 'm', messages: [], temperature: 0, maxTokens: 1, tools, parallelToolCalls: false }).parallel_tool_calls, false, 'the chat lane still sends exactly one reply')
   assert.equal(payload.stream, false)
   assert.equal(payload.tools.length, tools.length)
   assert.equal(buildToolsPayload({ model: 'm', messages: [], temperature: 0, maxTokens: 1, tools, toolChoice: 'auto' }).tool_choice, 'auto')

@@ -85,6 +85,18 @@ const COMMANDS = Object.freeze([
     detail: 'One generic, validated, persistent store. `config` lists everything with defaults; `config show <group>` narrows it; `config set` prints the old and the new value.'
   },
   {
+    name: 'update',
+    args: '[check | force]',
+    summary: 'pull the newest source from GitHub and restart on it',
+    detail: 'Fetches the branch this checkout is on, fast-forwards to it, reinstalls dependencies only if they changed, proves the new source loads (--check), then saves state, leaves the server and restarts the process on the new code. If anything fails the checkout is rolled back and the running bot is untouched. `update check` only reports whether there is something to pull. `update force` discards local edits to tracked files and local commits, taking GitHub\'s version.'
+  },
+  {
+    name: 'restart',
+    args: '',
+    summary: 'restart the whole process on the source that is on disk (no pull)',
+    detail: 'Saves state, leaves the server and starts a fresh process — for after editing files by hand. Memory, identity, goals and checkpoints are on disk and are picked up again.'
+  },
+  {
     name: 'shutdown',
     args: '[exit-code]',
     summary: 'stop the whole process now: body, model, everything',

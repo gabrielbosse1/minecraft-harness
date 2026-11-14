@@ -170,6 +170,19 @@ class Skills {
     return { label: t.label, seconds: Math.round((Date.now() - t.startedAt) / 1000), paused: this.lane.active && !this.lane.isTop }
   }
 
+  /**
+   * Where the running errand is headed, if it is a walk: `{ label, position }`.
+   * The reflex layer reads this to keep an escape SHORT and pointed back at
+   * the errand (see System1 "tether"). null when no walk is running.
+   */
+  tether () {
+    const t = this._token
+    if (!t || t.cancelled || !(t.walking || t.tetherPos)) return null
+    let position = null
+    try { position = (t.tetherPos || t.walkTarget)?.() || null } catch { position = null }
+    return { label: t.label, position }
+  }
+
   /** Stop whatever skill is running. Its promise resolves as cancelled. */
   cancel (reason = 'cancelled') {
     const t = this._token
@@ -244,6 +257,10 @@ class Skills {
     lane.acquire({ reason: token.label })
     this._noPathAt = 0
     lane.setGoal(goal, dynamic)
+    // Where this errand is headed, for the reflex layer: with somewhere to be,
+    // the body dodges a mob and comes back instead of running out of the area.
+    token.walking = true
+    if (!token.tetherPos) token.walkTarget = () => goal?.entity?.position || targetOfGoal(goal)
     let budget = timeoutMs
     let retried = false
     let interrupted = false
@@ -300,6 +317,8 @@ class Skills {
       // A dig corridor is for ONE walk: whoever granted it gets it closed here,
       // on success, on noPath and on cancellation alike.
       if (token.digWindow) { try { this._pathfinder()?.endDigging?.(token.cancelled || 'walk done') } catch { /* gone */ } }
+      token.walking = false
+      token.walkTarget = null
       // A replaced walk must not wipe the goal its replacement just set.
       if (this._token === token) {
         lane.setGoal(null)
@@ -463,34 +482,106 @@ class Skills {
   }
 
   _recentJamHint () {
-    const j = this.pathfinder?.lastJam
+    const j = this._pathfinder()?.lastJam
     if (!j || Date.now() - j.at > 15_000) return ''
     return ` (${j.name} at ${j.x},${j.y},${j.z} would not open)`
   }
 
-  /** Keep following a player until told otherwise (or `maxMs`). */
-  follow ({ player, maxMs = 10 * 60_000 } = {}) {
+  /**
+   * Follow a player until told otherwise.
+   *
+   * This used to be ONE walk with a ten-second fuse: the body ran from a
+   * zombie, the player went out of sight for ten seconds, and the follow ended
+   * ("lost sight") — or A* said "no path" twice while the mob stood in the way
+   * and it ended as "stopped following (no path)", reported as a success. The
+   * model then had to notice and ask again; usually it did not.
+   *
+   * Following is now a loop that owns its own recovery:
+   *   - the player entity is looked up again on every pass (a respawn, a
+   *     dimension hop or a chunk reload gives them a NEW entity object);
+   *   - while a reflex drives the body the walk simply waits — and because a
+   *     follow is a tether (see `tether()`), that escape is a short dodge;
+   *   - "no path" waits and tries again (mobs move, doors open) for `stuckMs`;
+   *   - out of sight: walk to where they were last seen, look for `lostMs`.
+   * It ends only when stopped/replaced, when the player leaves the game, or
+   * when one of those two clocks runs out — and then it says exactly why.
+   *
+   * @param {{ player: string, maxMs?: number, lostMs?: number, stuckMs?: number }} opts
+   *   maxMs 0 = no time limit
+   */
+  follow ({ player, maxMs = 0, lostMs = 45_000, stuckMs = 60_000 } = {}) {
     const bot = this.bot
-    const { GoalFollow } = this._goals()
+    const { GoalFollow, GoalNear } = this._goals()
     return this._run('follow', async (token) => {
-      const { name, entity } = this._playerEntity(player)
-      if (!name) return fail(`no player named "${player}" is online`)
-      if (!entity) return fail(`${name} is too far away to see`)
-      token.label = `following ${name}`
+      const first = this._playerEntity(player)
+      if (!first.name) return fail(`no player named "${player}" is online`)
+      if (!first.entity) return fail(`${first.name} is too far away to see`)
+      const name = first.name
+      const base = `following ${name}`
+      token.label = base
+      const startedAt = Date.now()
+      const online = () => Boolean(bot.players?.[name])
+      const entityNow = () => bot.players?.[name]?.entity || null
+      const at = (p) => `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}`
+      let lastSeen = first.entity.position.clone()
       let lostAt = 0
-      const r = await this._walk(token, new GoalFollow(entity, 2), {
-        dynamic: true,
-        timeoutMs: maxMs,
-        done: () => {
-          // Never "arrives"; ends when the player has been out of sight for 10 s.
-          const visible = Boolean(bot.players?.[name]?.entity)
-          if (visible) { lostAt = 0; return false }
-          if (!lostAt) lostAt = Date.now()
-          return Date.now() - lostAt > 10_000
+      let stuckAt = 0
+      token.tetherPos = () => entityNow()?.position || lastSeen
+      const forever = !(maxMs > 0)
+      for (;;) {
+        if (token.cancelled) return ok(`stopped following ${name} (${token.cancelled})`)
+        if (!forever && Date.now() - startedAt > maxMs) return ok(`stopped following ${name} (time limit)`)
+        if (!bot.entity?.position) return fail(`stopped following ${name}: no position (dead or disconnected)`)
+        if (!online()) return fail(`${name} left the game; stopped following`)
+        const entity = entityNow()
+        if (entity) {
+          lostAt = 0
+          lastSeen = entity.position.clone()
+          token.label = stuckAt ? `${base} (no way through right now — retrying)` : base
+          const r = await this._walk(token, new GoalFollow(entity, 2), {
+            dynamic: true,
+            timeoutMs: Infinity,
+            // Never "arrives". The pass ends when this entity object is no
+            // longer the player (gone from view, or replaced by a new one).
+            done: () => {
+              const e = entityNow()
+              if (e && e.position) lastSeen = e.position.clone()
+              if (e === entity && stuckAt && bot.pathfinder?.isMoving?.()) { stuckAt = 0; token.label = base }
+              return e !== entity
+            }
+          })
+          if (token.cancelled) continue
+          if (r.ok) { stuckAt = 0; continue } // lost or replaced: next pass decides
+          if (r.why === 'no path') {
+            if (!stuckAt) stuckAt = Date.now()
+            if (Date.now() - stuckAt > stuckMs) {
+              return fail(`cannot reach ${name}: no path for ${Math.round(stuckMs / 1000)}s (they are at ${at(lastSeen)})${this._recentJamHint()}; stopped following — dig to them, widen dig_policy, or ask them to come back`)
+            }
+            await sleep(1500)
+            continue
+          }
+          return fail(`stopped following ${name}: ${r.why}`)
         }
-      })
-      if (r.ok) return fail(`lost sight of ${name}; stopped following`)
-      return ok(`stopped following ${name} (${r.why})`)
+        // Out of sight. Go to where they were, and look.
+        if (!lostAt) lostAt = Date.now()
+        const left = lostMs - (Date.now() - lostAt)
+        if (left <= 0) return fail(`lost sight of ${name} for ${Math.round(lostMs / 1000)}s (last seen at ${at(lastSeen)}); stopped following`)
+        token.label = `${base} (out of sight — heading to where they were, ${at(lastSeen)})`
+        const me = bot.entity.position
+        if (Math.hypot(me.x - lastSeen.x, me.z - lastSeen.z) > 3) {
+          const r = await this._walk(token, new GoalNear(Math.floor(lastSeen.x), Math.floor(lastSeen.y), Math.floor(lastSeen.z), 2), {
+            timeoutMs: left,
+            retryNoPath: false,
+            done: () => Boolean(entityNow()) || !online() || Date.now() - lostAt > lostMs
+          })
+          if (token.cancelled) continue
+          // Not allowed to move at all (paused, permission off): that is not "lost".
+          if (!r.ok && !['no path', 'timeout'].includes(r.why)) return fail(`stopped following ${name}: ${r.why}`)
+          if (!r.ok) await sleep(600)
+        } else {
+          await sleep(300)
+        }
+      }
     })
   }
 

@@ -152,12 +152,13 @@ test('a window expires on its own and is never inherited by the next route', asy
   wrapper.endDigging()
 })
 
-test('the model can call dig, and the schema says it is the only way to break anything', () => {
+test('the model can call dig: one deliberate corridor, beyond what its standing dig_policy allows', () => {
   const dig = createZincTools().find((t) => t.function.name === 'dig')
   assert.ok(dig, 'dig is part of the action tool set')
   assert.deepEqual(Object.keys(dig.function.parameters.properties).sort(), ['avoid', 'materials', 'place', 'player', 'x', 'y', 'z'])
   assert.ok(dig.function.parameters.properties.materials.items, 'materials is a list of block ids')
-  assert.match(dig.function.description, /only|nothing is broken without this call/i)
+  assert.match(dig.function.description, /deliberate corridor/i)
+  assert.match(dig.function.description, /dig_policy/, 'and it points at the standing rule for ordinary walks')
 
   const action = coerceAction({ tool_calls: [{ function: { name: 'dig', arguments: JSON.stringify({ x: 8, z: 0, materials: ['stone'], avoid: ['oak_log'] }) } }] })
   assert.deepEqual(action, { x: 8, z: 0, materials: ['stone'], avoid: ['oak_log'], a: 'dig', _via: 'tool' })
@@ -220,4 +221,129 @@ test('a dig walk closes its window however it ends', async () => {
   try { wrapper.endDigging('walk done') } catch { /* noop */ }
   assert.equal(movements.canDig, false)
   assert.equal(wrapper.digging, null)
+})
+
+// ---------------------------------------------------------------------------
+// The standing dig policy (dig_policy.js): a persistent flag and a list, both
+// the model's. Same real Movements + A*, different rooms.
+// ---------------------------------------------------------------------------
+
+const { DigPolicy } = require('../zincai/dig_policy')
+
+/** The same sealed room, but built of `wall` (a block name) — and optionally one extra block somewhere. */
+const roomOf = (wall, extra = null) => (x, y, z) => {
+  const fx = Math.floor(x); const fy = Math.floor(y); const fz = Math.floor(z)
+  if (extra) { const e = extra(fx, fy, fz); if (e) return e }
+  if (fy <= 63) return true
+  if (Math.abs(fx) <= 1 && Math.abs(fz) <= 1 && fy <= 68) return false
+  return (Math.abs(fx) <= 2 && Math.abs(fz) <= 2 && fy <= 68) ? wall : false
+}
+
+function policyWrapper (bot, policy, extra = {}) {
+  const movements = new Movements(bot)
+  bot.pathfinder = { ...(bot.pathfinder || {}), movements, setMovements (m) { this.movements = m } }
+  const wrapper = new PathfinderWrapper(bot, { logger: () => {}, digPolicy: policy, ...extra })
+  wrapper.configureMovements(movements)
+  return { wrapper, movements }
+}
+
+test('standing policy: a walk breaks what the list allows — dirt in the way is no longer "no path"', () => {
+  const bot = makeWorld(roomOf('dirt'))
+  const { movements } = policyWrapper(bot, new DigPolicy({ file: null }))
+  assert.equal(movements.canDig, true)
+  const out = plan(bot, movements, outside)
+  assert.equal(out.status, 'success', 'the walk goes through the dirt wall on its own')
+  assert.ok(out.broken > 0)
+})
+
+test('standing policy: stone is not on the starting list, until the model adds it', () => {
+  const bot = makeWorld(roomOf(true))
+  const policy = new DigPolicy({ file: null })
+  const { wrapper, movements } = policyWrapper(bot, policy)
+  const blocked = plan(bot, movements, outside)
+  assert.equal(blocked.status, 'noPath', 'stone is a decision, not a default')
+  assert.equal(blocked.broken, 0)
+
+  assert.equal(policy.apply({ add: ['stone'] }, { registry }).ok, true)
+  wrapper.refreshDigPolicy()
+  const through = plan(bot, movements, outside)
+  assert.equal(through.status, 'success', 'one edit, and every later walk may tunnel stone')
+  assert.ok(through.broken > 0)
+
+  // …and it stays that way: there is no window to lapse.
+  const again = plan(bot, movements, outside)
+  assert.equal(again.status, 'success')
+})
+
+test('standing policy: can_dig off breaks nothing; mode all breaks anything but the unbreakable', () => {
+  const policy = new DigPolicy({ file: null })
+  const bot = makeWorld(roomOf('oak_log'))
+  const { wrapper, movements } = policyWrapper(bot, policy)
+  assert.equal(plan(bot, movements, outside).status, 'noPath', 'logs are not on the list')
+
+  policy.apply({ mode: 'all' })
+  wrapper.refreshDigPolicy()
+  assert.equal(plan(bot, movements, outside).status, 'success', 'mode all: anything in the way')
+
+  policy.apply({ can_dig: false })
+  wrapper.refreshDigPolicy()
+  assert.equal(movements.canDig, false)
+  const off = plan(bot, movements, outside)
+  assert.equal(off.status, 'noPath', 'the switch wins over the mode')
+  assert.equal(off.broken, 0)
+
+  // Bedrock is never broken, in any mode.
+  policy.apply({ can_dig: true, mode: 'all' })
+  // (The floor is bedrock too, or the route would simply go under the wall.)
+  const hard = makeWorld(roomOf('bedrock', (x, y) => (y <= 63 ? 'bedrock' : null)))
+  const h = policyWrapper(hard, policy)
+  const sealed = plan(hard, h.movements, outside)
+  assert.equal(sealed.status, 'noPath')
+  assert.equal(sealed.broken, 0)
+})
+
+test('standing policy: the operator switch (digAllowed) turns it off without touching the model\'s rule', () => {
+  let allowed = true
+  const policy = new DigPolicy({ file: null })
+  const bot = makeWorld(roomOf('dirt'))
+  const { wrapper, movements } = policyWrapper(bot, policy, { digAllowed: () => allowed })
+  assert.equal(plan(bot, movements, outside).status, 'success')
+  allowed = false
+  wrapper.refreshDigPolicy()
+  assert.equal(movements.canDig, false)
+  assert.equal(plan(bot, movements, outside).status, 'noPath')
+  assert.equal(policy.enabled, true, 'the model\'s own flag is unchanged')
+})
+
+test('standing policy: soft blocks that are part of a build are not terrain', () => {
+  // A dirt room whose every wall block touches oak planks (a floor of planks
+  // under the walls): somebody built this.
+  const built = roomOf('dirt', (x, y, z) => (y === 63 && Math.abs(x) <= 3 && Math.abs(z) <= 3 ? 'oak_planks' : (y === 65 || y === 66) && Math.abs(x) <= 3 && Math.abs(z) <= 3 && !(Math.abs(x) <= 1 && Math.abs(z) <= 1) && (Math.abs(x) === 3 || Math.abs(z) === 3) ? 'oak_planks' : null))
+  const bot = makeWorld(built)
+  const { wrapper, movements } = policyWrapper(bot, new DigPolicy({ file: null }))
+  const out = plan(bot, movements, outside)
+  assert.equal(out.status, 'noPath', 'dirt that touches planks is left alone by an ordinary walk')
+  assert.equal(out.broken, 0)
+
+  // A claim does the same for untouched terrain.
+  const wild = makeWorld(roomOf('dirt'))
+  const claimed = policyWrapper(wild, new DigPolicy({ file: null }), { isProtected: (pos) => Math.abs(pos.x) <= 3 && Math.abs(pos.z) <= 3 })
+  assert.equal(plan(wild, claimed.movements, outside).status, 'noPath', 'nothing inside a claim is broken by walking')
+
+  // The explicit corridor is still the model's deliberate way through.
+  wrapper.beginDigging({ canDig: null, maxMs: 30_000 })
+  assert.equal(plan(bot, movements, outside).status, 'success', '`dig` is aimed by the model, so the guard steps aside')
+  wrapper.endDigging('done')
+  assert.equal(movements.canDig, true, 'after the corridor the standing policy applies again, not "no digging"')
+  assert.equal(plan(bot, movements, outside).status, 'noPath')
+})
+
+test('standing policy: a `dig` corridor narrows the walk to its own materials, then the policy returns', () => {
+  const bot = makeWorld(roomOf('dirt'))
+  const { wrapper, movements } = policyWrapper(bot, new DigPolicy({ file: null }))
+  const stone = registry.blocksByName.stone.id
+  wrapper.beginDigging({ canDig: [stone], maxMs: 30_000 })
+  assert.equal(plan(bot, movements, outside).status, 'noPath', 'inside a corridor only its materials may be broken')
+  wrapper.endDigging('done')
+  assert.equal(plan(bot, movements, outside).status, 'success', 'the standing rule is back')
 })

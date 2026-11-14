@@ -31,6 +31,12 @@
  * mob could ever be), so every error is on the safe side.
  *
  * Pure: reads blocks through `movements`, touches no controls, no timers.
+ *
+ * The search is bounded by `maxNodes`, not by elapsed wall time by default.
+ * A wall-clock cutoff made the explored edge depend on server load; the
+ * unfinished cells were then mistaken for exits, so the same flee could pick
+ * a different destination on each refresh. Callers can still opt into a
+ * positive `budgetMs` for a best-effort partial search.
  */
 'use strict'
 
@@ -105,6 +111,8 @@ function nearestPursuer (pursuers, x, y, z) {
  * @param {{ radius?:number, maxNodes?:number, budgetMs?:number, botSpeed?:number,
  *           minMargin?:number, graceSec?:number, minRun?:number,
  *           avoid?:(x:number,y:number,z:number)=>number, now?:()=>number }} [opts]
+ *           `budgetMs` defaults to 0 (deterministic node cap only); a positive
+ *           value enables a best-effort wall-clock cutoff.
  * @returns {null | { target:{x:number,y:number,z:number}, path:Array<{x:number,y:number,z:number}>,
  *   direction:{x:number,z:number}, margin:number, safe:boolean, leadsOut:boolean,
  *   cornered:boolean, why:string, explored:number, safeCells:number, ms:number }}
@@ -119,7 +127,8 @@ function planEscape (bot, movements, pursuers, opts = {}) {
   if (!pos || !movements || typeof movements.getNeighbors !== 'function' || !pursuers?.length) return null
   const radius = opts.radius ?? 18
   const maxNodes = opts.maxNodes ?? 700
-  const budgetMs = opts.budgetMs ?? 14
+  const budgetMs = opts.budgetMs ?? 0
+  const timeLimited = Number.isFinite(budgetMs) && budgetMs > 0
   const botSpeed = opts.botSpeed ?? 5.4
   const minMargin = opts.minMargin ?? 0.4
   const graceSec = opts.graceSec ?? 0.55
@@ -155,7 +164,7 @@ function planEscape (bot, movements, pursuers, opts = {}) {
   let cutShort = false
 
   while (open.size) {
-    if (explored >= maxNodes || (explored % 16 === 0 && clock() - started > budgetMs)) { cutShort = true; break }
+    if (explored >= maxNodes || (timeLimited && explored % 16 === 0 && clock() - started > budgetMs)) { cutShort = true; break }
     const { node } = open.pop()
     if (node.closed) continue
     node.closed = true
@@ -186,7 +195,7 @@ function planEscape (bot, movements, pursuers, opts = {}) {
       open.push({ key: g + (via ? 1e6 : 0), node: next })
     }
   }
-  // Cells still waiting when the budget ran out: reachable, with unexplored ground beyond.
+  // Cells still waiting at the configured search limit: reachable, with unexplored ground beyond.
   if (cutShort) for (const { node } of open.a) if (!node.closed && node.safe) node.frontier = true
 
   // A cell leads out when its branch reaches the edge of the search safely.
@@ -288,6 +297,7 @@ function contact (pursuers, x, y, z) {
  * @returns {object|null} the destination node ({ x, y, z, g, parent })
  */
 function breakOut (movements, pursuers, { sx, sy, sz, radius, maxNodes, budgetMs, avoid, clock }) {
+  const timeLimited = Number.isFinite(budgetMs) && budgetMs > 0
   const keyOf = (x, y, z) => x + ',' + y + ',' + z
   const seen = new Map()
   const heap = new Heap()
@@ -299,7 +309,7 @@ function breakOut (movements, pursuers, { sx, sy, sz, radius, maxNodes, budgetMs
   let top = null
   let topScore = -Infinity
   while (heap.size) {
-    if (count >= maxNodes || (count % 16 === 0 && clock() - started > budgetMs)) break
+    if (count >= maxNodes || (timeLimited && count % 16 === 0 && clock() - started > budgetMs)) break
     const { node } = heap.pop()
     if (node.closed) continue
     node.closed = true

@@ -42,9 +42,9 @@
 'use strict'
 
 const { ControlArbiter, PRIORITY } = require('./control')
-const { ThreatSense } = require('./threats')
+const { ThreatSense, isHostileMob } = require('./threats')
 const { mobSpeed, mobStats, statsOf, reachOf, cornerText } = require('./tactics')
-const { runnableHeading } = require('./custom_mineflayer/escape')
+const { runnableHeading, surveyGround } = require('./custom_mineflayer/escape')
 
 const byDistance = (a, b) => a.distance - b.distance
 
@@ -857,13 +857,63 @@ class System1 {
     // `maxNodes` bounds the search. Do not also stop on wall time: a deadline
     // made the candidate frontier depend on server load, so identical threats
     // could produce a different escape point on each refresh.
-    const opts = { radius: lit ? 22 : (tether ? 14 : 18), maxNodes: 700, budgetMs: 0, ...(toward ? { toward } : {}) }
+    // Where to, not only away: the hostiles that are NOT chasing (do not run
+    // into them, do not stop beside them), what the land looks like further
+    // out, and the heading already taken. A longer look than before — 18
+    // blocks of flood found the nearest safe ledge, not the open ground
+    // behind it.
+    const ground = this._groundSense(threats)
+    const opts = {
+      radius: lit ? 22 : (tether ? 14 : 24),
+      maxNodes: tether ? 700 : 1400,
+      budgetMs: 0,
+      crowd: ground.crowd,
+      ...(ground.sectors ? { sectors: ground.sectors } : {}),
+      ...(this._flee?.dir && !tether ? { heading: this._flee.dir } : {}),
+      ...(toward ? { toward } : {})
+    }
     try { plan = this.pathfinder?.escapePlan?.(this._pursuers(threats), opts) || null } catch (err) { this.logger?.debug?.('reflex', `escape plan failed: ${err.message || err}`); plan = null }
     if (plan) return plan
     let old = null
     try { old = this.pathfinder?.fleePlan?.({ distance: lit ? this.fleeDistance + 4 : this.fleeDistance }) } catch { old = null }
     if (!old?.goal) return null
     return { goal: old.goal, target: { x: old.x, y: old.y, z: old.z }, direction: old.direction, cornered: false, leadsOut: true, why: 'vector', margin: 0 }
+  }
+
+  /**
+   * What the escape planner needs to know beyond the pursuers: every other
+   * hostile within 40 blocks (`crowd`), and a survey of the land in 16
+   * headings out to 48 blocks (`sectors`; re-done every 2 s or 6 blocks).
+   */
+  _groundSense (threats) {
+    const bot = this.bot
+    const pos = bot.entity?.position
+    const crowd = []
+    const all = []
+    if (!pos) return { crowd, sectors: null }
+    const chasing = new Set()
+    for (const t of threats) { if (t.entity?.id !== undefined) chasing.add(t.entity.id); const p = t.entity?.position; if (p) all.push({ x: p.x, y: p.y, z: p.z }) }
+    for (const e of Object.values(bot.entities || {})) {
+      if (!e || e === bot.entity || !e.position || chasing.has(e.id)) continue
+      const name = String(e.name || '')
+      let hostile = false
+      try { hostile = isHostileMob(name, bot) } catch { hostile = false }
+      if (!hostile) continue
+      const d = Math.hypot(e.position.x - pos.x, e.position.z - pos.z)
+      if (d > 40) continue
+      // Most mobs notice a player at 16; stay well inside "would not turn its head".
+      const m = { x: e.position.x, y: e.position.y, z: e.position.z, notice: /skeleton|stray|pillager|witch|blaze|ghast/.test(name) ? 16 : 12, name }
+      crowd.push(m)
+      all.push(m)
+    }
+    const now = this.now()
+    const c = this._survey
+    if (!c || now - c.at > 2000 || Math.hypot(pos.x - c.x, pos.z - c.z) > 6) {
+      let sectors = null
+      try { sectors = surveyGround(bot, { mobs: all }) } catch { sectors = null }
+      this._survey = { at: now, x: pos.x, z: pos.z, sectors }
+    }
+    return { crowd, sectors: this._survey.sectors }
   }
 
   /** Unit vector away from the weighted centre of the threats. */

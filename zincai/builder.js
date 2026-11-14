@@ -144,7 +144,18 @@ class BlueprintParser {
       throw new Error('blueprint needs { palette, grid }')
     }
     const blocks = []
-    const layers = doc.grid
+    let layers = doc.grid
+    // A flat 2D grid of single cells — [["s","s","s"],["s","s","s"],["s","s","s"]] —
+    // is how a model writes "a 3x3 floor". Read as layers of one-character rows
+    // it is a 3-high, 1-wide WALL, and its "foundation" is three blocks (live
+    // log: "inline — 9 blocks … completed 3/3"). When every cell is a single
+    // character and there are several rows of several cells, it is one layer.
+    let flatRead = false
+    if (name === 'inline' && layers.length >= 2 &&
+        layers.every((l) => Array.isArray(l) && l.length >= 2 && l.every((c) => typeof c === 'string' && c.length === 1))) {
+      layers = [layers.map((row) => row.join(''))]
+      flatRead = true
+    }
     for (let y = 0; y < layers.length; y++) {
       const rows = parseLayer(layers[y])
       for (let z = 0; z < rows.length; z++) {
@@ -160,7 +171,7 @@ class BlueprintParser {
     }
     // bottom -> top, then nearest-first inside each layer (stable placement order)
     blocks.sort((a, b) => (a.dy - b.dy) || (Math.abs(a.dx - Math.floor(0)) + Math.abs(a.dz - Math.floor(0))) - (Math.abs(b.dx - Math.floor(0)) + Math.abs(b.dz - Math.floor(0))))
-    return { name, blocks, blockCount: blocks.length }
+    return { name, blocks, blockCount: blocks.length, ...(flatRead ? { flatRead: true, note: `the grid was read as ONE flat layer ${layers[0][0].length}x${layers[0].length} (rows of single cells); for height, give each layer as row strings: [["ss","ss"],["ss","ss"]]` } : {}) }
   }
 
   /** Inventory census: { name -> count } (summed over stacks). */

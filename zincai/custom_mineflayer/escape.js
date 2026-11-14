@@ -105,6 +105,159 @@ function nearestPursuer (pursuers, x, y, z) {
 }
 
 /**
+ * WHERE the safe ground is matters as much as whether it is safe. A live run
+ * showed a bot that outran every zombie and still died four times: it ran to
+ * the cell with the most seconds in hand, which was a ledge on a mountainside
+ * or a notch between two walls, with other mobs standing next to it — and the
+ * next escape started from there with nowhere left to go.
+ *
+ * So, among cells the clock calls safe, the planner now also asks:
+ *
+ *   open     how much level, walkable ground is around the cell (5x5)
+ *   crowd    hostile mobs that are NOT chasing yet but would notice it there
+ *   sector   what the land looks like further out that way (surveyGround):
+ *            level and empty, or broken, steep and full of mobs
+ *   heading  keep the way it was already running (no doubling back into
+ *            the ones that follow)
+ *
+ * and the way there pays for every cell that passes inside the notice range
+ * of a mob that is not chasing. The clock still decides what is safe; these
+ * decide which safe place.
+ */
+
+/** Hostiles that are not chasing: cost of passing/standing at (x, y, z). 0 = nobody would notice. */
+function crowdAt (crowd, x, y, z) {
+  let c = 0
+  for (const m of crowd) {
+    const notice = m.notice || 12
+    const d = Math.hypot(m.x - x, (m.y - y) * 0.5, m.z - z)
+    if (d < notice) c += (notice - d) / notice
+  }
+  return c
+}
+
+/** A per-plan cache of "can a body stand at x, y, z" straight from the blocks. */
+function standableCache (bot) {
+  if (!bot || typeof bot.blockAt !== 'function') return null
+  const cache = new Map()
+  const HAZARD = /lava|fire|magma|cactus|sweet_berry|powder_snow|wither_rose|campfire/
+  const at = (x, y, z) => { try { return bot.blockAt({ x, y, z }, false) } catch { return null } }
+  const solid = (b) => Boolean(b) && b.boundingBox === 'block'
+  return (x, y, z) => {
+    const key = x + ',' + y + ',' + z
+    let v = cache.get(key)
+    if (v !== undefined) return v
+    const below = at(x, y - 1, z); const feet = at(x, y, z); const head = at(x, y + 1, z)
+    if (!below || !feet || !head) v = null // unloaded: unknown
+    else v = solid(below) && !HAZARD.test(below.name) && !solid(feet) && !solid(head) && !/water|lava/.test(feet.name) && !HAZARD.test(feet.name)
+    cache.set(key, v)
+    return v
+  }
+}
+
+/**
+ * How open and level the ground around a cell is, 0..1: the share of the 24
+ * columns around it (5x5) where a body can stand at the same height (the
+ * outer ring may be one step up or down). A plain is 1, a corridor ~0.35,
+ * a corner or a ledge less.
+ */
+function openness (standable, x, y, z) {
+  if (!standable) return null
+  let ok = 0; let known = 0
+  for (let dx = -2; dx <= 2; dx++) {
+    for (let dz = -2; dz <= 2; dz++) {
+      if (!dx && !dz) continue
+      const here = standable(x + dx, y, z + dz)
+      if (here === null) continue
+      known++
+      if (here) { ok++; continue }
+      if (Math.max(Math.abs(dx), Math.abs(dz)) === 2 && (standable(x + dx, y + 1, z + dz) || standable(x + dx, y - 1, z + dz))) ok += 0.6
+    }
+  }
+  return known >= 8 ? ok / 24 : null
+}
+
+/**
+ * Look further than the flood can: sample the surface along `dirs` headings
+ * out to `range` blocks and say which way the land is level and empty.
+ *
+ * @param {object} bot
+ * @param {{ range?:number, dirs?:number, step?:number, mobs?:Array<{x:number,y:number,z:number}> }} [opts]
+ *        mobs: every hostile around, chasing or not
+ * @returns {null | Array<{ x:number, z:number, score:number, rough:number, mobs:number, blocked:boolean, known:number }>}
+ *        score 1 = level, empty ground as far as it was looked at; -1 = cliffs, lava or a crowd
+ */
+function surveyGround (bot, opts = {}) {
+  const pos = bot?.entity?.position
+  if (!pos || typeof bot.blockAt !== 'function') return null
+  const range = opts.range ?? 48
+  const dirs = opts.dirs ?? 16
+  const step = opts.step ?? 4
+  const mobs = Array.isArray(opts.mobs) ? opts.mobs : []
+  const at = (x, y, z) => { try { return bot.blockAt({ x: Math.floor(x), y, z: Math.floor(z) }, false) } catch { return null } }
+  const solid = (b) => Boolean(b) && b.boundingBox === 'block'
+  const y0 = Math.floor(pos.y + 0.01)
+  const out = []
+  for (let i = 0; i < dirs; i++) {
+    const a = (i / dirs) * 2 * Math.PI
+    const ux = Math.cos(a); const uz = Math.sin(a)
+    let y = y0
+    let climb = 0; let samples = 0; let blocked = false; let wet = 0; let lava = false
+    for (let r = step; r <= range; r += step) {
+      const x = pos.x + ux * r; const z = pos.z + uz * r
+      let feet = at(x, y, z)
+      if (!feet) break // not loaded: nothing known past here
+      let ny = y
+      let found = false
+      if (solid(feet)) {
+        for (let k = 1; k <= 5; k++) { const b = at(x, y + k, z); if (!b) break; if (!solid(b)) { ny = y + k; feet = b; found = true; break } }
+      } else {
+        for (let k = 0; k <= 6; k++) { const b = at(x, y - 1 - k, z); if (!b) break; if (solid(b) || /water|lava/.test(b.name)) { ny = y - k; found = true; if (/lava/.test(b.name)) lava = true; if (/water/.test(b.name)) wet++; break } }
+      }
+      if (!found) { blocked = true; break } // a wall or a drop no one walks
+      if (/lava/.test(feet.name)) lava = true
+      if (/water/.test(feet.name)) wet++
+      const dy = Math.abs(ny - y)
+      climb += dy <= 1 ? dy : dy * 2 // a step is walked; more than that is climbed or fallen
+      y = ny
+      samples++
+    }
+    const rough = samples ? climb / samples : 0 // blocks of up/down per `step` blocks walked
+    let crowd = 0
+    for (const m of mobs) {
+      const dx = m.x - pos.x; const dz = m.z - pos.z
+      const d = Math.hypot(dx, dz)
+      if (d < 1 || d > range) continue
+      const cos = (dx * ux + dz * uz) / d
+      if (cos > 0.8) crowd += (1 - d / range) * (cos > 0.95 ? 1 : 0.6)
+    }
+    const reach = samples * step / range // how far that way is known, walkable ground
+    let score = 1 - rough * 0.7 - crowd * 0.5 - (wet / Math.max(1, samples)) * 0.6
+    if (blocked) score -= 0.9 * (1 - reach)
+    if (lava) score -= 1
+    if (!samples && !blocked) score = 0 // nothing known: neither good nor bad
+    out.push({ x: ux, z: uz, score: Math.max(-1, Math.min(1, score)), rough, mobs: crowd, blocked, known: samples })
+  }
+  // A good heading between two bad ones is a ridge or a gap, not a plain.
+  const smooth = out.map((s, i) => 0.5 * s.score + 0.25 * out[(i + 1) % dirs].score + 0.25 * out[(i + dirs - 1) % dirs].score)
+  for (let i = 0; i < dirs; i++) out[i].score = smooth[i]
+  return out
+}
+
+/** The survey's opinion (-1..1) of the heading (dx, dz). */
+function sectorScore (sectors, dx, dz) {
+  if (!sectors?.length) return 0
+  const len = Math.hypot(dx, dz)
+  if (len < 0.5) return 0
+  let best = 0; let bestCos = -Infinity
+  for (const s of sectors) {
+    const cos = (dx * s.x + dz * s.z) / len
+    if (cos > bestCos) { bestCos = cos; best = s.score }
+  }
+  return best
+}
+
+/**
  * @param {object} bot
  * @param {object} movements a Movements instance WITHOUT threat costs (pure geometry)
  * @param {Pursuer[]} pursuers
@@ -133,7 +286,17 @@ function planEscape (bot, movements, pursuers, opts = {}) {
   const minMargin = opts.minMargin ?? 0.4
   const graceSec = opts.graceSec ?? 0.55
   const minRun = opts.minRun ?? 5
-  const avoid = typeof opts.avoid === 'function' ? opts.avoid : null
+  const baseAvoid = typeof opts.avoid === 'function' ? opts.avoid : null
+  // Ground quality (see the note above crowdAt). All of it is optional: with
+  // no `crowd`, no `sectors` and `terrain: false` this is the clock alone.
+  const crowd = Array.isArray(opts.crowd) ? opts.crowd : []
+  const sectors = Array.isArray(opts.sectors) && opts.sectors.length ? opts.sectors : null
+  const heading = opts.heading && Number.isFinite(opts.heading.x) && Number.isFinite(opts.heading.z) ? opts.heading : null
+  const standable = opts.terrain === false ? null : standableCache(bot)
+  const maxDrop = opts.maxDrop ?? 3 // a longer fall costs health the escape needs
+  const avoid = (baseAvoid || crowd.length)
+    ? (x, y, z) => (baseAvoid ? baseAvoid(x, y, z) : 0) + (crowd.length ? crowdAt(crowd, x + 0.5, y, z + 0.5) * 5 : 0)
+    : null
   // `toward`: somewhere the body has business (the player it follows, the
   // place it was walking to). Among cells that are equally safe, prefer the
   // ones that do not carry it further from there — a dodge, not a retreat.
@@ -146,6 +309,19 @@ function planEscape (bot, movements, pursuers, opts = {}) {
   }
   const clock = typeof opts.now === 'function' ? opts.now : () => performance.now()
   const started = clock()
+  /** What the ground at a cell is worth, on top of the seconds in hand there (about -9..+9). */
+  const groundBonus = (node) => {
+    let b = 0
+    const open = openness(standable, node.x, node.y, node.z)
+    node.open = open
+    if (open !== null) b += (open - 0.5) * 8
+    if (crowd.length) { node.crowd = crowdAt(crowd, node.x + 0.5, node.y, node.z + 0.5); b -= Math.min(6, node.crowd * 3) }
+    const dx = node.x + 0.5 - pos.x; const dz = node.z + 0.5 - pos.z
+    const len = Math.hypot(dx, dz)
+    if (sectors) b += sectorScore(sectors, dx, dz) * 3
+    if (heading && len > 2) b += ((dx * heading.x + dz * heading.z) / len) * 1.2
+    return b
+  }
 
   const sx = Math.floor(pos.x); const sy = Math.floor(pos.y); const sz = Math.floor(pos.z)
   const keyOf = (x, y, z) => x + ',' + y + ',' + z
@@ -181,6 +357,7 @@ function planEscape (bot, movements, pursuers, opts = {}) {
     try { neighbors = movements.getNeighbors({ x: node.x, y: node.y, z: node.z, remainingBlocks: 0 }) } catch { neighbors = [] }
     for (const n of neighbors) {
       if (n.toBreak?.length || n.toPlace?.length) continue // running, not building
+      if (node.y - n.y > maxDrop) continue // not off a cliff
       const step = Math.max(0.5, Number(n.cost) || 1) + (avoid ? avoid(n.x, n.y, n.z) : 0)
       const g = node.g + step
       const via = node.via || !through
@@ -214,7 +391,7 @@ function planEscape (bot, movements, pursuers, opts = {}) {
     safeCells++
     if (node.g < minRun) continue
     // Time in hand on arrival, capped so "far enough" does not always mean "as far as possible".
-    consider(node, Math.min(node.margin, 12) + (node.leadsOut ? 6 : 0) + Math.min(node.g, 16) * 0.05 + towardBonus(node))
+    consider(node, Math.min(node.margin, 12) + (node.leadsOut ? 6 : 0) + Math.min(node.g, 16) * 0.05 + towardBonus(node) + groundBonus(node))
   }
   let why = best ? (best.leadsOut ? 'open' : 'pocket') : ''
   let chased = false
@@ -222,7 +399,7 @@ function planEscape (bot, movements, pursuers, opts = {}) {
     // B. Only a few safe cells, right here: a pocket. Take the one that buys the
     //    most time (that may be where the bot already stands) and say so — the
     //    model gets those seconds to decide.
-    for (const node of nodes.values()) if (node.safe) consider(node, node.margin + (node.leadsOut ? 6 : 0))
+    for (const node of nodes.values()) if (node.safe) consider(node, node.margin + (node.leadsOut ? 6 : 0) + groundBonus(node) * 0.5)
     why = best.leadsOut ? 'open' : 'pocket'
   }
   if (best && why === 'pocket') {
@@ -245,7 +422,7 @@ function planEscape (bot, movements, pursuers, opts = {}) {
     //    Judged from the pursuers and the map, never from how far a budget got.
     let reachedEdge = cutShort && open.size > 0
     if (!reachedEdge) for (const node of nodes.values()) if (node.frontier) { reachedEdge = true; break }
-    best = breakOut(movements, pursuers, { sx, sy, sz, radius, maxNodes, budgetMs, avoid, clock })
+    best = breakOut(movements, pursuers, { sx, sy, sz, radius, maxNodes, budgetMs, avoid, clock, maxDrop, groundBonus })
     if (best) {
       if (encircled(pursuers, pos)) why = 'surrounded'
       else if (reachedEdge) { why = 'chased'; chased = true } else why = 'trapped'
@@ -268,6 +445,8 @@ function planEscape (bot, movements, pursuers, opts = {}) {
     path,
     direction: len > 0.05 ? { x: dx / len, z: dz / len } : null,
     margin: best.margin,
+    open: best.open ?? openness(standable, best.x, best.y, best.z),
+    crowd: crowd.length ? crowdAt(crowd, best.x + 0.5, best.y, best.z + 0.5) : 0,
     safe: best.safe,
     leadsOut: best.leadsOut || chased,
     cornered: !best.leadsOut && !chased,
@@ -296,7 +475,7 @@ function contact (pursuers, x, y, z) {
  * distance plus contact.
  * @returns {object|null} the destination node ({ x, y, z, g, parent })
  */
-function breakOut (movements, pursuers, { sx, sy, sz, radius, maxNodes, budgetMs, avoid, clock }) {
+function breakOut (movements, pursuers, { sx, sy, sz, radius, maxNodes, budgetMs, avoid, clock, maxDrop = 3, groundBonus = null }) {
   const timeLimited = Number.isFinite(budgetMs) && budgetMs > 0
   const keyOf = (x, y, z) => x + ',' + y + ',' + z
   const seen = new Map()
@@ -318,13 +497,14 @@ function breakOut (movements, pursuers, { sx, sy, sz, radius, maxNodes, budgetMs
     // Seconds until a mob could be there, a bonus for ground that goes on, minus
     // the distance. Contact on the way only breaks ties: it is already what
     // chose the route, and standing still among them is contact without end.
-    const score = Math.min(mobClock(pursuers, node.x + 0.5, node.y, node.z + 0.5), 10) * 2 + (edge ? 6 : 0) - node.g * 0.1 - Math.min(node.cost - node.g, 60) * 0.05
+    const score = Math.min(mobClock(pursuers, node.x + 0.5, node.y, node.z + 0.5), 10) * 2 + (edge ? 6 : 0) - node.g * 0.1 - Math.min(node.cost - node.g, 60) * 0.05 + (groundBonus && node.g >= 3 ? groundBonus(node) * 0.6 : 0)
     if (score > topScore) { topScore = score; top = node }
     if (Math.hypot(node.x - sx, node.z - sz) >= radius - 1) continue
     let neighbors = []
     try { neighbors = movements.getNeighbors({ x: node.x, y: node.y, z: node.z, remainingBlocks: 0 }) } catch { neighbors = [] }
     for (const n of neighbors) {
       if (n.toBreak?.length || n.toPlace?.length) continue
+      if (node.y - n.y > maxDrop) continue
       const step = Math.max(0.5, Number(n.cost) || 1) + (avoid ? avoid(n.x, n.y, n.z) : 0)
       const cost = node.cost + step + contact(pursuers, n.x + 0.5, n.y, n.z + 0.5) * 14
       const key = keyOf(n.x, n.y, n.z)
@@ -412,4 +592,4 @@ function runnableHeading (bot, dir, opts = {}) {
   return null
 }
 
-module.exports = { planEscape, mobClock, encircled, clearToRun, runnableHeading }
+module.exports = { planEscape, mobClock, encircled, clearToRun, runnableHeading, surveyGround, sectorScore, openness, standableCache, crowdAt }

@@ -69,6 +69,7 @@ const TOOL_LANES = Object.freeze({
   // --- WORLD INFO: read-only ---
   inspect_block: LANES.WORLD_INFO,
   inspect_region: LANES.WORLD_INFO,
+  screenshot: LANES.WORLD_INFO,
   find: LANES.WORLD_INFO,
   redstone_scan: LANES.WORLD_INFO,
   redstone_component: LANES.WORLD_INFO,
@@ -101,6 +102,7 @@ const TOOL_RESOURCES = Object.freeze({
   redstone_engineer: ['world-read'],
   redstone_scan: ['world-read'],
   inspect_region: ['world-read'],
+  screenshot: ['world-read'],
   inspect_block: ['world-read'],
   find: ['world-read'],
   look_in: ['world-read']

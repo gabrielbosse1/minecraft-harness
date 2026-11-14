@@ -21,10 +21,14 @@
     "maxConcurrent": 2,
     "chatTimeoutMs": 90000,
     "chatMaxRetries": 1,
-    "_lanesNote": "maxConcurrent 2 = the chat lane and the action lane each have one call in flight, so a slow action call never holds a chat reply (set 1 if the endpoint refuses parallel requests; chat still goes first). chatTimeoutMs 90000 accommodates Qwen3.8-27B latency (~47s p50) while remaining shorter than action timeoutMs (120000); adaptive p90 scaling lifts slow calls automatically."
+    "_lanesNote": "maxConcurrent 2 = the chat lane and the action lane each have one call in flight, so a slow action call never holds a chat reply (set 1 if the endpoint refuses parallel requests; chat still goes first). chatTimeoutMs 90000 accommodates Qwen3.8-27B latency (~47s p50) while remaining shorter than action timeoutMs (120000); adaptive p90 scaling lifts slow calls automatically.",
+    "rescueMaxTokens": 1024,
+    "thinkMaxTokens": 1536,
+    "_thinkMaxTokensNote": "Output room for an action call that is allowed to reason (inference.thinking adaptive). Quick calls use maxTokens.",
+    "_truncationNote": "A reasoning model spends output tokens thinking BEFORE its tool call. maxTokens 512 cut every first action answer of the 2026-11-14 live run (each then needed a second ~12.6k-token call, and 20 turns needed three and still called nothing). An answer cut off by the limit is now asked for ONCE more with the reasoning phase switched off and rescueMaxTokens of room (never less than maxTokens). See inference.thinking."
   },
   "inference": {
-    "_note": "Two lanes: chat (reads people) and action (drives the body). Wake-ups are queued, never dropped. rpm is the shared calls-per-minute budget \u2014 the API's pacing, which is the only budget that still limits the model; chatReserve of those are for the chat lane alone. chatBatchMs is the IRC window: chat lines are collected this long and handed over as ONE chunk (several speakers, in order) instead of one model call per line; 0 turns batching off. urgentMinIntervalMs: the start of an escape or being cornered may be thought about this soon after the last call. heartbeatMs is the longest the agent loop ever waits between turns when nothing happens (0 = loop off); see _loopNote.",
+    "_note": "Two lanes: chat (reads people) and action (drives the body). Wake-ups are queued, never dropped. rpm is the shared calls-per-minute budget — the API's pacing, which is the only budget that still limits the model; chatReserve of those are for the chat lane alone. chatBatchMs is the IRC window: chat lines are collected this long and handed over as ONE chunk (several speakers, in order) instead of one model call per line; 0 turns batching off. urgentMinIntervalMs: the start of an escape or being cornered may be thought about this soon after the last call. heartbeatMs is the longest the agent loop ever waits between turns when nothing happens (0 = loop off); see _loopNote.",
     "minIntervalMs": 3000,
     "urgentMinIntervalMs": 1000,
     "chatMinIntervalMs": 1200,
@@ -43,7 +47,10 @@
     "_chatMaxTokensNote": "Room for the reply call. 160 was enough for the line itself but not for a model that reasons first: the output was cut off before the call and the chat lane logged '(silent)'. An answer that still comes back empty is asked for once more with three times the room, and the log says 'cut off' instead of 'silent'.",
     "failGateAfter": 2,
     "failWindowMs": 120000,
-    "_failGateNote": "the same tool call with the same arguments failing failGateAfter times inside failWindowMs is refused locally (no wake) until the world changes (success, movement, hurt, new threat, timeout)."
+    "_failGateNote": "the same tool call with the same arguments failing failGateAfter times inside failWindowMs is refused locally (no wake) until the world changes (success, movement, hurt, new threat, timeout).",
+    "thinking": "adaptive",
+    "chatThinking": "off",
+    "_thinkingNote": "Reasoning control for a thinking model (Qwen 3.x). thinking: adaptive (default) = the harness decides per call (zincai/effort.js): calls that continue a written plan, follow a successful step, or happen in danger skip the reasoning phase; a new player request, a failure, a death, a loop, or a goal without a plan get reasoning with amd.thinkMaxTokens of room; after 8 quick calls in a row one call reviews the plan. on = always reason first; off = never; auto = always reason first but back off after cut-offs. In every mode a cut-off answer is retried once without reasoning. chatThinking is the same switch (on/off/auto) for chat replies. 'Off' is sent three ways at once - chat_template_kwargs.enable_thinking=false, enable_thinking=false and the /no_think prompt switch; an endpoint that rejects the two fields keeps only the prompt switch."
   },
   "memory": {
     "file": "zincai-data/memories.json",
@@ -69,7 +76,7 @@
     "engageRadius": 24,
     "perceptionRange": 10,
     "useArmorManager": true,
-    "_armorNote": "useArmorManager: whether the armor autopilot starts ON (zincai/armor.js \u2014 the bot's own; the mineflayer-armor-manager plugin is no longer used). On, the best armor carried is put on whenever the inventory changes. The model owns it at run time through the equip tool: equip {auto:false|true}, and a slot it dresses or empties itself is left alone.",
+    "_armorNote": "useArmorManager: whether the armor autopilot starts ON (zincai/armor.js — the bot's own; the mineflayer-armor-manager plugin is no longer used). On, the best armor carried is put on whenever the inventory changes. The model owns it at run time through the equip tool: equip {auto:false|true}, and a slot it dresses or empties itself is left alone.",
     "perception3D": false,
     "autoElytra": true,
     "_senseNote": "perceptionRange: horizontal radius of the 3D build grid shown when holding building materials (2-12). perception3D: true also shows the full cross-section (tall vertical span) instead of 5 up / 2 down. There is no field-of-view setting: the vision block is a 360-degree scan around the bot, including blocks behind it."
@@ -159,7 +166,7 @@
     "_keepAliveNote": "How long without ANY decoded server packet before Zinc gives up the link. Keep-alive challenges are still echoed exactly, but a pause in only that packet stream never disconnects an otherwise active session."
   },
   "goals": {
-    "_note": "Durable objectives (goals.js). Every long task becomes a record with an id, origin, priority, checkpoint and lifecycle; it survives deaths, restarts and context resets (goals.json in the data dir). stallMs: an ACTIVE goal whose checkpoint has not moved for this long wakes the model once (remindMs before a second nudge) \u2014 waiting on a furnace or the night is legitimate, so only the running goal is nudged and never failed automatically. maxFails: repeated failures plus no progress suspend it as blocked. starveMs/starveRemindMs: an open goal that waits this long while the body is idle is offered back to the model. maxResumes: a main task paused this many times is set aside (not deleted). verifyRadius: a restored build goal within this many blocks of its site is re-checked at startup (farther away it is left resumable+needsVerify; gather goals are always checked, they have no site). staleGuard: refuse quiet actions whose snapshot no longer matches the world (new threat or a different active goal).",
+    "_note": "Durable objectives (goals.js). Every long task becomes a record with an id, origin, priority, checkpoint and lifecycle; it survives deaths, restarts and context resets (goals.json in the data dir). stallMs: an ACTIVE goal whose checkpoint has not moved for this long wakes the model once (remindMs before a second nudge) — waiting on a furnace or the night is legitimate, so only the running goal is nudged and never failed automatically. maxFails: repeated failures plus no progress suspend it as blocked. starveMs/starveRemindMs: an open goal that waits this long while the body is idle is offered back to the model. maxResumes: a main task paused this many times is set aside (not deleted). verifyRadius: a restored build goal within this many blocks of its site is re-checked at startup (farther away it is left resumable+needsVerify; gather goals are always checked, they have no site). staleGuard: refuse quiet actions whose snapshot no longer matches the world (new threat or a different active goal).",
     "file": "zincai-data/goals.json",
     "maxGoals": 40,
     "terminalKeep": 12,
@@ -185,5 +192,22 @@
       "name": "",
       "uuid": ""
     }
+  },
+  "vision": {
+    "_note": "The screenshot tool (zincai/vision.js). The bot is a headless protocol client with no game window, so the picture is ray-cast from the loaded chunks and written to a PNG in-process: no GPU, no browser, no extra dependency. enabled false removes the image (the tool then says so). The image is sent as an OpenAI image_url data URL after the tool result; an endpoint or model alias that refuses images is detected on the first try and the tool falls back to its text summary for the session. width/height: the first-person frame (448x252 is roughly 150-250 image tokens for Qwen-VL-style encoders). maxDistance: ray length in blocks (8-96). mapRadius: half-size of the top-down map in blocks (8-48). maxPerTurn: a picture costs a whole model call to read. save: keep the last image of each view in <data dir>/screenshots/last-<view>.png so you can see what the model saw.",
+    "enabled": true,
+    "width": 448,
+    "height": 252,
+    "maxDistance": 64,
+    "mapRadius": 32,
+    "maxPerTurn": 2,
+    "save": true
+  },
+  "compaction": {
+    "_note": "Compaction with goal continuation (zincai/journal.js, persisted in <data dir>/journal.json). Every finished tool call is journaled against the goal it served. The newest keepRecent steps stay as they are (identical repeats merged); older ones are folded, deterministically and without a model call, into a per-goal digest: what succeeded (xN, last result), what keeps failing and why, deaths. Together with the goal's plan (goal {steps, done, next}) that is rendered every turn as the 'continue <goal>' block, so a turn after a death, a restart or a context reset continues the work instead of re-planning it. maxDigest: facts kept per goal and kind. turnMaxChars: inside ONE multi-step turn, earlier tool results are cut to a headline once they total more than this, and only the newest screenshot keeps its image.",
+    "enabled": true,
+    "keepRecent": 10,
+    "maxDigest": 8,
+    "turnMaxChars": 6000
   }
 }

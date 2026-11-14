@@ -932,7 +932,7 @@ class Skills {
    * task lane first, then craft. Runs as one skill so `stop` and the flee
    * reflex treat the whole thing as one job.
    */
-  craft ({ item } = {}) {
+  craft ({ item, count = null } = {}) {
     const { craftItem } = require('../src/recipes')
     const bot0 = this.bot
     return this._run('craft', async (token) => {
@@ -955,7 +955,21 @@ class Skills {
           r = await craftItem(this.bot, want, { approach })
         }
       }
-      if (r.ok) return ok(`crafted ${r.item} x${r.count}${placedTable}`)
+      if (r.ok) {
+        // `count` = how many of the ITEM are wanted in total from this call: the
+        // recipe is repeated until that many were made (or the materials run
+        // out). One call for "36 planks" instead of nine calls of four.
+        const wantN = Math.max(0, Math.min(256, Math.trunc(Number(count)) || 0))
+        let made = r.count
+        let stopped = ''
+        while (wantN && made < wantN && !token.cancelled) {
+          const more = await craftItem(this.bot, want, { approach })
+          if (!more.ok) { stopped = ` — stopped there: ${more.why === 'missing_materials' ? 'out of materials' : more.why}${more.needs ? ` (one recipe needs ${more.needs})` : ''}`; break }
+          made += more.count
+        }
+        const have = this.bot.inventory?.items?.().filter((i) => i.name === r.item).reduce((n, i) => n + i.count, 0)
+        return ok(`crafted ${r.item} x${made}${wantN && made < wantN ? ` of the ${wantN} asked` : ''}${stopped}${Number.isFinite(have) && have > 0 ? `; you now carry ${have}` : ''}${placedTable}`)
+      }
       const why = String(r.why)
       // What it takes and what is carried, so the next call is not a guess.
       const needs = r.needs ? ` — one recipe needs ${r.needs}` : ''

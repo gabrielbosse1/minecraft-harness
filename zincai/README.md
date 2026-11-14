@@ -872,3 +872,49 @@ adder outputs. Testing is abstract only: a counterexample identifies differing
 outputs and a declared dependency cone, **not a physical fault or its cause**.
 No timing, live signal propagation, layout verification or world mutation is
 performed by this workflow.
+
+## Seeing, thinking and continuing (2026-11-14)
+
+Added after the live log audited in `../LIVE_LOG_AUDIT_2026-11-14.md`.
+
+**Reasoning control** — `inference.thinking` and `inference.chatThinking`
+(`auto | on | off`; env `INFERENCE_THINKING`, `INFERENCE_CHAT_THINKING`). A
+reasoning model spends output tokens before its tool call; when `amd.maxTokens`
+runs out mid-thought the answer contains no call. Such an answer is asked for
+once more with reasoning off and `amd.rescueMaxTokens` of room. `auto` also
+skips reasoning up front for 10 calls after two cut-offs in a row. `off` is the
+fastest setting.
+
+**`screenshot`** — `view: look | panorama | map`, optional `direction` or `at`.
+Rendered by `vision.js` from the loaded chunks (the bot has no game window):
+flat colours per material, block edges, labelled boxes for creatures, always
+lit, no textures. `map` carries labelled x/z grid lines. The image goes to the
+model as an `image_url` part after the tool result; an endpoint that refuses
+images is detected once and the tool returns its text summary only. Config:
+`vision.*`; env `VISION_ENABLED`. The last image of each view is kept in
+`<data dir>/screenshots/last-<view>.png`.
+
+**Compaction with goal continuation** — `journal.js`, `<data dir>/journal.json`.
+Every tool result is journaled against the goal it served. The newest
+`compaction.keepRecent` steps stay as they are; older ones are folded, without
+a model call, into per-goal counted facts. A goal can carry a plan:
+`goal {operation:"add", description, steps:[…]}`, then
+`goal {operation:"update", id, done:<n>, next:"…"}`. Every action prompt shows
+a `continue <goal>` block (plan, next step, done earlier, still failing,
+deaths, recent steps, loop check). After a death a plan-type goal becomes
+current again by itself. Inside one multi-step turn, tool results older than
+the last two are cut to a headline once the turn's history passes
+`compaction.turnMaxChars`, and only the newest screenshot keeps its image.
+
+Also changed: `craft` takes `count`; `hold` fails on ids that match no threat;
+a stale-threat refusal names the threats and their ids; a flat grid of single
+cells in `build` is one layer.
+
+**Adaptive reasoning** (`inference.thinking: "adaptive"`, the default; `effort.js`).
+The harness decides per action call whether the model reasons first. Quick (no
+reasoning, `amd.maxTokens`): continuing a written plan, the step after a
+success, anything in danger. Thinking (`amd.thinkMaxTokens`, default 1536): a
+new player request, a failed result, a death, a loop check, a goal without a
+plan, no goal, and one review after 8 quick calls in a row. The last line of
+the turn's prompt says which (`this turn: QUICK` / `this turn: THINK BRIEFLY —
+…`), and `metrics.jsonl` tags each action row with it.

@@ -132,7 +132,10 @@ function loadConfig () {
       maxRetries: settings.int(['AMD_API_MAX_RETRIES', 'amd.maxRetries'], raw.amd.maxRetries ?? 2, { min: 0, max: 5 }),
       maxConcurrent: settings.int(['AMD_MAX_CONCURRENT', 'amd.maxConcurrent'], raw.amd.maxConcurrent ?? 2, { min: 1, max: 8 }),
       chatTimeoutMs: settings.int(['AMD_CHAT_TIMEOUT_MS', 'amd.chatTimeoutMs'], raw.amd.chatTimeoutMs ?? null, { min: 1_000, max: 600_000 }),
-      chatMaxRetries: settings.int(['AMD_CHAT_MAX_RETRIES', 'amd.chatMaxRetries'], raw.amd.chatMaxRetries ?? 1, { min: 0, max: 5 })
+      chatMaxRetries: settings.int(['AMD_CHAT_MAX_RETRIES', 'amd.chatMaxRetries'], raw.amd.chatMaxRetries ?? 1, { min: 0, max: 5 }),
+      // Room for the ONE retry of an answer the output limit cut off (never less than maxTokens).
+      rescueMaxTokens: settings.int(['AMD_RESCUE_MAX_TOKENS', 'amd.rescueMaxTokens'], raw.amd.rescueMaxTokens ?? 1024, { min: 64, max: 8192 }),
+      thinkMaxTokens: settings.int(['AMD_THINK_MAX_TOKENS', 'amd.thinkMaxTokens'], raw.amd.thinkMaxTokens ?? 1536, { min: 64, max: 8192 })
     },
     inference: raw.inference || {},
     memory: raw.memory || {},
@@ -146,8 +149,15 @@ function loadConfig () {
     scout: raw.scout || {},
     reconnect: raw.reconnect || {},
     places: raw.places || {},
-    goals: raw.goals || {}
+    goals: raw.goals || {},
+    vision: raw.vision || {},
+    compaction: raw.compaction || {}
   }
+  // Reasoning control and the screenshot switch are worth a panel/env variable:
+  // they are the two knobs that depend on which model the endpoint serves.
+  cfg.inference.thinking = opt(option('INFERENCE_THINKING', 'inference.thinking', cfg.inference.thinking || 'adaptive', ['adaptive', 'auto', 'on', 'off']))
+  cfg.inference.chatThinking = opt(option('INFERENCE_CHAT_THINKING', 'inference.chatThinking', cfg.inference.chatThinking || 'off', ['auto', 'on', 'off']))
+  cfg.vision.enabled = settings.bool('VISION_ENABLED', cfg.vision.enabled ?? true)
 
   // A handful of behaviour knobs are worth exposing to the panel without a
   // defaults.json edit; they win over the file only when actually set.
@@ -226,7 +236,11 @@ function makeShared (cfg, { dataDir = DATA_DIR } = {}) {
       maxTokens: cfg.amd.maxTokens,
       maxConcurrent: cfg.amd.maxConcurrent ?? 2,
       chatTimeoutMs: cfg.amd.chatTimeoutMs ?? null,
-      chatMaxRetries: cfg.amd.chatMaxRetries ?? 1
+      chatMaxRetries: cfg.amd.chatMaxRetries ?? 1,
+      thinking: cfg.inference?.thinking ?? 'adaptive',
+      thinkMaxTokens: cfg.amd.thinkMaxTokens ?? null,
+      chatThinking: cfg.inference?.chatThinking ?? 'off',
+      rescueMaxTokens: cfg.amd.rescueMaxTokens ?? null
     }),
     parser: new BlueprintParser({ scaffoldBlocks: cfg.build.scaffoldBlocks, reach: cfg.build.reach }),
     // Durable perception journal: undelivered important events survive a
@@ -245,6 +259,13 @@ function makeShared (cfg, { dataDir = DATA_DIR } = {}) {
       enabled: cfg.behavior?.digging?.enabled !== false,
       mode: cfg.behavior?.digging?.mode || 'list',
       allow: Array.isArray(cfg.behavior?.digging?.allow) ? cfg.behavior.digging.allow : null,
+      logger: (level, msg) => logger[level]?.(TAG, msg)
+    }),
+    /** compaction with goal continuation (journal.js): what was done for each goal, its plan and next step; persisted */
+    journal: new (require('./journal').WorkJournal)({
+      file: path.join(dataDir, 'journal.json'),
+      keepRecent: cfg.compaction?.keepRecent ?? 10,
+      maxDigest: cfg.compaction?.maxDigest ?? 8,
       logger: (level, msg) => logger[level]?.(TAG, msg)
     }),
     shuttingDown: false,
@@ -442,6 +463,11 @@ function createHost (shared, cfg, { dataDir = null } = {}) {
  */
 function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   const { cfg, memory, places, amd, parser } = shared
+  const journal = shared.journal
+  const { compactSteps } = require('./journal')
+  const vision = require('./vision')
+  const { decideEffort, QUESTION_TOOLS } = require('./effort')
+  const VISION = cfg.vision || {}
   // One timestamped IRC-style log of chat and events (irc.js), and the model's
   // standing dig policy. Both live on `shared` so they outlive a reconnect.
   const timeline = shared.timeline || (shared.timeline = new (require('./irc').Timeline)())
@@ -853,7 +879,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   }
 
   // ------------------------------------------------------ action results --
-  const INFORMATIONAL = new Set(['find', 'look_in', 'inspect_block', 'inspect_region', 'logic_test', 'redstone_scan', 'redstone_component', 'redstone_engineer', 'recall', 'circuit_project', 'goal', 'note', 'social', 'remember_here', 'dig_policy'])
+  const INFORMATIONAL = new Set(['find', 'look_in', 'inspect_block', 'inspect_region', 'screenshot', 'logic_test', 'redstone_scan', 'redstone_component', 'redstone_engineer', 'recall', 'circuit_project', 'goal', 'note', 'social', 'remember_here', 'dig_policy'])
   // stop the model re-issuing a call the body keeps refusing.
   const failGate = new FailGate({
     windowMs: cfg.inference?.failWindowMs ?? 120_000,
@@ -867,6 +893,10 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
    * output and continue (see act()).
    */
   let resultTap = null
+  /** Screenshots taken by the calls of the answer that is running: [{ png, caption }] — handed to the model with the tool results. */
+  let imageTap = null
+  /** Screenshots taken since the last turn started (a picture costs a model call to read: bounded per turn). */
+  let shotsThisTurn = 0
   let currentActId = null
   /**
    * Lane-lease handoff.
@@ -935,6 +965,17 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     } catch { /* never let instrumentation break reporting */ }
     logger.info(TAG, `${label}: ${r.ok ? 'ok' : 'FAILED'} — ${msg}`)
     note({ type: 'result', msg: `${label}: ${msg}` })
+    // The work journal: what was done for which goal (compacted, persisted).
+    try {
+      journal.record({
+        tool: label,
+        args: gateCtx && String(gateCtx.a) === label ? goalArgs(gateCtx) : (agenda.main?.tool === label ? (agenda.main.detail?.args || {}) : {}),
+        ok: Boolean(r.ok),
+        msg,
+        goalId: agenda.main?.goalId || journal.focus || null,
+        pos: here()
+      })
+    } catch { /* the journal never breaks reporting */ }
     // Promote durable world/exploration findings (not ephemeral walk/eat failures) to long-term memory.
     if (r.ok) {
       try {
@@ -1330,6 +1371,22 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     return [head, ...goalReg.brief({ limit, now }).map((l) => `  - ${l}`)].join('\n')
   }
 
+  /** The goal a fresh turn continues: the running task's, else the one the model last worked on, else the active one. */
+  function focusGoal () {
+    const open = goalReg.openGoals()
+    const byId = (id) => (id ? open.find((g) => g.id === id) : null)
+    return byId(agenda.main && !agenda.main.paused ? agenda.main.goalId : null) || byId(journal.focus) || open.find((g) => g.status === 'active') || null
+  }
+
+  /** Compaction with goal continuation (journal.js): plan, next step, what was done and what keeps failing. */
+  function continuationBlock (exclude = 0) {
+    if (cfg.compaction?.enabled === false) return null
+    try {
+      journal.prune(goalReg.openGoals().map((g) => g.id))
+      return journal.continuation({ goal: focusGoal(), exclude })
+    } catch { return null }
+  }
+
   /** One compact line for the chat lane: active goals (yours, shared, or accepted). */
   function goalBriefLine () {
     const open = goalReg.openGoals()
@@ -1370,7 +1427,19 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     const known = new Set(snap.threatIds || [])
     const fresh = [...(sense.last?.dangerIds || [])].filter((id) => !known.has(id))
     if (fresh.length) {
-      return `refused: ${fresh.length} new threat${fresh.length === 1 ? '' : 's'} came close while you were deciding (not in the snapshot you answered). Decide again — fight, hold or flee.`
+      // WHO they are, with the ids `hold`/`attack` take. The refusal used to say
+      // only "1 new threat": the model could not see its id (it was not in the
+      // snapshot it had), guessed `hold {ids:[1]}`, was told "nothing to hold",
+      // and its next call was refused again — a loop that ate whole turns.
+      const byId = new Map([...(sense.last?.threats || []), ...(sense.last?.watch || [])].map((t) => [t.id, t]))
+      const who = fresh.slice(0, 6).map((id) => {
+        const t = byId.get(id)
+        return t ? `${t.name} [id=${id}] ${t.where || `${Math.round(t.distance)}m`}` : `[id=${id}]`
+      }).join(', ')
+      // Having been told, the model's NEXT call in this turn is an informed
+      // decision: the same threats do not refuse it a second time.
+      if (Array.isArray(snap.threatIds)) for (const id of fresh) if (!snap.threatIds.includes(id)) snap.threatIds.push(id)
+      return `refused: ${fresh.length} new threat${fresh.length === 1 ? '' : 's'} came close while you were deciding (not in the snapshot you answered): ${who}. Decide again — attack, hold {ids:[${fresh.slice(0, 6).join(',')}]} (or hold with no ids), a go_to away from them, or call ${action.a} again to do it anyway.`
     }
     const then = snap.goalId || null
     const now = agenda.main && !agenda.main.paused ? agenda.main.goalId : null
@@ -1573,7 +1642,12 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         if (rawOrigin === 'shared_project') {
           for (const p of players) continuity.touchPlayer(p, { sharedGoal: true, interacted: true })
         }
-        return { ok: true, msg: `goal ${g.id} recorded (${g.originType}): ${g.description}${g.parentId ? ` [subgoal of ${g.parentId}]` : ''}.` }
+        // A goal the model declares is what it is working on from now on, and
+        // its plan (if it gave one) is what every later turn continues from.
+        journal.setFocus(g.id)
+        const planned = action.steps ? journal.setPlan(g.id, action.steps) : null
+        if (action.next) journal.setNext(g.id, action.next)
+        return { ok: true, msg: `goal ${g.id} recorded (${g.originType}): ${g.description}${g.parentId ? ` [subgoal of ${g.parentId}]` : ''}.${planned ? ` plan: ${journal.planLine(g.id)}` : ' No plan yet: add steps with goal update {id, steps:[…]} so later turns continue instead of re-planning.'}` }
       }
       case 'update': {
         if (!goal) return { ok: false, msg: `no goal matches "${wanted || '?'}"` }
@@ -1595,7 +1669,16 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         if (action.percent !== undefined || action.note !== undefined) {
           goalReg.progress(goal.id, { percent: action.percent, note: action.note })
         }
-        return { ok: true, msg: `updated: ${goalReg.describe(goalReg.get(goal.id))}` }
+        // The plan: ordered steps, which of them are done, and what comes next.
+        if (action.steps) journal.setPlan(goal.id, action.steps)
+        const marked = action.done !== undefined ? journal.markDone(goal.id, action.done) : []
+        if (action.next !== undefined) journal.setNext(goal.id, action.next)
+        else if (marked.length) journal.setNext(goal.id, '') // the old "next" was the step just finished
+        if (action.done !== undefined && !marked.length) {
+          return { ok: false, msg: `${goal.id} has no open step number ${[].concat(action.done).join(', ')} — plan: ${journal.planLine(goal.id) || 'none (set steps first)'}` }
+        }
+        const planNow = journal.planLine(goal.id)
+        return { ok: true, msg: `updated: ${goalReg.describe(goalReg.get(goal.id))}${planNow ? ` — plan: ${planNow}` : ''}${journal.nextStep(goal.id) ? ` — next: ${journal.nextStep(goal.id)}` : ''}` }
       }
       case 'combine': {
         const ids = String(action.id || '').split(/[\s,]+/).map((s) => s.trim()).filter(Boolean)
@@ -1646,6 +1729,11 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
           return { ok: false, msg: `${goal.id} is ${goal.status}; it cannot be resumed` }
         }
         if (goal.status === 'active' && agenda.main?.goalId === goal.id) return { ok: true, msg: `${goal.id} is already running: ${goalReg.describe(goal)}` }
+        // Already the current objective: resuming it again is a wasted call.
+        if (goal.status === 'active' && journal.focus === goal.id) {
+          const nextStep = journal.nextStep(goal.id)
+          return { ok: true, msg: `${goal.id} is already your current objective — nothing to resume. Do the next step${nextStep ? `: ${nextStep}` : ' (see the continue block)'}.` }
+        }
         // Always look at the world before continuing an old plan.
         const verdict = reconcileGoal(goalReg.get(goal.id))
         const fresh = goalReg.get(goal.id)
@@ -1659,8 +1747,12 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         const spec = runFromDetail(fresh)
         if (!spec.ok) {
           const r = goalReg.resume(fresh.id, { reason: 'resume requested' })
+          if (r.ok) journal.setFocus(fresh.id)
+          const nextStep = journal.nextStep(fresh.id)
+          // (This used to read "…no executable checkpoint; start it with the
+          // normal tools; start it with the normal tools." — the same clause twice.)
           return r.ok
-            ? { ok: true, msg: `${fresh.id} is active again: ${fresh.description}. ${spec.why}; start it with the normal tools.` }
+            ? { ok: true, msg: `${fresh.id} is active again: ${fresh.description}. It is a plan of your own, not a single task the body can re-run: continue it with the normal tools${nextStep ? ` — next: ${nextStep}` : ' (see the continue block for what is already done)'}.` }
             : { ok: false, msg: r.why }
         }
         if (spec.side && agenda.main) {
@@ -2033,6 +2125,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       doingLine(),
       agendaLine(),
       goalLines(),
+      continuationBlock(res ? Math.min(4, results.length) : 0),
       ...threatLines(),
       observe.playersLine(bot),
       observe.mobsLine(bot, { threatIds: sense.last.dangerIds, notes: hostileNotes() }),
@@ -2181,7 +2274,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   function isPreDecisionInspect (action) {
     if (!action) return false
     const a = String(action.a || '')
-    if (['look_in', 'inspect_block', 'inspect_region', 'redstone_scan', 'redstone_component', 'redstone_engineer', 'recall', 'find', 'equip', 'eat'].includes(a)) return true
+    if (['look_in', 'inspect_block', 'inspect_region', 'screenshot', 'redstone_scan', 'redstone_component', 'redstone_engineer', 'recall', 'find', 'equip', 'eat'].includes(a)) return true
     if (a === 'social' && ['list', 'show'].includes(String(action.operation || 'list'))) return true
     if (a === 'goal' && ['list', 'show', 'verify'].includes(String(action.operation || 'list'))) return true
     return false
@@ -2233,7 +2326,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     return out
   }
   /** An answer that called nothing usable (prose, an invented tool, broken arguments). */
-  const isBrokenCall = (action) => Boolean(action && (action._prose || action._unknownTool || action._badArgs || action._fallback))
+  const isBrokenCall = (action) => Boolean(action && (action._prose || action._unknownTool || action._badArgs || action._fallback || action._truncated))
   /** Is the body in the middle of something a tool started? (A reflex running is not a task.) */
   const bodyWorking = () => Boolean(skills?.current() || task || combat?.isEngaged)
   /**
@@ -2272,6 +2365,9 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
    *     step / rate budget ran out.
    * Between turns the scheduler (brain.js) starts the next one by itself.
    */
+  /** Consecutive action calls made without a reasoning phase (effort.js: periodic review). */
+  let quickStreak = 0
+
   async function act (reasons, meta = null) {
     if (!alive || ended) return { idle: true }
     const snap = buildActionPrompt(reasons)
@@ -2280,13 +2376,41 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     logger.debug(TAG, `action turn (${reasons.join(' | ')})`)
     const tools = ALL_TOOLS
     const maxSteps = Math.max(1, Math.min(12, Math.trunc(Number(cfg.inference.maxStepsPerTurn ?? 6)) || 1))
+    // How much thought this call deserves (effort.js): most turns continue a
+    // plan and need none; a new request, a failure or a missing plan do.
+    const effortFor = (stepNo, prev = null) => {
+      const goal = focusGoal()
+      let hasNext = false; let loop = false
+      try { hasNext = Boolean(goal && journal.nextStep(goal.id)) } catch { hasNext = false }
+      try { loop = Boolean(journal.loopHint()) } catch { loop = false }
+      const hp = Number(bot.health)
+      const last = results[results.length - 1]
+      return decideEffort({
+        mode: cfg.inference?.thinking || 'adaptive',
+        step: stepNo,
+        reasons,
+        danger: Boolean(snap.threatIds?.length || system1?.fleeing || (Number.isFinite(hp) && hp > 0 && hp <= 8)),
+        lastFailed: Boolean(last && last.ok === false),
+        stepFailed: Boolean(prev?.some((c) => /^(FAILED|NOT RUN)|: FAILED — /.test(String(c.result)))),
+        stepAsked: Boolean(prev?.some((c) => QUESTION_TOOLS.has(c.name))),
+        loop,
+        hasGoal: Boolean(goal),
+        hasNext,
+        quickStreak
+      })
+    }
+    let effort = effortFor(1)
     const head = [
       { role: 'system', content: SYSTEM_PROMPT },
-      { role: 'user', content: snap.text }
+      { role: 'user', content: effort.line ? `${snap.text}\n${effort.line}` : snap.text }
     ]
     /** What each earlier step of this turn called and got back: [{ calls, content }]. */
     const history = []
-    const buildMessages = () => [...head, ...history.flatMap((h) => toolTurnMessages(h.calls, { format: toolResultFormat, content: h.content }))]
+    // In-turn compaction: every step re-sends all earlier tool results, so once
+    // they pass the budget the oldest are cut to a headline and only the newest
+    // screenshot keeps its image.
+    const buildMessages = () => [...head, ...compactSteps(history, { maxChars: cfg.compaction?.turnMaxChars ?? 6000 }).flatMap((h) => toolTurnMessages(h.calls, { format: toolResultFormat, content: h.content, images: h.images || [] }))]
+    shotsThisTurn = 0
     /** Every action this turn executed, in order. */
     const executed = []
     let step = 0
@@ -2309,16 +2433,19 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         return true
       }
       let result
+      if (effort.think) quickStreak = 0; else quickStreak++
+      logger.debug(TAG, `effort: ${effort.think ? 'think' : 'quick'} (${effort.why})`)
+      const effortTag = effort.think ? `think: ${effort.why}` : 'quick'
       try {
         try {
-          result = await amd.chatWithTools(buildMessages(), tools, { signal: controller.signal })
+          result = await amd.chatWithTools(buildMessages(), tools, { signal: controller.signal, think: effort.think })
         } catch (err) {
           // An endpoint whose chat template rejects tool messages: say the same
           // thing in plain text, for the rest of the session.
           if (step > 1 && toolResultFormat === 'tool' && [400, 404, 415, 422].includes(Number(err?.status))) {
             logger.warn(TAG, `endpoint rejected tool-result messages (HTTP ${err.status}); sending tool results as text from now on`)
             toolResultFormat = 'text'
-            result = await amd.chatWithTools(buildMessages(), tools, { signal: controller.signal })
+            result = await amd.chatWithTools(buildMessages(), tools, { signal: controller.signal, think: effort.think })
           } else throw err
         }
       } catch (err) {
@@ -2331,7 +2458,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       }
       const actions = Array.isArray(result.actions) && result.actions.length ? result.actions : [result.action]
       latency.record('modelInferenceMs', performance.now() - invokeMono)
-      logUsage('action', `${step > 1 ? `step ${step}: ` : ''}${reasons.join(' | ')}`, result.usage, Date.now() - t0, actions.map((x) => x?.a).join('+'))
+      logUsage('action', `[${effortTag}] ${step > 1 ? `step ${step}: ` : ''}${reasons.join(' | ')}`, result.usage, Date.now() - t0, actions.map((x) => x?.a).join('+'))
       if (ended) return { idle: true }
       // A turn cancelled mid-thought is not a failure and not an idle: nothing
       // it "decided" may run. On the first step, ask again; on a later one the
@@ -2341,6 +2468,9 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         return { idle: false }
       }
       if (epoch !== decisionEpoch) {
+        // Visible, not silent: on a slow endpoint this is minutes of thinking
+        // thrown away, and the log used to show a model call with no outcome.
+        logger.info(TAG, `decision discarded after ${Math.round((Date.now() - t0) / 1000)}s (${actions.map((x) => x?.a).join('+')}): ${life === lifeEpoch ? 'the situation changed while the model was thinking' : 'the bot died while the model was thinking'}`)
         if (step === 1) {
           const context = life === lifeEpoch ? reasons.join('; ') : 'previous life ended; reassess after respawn'
           brain.wake(`decision discarded: situation changed while thinking; reassess. ${context}`, { external: true })
@@ -2352,6 +2482,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
 
       // ---- run every call of this answer, in order ----
       const calls = []
+      const stepImages = []
       const consumedWakes = []
       let wantsEnd = false
       let bodyStarted = null
@@ -2371,10 +2502,12 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         }
         const tap = []
         resultTap = tap
+        imageTap = stepImages
         try {
           await executeAction(action, snap)
         } finally {
           if (resultTap === tap) resultTap = null
+          if (imageTap === stepImages) imageTap = null
         }
         executed.push(action)
         const own = tap.filter((r) => r.label === action.a || (action.a === 'idle' && r.label === 'reply'))
@@ -2402,7 +2535,8 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       // These results are handed back right now, as tool output: they must not
       // also wake a second turn about the same thing.
       brain.unwake(consumedWakes)
-      history.push({ calls, content: result.content || '' })
+      history.push({ calls, content: result.content || '', images: stepImages })
+      effort = effortFor(step + 1, calls)
     }
 
     // Player requests are optional proposals. Once Zinc has completed a non-inspect
@@ -2689,7 +2823,10 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     const preflight = parser.checkInventory(remaining, bot.inventory.items())
     if (!preflight.ok) {
       const missing = preflight.missing.map((m) => `${m.name} x${m.need - m.have}`).join(', ')
-      return { ok: false, msg: `cannot build ${label}${stage ? ' (' + stage + ')' : ''}: missing ${missing}. Gather them (gather) or ask a player, then call the same stage again — phases already placed do not redo.` }
+      // How big the thing is and what is carried, so the next move is a
+      // decision (get more / make it smaller) and not another blind attempt.
+      const sizes = preflight.missing.map((m) => `${m.need} ${m.name} needed, you carry ${m.have}`).join('; ')
+      return { ok: false, msg: `cannot build ${label}${stage ? ' (' + stage + ')' : ''}: missing ${missing}. This ${stage ? 'stage' : 'build'} is ${remaining.length} blocks (${sizes}) — get the rest first (gather / craft with count) or make it smaller (params / fewer rows), then call the same stage again — phases already placed do not redo.` }
     }
     logger.info(TAG, `${label} — ${plan.steps.length} blocks${stage ? ` (stage ${stage})` : ''}${plan.towerNeeded ? `, tower ${plan.towerHeight} high` : ''}`)
     const runningGoalId = agenda.main?.goalId || null
@@ -2833,7 +2970,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     }
     return leaseContext.run({ lease: laneLease, claimed: false }, async () => {
     gateCtx = action
-    const IMMEDIATE_TRACKED = new Set(['say', 'stop', 'hold', 'equip', 'dig_policy', 'redstone_scan', 'redstone_component', 'redstone_engineer', 'recall', 'circuit_project', 'logic_test', 'inspect_region', 'inspect_block', 'find', 'remember_here', 'note', 'social', 'goal'])
+    const IMMEDIATE_TRACKED = new Set(['say', 'stop', 'hold', 'equip', 'dig_policy', 'redstone_scan', 'redstone_component', 'redstone_engineer', 'recall', 'circuit_project', 'logic_test', 'inspect_region', 'inspect_block', 'screenshot', 'find', 'remember_here', 'note', 'social', 'goal'])
     currentActId = IMMEDIATE_TRACKED.has(a)
       ? continuity.beginAction({ tool: a, summary: `${a} ${JSON.stringify(goalArgs(action)).slice(0, 80)}`, sig: `${a}:${JSON.stringify(goalArgs(action))}`, goalId: agenda.main?.goalId || null, args: goalArgs(action) })
       : null
@@ -2846,6 +2983,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         if (action._prose) report('reply', { ok: false, msg: 'you answered in prose without calling a tool, so nothing happened — call a tool (say to talk)' })
         else if (action._unknownTool) report('reply', { ok: false, msg: `there is no tool "${action._unknownTool}"` })
         else if (action._badArgs) report('reply', { ok: false, msg: `arguments for ${action._badArgs} failed schema validation` })
+        else if (action._truncated) report('reply', { ok: false, msg: 'your answer hit the output-token limit while you were still reasoning, so no tool was called and nothing happened. Decide in one line and put the tool call FIRST; the continue block already holds the plan — do not re-derive it' })
         else if (action._fallback) report('reply', { ok: false, msg: 'you returned no tool call, so nothing happened — call a listed tool (say to talk, idle to wait)' })
         return
       case 'say': {
@@ -2911,7 +3049,9 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         // silently two minutes later.)
         // `ids` is optional: a bare `hold` means "all of them", which is what
         // it always meant. Naming ids holds only those and leaves the rest.
-        const listed = Array.isArray(snap.threatIds) ? snap.threatIds : []
+        // Listed = what the snapshot showed PLUS what is coming right now (a turn
+        // of several calls outlives its snapshot by minutes on a slow endpoint).
+        const listed = [...new Set([...(Array.isArray(snap.threatIds) ? snap.threatIds : []), ...(sense.last?.dangerIds || [])])]
         const wanted = Array.isArray(action.ids) && action.ids.length
           ? action.ids.map(Number).filter((id) => Number.isFinite(id))
           : listed
@@ -2921,6 +3061,15 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         // Without this the ids were parsed and then dropped on the floor.
         if (holdIds.length) system1.acknowledge(holdIds, { label: 'hold', ttlMs: 30 * 60_000 })
         const n = holdIds.length
+        // Ids that match nothing are a guess, and a guess must not read as "ok".
+        if (!n && unknown.length) {
+          return report('hold', {
+            ok: false,
+            msg: listed.length
+              ? `no threat has id ${unknown.join(', ')}. The ids are the numbers in [id=…] on the threats lines: ${listed.slice(0, 8).join(', ')}. Call hold with those, or with no ids to hold them all`
+              : `no threat has id ${unknown.join(', ')} — and none is listed right now, so there is nothing to hold: carry on with your task`
+          }, { wake: false })
+        }
         const cur = skills?.current()
         const skipped = listed.length - n
         const note = skipped > 0 && n > 0 ? ` (${skipped} other${skipped === 1 ? '' : 's'} still live)` : ''
@@ -3102,6 +3251,43 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       }
       case 'inspect_region':
         return report('inspect_region', require('./region_inspect').inspectRegion(bot, action))
+      case 'screenshot': {
+        // A picture for a model that can see (vision.js renders it from the
+        // loaded chunks; there is no game window to grab). The text summary is
+        // always returned, so the call is useful even where images are not.
+        if (VISION.enabled === false) return report('screenshot', { ok: false, msg: 'screenshots are switched off (vision.enabled) — use inspect_region / find / the grid instead' })
+        const maxPerTurn = Math.max(1, Math.min(4, Math.trunc(Number(VISION.maxPerTurn ?? 2)) || 2))
+        if (shotsThisTurn >= maxPerTurn) {
+          return report('screenshot', { ok: false, msg: `already ${shotsThisTurn} screenshot(s) this turn — act on what you saw. For exact blocks and coordinates use inspect_block / inspect_region / find` })
+        }
+        let shot
+        try {
+          shot = await vision.screenshot(bot, {
+            view: action.view,
+            direction: action.direction,
+            at: action.at,
+            width: VISION.width,
+            height: VISION.height,
+            maxDist: VISION.maxDistance,
+            radius: VISION.mapRadius,
+            isHostile: (name) => isHostileMob(name, bot)
+          })
+        } catch (err) { return report('screenshot', { ok: false, msg: `could not render: ${String(err?.message || err).slice(0, 120)}` }) }
+        shotsThisTurn++
+        if (VISION.save !== false) {
+          try {
+            const dir = path.join(shared.dataDir || path.dirname(journal.file || '.'), 'screenshots')
+            fs.mkdirSync(dir, { recursive: true })
+            fs.writeFileSync(path.join(dir, `last-${shot.view}.png`), shot.png)
+          } catch { /* a debug copy, never required */ }
+        }
+        const sendsImage = amd.visionSupported !== false
+        if (sendsImage && imageTap) imageTap.push({ url: `data:image/png;base64,${shot.png.toString('base64')}`, caption: `screenshot (${shot.view}, ${shot.width}x${shot.height}) — the picture your screenshot call returned:` })
+        return report('screenshot', {
+          ok: true,
+          msg: `${shot.summary}\n${sendsImage ? 'the image is attached to this result' : 'NO IMAGE: this endpoint does not accept pictures — this text is all there is; use inspect_region / find for detail'}`
+        })
+      }
       case 'inspect_block':
         return report('inspect_block', require('./block_inspect').inspectBlock(bot, action))
       case 'find':
@@ -3214,7 +3400,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         const item = String(action.i ?? action.item ?? '')
         if (!item) return report('craft', { ok: false, msg: 'craft needs an item' })
         decided(snap, { label: 'craft' })
-        return startSide('craft', () => skills.craft({ item }), sideOpts('craft', action, snap))
+        return startSide('craft', () => skills.craft({ item, count: action.count }), sideOpts('craft', action, snap))
       }
       case 'build': {
         if (!executor) return report('build', { ok: false, msg: 'not ready yet' })
@@ -3377,8 +3563,20 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     // 3. Resume only what remains valid: goals that could be verified are put
     //    back on the agenda as resumable+needsVerify; a goal already done in
     //    the world was completed by reconcileRestored/reconcileGoal.
+    // GOAL CONTINUATION. The objective the model was working on is put back
+    // as the current one by itself when it is a plan of the model's own (there
+    // is nothing for the body to re-run, so nothing starts moving): the model
+    // used to spend a whole call on `goal resume` after every death.
+    let continued = ''
+    try {
+      const focus = journal.focus ? goalReg.get(journal.focus) : null
+      if (focus && ['suspended', 'resumable'].includes(focus.status) && !runFromDetail(focus).ok) {
+        const r = goalReg.resume(focus.id, { reason: 'continued after respawn' })
+        if (r.ok) continued = `; ${journal.resumeSentence(goalReg.get(focus.id))}`
+      }
+    } catch (err) { logger.debug(TAG, `goal continuation: ${err.message || err}`) }
     const open = goalReg.openGoals()
-    const pending = open.length ? `; unfinished: ${open.slice(0, 4).map((g) => goalReg.describe(g)).join(' | ')}` : ''
+    const pending = (open.length ? `; unfinished: ${open.slice(0, 4).map((g) => goalReg.describe(g)).join(' | ')}` : '') + continued
     const summary = require('./death_recovery').respawnSummary(deathRecovery.lastDeath, observation)
     const tail = recovery.verdict === 'go_home'
       ? `; ${recovery.why}`
@@ -3977,6 +4175,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     logger.warn(TAG, `died at ${where}${lastHurt.text ? ` (${lastHurt.text})` : ''}`)
     note({ type: 'death', msg: `I died at ${where}${lastHurt.text ? ` — ${lastHurt.text}` : ''}` }, { promote: true })
     if (p) places.remember('last death', p, { dim: dim(), note: lastHurt.text })
+    try { journal.death({ where, cause: lastHurt.text || '', goalId: agenda.main?.goalId || journal.focus }) } catch { /* noop */ }
     failGate.clearContext()
     fight = null
     // A new life, not a new plan: the main task stops running but goes back to
@@ -4277,7 +4476,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     internals: () => ({
       arbiter, sense, wrapper, combat, system1, skills, brain, results, agenda,
       events: pipeline, latency, redstoneEngineer, redstoneLibrary: shared.redstoneLibrary,
-      goals: goalReg, continuity, resetContext, executeAction, buildActionPrompt, buildChatPrompt,
+      goals: goalReg, continuity, journal, focusGoal, continuationBlock, resetContext, executeAction, buildActionPrompt, buildChatPrompt,
       lanes, jobs, laneOf: (tool) => laneOf(tool), LANES, footprintOf,
       // Goal orchestration surface (tests and the session's own monitor):
       startMain, resumeMain, finishGoal, runGoalOp, goalLines, goalTick,

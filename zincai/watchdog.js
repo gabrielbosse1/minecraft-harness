@@ -269,7 +269,15 @@ class LoopWatchdog {
     if (name === 'keep_alive') {
       const previousAt = link.lastKeepAliveAt || link.since
       if (link.keepAliveLateWarnedAt) {
-        this.log('info', `server keep-alives resumed after ${((now - previousAt) / 1000).toFixed(1)}s; the link stayed up because ordinary server traffic never stopped`)
+        // Learn the server's real cadence. A server that challenges every 120 s
+        // (the live one does) tripped the 60 s "late" check on every single
+        // cycle: a warning and a "resumed" line every two minutes, for hours —
+        // half of the log. From the first resume on, "late" means late for
+        // THIS server (1.5× the slowest cadence it has shown).
+        const cadence = now - previousAt
+        const learned = cadence > (link.keepAliveCadenceMs || 0)
+        if (learned) link.keepAliveCadenceMs = cadence
+        this.log('info', `server keep-alives resumed after ${(cadence / 1000).toFixed(1)}s; the link stayed up because ordinary server traffic never stopped${learned ? ` — this server's keep-alive cadence is ~${Math.round(cadence / 1000)}s, so from now on a gap is reported only past ${Math.round((cadence * 1.5) / 1000)}s` : ''}`)
         link.keepAliveLateWarnedAt = 0
       }
       if (link.lastKeepAliveAt) {
@@ -321,7 +329,7 @@ class LoopWatchdog {
     const link = this._link
     if (!link || link.keepAliveLateWarnedAt) return
     const gap = now - (link.lastKeepAliveAt || link.since)
-    if (gap < link.timeoutMs) return
+    if (gap < Math.max(link.timeoutMs, (link.keepAliveCadenceMs || 0) * 1.5)) return
     const packetQuiet = now - link.lastPacketAt
     if (link.packets === 0 || packetQuiet >= this.silentMs) return
     link.keepAliveLateWarnedAt = now

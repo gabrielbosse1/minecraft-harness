@@ -722,6 +722,8 @@ class Host extends EventEmitter {
     const off = Object.entries(limits.actions).filter(([, v]) => v === false).map(([k]) => k)
     L.push(`limits: ${st.boundary.actionsLastMinute}/${limits.rates.maxPhysicalActionsPerMinute} physical actions last minute; public chat ${limits.communication.publicChat ? 'on' : 'off'}; private messages ${limits.communication.privateMessages ? 'on' : 'off'}; permissions off: ${off.length ? off.join(',') : 'none'}`)
     L.push(`boundary: ${st.boundary.boundary ? `${st.boundary.boundary.dimension} r=${st.boundary.boundary.radius} around ${st.boundary.boundary.center.join(',')}${limits.boundary.blockOutside ? '' : ' (report only)'}` : 'off'}`)
+    const wd = this.watchdog || null
+    if (wd) L.push(`health: ${wd.describe()}`)
     if (st.pendingConfig.length) L.push(`pending config: ${st.pendingConfig.join(', ')} (apply at the next safe boundary)`)
     const refused = st.boundary.lastRefusals || []
     if (refused.length) L.push(`last refusals: ${refused.slice(-3).map((r) => `${r.what}: ${r.why}`).join(' | ')}`)

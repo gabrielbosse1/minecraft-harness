@@ -234,11 +234,14 @@ function startTestSession ({ chat = [], actions = [], bot = simulatedBot(), cfg:
       : body.messages[body.messages.length - 1].content
     prompts.requests.push(body)
     let message
+    let finishReason = 'stop'
     if (isChat) {
       prompts.chat.push(user)
       const next = typeof chat === 'function' ? chat : (chat.length ? chat.shift() : { text: '' })
       const args = (typeof next === 'function' ? next(user) : next) || { text: '' }
-      message = { content: null, tool_calls: [{ function: { name: 'reply', arguments: JSON.stringify(args) } }] }
+      // `{ __raw: { message, finish_reason } }` = the wire answer itself, for
+      // tests about answers that are not a well-formed reply call.
+      if (args.__raw) { message = args.__raw.message; finishReason = args.__raw.finish_reason || 'stop' } else message = { content: null, tool_calls: [{ function: { name: 'reply', arguments: JSON.stringify(args) } }] }
     } else {
       prompts.action.push(user)
       if (followUp) prompts.steps.push(user)
@@ -254,7 +257,7 @@ function startTestSession ({ chat = [], actions = [], bot = simulatedBot(), cfg:
         }
       }
     }
-    return { ok: true, status: 200, json: async () => ({ choices: [{ message }], usage: { prompt_tokens: 100, completion_tokens: 10 } }), text: async () => '' }
+    return { ok: true, status: 200, json: async () => ({ choices: [{ message, finish_reason: finishReason }], usage: { prompt_tokens: 100, completion_tokens: 10 } }), text: async () => '' }
   }
 
   const index = require('../../zincai/index.js')

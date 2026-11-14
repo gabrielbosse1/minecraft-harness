@@ -19,6 +19,7 @@
 const { PRIORITY } = require('./control')
 const { PlaceIndex, CONTAINER_KINDS } = require('./places')
 const { whereIs } = require('./threats')
+const { findBlocksFast } = require('./block_search')
 const { chooseFood, FOODS, HEALING } = require('./system1')
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -68,6 +69,12 @@ function targetOfGoal (goal) {
   if (x === null || z === null) return null
   return { x, y: num(goal.y ?? goal.pos?.y ?? goal.block?.y ?? goal.entity?.position?.y), z }
 }
+
+const GATHER_DEFAULT_RADIUS = 32
+/** The most one gather walks out to. */
+const GATHER_MAX_RADIUS = 64
+/** How far a failed gather looks to say where the resource IS (the loaded world). */
+const GATHER_SCOUT_RADIUS = 128
 
 const HARVEST_NEED = {
   coal_ore: 0, deepslate_coal_ore: 0,
@@ -859,27 +866,79 @@ class Skills {
    */
   craft ({ item } = {}) {
     const { craftItem } = require('../src/recipes')
+    const bot0 = this.bot
     return this._run('craft', async (token) => {
       const want = fold(item).replace(/\s+/g, '_')
       if (!want) return fail('craft needs an item id (e.g. "crafting_table")')
       token.label = `crafting ${want}`
-      const r = await craftItem(this.bot, want, {
-        approach: async (table) => {
-          const pos = table.position
-          const ap = await this._approachBlock(token, pos)
-          return ap.ok ? { ok: true } : { ok: false, why: ap.why }
+      const approach = async (table) => {
+        const pos = table.position
+        const ap = await this._approachBlock(token, pos)
+        return ap.ok ? { ok: true } : { ok: false, why: ap.why }
+      }
+      let r = await craftItem(this.bot, want, { approach })
+      // A table in the pocket is a table: put it down and carry on, instead of
+      // sending the model off to find a way to place one block.
+      let placedTable = ''
+      if (!r.ok && r.why === 'need_crafting_table' && !token.cancelled && this._item('crafting_table')) {
+        const spot = await this._placeCarried('crafting_table')
+        if (spot) {
+          placedTable = ` (put the crafting table down at ${spot.x},${spot.y},${spot.z})`
+          r = await craftItem(this.bot, want, { approach })
         }
-      })
-      if (r.ok) return ok(`crafted ${r.item} x${r.count}`)
+      }
+      if (r.ok) return ok(`crafted ${r.item} x${r.count}${placedTable}`)
       const why = String(r.why)
-      const msg = why === 'missing_materials' ? `missing materials for ${want}`
-        : why === 'need_crafting_table' ? `${want} needs a crafting table and none is within 8 blocks`
+      // What it takes and what is carried, so the next call is not a guess.
+      const needs = r.needs ? ` — one recipe needs ${r.needs}` : ''
+      const tableHow = bot0.inventory.items().some((i) => i.name === 'crafting_table')
+        ? 'you carry one but there was no free ground within 2 blocks to put it on: move to open ground and craft again'
+        : 'craft a crafting_table first (4 planks of any wood; it is put down for you when the next craft needs it), or go_to one'
+      const msg = why === 'missing_materials' ? `missing materials for ${want}${needs}`
+        : why === 'need_crafting_table' ? `${want} needs a crafting table and none is within 8 blocks — ${tableHow}${needs}`
           : why === 'no_recipe' ? `no recipe for ${want}`
             : why === 'unknown_item' ? `unknown item "${want}"`
               : why.startsWith('table_unreachable') ? `the crafting table is out of reach (${why.split(':')[1]}) — put one down close or walk me there with go_to`
                 : `craft ${want} failed: ${why}`
-      return fail(msg)
+      return fail(`${msg}${placedTable}`)
     })
+  }
+
+  /**
+   * Put one carried block down on the ground next to the body. Returns the
+   * cell it now occupies, or null (nothing carried, no free floor in reach, the
+   * placement was refused or did not take).
+   */
+  async _placeCarried (name) {
+    const bot = this.bot
+    const item = this._item(name)
+    const me = bot.entity?.position?.floored?.()
+    if (!item || !me || typeof bot.placeBlock !== 'function') return null
+    const { Vec3 } = require('vec3')
+    const cells = []
+    for (let dx = -2; dx <= 2; dx++) {
+      for (let dz = -2; dz <= 2; dz++) {
+        if (dx === 0 && dz === 0) continue
+        for (const dy of [0, -1, 1]) cells.push({ x: me.x + dx, y: me.y + dy, z: me.z + dz, d: Math.abs(dx) + Math.abs(dz) + Math.abs(dy) * 0.5 })
+      }
+    }
+    cells.sort((a, b) => a.d - b.d)
+    for (const c of cells) {
+      try {
+        const floor = bot.blockAt(new Vec3(c.x, c.y - 1, c.z))
+        const cell = bot.blockAt(new Vec3(c.x, c.y, c.z))
+        if (!floor || floor.boundingBox !== 'block' || !cell || cell.boundingBox !== 'empty') continue
+        if (/water|lava|fire/.test(cell.name) || /cactus|magma|farmland|_leaves$/.test(floor.name)) continue
+        // Not while a reflex (flee, fight) has the body.
+        const owner = this.arbiter?.top?.()
+        if (owner && owner !== this.lane) return null
+        await bot.equip(item, 'hand')
+        await bot.placeBlock(floor, new Vec3(0, 1, 0))
+        await sleep(150)
+        if (bot.blockAt(new Vec3(c.x, c.y, c.z))?.name === name) return { x: c.x, y: c.y, z: c.z }
+      } catch { /* try the next cell */ }
+    }
+    return null
   }
 
   // ------------------------------------------------- resource chores -----
@@ -926,7 +985,47 @@ class Skills {
    * whitelisted alias for it), skipping blocks attached to crafted structures
    * or protected player claims.
    */
-  gather ({ item, count = 1, radius = 32, guard = null } = {}) {
+  /**
+   * "None within R blocks" is a dead end unless it says where there IS some.
+   * Looks once over everything the client has loaded: the same resource further
+   * out (with coordinates to walk to), else its relatives that are close (asked
+   * for oak, standing in a birch forest), else an honest "not around here".
+   */
+  _gatherMiss (want, targets, radius) {
+    const bot = this.bot
+    const me = bot.entity?.position
+    const what = targets.names.length > 3 ? want : targets.names.join(' or ')
+    const head = `no ${what} within ${radius} blocks`
+    if (!me) return `${head} — go_to a place first, then gather again`
+    let partial = false // the look-around ran out of time before covering everything
+    const nearest = (ids, maxDistance) => {
+      try {
+        const found = findBlocksFast(bot, ids, { maxDistance, count: 1, budgetMs: 60 })
+        if (found && found.truncated) partial = true
+        return found && found.length ? found[0] : null
+      } catch { return null }
+    }
+    const at = (p) => `${p.x},${p.y},${p.z} (${whereIs(me, p)})`
+    const far = radius < GATHER_SCOUT_RADIUS ? nearest(targets.ids, GATHER_SCOUT_RADIUS) : null
+    if (far) {
+      const name = bot.blockAt(far)?.name || targets.names[0]
+      return `${head}, but there is ${name} at ${at(far)} — go_to {x:${far.x}, y:${far.y}, z:${far.z}} and gather again`
+    }
+    // Relatives: another wood when one wood was named; the other ore variant.
+    const family = /_log$|_stem$|_hyphae$/.test(targets.names[0]) ? resolveGatherTargets(bot.registry, 'log') : null
+    if (family) {
+      const otherIds = family.ids.filter((id) => !targets.ids.includes(id))
+      const alt = otherIds.length ? nearest(otherIds, GATHER_SCOUT_RADIUS) : null
+      if (alt) {
+        const name = bot.blockAt(alt)?.name || 'another log'
+        return `${head} and none anywhere in sight, but there is ${name} at ${at(alt)} — gather {item:"${name}"} takes that instead (item:"log" takes any wood; every kind of log makes planks)`
+      }
+    }
+    if (partial) return `${head} — go somewhere it is likely to be (go_to a player, a remembered place or coordinates), then gather again`
+    return `${head}, and none anywhere in the loaded world around you (about ${GATHER_SCOUT_RADIUS} blocks) — asking for a bigger radius will not find any. Travel somewhere else first (go_to a player, a remembered place or coordinates a few hundred blocks away), or ask someone where there is some`
+  }
+
+  gather ({ item, count = 1, radius = GATHER_DEFAULT_RADIUS, guard = null } = {}) {
     const bot = this.bot
     return this._run('gather', async (token) => {
       const want = fold(item).replace(/\s+/g, '_')
@@ -942,7 +1041,13 @@ class Skills {
         if (best < need) return fail(`need at least a ${TOOL_NAMES[need]} pickaxe in the inventory to mine ${targets.names[0]} (carrying: ${picks.map((p) => p.name).join(', ') || 'no pickaxe'})`)
       }
       const wanted = Math.max(1, Math.min(64, Math.trunc(Number(count)) || 1))
-      radius = Math.max(1, Math.min(32, Math.trunc(Number(radius)) || 32))
+      // The radius the model asks for is the radius it gets, up to the most a
+      // gather may cover; a larger ask is cut down OUT LOUD (it used to be cut
+      // to 32 silently, so asking for 48 and then 64 changed nothing but the
+      // model could not know that).
+      const askedRadius = Math.trunc(Number(radius)) || GATHER_DEFAULT_RADIUS
+      radius = Math.max(1, Math.min(GATHER_MAX_RADIUS, askedRadius))
+      const cut = askedRadius > GATHER_MAX_RADIUS ? ` (${GATHER_MAX_RADIUS} is the most one gather covers — a larger radius changes nothing)` : ''
       const countExact = () => bot.inventory.items().filter((i) => i.name === want).reduce((n, i) => n + (Number(i.count) || 0), 0)
       const before = countExact()
       const progress = () => `dig calls completed: ${dug}/${wanted}; exact inventory ${want} net change: ${countExact() - before} (not attributable; other drops or later pickup not counted)`
@@ -955,8 +1060,8 @@ class Skills {
       while (dug < wanted && misses < 4 && Date.now() < deadline) {
         if (token.cancelled) break
         let allPositions = []
-        try { allPositions = bot.findBlocks({ matching: targets.ids, maxDistance: radius, count: 24 }) } catch (err) { return fail(`search failed: ${err.message || err}`) }
-        if (!allPositions.length) return dug > 0 ? ok(`${progress()}; no more targets within ${radius} blocks`) : fail(`no ${targets.names.join(' or ')} within ${radius} blocks — go_to a place first, then gather again`)
+        try { allPositions = findBlocksFast(bot, targets.ids, { maxDistance: radius, count: 24 }) } catch (err) { return fail(`search failed: ${err.message || err}`) }
+        if (!allPositions.length) return dug > 0 ? ok(`${progress()}; no more targets within ${radius} blocks`) : fail(`${this._gatherMiss(want, targets, radius)}${cut}`)
         const positions = []
         for (const p of allPositions) {
           const k = `${p.x},${p.y},${p.z}`
@@ -1034,7 +1139,7 @@ class Skills {
       const existing = new Set()
       try {
         const tid = bot.registry.blocksByName?.torch?.id
-        if (tid !== undefined) for (const p of bot.findBlocks({ matching: tid, maxDistance: r * 2, count: 64 })) existing.add(`${p.x},${p.z}`)
+        if (tid !== undefined) for (const p of findBlocksFast(bot, [tid], { maxDistance: r * 2, count: 64 })) existing.add(`${p.x},${p.z}`)
       } catch { /* partial world */ }
       const me = bot.entity.position.floored()
       const spots = []
@@ -1177,7 +1282,7 @@ class Skills {
       try {
         const ids = bot.registry.blocksArray.filter((b) => b.name === q || b.name.includes(q)).map((b) => b.id)
         if (ids.length) {
-          const found = bot.findBlocks({ matching: ids, maxDistance: 48, count: 3 })
+          const found = findBlocksFast(bot, ids, { maxDistance: 48, count: 3 })
           for (const p of found) parts.push(`${bot.blockAt(p)?.name || q} block at ${p.x},${p.y},${p.z} (${whereIs(pos, p)})`)
         }
       } catch { /* partial mock */ }

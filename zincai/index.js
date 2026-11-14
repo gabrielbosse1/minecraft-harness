@@ -160,6 +160,7 @@ function loadConfig () {
   cfg.inference.chatBatchMs = settings.int('INFERENCE_CHAT_BATCH_MS', cfg.inference.chatBatchMs ?? 6000, { min: 0 })
   cfg.reconnect.enabled = settings.bool('RECONNECT', cfg.reconnect.enabled ?? true)
   cfg.reconnect.maxAttempts = settings.int('RECONNECT_MAX_ATTEMPTS', cfg.reconnect.maxAttempts, { min: 1 })
+  cfg.reconnect.keepAliveTimeoutMs = settings.int('KEEPALIVE_TIMEOUT_MS', cfg.reconnect.keepAliveTimeoutMs ?? 60_000, { min: 20_000 })
 
   // Used by validateConfig() and the --dry-run summary; never logged with values.
   Object.defineProperty(cfg, '_rejectedOptions', { value: rejected, enumerable: false })
@@ -283,7 +284,7 @@ function makeShared (cfg, { dataDir = DATA_DIR } = {}) {
  */
 function main () {
   if (process.argv.includes('--check')) {
-    for (const m of ['./api_wrapper', './memory', './perception', './filter', './builder', './continuity', './custom_mineflayer/pathfinder_wrapper', './custom_mineflayer/doors', './custom_mineflayer/escape', './system1', './tactics', './reflex_registry', './vanilla_guard', './control', './threats', './places', './skills', './observe', './brain', './events', './redstone_engine', './runtime_config', './boundary', './connection', './death_recovery', './host', './control_commands', './irc', './dig_policy', './updater', './supervisor', './lanes', './goals']) require(m)
+    for (const m of ['./api_wrapper', './memory', './perception', './filter', './builder', './continuity', './custom_mineflayer/pathfinder_wrapper', './custom_mineflayer/doors', './custom_mineflayer/escape', './system1', './tactics', './reflex_registry', './vanilla_guard', './control', './threats', './places', './skills', './observe', './brain', './events', './redstone_engine', './runtime_config', './boundary', './connection', './death_recovery', './host', './control_commands', './irc', './dig_policy', './updater', './supervisor', './watchdog', './block_search', './lanes', './goals']) require(m)
     require('minecraft-data')('26.3') // postinstall patch must be in place
     logger.info(TAG, '--check OK — all modules load, 26.3 data present')
     return
@@ -298,7 +299,7 @@ function main () {
     logger.info(TAG, `data dir: ${DATA_DIR} (memories, places, goals, metrics, runtime-config)`)
     logger.info(TAG, `behaviour: elytra=${cfg.behavior.autoElytra ? 'yes' : 'no'} limits=${cfg.inference.rpm}/min`)
     logger.info(TAG, `agent loop: ${cfg.inference.heartbeatMs > 0 && cfg.inference.loopMs > 0 ? `every ${cfg.inference.loopMs}ms, backing off to ${cfg.inference.heartbeatMs}ms while idle` : 'off (events only)'}; up to ${cfg.inference.maxStepsPerTurn ?? 6} model steps per turn; chat window ${cfg.inference.chatBatchMs}ms`)
-    logger.info(TAG, `limits: rpm=${cfg.inference.rpm} minInterval=${cfg.inference.minIntervalMs}ms heartbeat=${cfg.inference.heartbeatMs}ms reconnect=${cfg.reconnect.enabled ? `${cfg.reconnect.maxAttempts} attempts` : 'off'}`)
+    logger.info(TAG, `limits: rpm=${cfg.inference.rpm} minInterval=${cfg.inference.minIntervalMs}ms heartbeat=${cfg.inference.heartbeatMs}ms reconnect=${cfg.reconnect.enabled ? `${cfg.reconnect.maxAttempts} attempts` : 'off'} keepAliveTimeout=${cfg.reconnect.keepAliveTimeoutMs}ms`)
     logger.info(TAG, `prompts: action ${SYSTEM_PROMPT.split(/\s+/).length} words, chat ${CHAT_PROMPT.split(/\s+/).length} words (static), ${ZINC_TOOLS.length} tools`)
     logger.info(TAG, 'policy: flee from real threats until the model decides; no PvP unless the model names a player; no friend list')
     // The control plane is part of the preflight: an empty operator list and a
@@ -374,6 +375,17 @@ function main () {
   // save everything, leave the server, then exit with the restart code.
   host.exitProcess = (code, reason) => shutdown(code, reason)
 
+  // Says what froze when something freezes: a stall of this thread is logged
+  // with the function that held it, a silent server is logged as a silent
+  // server. Report-only (watchdog.js); ZINCAI_WATCHDOG=0 turns it off.
+  try {
+    const { LoopWatchdog, watchdogEnabled, stackEnabled } = require('./watchdog')
+    if (watchdogEnabled()) {
+      shared.watchdog = new LoopWatchdog({ log: (level, msg) => logger[level]?.(TAG, msg), stack: stackEnabled() }).start()
+      host.watchdog = shared.watchdog // `status` shows its counters
+    }
+  } catch (err) { logger.debug(TAG, `watchdog unavailable: ${err.message || err}`) }
+
   // The control interface is up before the first join: status, config, help and
   // even stop/resume work while the link is still CONNECTING.
   host.attachStdin()
@@ -411,6 +423,30 @@ function createHost (shared, cfg, { dataDir = null } = {}) {
     tag: TAG,
     createSession: (hooks) => startSession(shared, hooks && hooks.onEnded ? hooks.onEnded : null, { host: hooks?.host || shared.host || null, hooks })
   })
+}
+
+/**
+ * A third-party plugin whose event handlers cannot take the process down.
+ * A handler that throws while a packet is being dispatched is an uncaught
+ * exception: the armor manager did exactly that on picking up an item whose
+ * entity data had not arrived ("Cannot read properties of undefined"), and the
+ * bot exited with code 1 in the middle of a gather. Its listeners are wrapped
+ * as they are registered; a failure is logged and that one event is skipped.
+ */
+function containedPlugin (plugin, name) {
+  const wrapped = (bot, options) => {
+    const realOn = bot.on
+    let warned = false
+    bot.on = function (event, fn) {
+      return realOn.call(this, event, function (...args) {
+        try { return fn.apply(this, args) } catch (err) {
+          if (!warned) { warned = true; logger.warn(TAG, `${name}: a "${String(event)}" handler failed (${err?.message || err}) — skipped, the bot carries on`) }
+        }
+      })
+    }
+    try { return plugin(bot, options) } finally { delete bot.on }
+  }
+  return wrapped
 }
 
 // ========================================================= one session ==
@@ -513,12 +549,27 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     username: cfg.server.username, // always ZincAI — enforced in loadConfig()
     version: cfg.server.version || false,
     auth: cfg.server.auth,
-    checkTimeoutInterval: 30_000
+    // How long without a keep-alive before the client gives the link up. The
+    // server sends one every 15 s; 30 s (the library default) drops the bot
+    // after ONE late keep-alive — a server on a small board that stalls on a
+    // world save, or a hitch on our side — and costs a reconnect and whatever
+    // the body was doing. 60 s rides through that and still ends a dead link.
+    checkTimeoutInterval: Math.max(20_000, Number(cfg.reconnect?.keepAliveTimeoutMs) || 60_000)
   })
+  // Every packet from the server is a sign of life (watchdog.js): silence is
+  // then reported as the server's, a stall of this thread as ours.
+  try {
+    const wd = shared.watchdog
+    if (wd && bot._client?.on) {
+      bot._client.on('packet', () => wd.traffic())
+      bot._client.on('connect', () => wd.linkUp())
+      bot._client.on('end', () => wd.linkDown())
+    }
+  } catch { /* a simulated bot has no client */ }
   // Runtime vanilla invariant: no slash-command can ever leave this process.
   const guard = installVanillaGuard(bot, { logger })
   bot.loadPlugin(pathfinder)
-  if (cfg.behavior.useArmorManager) bot.loadPlugin(armorManager)
+  if (cfg.behavior.useArmorManager) bot.loadPlugin(containedPlugin(armorManager, 'armor manager'))
   // Network-level physical barrier: every primitive that could move the body or
   // change the world is refused while the body is paused, disconnected, dead or
   // outside its permissions. Installed BEFORE any subsystem gets the bot.
@@ -2017,6 +2068,19 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
    * function does do is make the stream legible: who spoke, in what order, and
    * whether it was said aloud or whispered.
    */
+  /**
+   * Who is on the server. With one other player online there is nobody else
+   * their public chat could be for — the model used to read "is this line for
+   * me?" as an open question even then, and stayed silent to direct questions.
+   */
+  function roomLine () {
+    const self = bot.username
+    const names = Object.keys(bot.players || {}).filter((n) => n && n !== self)
+    if (!names.length) return null
+    if (names.length === 1) return `room: only you and ${names[0]} are online — whatever ${names[0]} says in public chat is said to you`
+    return `room: ${names.length} other players online (${names.slice(0, 8).join(', ')}${names.length > 8 ? ', …' : ''}) — public chat may be for any of you`
+  }
+
   function buildChatPrompt (sender, incoming) {
     const pos = here()
     if (pos) { try { places.scan(bot, { radius: cfg.places.scanRadius ?? 16 }) } catch { /* partial world */ } }
@@ -2067,6 +2131,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       `relationship with ${relLine}`,
       ...threatBrief(),
       observe.playersLine(bot),
+      roomLine(),
       nearby ? `nearby: ${nearby.split('\n').join(' | ')}` : null,
       named ? `places: ${named}` : null,
       prefs || null,
@@ -2101,6 +2166,8 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   // this repo's cost tables stop being estimates the first time this runs
   // against a live endpoint that reports them.
   let metricsWarned = false
+  const SLOW_CALL_MS = 20_000
+  let slowCallSaidAt = 0
   function logUsage (lane, why, usage, ms, tool) {
     try {
       if (!usage) return
@@ -2113,6 +2180,12 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         ms: Number.isFinite(ms) ? ms : null
       }
       fs.appendFileSync(path.join(shared.dataDir || DATA_DIR, 'metrics.jsonl'), JSON.stringify(row) + '\n')
+      // A slow endpoint is the usual reason "the bot does nothing for half a
+      // minute": say so where the operator is looking, at most once a minute.
+      if (row.ms >= SLOW_CALL_MS && Date.now() - slowCallSaidAt > 60_000) {
+        slowCallSaidAt = Date.now()
+        logger.info(TAG, `model call took ${(row.ms / 1000).toFixed(0)}s (${lane} lane${row.in ? `, ${row.in} prompt tokens` : ''}${row.out ? `, ${row.out} generated` : ''}) — the bot waits for the endpoint, not the other way round; every call is timed in metrics.jsonl`)
+      }
     } catch (err) {
       if (!metricsWarned) { metricsWarned = true; logger.warn(TAG, `metrics log unavailable: ${err.message || err}`) }
     }
@@ -2348,6 +2421,13 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     stop: () => ({ a: 'stop' })
   }
 
+  /** Why a chat window got no line: the model's own choice, or an answer that never arrived whole. */
+  function silentWhy (reply) {
+    if (reply._empty === 'cut_off') return '(no answer: the model\'s output was cut off before it finished a reply — raise inference.chatMaxTokens if this repeats)'
+    if (reply._empty === 'no_call') return '(no answer: the model returned neither a reply call nor text)'
+    return `(chose not to answer${reply.decision ? `: ${reply.decision}` : ''})`
+  }
+
   async function talk (sender, lines, meta = null) {
     const text = buildChatPrompt(sender, lines)
     const messages = [
@@ -2362,7 +2442,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       latency.record('architectureOverheadMs', Math.max(0, (meta.invokeMono || chatInvokeMono) - meta.queuedMono))
     }
     const epoch = lifeEpoch
-    let { reply, usage: chatUsage } = await amd.chatReply(messages, { maxTokens })
+    const { reply, usage: chatUsage } = await amd.chatReply(messages, { maxTokens })
     latency.record('modelInferenceMs', performance.now() - chatInvokeMono)
     if (ended || epoch !== lifeEpoch) return
     logUsage('chat', `${sender}: ${lines.map((l) => l.text).join(' / ').slice(0, 60)}`, chatUsage, Date.now() - tChat0, 'reply')
@@ -2428,7 +2508,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       continuity.addPendingEvent({ kind: 'player_request', from: target, text: reply.task })
       brain.wake(`chat request from ${target}: ${reply.task}`, { external: true, fast: true, important: true, preempt: true })
     }
-    logger.info(TAG, `chat ${sender}: "${lines.map((l) => l.text).join(' / ').slice(0, 80)}" -> ${reply.text ? `"${reply.text.slice(0, 80)}"` : '(silent)'}${reply.do ? ` [do: ${reply.do} ${target}]` : ''}${reply.task ? ` [task: ${reply.task.slice(0, 60)}]` : ''}`)
+    logger.info(TAG, `chat ${sender}: "${lines.map((l) => l.text).join(' / ').slice(0, 80)}" -> ${reply.text ? `"${reply.text.slice(0, 80)}"` : silentWhy(reply)}${reply.do ? ` [do: ${reply.do} ${target}]` : ''}${reply.task ? ` [task: ${reply.task.slice(0, 60)}]` : ''}`)
   }
 
   // ------------------------------------------------------------ fights ---
@@ -2670,7 +2750,9 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     // "follow Steve" again used to cancel the walk and start it over.
     const running = sameAsRunning(action)
     if (running) return report(a, { ok: true, msg: `already ${running} — still going, not restarted. Call stop to end it, or idle to let it continue.` }, { wake: false })
-    if (a !== 'idle') logger.info(TAG, `action: ${a} ${JSON.stringify(Object.fromEntries(Object.entries(action).filter(([k]) => !k.startsWith('_') && k !== 'a')))}`)
+    // Logged as the model made the call: the internal short aliases of an
+    // argument (craft's `i`, say's `t`) are not a second argument.
+    if (a !== 'idle') logger.info(TAG, `action: ${a} ${JSON.stringify(publicArgs(action))}`)
     // Take the lane this tool belongs to. BODY is exclusive, so a second
     // physical action cannot start while one is in flight; COMPUTATION,
     // INTERACTION and WORLD_INFO run alongside it. `tryAcquire` is used for

@@ -390,7 +390,7 @@ function installPhysicalGuard (bot, boundary, { logger = () => {}, onRefused = n
   const log = asLogger(logger)
   if (bot.__zincaiPhysicalGuard) return bot.__zincaiPhysicalGuard
   const originals = new Map()
-  const state = { refused: 0, uninstall }
+  const state = { refused: 0, gated: 0, uninstall }
 
   const gate = (obj, name, optional = null) => {
     const original = obj?.[name]
@@ -411,32 +411,57 @@ function installPhysicalGuard (bot, boundary, { logger = () => {}, onRefused = n
     return true
   }
 
-  // Movement and control-state writes; releasing a key is always allowed.
-  gate(bot, 'setControlState', (key, value) => value === false)
-  gate(bot, 'clearControlStates', () => true)
-  // World mutation.
-  gate(bot, 'dig')
-  gate(bot, 'placeBlock')
-  gate(bot, 'activateItem')
-  gate(bot, 'activateBlock')
-  gate(bot, 'attack')
-  gate(bot, 'equip')
-  gate(bot, 'unequip')
-  gate(bot, 'consume')
-  gate(bot, 'toss')
-  gate(bot, 'tossStack')
-  gate(bot, 'craft')
-  gate(bot, 'openContainer')
-  gate(bot, 'openFurnace')
-  gate(bot, 'elytraFly')
-  // Pathfinder: dropping a goal releases the body, setting one drives it.
-  if (bot.pathfinder) {
-    gate(bot.pathfinder, 'setGoal', (goal) => goal === null || goal === undefined)
-    gate(bot.pathfinder, 'goto')
-    gate(bot.pathfinder, 'stop', () => true)
+  const installNow = () => {
+    // Movement and control-state writes; releasing a key is always allowed.
+    gate(bot, 'setControlState', (key, value) => value === false)
+    gate(bot, 'clearControlStates', () => true)
+    // World mutation.
+    gate(bot, 'dig')
+    gate(bot, 'placeBlock')
+    gate(bot, 'activateItem')
+    gate(bot, 'activateBlock')
+    gate(bot, 'attack')
+    gate(bot, 'equip')
+    gate(bot, 'unequip')
+    gate(bot, 'consume')
+    gate(bot, 'toss')
+    gate(bot, 'tossStack')
+    gate(bot, 'craft')
+    gate(bot, 'openContainer')
+    gate(bot, 'openFurnace')
+    gate(bot, 'elytraFly')
+    // Pathfinder: dropping a goal releases the body, setting one drives it.
+    if (bot.pathfinder) {
+      gate(bot.pathfinder, 'setGoal', (goal) => goal === null || goal === undefined)
+      gate(bot.pathfinder, 'goto')
+      gate(bot.pathfinder, 'stop', () => true)
+    }
+    state.gated = originals.size
+    log(originals.size ? 'info' : 'warn', originals.size
+      ? `physical boundary installed — ${originals.size} primitives gated`
+      : 'physical boundary: this bot exposes none of the primitives to gate — pause and permissions are enforced at the tool level only')
+  }
+
+  // mineflayer adds dig/placeBlock/setControlState/… (and the pathfinder) when
+  // its plugins are injected, which happens one timer AFTER createBot returns.
+  // Installing straight away on a real bot therefore gated nothing at all
+  // ("0 primitives gated") and left the network-level barrier out of every
+  // real session; only a simulated bot, which is born complete, was covered.
+  // So: now if the body is already there, otherwise right after injection (this
+  // listener is added after mineflayer's own, so the plugins are in by then).
+  let pending = null
+  const ready = PRIMITIVES_PROBE.some((name) => typeof bot[name] === 'function')
+  if (ready || typeof bot.once !== 'function') installNow()
+  else {
+    pending = () => { pending = null; installNow() }
+    bot.once('inject_allowed', pending)
   }
 
   function uninstall () {
+    if (pending) {
+      try { bot.removeListener?.('inject_allowed', pending) } catch { /* noop */ }
+      pending = null
+    }
     for (const { obj, name, original } of originals.values()) {
       try { obj[name] = original } catch { /* already replaced */ }
     }
@@ -445,9 +470,11 @@ function installPhysicalGuard (bot, boundary, { logger = () => {}, onRefused = n
   }
 
   bot.__zincaiPhysicalGuard = state
-  log('info', `physical boundary installed — ${originals.size} primitives gated`)
   return state
 }
+
+/** Any of these on the bot means its plugins are in. */
+const PRIMITIVES_PROBE = ['setControlState', 'dig', 'placeBlock', 'attack', 'equip']
 
 /** A refused primitive resolves like a no-op, so `await` callers do not throw. */
 function refuseValue (primitive) {

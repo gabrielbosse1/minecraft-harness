@@ -13,7 +13,7 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const path = require('node:path')
-const { EventEmitter } = require('node:events')
+const { EventEmitter, once } = require('node:events')
 const { Vec3 } = require('vec3')
 const { simulatedBot, startTestSession, addPlayer, sleep } = require('./helpers/session')
 const { installPhysicalGuard } = require('../zincai/boundary')
@@ -629,12 +629,118 @@ test('a silent server is reported as the server, not as the bot', async () => {
   wd.stop()
 })
 
+test('timeout diagnosis separates an active protocol link, server silence and a blocked bot', () => {
+  const run = (kind) => {
+    const logs = []
+    let now = 1_000_000
+    const wd = new LoopWatchdog({ log: (level, msg) => logs.push({ level, msg }), now: () => now, stack: false })
+    wd.linkUp({ timeoutMs: 60_000 })
+    wd.packet('keep_alive', { keepAliveId: 123n })
+    wd.outbound('keep_alive', { keepAliveId: 123n })
+    if (kind === 'active') {
+      for (let i = 0; i < 11; i++) { now += 5_000; wd.packet('time_update', {}) }
+      now += 5_000
+    } else if (kind === 'silent') {
+      now += 60_001
+    } else {
+      now += 60_001
+      wd._lastStall = { startedAt: now - 59_000, endedAt: now, durationMs: 59_000 }
+    }
+    const cause = wd.connectionError(new Error('client timed out after 60000 milliseconds'))
+    return { cause, logs, wd }
+  }
+
+  const active = run('active')
+  assert.equal(active.cause, 'keepalive-stream-only')
+  assert.match(active.logs.at(-1).msg, /ordinary server packet\(s\).*TCP link was alive/)
+  assert.equal(active.wd.stats.keepAlives, 1)
+  assert.equal(active.wd.stats.keepAliveReplies, 1)
+
+  const silent = run('silent')
+  assert.equal(silent.cause, 'server-or-tcp-silence')
+  assert.match(silent.logs.at(-1).msg, /Minecraft server process\/tick loop stalled/)
+
+  const blocked = run('blocked')
+  assert.equal(blocked.cause, 'bot-main-thread')
+  assert.match(blocked.logs.at(-1).msg, /JavaScript thread was blocked/)
+})
+
+test('a wrong keep-alive echo is identified as a client protocol failure', () => {
+  const logs = []
+  let now = 50_000
+  const wd = new LoopWatchdog({ log: (level, msg) => logs.push(msg), now: () => now, stack: false })
+  wd.linkUp({ timeoutMs: 60_000 })
+  wd.packet('keep_alive', { keepAliveId: 987654321n })
+  wd.outbound('keep_alive', { keepAliveId: 987654320n })
+  now += 60_001
+  assert.equal(wd.connectionError(new Error('client timed out after 60000 milliseconds')), 'client-reply-path')
+  assert.equal(wd.stats.replyMismatches, 1)
+  assert.match(logs.join('\n'), /client\/protocol reply path/)
+})
+
+test('the real 26.3 protocol echoes a non-zero 64-bit keep-alive id exactly on localhost', { timeout: 5000 }, async (t) => {
+  const mc = require('minecraft-protocol')
+  const server = mc.createServer({
+    'online-mode': false,
+    host: '127.0.0.1',
+    port: 0,
+    version: '26.3',
+    keepAlive: false
+  })
+  let client = null
+  const close = async () => {
+    // Destroy the test sockets directly. Client.end() deliberately keeps a
+    // 30-second hard-close safety timer, which would make this fast test keep
+    // the whole test process alive for another 30 seconds.
+    try { clearTimeout(client?.closeTimer); client?.socket?.destroy() } catch { /* already closed */ }
+    for (const peer of Object.values(server.clients || {})) {
+      try { clearTimeout(peer.closeTimer); peer.socket?.destroy() } catch { /* already closed */ }
+    }
+    if (server.socketServer?.listening) {
+      const closed = once(server, 'close')
+      server.socketServer.close()
+      await closed.catch(() => {})
+    }
+  }
+  t.after(close)
+  const within = (promise, label) => Promise.race([
+    promise,
+    sleep(2000).then(() => { throw new Error(`timed out waiting for ${label}`) })
+  ])
+
+  await within(once(server, 'listening'), 'loopback server')
+  const port = server.socketServer.address().port
+  const login = once(server, 'login')
+  client = mc.createClient({
+    username: 'ZincKeepAliveProbe',
+    auth: 'offline',
+    host: '127.0.0.1',
+    port,
+    version: '26.3',
+    checkTimeoutInterval: 2000
+  })
+  client.on('error', () => {})
+  const [peer] = await within(login, 'protocol login')
+  while (peer.state !== 'play') await within(once(peer, 'state'), 'play state')
+
+  const wanted = 0x123456789abcdefn
+  const decoded = once(client, 'keep_alive')
+  const echoed = once(peer, 'keep_alive')
+  peer.write('keep_alive', { keepAliveId: wanted })
+  const [[challenge], [reply]] = await within(Promise.all([decoded, echoed]), 'keep-alive round trip')
+  assert.equal(challenge.keepAliveId.valueOf(), wanted, 'client decoded all 64 bits')
+  assert.equal(reply.keepAliveId.valueOf(), wanted, 'minecraft-protocol echoed the exact challenge')
+  await close()
+})
+
 test('the watchdog can be switched off, and the keep-alive tolerance is configurable', () => {
   assert.equal(watchdogEnabled({}), true)
   assert.equal(watchdogEnabled({ ZINCAI_WATCHDOG: '0' }), false)
   const defaults = JSON.parse(fs.readFileSync(path.join(root, 'zincai', 'config', 'defaults.json'), 'utf8'))
   assert.equal(defaults.reconnect.keepAliveTimeoutMs, 60000)
   const src = fs.readFileSync(path.join(root, 'zincai', 'index.js'), 'utf8')
-  assert.match(src, /checkTimeoutInterval: Math\.max\(20_000, Number\(cfg\.reconnect\?\.keepAliveTimeoutMs\) \|\| 60_000\)/)
+  assert.match(src, /const keepAliveTimeoutMs = Math\.max\(20_000, Number\(cfg\.reconnect\?\.keepAliveTimeoutMs\) \|\| 60_000\)/)
+  assert.match(src, /checkTimeoutInterval: keepAliveTimeoutMs/)
+  assert.match(src, /wd\.outbound\(name, packet\)/, 'the exact keep-alive echo is observed')
   assert.doesNotMatch(src, /checkTimeoutInterval: 30_000/)
 })

@@ -47,7 +47,57 @@ function tokenize (text) {
     .split(/[\s,]+/)
     .map((w) => (w.length > 3 && w.endsWith('s') ? w.slice(0, -1) : w))
     .filter((w) => w.length > 1 && !STOPWORDS.has(w))
+    // Fold curated synonyms onto one canonical word so a paraphrase can meet
+    // the memory it means. Both the query and the stored text go through here,
+    // so "treasure" and "diamonds" land on the same token.
+    .map((w) => SYNONYM_OF.get(w) || w)
 }
+
+/**
+ * Small, curated synonym map for the vocabulary a Minecraft player actually
+ * uses when asking where something is. This is what lets "the stash"/"treasure"
+ * meet a memory that says "diamonds". It is deliberately a fixed table, not a
+ * model: cheap, predictable, and honest about being a lookup.
+ */
+const SYNONYMS = [
+  // One "valuables" cluster: a player who says "where is the treasure" and a
+  // memory that says "diamonds in chest2" are talking about the same errand.
+  ['diamond', 'gem', 'jewel', 'treasure', 'loot', 'stash', 'hoard', 'swag', 'valuable'],
+  ['iron', 'ingot'],
+  ['gold', 'gilded'],
+  ['chest', 'box', 'container', 'storage', 'store'],
+  ['house', 'home', 'base', 'cabin', 'hut', 'shelter', 'cottage'],
+  ['farm', 'field', 'crops', 'plantation'],
+  ['food', 'eat', 'meal', 'provision'],
+  ['weapon', 'sword', 'blade', 'gear', 'kit'],
+  ['armor', 'armour', 'protection'],
+  ['mine', 'mineshaft', 'cavea', 'cave', 'cavern'],
+  ['river', 'stream', 'water'],
+  ['village', 'town', 'hamlet'],
+  ['nether', 'hell'],
+  ['enchanted', 'enchantment', 'enchants'],
+  ['station', 'workbench', 'bench', 'table'],
+  ['furnace', 'smelter', 'kiln', 'oven'],
+  ['bed', 'bunk'],
+  ['door', 'gate', 'entrance'],
+  ['tower', 'spire', 'watchtower'],
+  ['bridge', 'crossing'],
+  ['path', 'road', 'trail', 'way'],
+  ['tunnel', 'corridor', 'shaft'],
+  ['portal', 'gateway'],
+  ['tree', 'forest', 'wood', 'woods', 'grove'],
+  ['spawn', 'origin', 'start']
+]
+const SYNONYM_OF = (() => {
+  const map = new Map()
+  for (const group of SYNONYMS) {
+    const canonical = group[0]
+    for (const word of group) {
+      if (!map.has(word)) map.set(word, canonical)
+    }
+  }
+  return map
+})()
 
 /** Hashed bag-of-words vector (sparse map token -> tf). */
 function embed (text) {

@@ -557,8 +557,58 @@ class ContinuityStore {
   }
 
   /**
+   * Mirror of containerTakeGuard for the other direction: may we put OUR items
+   * into this container? Taking a stranger's diamonds and filling their chest
+   * with cobblestone are the same trespass, and only one of them was checked.
+   *
+   * Reading is still free (`look_in` is reversible and reveals nothing the
+   * model could not already see from the block).
+   */
+  containerPutGuard (entry, dim = 'overworld', { askedBy = null } = {}) {
+    if (!entry) return { ok: true }
+    const labelText = entry.label || entry.text || ''
+    const labelCheck = classifySignOwnership(labelText, this.botName)
+    if (labelCheck.kind === 'own' || labelCheck.kind === 'shared') return { ok: true, ownership: labelCheck.kind }
+    if (labelCheck.kind === 'player') {
+      if (askedBy && labelCheck.owner && askedBy.toLowerCase() === labelCheck.owner.toLowerCase()) {
+        return { ok: true, ownership: 'player_authorized' }
+      }
+      const who = labelCheck.owner ? `${labelCheck.owner}'s` : 'a private'
+      return { ok: false, ownership: 'private', reason: `${entry.id} is marked as ${who} private container ("${labelText}") — do not put things in it without permission` }
+    }
+    const ePos = entry.pos || entry
+    const claim = this.claimAt(ePos, dim)
+    if (claim && claim.kind === 'player') {
+      if (askedBy && claim.owner && askedBy.toLowerCase() === claim.owner.toLowerCase()) {
+        return { ok: true, ownership: 'player_authorized' }
+      }
+      const who = claim.owner ? `${claim.owner}'s` : 'another player\'s'
+      return { ok: false, ownership: 'private', reason: `${entry.id} sits inside ${who} property "${claim.name}" — ask before putting items in it` }
+    }
+    return { ok: true, ownership: claim?.kind || 'unknown' }
+  }
+
+  /**
+   * May we use (right-click) this block? A lever, button, door, bed or
+   * dispenser inside somebody's claim does something when touched, and "who
+   * owns this bed" matters more than "who owns this wall" because a bed can
+   * move our respawn point into a stranger's house.
+   */
+  useBlockGuard (pos, dim = 'overworld', { askedBy = null, what = 'that block' } = {}) {
+    const claim = this.claimAt(pos, dim)
+    if (!claim) return { ok: true }
+    if (claim.kind === 'own') return { ok: true, claim }
+    if (askedBy && claim.owner && askedBy.toLowerCase() === claim.owner.toLowerCase()) return { ok: true, claim, ownership: 'player_authorized' }
+    if (claim.kind === 'player') {
+      const who = claim.owner ? `${claim.owner}'s` : 'another player\'s'
+      return { ok: false, claim, reason: `${what} is inside ${who} property "${claim.name}" — ask before touching it` }
+    }
+    return { ok: true, claim }
+  }
+
+  /**
    * Evolve Zinc's emergent personal interests (never pre-populated; driven only
-   * by Zinc's own experiences and choices). Prefix `-` removes an interest.
+   * by Zinc's own experiences and choices. Prefix `-` removes an interest).
    */
   updateInterest (raw) {
     const s = clean(raw, 60)

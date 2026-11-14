@@ -863,6 +863,44 @@ class Skills {
     return { ...ok(`equipped ${mine.name} (${dest})`), slot: dest }
   }
 
+  /**
+   * Which block would `use_block {what}` act on, and on which of the matching
+   * ids? Shared by the action itself and by the property guard in index.js, so
+   * the block that is checked is exactly the block that gets clicked.
+   *
+   * The match used to be a bare `name.includes(q)`, which meant "bed" also
+   * matched **bedrock** (first alphabetically, so it won) and "chest" could
+   * resolve to `ender_chest` — a different interaction entirely. Now: an exact
+   * id wins outright, then the shortest family match, and the family must be a
+   * real word boundary (`bed` matches `*_bed`, never `bedrock`).
+   */
+  _matchUseBlockIds (what) {
+    const q = fold(what).replace(/\s+/g, '_').replace(/^minecraft:/, '')
+    if (!q) return []
+    const all = this.bot?.registry?.blocksArray
+    if (!Array.isArray(all)) return []
+    const exact = all.filter((b) => b.name === q)
+    if (exact.length) return [exact[0], ...all.filter((b) => b.name !== q && b.name.endsWith('_' + q))]
+    // Family match on a word boundary, shortest name first so `oak_door` beats
+    // `oak_trapdoor`-style near-misses when both are present.
+    return all.filter((b) => b.name.endsWith('_' + q) || b.name.includes('_' + q + '_'))
+      .sort((a, b) => a.name.length - b.name.length || a.name.localeCompare(b.name))
+  }
+
+  /** The block `use_block` would touch right now, without touching it. Null when nothing matches. */
+  previewUseBlockTarget ({ what } = {}) {
+    try {
+      const blocks = this._matchUseBlockIds(what)
+      if (!blocks.length) return null
+      const ids = blocks.map((b) => b.id)
+      const positions = this.bot.findBlocks({ matching: ids, maxDistance: 16, count: 8 })
+      if (!positions?.length) return null
+      const p = positions[0]
+      const block = this.bot.blockAt(p)
+      return block ? { pos: p, name: block.name } : null
+    } catch { return null }
+  }
+
   /** Right-click a nearby block by name: door, gate, lever, button, bell… */
   useBlock ({ what } = {}) {
     const bot = this.bot
@@ -871,9 +909,9 @@ class Skills {
       if (!q) return fail('use_block needs a block name')
       let positions = []
       try {
-        const ids = bot.registry.blocksArray.filter((b) => b.name === q || b.name.includes(q)).map((b) => b.id)
-        if (!ids.length) return fail(`unknown block "${what}"`)
-        positions = bot.findBlocks({ matching: ids, maxDistance: 16, count: 8 })
+        const blocks = this._matchUseBlockIds(what)
+        if (!blocks.length) return fail(`unknown block "${what}"`)
+        positions = bot.findBlocks({ matching: blocks.map((b) => b.id), maxDistance: 16, count: 8 })
       } catch (err) { return fail(`search failed: ${err.message || err}`) }
       if (!positions.length) return fail(`no ${q} within 16 blocks`)
       const p = positions[0]

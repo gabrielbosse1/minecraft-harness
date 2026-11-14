@@ -130,14 +130,36 @@ test('wall primitive generates exact l×h footprint cells', () => {
   assert.equal(xs.size, 20)
 })
 
-test('arch primitive springs from the ground and apexes exactly at h', () => {
+test('arch primitive springs from the ground and is exactly h courses tall', () => {
+  // `h` means the same thing for every shape: how many courses it occupies.
+  // The arch used to emit y=0..h (h+1 courses) while wall/box/cylinder `h` was
+  // the course count, so an arch stacked on a wall of the same h overshot by one.
   for (const [w, h] of [[10, 8], [9, 8], [12, 10], [6, 5]]) {
     const a = generateShape('arch', { w, h }, 'stone')
     const ys = a.map((b) => b.dy)
-    assert.equal(Math.max(...ys), h, `apex for w=${w},h=${h}`)
+    assert.equal(Math.max(...ys), h - 1, `apex (top course) for w=${w},h=${h}`)
     assert.equal(Math.min(...ys), 0, `base for w=${w},h=${h}`)
+    assert.equal(ys.length, a.length)
     const keySet = new Set(a.map((b) => `${b.dx},${b.dy},${b.dz}`))
     assert.equal(keySet.size, a.length, 'no duplicate cells')
+  }
+})
+
+test('arch honours axis, and every shape is corner-anchored at `at`', () => {
+  const x = generateShape('arch', { w: 5, h: 4 }, 'stone')
+  const z = generateShape('arch', { w: 5, h: 4, axis: 'z' }, 'stone')
+  assert.equal(Math.max(...x.map((b) => b.dx)) - Math.min(...x.map((b) => b.dx)), 4, 'axis x spans x')
+  assert.equal(Math.max(...x.map((b) => b.dz)) - Math.min(...x.map((b) => b.dz)), 0, 'axis x is flat in z')
+  assert.equal(Math.max(...z.map((b) => b.dz)) - Math.min(...z.map((b) => b.dz)), 4, 'axis z spans z')
+  assert.equal(Math.max(...z.map((b) => b.dx)) - Math.min(...z.map((b) => b.dx)), 0, 'axis z is flat in x')
+  // Corner convention: nothing may start at a negative offset, or a shape would
+  // spill outside the `at` the model gave (cylinders/domes/rings used to be
+  // centred there, so a dome on a box was silently off by r in both axes).
+  for (const [shape, params] of [['cylinder', { r: 2, h: 1 }], ['ring', { r: 2 }], ['dome', { r: 2 }], ['box', { w: 3, d: 3, h: 1 }], ['floor', { w: 3, d: 3 }], ['wall', { l: 3, h: 1 }], ['arch', { w: 3, h: 3 }]]) {
+    const blocks = generateShape(shape, params, 'stone')
+    assert.equal(Math.min(...blocks.map((b) => b.dx)), 0, `${shape} starts at dx=0`)
+    assert.equal(Math.min(...blocks.map((b) => b.dy)), 0, `${shape} starts at dy=0`)
+    assert.equal(Math.min(...blocks.map((b) => b.dz)), 0, `${shape} starts at dz=0`)
   }
 })
 

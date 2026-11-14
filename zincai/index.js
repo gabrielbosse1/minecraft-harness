@@ -1924,11 +1924,21 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
    * to be builder-mode-only; the grid is now offered whenever the situation
    * looks like building, so the model is never handed a build job blind.
    */
-  const BUILD_BLOCK_HINT = /(planks|log|stone|dirt|cobble|brick|concrete|terracotta|wool|glass|sand|gravel|deepslate|_slab|_stairs|_fence|_wall|scaffold|torch|redstone|_door|_trapdoor|ladder|rail)/i
+  // A name regex here meant a quartz, blackstone, tuff or prismarine builder
+  // was handed no grid at all while a dirt builder got one — the prompt promises
+  // "never handed a build blind". Ask the registry instead: it knows exactly
+  // which items are placeable blocks, with no list to keep in sync.
+  const NOT_A_BUILD_BLOCK = /(_bucket$|^bucket$|_boat$|_raft$|_minecart|^potion$|^splash_potion$|^lingering_potion$|^arrow$|^spectral_arrow$|^egg$|^snowball$|^ender_pearl$|^ender_eye$|^firework|^fire_charge$|^totem|^shield$|_sword$|_pickaxe$|_axe$|_shovel$|_hoe$|^flint_and_steel$|^shears$|^bow$|^crossbow$|^trident$|^fishing_rod$|^carrot_on_a_stick$|^warped_fungus_on_a_stick$|_spawn_egg$|^experience_bottle$|^honey_bottle$|^milk_bucket$)/
   function holdingBuildMaterials () {
     try {
       const held = bot.heldItem?.name
-      if (held && BUILD_BLOCK_HINT.test(held)) return true
+      if (held) {
+        // Registry first: a placeable block is a building material whatever it
+        // is made of. Non-block items fall through to the regex-free path below.
+        const asBlock = bot.registry?.blocksByName?.[held]
+        if (asBlock) return !NOT_A_BUILD_BLOCK.test(held)
+        if (NOT_A_BUILD_BLOCK.test(held)) return false
+      }
       // Mid-build the executor holds a scaffold or a placement item even when
       // the model is between tool calls; the running task is the better signal.
       if (task && /build/i.test(String(task.tool || ''))) return true
@@ -2030,7 +2040,20 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     // chooses, so the sense it builds WITH must not be locked behind a persona:
     // if it is holding blocks (or something it made), it gets the grid.
     if (holdingBuildMaterials()) {
-      try { lines.push(`grid (legend: ${VISION_LEGEND}):\n${buildVisionBlock(bot, { range: 6, radius: 6, heightUp: 5, heightDown: 2 })}`) } catch { /* cosmetic */ }
+      // behavior.perceptionRange / behavior.perception3D are the operator's
+      // knobs for this block, and nothing read them for a long time. The radius
+      // is the horizontal span; perception3D adds height on both sides (the
+      // cross-section) instead of the shallow default.
+      const bRange = Math.max(2, Math.min(12, Math.trunc(Number(cfg.behavior?.perceptionRange)) || 6))
+      const vertical = cfg.behavior?.perception3D === true
+      try {
+        lines.push(`grid (legend: ${VISION_LEGEND}):\n${buildVisionBlock(bot, {
+          range: bRange,
+          radius: bRange,
+          heightUp: vertical ? Math.max(4, bRange) : 5,
+          heightDown: vertical ? Math.max(4, bRange) : 2
+        })}`)
+      } catch { /* cosmetic */ }
     }
     // Who asked for what this turn is about (the newest chat request among the reasons).
     const asked = /^chat request from (\S+?):/.exec([...reasons].reverse().find((r) => /^chat request from /.test(r)) || '')
@@ -2614,11 +2637,33 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     }
     const plan = parser.plan({ name: label, blocks }, origin, bot.entity.position)
     // Property respect check: never build over another player's claimed structure without authorization.
+    //
+    // This used to probe exactly three cells — first, middle, last step. Steps
+    // come out in build order, so for a flat floor those three all sit on one
+    // diagonal, and a claim anywhere else in the footprint was invisible: a
+    // 15×15 floor with a player's claim on its centre passed the check and then
+    // placed 29 blocks inside it. A claim is a circle, so testing a subset of
+    // cells only works if the subset is chosen against the claims, not against
+    // the plan. Check every distinct claim the bounding box could touch, then
+    // every step whose cell lies in one.
     if (plan.steps?.length) {
-      for (const probe of [plan.steps[0], plan.steps[Math.floor(plan.steps.length / 2)], plan.steps[plan.steps.length - 1]]) {
-        const g = continuity.propertyGuardAt(probe, dim(), { askedBy })
+      const claims = (continuity.identity?.claims || []).filter((c) => !c.dim || c.dim === dim())
+      for (const claim of claims) {
+        const pad = (claim.radius || 8) + 1
+        const near = plan.steps.some((s) =>
+          s.x >= (claim.x - pad) && s.x <= (claim.x + pad) &&
+          s.z >= (claim.z - pad) && s.z <= (claim.z + pad))
+        if (!near) continue
+        const g = continuity.propertyGuardAt({ x: claim.x, y: claim.y, z: claim.z }, dim(), { askedBy })
         if (!g.ok) {
           return { ok: false, msg: `refused to build ${label}: footprint overlaps ${g.reason} — move to clear ground or get permission first` }
+        }
+      }
+      // Belt and braces for claims registered elsewhere (a place, a live scan).
+      for (const step of plan.steps) {
+        const g = continuity.propertyGuardAt(step, dim(), { askedBy })
+        if (!g.ok) {
+          return { ok: false, msg: `refused to build ${label}: ${step.x},${step.y},${step.z} overlaps ${g.reason} — move to clear ground or get permission first` }
         }
       }
     }
@@ -2851,10 +2896,27 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         // does NOT cancel what the bot was doing — a paused task resumes; `stop`
         // is the tool that ends a task. (It used to cancel, and to expire
         // silently two minutes later.)
+        // `ids` is optional: a bare `hold` means "all of them", which is what
+        // it always meant. Naming ids holds only those and leaves the rest.
+        const listed = Array.isArray(snap.threatIds) ? snap.threatIds : []
+        const wanted = Array.isArray(action.ids) && action.ids.length
+          ? action.ids.map(Number).filter((id) => Number.isFinite(id))
+          : listed
+        const unknown = wanted.filter((id) => !listed.includes(id))
+        const holdIds = wanted.filter((id) => listed.includes(id))
         decided(snap, { label: 'hold', ttlMs: 30 * 60_000 })
-        const n = snap.threatIds.length
+        // Without this the ids were parsed and then dropped on the floor.
+        if (holdIds.length) system1.acknowledge(holdIds, { label: 'hold', ttlMs: 30 * 60_000 })
+        const n = holdIds.length
         const cur = skills?.current()
-        return report('hold', { ok: true, msg: n ? `no longer running from ${n} listed threat${n === 1 ? '' : 's'}${cur ? `; carrying on with ${cur.label}` : ''}. The body runs again if one of them hurts you, a fuse is lit, or something new shows up` : 'nothing to hold against (no threats listed)' }, { wake: false })
+        const skipped = listed.length - n
+        const note = skipped > 0 && n > 0 ? ` (${skipped} other${skipped === 1 ? '' : 's'} still live)` : ''
+        return report('hold', {
+          ok: true,
+          msg: n
+            ? `no longer running from ${n} listed threat${n === 1 ? '' : 's'}${note}${cur ? `; carrying on with ${cur.label}` : ''}. The body runs again if one of them hurts you, a fuse is lit, or something new shows up`
+            : (unknown.length ? `no threat with id ${unknown.join(', ')} is listed — nothing to hold` : 'nothing to hold against (no threats listed)')
+        }, { wake: false })
       }
       case 'attack': {
         const request = action.player
@@ -2888,21 +2950,58 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         decided(snap, { label: 'take' })
         return startSide('take', () => skills.take({ item: action.item, count: action.count, where: action.where }), sideOpts('take', action, snap))
       }
-      case 'put':
+      case 'put': {
+        // Taking from a stranger's chest is refused; so is putting into it.
+        // Filling someone's storage with cobblestone is the same trespass as
+        // emptying it, and only one of the two used to be checked.
+        if (here() && places) {
+          try { places.scan(bot, { radius: cfg.places.scanRadius ?? 16 }) } catch { /* noop */ }
+          const entry = places.resolve(action.where || '', here(), { dim: dim() })
+          const pg = continuity.containerPutGuard(entry, dim(), { askedBy: snap?.askedBy })
+          if (!pg.ok) return report('put', { ok: false, msg: `refused: ${pg.reason}` })
+        }
         decided(snap, { label: 'put' })
         return startSide('put', () => skills.put({ item: action.item, count: action.count, where: action.where }), sideOpts('put', action, snap))
-      case 'smelt':
+      }
+      case 'smelt': {
+        // Loading somebody else's furnace burns their coal and fills their
+        // output slot with our ore.
+        if (here() && places) {
+          try { places.scan(bot, { radius: cfg.places.scanRadius ?? 16 }) } catch { /* noop */ }
+          const entry = places.resolve(action.where || 'furnace', here(), { dim: dim() })
+          const sg = continuity.containerPutGuard(entry, dim(), { askedBy: snap?.askedBy })
+          if (!sg.ok) return report('smelt', { ok: false, msg: `refused: ${sg.reason}` })
+        }
         decided(snap, { label: 'smelt' })
         return startSide('smelt', () => skills.smelt({ item: action.item, count: action.count, where: action.where }), sideOpts('smelt', action, snap))
-      case 'sleep':
+      }
+      case 'sleep': {
+        // A bed inside somebody's claim sets OUR respawn point inside their
+        // house. That is the most persistent thing a bot can do to another
+        // player, so it needs the same permission as their chest.
+        if (here() && places) {
+          try { places.scan(bot, { radius: cfg.places.scanRadius ?? 16 }) } catch { /* noop */ }
+          const entry = places.resolve('bed', here(), { dim: dim(), fallbackKinds: new Set(['bed']) })
+          const bg = continuity.useBlockGuard(entry?.pos || entry, dim(), { askedBy: snap?.askedBy, what: entry?.id ? `the bed (${entry.id})` : 'that bed' })
+          if (!bg.ok) return report('sleep', { ok: false, msg: `refused: ${bg.reason}` })
+        }
         decided(snap, { label: 'sleep' })
         return startSide('sleep', () => skills.sleep(), { ...sideOpts('sleep', action, snap), until: 'wake' })
+      }
       case 'give':
         decided(snap, { label: 'give' })
         return startSide('give', () => skills.give({ player: action.player, item: action.item, count: action.count }), sideOpts('give', action, snap))
-      case 'use_block':
+      case 'use_block': {
+        // Right-clicking is an act: levers, buttons, doors, dispensers and
+        // beds all change state, so a block inside a claim needs permission.
+        const target = skills.previewUseBlockTarget ? skills.previewUseBlockTarget({ what: action.what }) : null
+        if (target) {
+          const ug = continuity.useBlockGuard(target.pos, dim(), { askedBy: snap?.askedBy, what: `the ${target.name}` })
+          if (!ug.ok) return report('use_block', { ok: false, msg: `refused: ${ug.reason}` })
+        }
         decided(snap, { label: 'use_block' })
         return startSide('use_block', () => skills.useBlock({ what: action.what }), sideOpts('use_block', action, snap))
+      }
       case 'eat':
         return background('eat', adoptLease(skills.eat({ item: action.item }), 'eat finished'))
       case 'equip': {
@@ -3199,9 +3298,24 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     if (!result) return
     logger.info(TAG, `scout: anchor ${result.x},${result.y},${result.z} (${result.reasons.join(', ')})`)
     const p = here()
-    if (Math.hypot(result.x - p.x, result.y - p.y, result.z - p.z) > (sc.relocateAboveBlocks ?? 6)) {
-      background('scout', skills.goTo({ x: result.x, y: result.y, z: result.z }))
+    // Don't walk away from a spot we just died at (deathAvoidRadius), and give
+    // the walk a deadline (relocateTimeoutMs) instead of leaving a background
+    // job to run for as long as the pathfinder feels like. Both were config
+    // keys that nothing read.
+    const death = deathRecovery?.lastDeath?.position || null
+    if (death && Number.isFinite(death.x) && Number.isFinite(death.z)) {
+      const d = Math.hypot(result.x - death.x, result.z - death.z)
+      if (d < (sc.deathAvoidRadius ?? 12)) {
+        logger.info(TAG, `scout: skipping anchor ${result.x},${result.z} — ${Math.round(d)} blocks from the last death`)
+        return
+      }
     }
+    const far = Math.hypot(result.x - p.x, result.y - p.y, result.z - p.z) > (sc.relocateAboveBlocks ?? 6)
+    if (!far) return
+    const walk = skills.goTo({ x: result.x, y: result.y, z: result.z })
+    const limit = Math.max(1_000, Number(sc.relocateTimeoutMs) || 25_000)
+    const timeout = sleep(limit).then(() => ({ ok: false, msg: `scout: relocation did not finish in ${Math.round(limit / 1000)}s` }))
+    background('scout', Promise.race([walk, timeout]))
   }
 
   /**

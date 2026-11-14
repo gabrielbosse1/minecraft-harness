@@ -24,7 +24,7 @@
     "_lanesNote": "maxConcurrent 2 = the chat lane and the action lane each have one call in flight, so a slow action call never holds a chat reply (set 1 if the endpoint refuses parallel requests; chat still goes first). chatTimeoutMs 90000 accommodates Qwen3.8-27B latency (~47s p50) while remaining shorter than action timeoutMs (120000); adaptive p90 scaling lifts slow calls automatically."
   },
   "inference": {
-    "_note": "Two lanes: chat (reads people) and action (drives the body). Wake-ups are queued, never dropped. rpm is the shared calls-per-minute budget — the API's pacing, which is the only budget that still limits the model; chatReserve of those are for the chat lane alone. chatBatchMs is the IRC window: chat lines are collected this long and handed over as ONE chunk (several speakers, in order) instead of one model call per line; 0 turns batching off. urgentMinIntervalMs: the start of an escape or being cornered may be thought about this soon after the last call. heartbeatMs is the longest the agent loop ever waits between turns when nothing happens (0 = loop off); see _loopNote.",
+    "_note": "Two lanes: chat (reads people) and action (drives the body). Wake-ups are queued, never dropped. rpm is the shared calls-per-minute budget \u2014 the API's pacing, which is the only budget that still limits the model; chatReserve of those are for the chat lane alone. chatBatchMs is the IRC window: chat lines are collected this long and handed over as ONE chunk (several speakers, in order) instead of one model call per line; 0 turns batching off. urgentMinIntervalMs: the start of an escape or being cornered may be thought about this soon after the last call. heartbeatMs is the longest the agent loop ever waits between turns when nothing happens (0 = loop off); see _loopNote.",
     "minIntervalMs": 3000,
     "urgentMinIntervalMs": 1000,
     "chatMinIntervalMs": 1200,
@@ -67,12 +67,12 @@
       "cost": 2
     },
     "engageRadius": 24,
-    "fovDegrees": 90,
     "perceptionRange": 10,
     "useArmorManager": true,
-    "_armorNote": "useArmorManager: whether the armor autopilot starts ON (zincai/armor.js — the bot's own; the mineflayer-armor-manager plugin is no longer used). On, the best armor carried is put on whenever the inventory changes. The model owns it at run time through the equip tool: equip {auto:false|true}, and a slot it dresses or empties itself is left alone.",
+    "_armorNote": "useArmorManager: whether the armor autopilot starts ON (zincai/armor.js \u2014 the bot's own; the mineflayer-armor-manager plugin is no longer used). On, the best armor carried is put on whenever the inventory changes. The model owns it at run time through the equip tool: equip {auto:false|true}, and a slot it dresses or empties itself is left alone.",
     "perception3D": false,
-    "autoElytra": true
+    "autoElytra": true,
+    "_senseNote": "perceptionRange: horizontal radius of the 3D build grid shown when holding building materials (2-12). perception3D: true also shows the full cross-section (tall vertical span) instead of 5 up / 2 down. There is no field-of-view setting: the vision block is a 360-degree scan around the bot, including blocks behind it."
   },
   "build": {
     "scaffoldBlocks": [
@@ -146,7 +146,8 @@
     "relocateAboveBlocks": 6,
     "waitForWorldMs": 6000,
     "relocateTimeoutMs": 25000,
-    "deathAvoidRadius": 12
+    "deathAvoidRadius": 12,
+    "_note2": "relocateTimeoutMs caps the relocation walk; deathAvoidRadius keeps a new anchor from being within that many blocks of your last death."
   },
   "reconnect": {
     "_note": "After a session that had spawned successfully, reconnect with back-off when the server restarts or the link drops. A rejection on the FIRST join (whitelist, name) is still fatal: no retries, no renames.",
@@ -158,7 +159,7 @@
     "_keepAliveNote": "How long without a keep-alive from the server before the link is given up (the server sends one every 15 s). 30000 dropped the bot after a single late one."
   },
   "goals": {
-    "_note": "Durable objectives (goals.js). Every long task becomes a record with an id, origin, priority, checkpoint and lifecycle; it survives deaths, restarts and context resets (goals.json in the data dir). stallMs: an ACTIVE goal whose checkpoint has not moved for this long wakes the model once (remindMs before a second nudge) — waiting on a furnace or the night is legitimate, so only the running goal is nudged and never failed automatically. maxFails: repeated failures plus no progress suspend it as blocked. starveMs/starveRemindMs: an open goal that waits this long while the body is idle is offered back to the model. maxResumes: a main task paused this many times is set aside (not deleted). verifyRadius: a restored build goal within this many blocks of its site is re-checked at startup (farther away it is left resumable+needsVerify; gather goals are always checked, they have no site). staleGuard: refuse quiet actions whose snapshot no longer matches the world (new threat or a different active goal).",
+    "_note": "Durable objectives (goals.js). Every long task becomes a record with an id, origin, priority, checkpoint and lifecycle; it survives deaths, restarts and context resets (goals.json in the data dir). stallMs: an ACTIVE goal whose checkpoint has not moved for this long wakes the model once (remindMs before a second nudge) \u2014 waiting on a furnace or the night is legitimate, so only the running goal is nudged and never failed automatically. maxFails: repeated failures plus no progress suspend it as blocked. starveMs/starveRemindMs: an open goal that waits this long while the body is idle is offered back to the model. maxResumes: a main task paused this many times is set aside (not deleted). verifyRadius: a restored build goal within this many blocks of its site is re-checked at startup (farther away it is left resumable+needsVerify; gather goals are always checked, they have no site). staleGuard: refuse quiet actions whose snapshot no longer matches the world (new threat or a different active goal).",
     "file": "zincai-data/goals.json",
     "maxGoals": 40,
     "terminalKeep": 12,

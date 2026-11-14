@@ -591,7 +591,7 @@ class BuilderExecutor {
 function generateShape (shape, p = {}, block = 'stone') {
   if (!block || !/^[a-z0-9_]+$/.test(block)) throw new Error(`build_shape: bad block id "${block}"`)
   const allowed = {
-    cylinder: ['r', 'h', 'th', 'filled'], dome: ['r', 'th'], arch: ['w', 'h', 'th'],
+    cylinder: ['r', 'h', 'th', 'filled'], dome: ['r', 'th'], arch: ['w', 'h', 'th', 'axis'],
     wall: ['l', 'h', 'th', 'axis'], box: ['w', 'd', 'h', 'th', 'filled'],
     floor: ['w', 'd'], ring: ['r', 'th']
   }
@@ -640,7 +640,9 @@ function generateShape (shape, p = {}, block = 'stone') {
               const inner = (r - th) > 0 ? (r - th) : 0
               if (inner > 0 && d2 < inner * inner) continue
             }
-            push(dx, y, dz)
+            // Corner-anchored like every other shape: `at` is the min corner,
+            // so this spans 0..2r rather than -r..r.
+            push(dx + r, y, dz + r)
           }
         }
       }
@@ -655,8 +657,8 @@ function generateShape (shape, p = {}, block = 'stone') {
           const d = Math.hypot(dx, dz)
           if (d > r) continue
           const y = Math.round(Math.sqrt(Math.max(0, r * r - d * d)))
-          push(dx, y, dz)
-          for (let t = 1; t < th; t++) push(dx, Math.max(0, y - t), dz)
+          push(dx + r, y, dz + r)
+          for (let t = 1; t < th; t++) push(dx + r, Math.max(0, y - t), dz + r)
         }
       }
       break
@@ -673,7 +675,10 @@ function generateShape (shape, p = {}, block = 'stone') {
       const r = w / 2
       const cx = (w - 1) / 2
       const endOffset = Math.sqrt(Math.max(0, r * r - cx * cx))
-      const S = Math.max(0.5, h - r + endOffset)
+      // `h` is the top course, so the apex must land on h-1: a 3-high arch
+      // occupies y=0,1,2. It used to emit y=0..h (h+1 courses) and overshoot
+      // every wall it was put on.
+      const S = Math.max(0.5, (h - 1) - r + endOffset)
       const colTop = Math.round(S)
       const seen = new Set()
       for (let t = 0; t < th; t++) {
@@ -685,10 +690,12 @@ function generateShape (shape, p = {}, block = 'stone') {
             const dy2 = r * r - (x - cx) * (x - cx)
             if (dy2 >= 0) cells.push([x, Math.round(S + Math.sqrt(dy2) - endOffset)])
             for (const [bx, by] of cells) {
-              const key = `${bx},${by},${dz}`
+              // Honours `axis` like a wall does: axis z puts the span along z.
+              const key = axis === 'x' ? `${bx},${by},${dz}` : `${dz},${by},${bx}`
               if (seen.has(key)) continue
               seen.add(key)
-              push(bx, by, dz)
+              if (axis === 'x') push(bx, by, dz)
+              else push(dz, by, bx)
             }
           }
         }
@@ -743,7 +750,7 @@ function generateShape (shape, p = {}, block = 'stone') {
         for (let dz = -r; dz <= r; dz++) {
           const d2 = dx * dx + dz * dz
           const inner = Math.max(0, r - th)
-          if (d2 <= r * r && d2 >= inner * inner) push(dx, 0, dz)
+          if (d2 <= r * r && d2 >= inner * inner) push(dx + r, 0, dz + r)
         }
       }
       break

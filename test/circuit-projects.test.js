@@ -63,7 +63,12 @@ test('model workflow binds a snapshot, saves a named logical graph and reruns by
   assert.ok(tools.some((t) => t.function.name === 'circuit_project'))
   // Unconditional: circuit work is not a persona you have to switch into.
   assert.ok(createZincTools({ mode: 'explorer' }).some((t) => t.function.name === 'circuit_project'))
-  assert.equal(call('circuit_project', { operation: 'bad' })._badArgs, 'circuit_project')
+  // An out-of-enum operation is NOT dropped by the schema any more: it reaches
+  // the handler, which explains what it accepts. Dropping the call first meant
+  // the model lost `name`/`snapshot`/`note` too and got no hint.
+  const badOp = call('circuit_project', { operation: 'bad' })
+  assert.equal(badOp.a, 'circuit_project')
+  assert.equal(badOp.operation, 'bad')
   const bot = simulatedBot(); const oldBlockAt = bot.blockAt.bind(bot)
   bot.blockAt = (p) => p.x === 0 && p.y === 64 && p.z === 0 ? { name: 'repeater', getProperties: () => ({ facing: 'north', powered: false, delay: 1, locked: false }) } : oldBlockAt(p)
   const s = startTestSession({ bot, actions: () => null })

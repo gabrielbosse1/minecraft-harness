@@ -25,6 +25,34 @@ ship a scarier report.
 
 ---
 
+## Status — fixed in this branch
+
+Every finding below is fixed, with a regression test in
+`test/tool-audit-regressions.test.js` that fails against the old code. Full suite:
+**432 tests, 0 failures**. What changed, in report order:
+
+| § | Fix |
+| --- | --- |
+| 1 | `_configureBreakGuard` now runs the **claim** check unconditionally; only the crafted-neighbour heuristic is waived by an open `dig` corridor. |
+| 2 | Containers, workstations, machines, liquids and TNT joined `NEVER_DIG`, and the never-break list is applied in **every** mode — the corridor used to narrow it to five names. |
+| 3 | `containerPutGuard` + `useBlockGuard` added; `put`, `smelt`, `sleep` and `use_block` wired to them. |
+| 4 | `build`'s claim check tests every distinct claim the footprint could touch, then every step — not three sampled cells. |
+| 5 | `hold` declares `ids` and honours them; a bare `hold` still holds everything. |
+| 6 | Out-of-enum values are mapped onto the declared spelling (case/prefix) or passed to the handler; closed verb lists (the chat lane's `do`) stay closed via `strict: true`. |
+| 7 | `recall` gained a curated synonym table, so "treasure"/"stash"/"spire" find "diamonds"/"chest"/"watchtower". |
+| 9 | Every shape is corner-anchored at `at`; `arch` honours `axis` and is exactly `h` courses. |
+| 10 | The grid is offered for any placeable block (registry lookup), not a name regex. |
+| 11 | `perceptionRange`/`perception3D` now drive the grid; `relocateTimeoutMs`/`deathAvoidRadius` now drive the scout; the unhonourable `fovDegrees` key is gone and the config says why. |
+| 12 | `use_block` matches exact → word-boundary family, so "bed" cannot reach bedrock. |
+| 13–14 | Prompt now names the real dig list and what is never broken. |
+
+Still open (deliberately, needs a product decision rather than a patch): **§8**'s
+missing `use_item` / `place` / hotbar verbs. Adding tools the model has never had
+is a design change, not a bug fix — it is called out at the bottom rather than
+silently shipped.
+
+---
+
 ## 1. S1 — `dig` breaks through somebody else's claim, and both prompts say it does not
 
 The `dig` schema (`api_wrapper.js:63`) calls itself "ONE deliberate corridor".
@@ -507,28 +535,34 @@ fine as about what is broken.
 
 ---
 
-## Priority
+## Priority (all but §8 are now fixed)
 
-1. **§1** `dig` waives the claim + crafted-block guard — the only finding that
-   destroys another player's build.
-2. **§2** `mode:"all"` makes containers and machines breakable, and four strings
-   say it cannot — destroys player storage.
-3. **§3** eight of fourteen verbs skip the property guards: `put` into a
-   stranger's chest, `sleep` in a stranger's bed, `use_block` on a stranger's
-   lever.
-4. **§4** `build`'s claim check samples three cells — a claim inside a large
-   footprint is not seen.
-5. **§5** `hold` cannot accept `ids` — the model cannot do the one thing the
-   prompt tells it to do when it is being chased.
-6. **§6** enum strictness discards whole answers on `goal` / `social` /
-   `redstone_engineer`.
-7. **§8** no `use_item`, no `place`, no slot control — the largest capability
-   gap, and the one that makes "every tool is available" only half true.
-8. **§9** `build_shape` origin conventions and `arch` height.
-9. **§7** "semantic" naming on a keyword search.
-10. **§10–§12** grid regex, dead FOV knobs, `use_block` substring matching.
-11. **§13–§14** wording.
+1. ~~**§1** `dig` waives the claim + crafted-block guard~~ — fixed.
+2. ~~**§2** `mode:"all"` makes containers and machines breakable~~ — fixed.
+3. ~~**§3** eight of fourteen verbs skip the property guards~~ — fixed for
+   `put`, `smelt`, `sleep`, `use_block`; `light_up`/`_placeCarried` place blocks
+   but now inherit the §1 claim guard on the pathfinder side.
+4. ~~**§4** `build`'s claim check samples three cells~~ — fixed.
+5. ~~**§5** `hold` cannot accept `ids`~~ — fixed, and the ids are now honoured.
+6. ~~**§6** enum strictness discards whole answers~~ — fixed for text enums;
+   closed verb lists are explicitly marked `strict`.
+7. **§8** no `use_item`, no `place`, no slot control — **still open on purpose.**
+   This is the one finding left, and it is not a bug: it is a missing feature
+   area. Adding `use_item`/`place`/hotbar control means new verbs, new schema
+   text on every call, and new failure modes to guard (placing a block where the
+   model cannot stand, drinking a potion mid-fight). It should be a deliberate
+   product decision with its own tests, not a drive-by patch at the end of an
+   audit. Everything it would add is listed in the §8 table, ready to pick up.
+8. ~~**§9** `build_shape` origin conventions and `arch` height~~ — fixed.
+9. ~~**§7** "semantic" naming on a keyword search~~ — fixed by making the claim
+   true (synonym table) rather than weakening the word.
+10. ~~**§10–§12** grid regex, dead FOV knobs, `use_block` substring matching~~ —
+    fixed.
+11. ~~**§13–§14** wording~~ — fixed.
 
 Reproduction scripts are in `.probe/` (workspace, so they persist) and
 `/tmp/probe*.js`. Each is a standalone `node` script that uses the repo's own
 test world. Nothing here was measured on a live server.
+
+The durable version of those probes is `test/tool-audit-regressions.test.js`
+(22 tests, one cluster per finding), which runs as part of `npm test`.

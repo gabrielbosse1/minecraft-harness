@@ -24,7 +24,7 @@
  *     ("could not reach", "too far", "not loaded" — being elsewhere is the
  *     cure). State failures ("too hurt to fight", "no food") do NOT clear on
  *     movement: the body dragging the bot away (the flee reflex) used to
- *     re-arm the very loop the gate exists to stop (repro 05);
+ *     re-arm the very loop the gate exists to stop;
  *   - death/respawn or a NEW threat on screen (clearContext). A hurt event by
  *     itself never clears: being hit does not make "too hurt to fight" viable.
  * Pure local logic, unit-tested. Nothing here talks to the model.

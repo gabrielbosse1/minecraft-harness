@@ -41,6 +41,8 @@
  */
 'use strict'
 
+const { Vec3 } = require('vec3')
+
 const { ControlArbiter, PRIORITY } = require('./control')
 const { ThreatSense, isHostileMob } = require('./threats')
 const { mobSpeed, mobStats, statsOf, reachOf, cornerText } = require('./tactics')
@@ -146,7 +148,7 @@ class System1 {
    *           sense?: ThreatSense,
    *           eatBelowFood?: number, lowHealth?: number, fleeBelowHealth?: number,
    *           mlgFallBlocks?: number, fleeDistance?: number,
-   *           tickMs?: number, autoElytra?: boolean, now?: () => number }} [opts]
+   *           tickMs?: number, now?: () => number }} [opts]
    */
   constructor (bot, opts = {}) {
     this.bot = bot
@@ -175,7 +177,6 @@ class System1 {
     this.mlgFallBlocks = opts.mlgFallBlocks ?? 5
     this.fleeDistance = opts.fleeDistance ?? 14
     this.tickMs = opts.tickMs ?? 200
-    this.autoElytra = opts.autoElytra !== false
     this._timer = null
     this._lastEat = 0
     this._lastElytra = 0
@@ -310,7 +311,7 @@ class System1 {
     R.register({ name: 'eat_when_hungry', trigger: 'food_low', action: 'eat', cooldownMs: 4000 })
     R.register({ name: 'heal_when_hurt', trigger: 'health_low', action: 'eat', cooldownMs: 3000 })
     R.register({ name: 'water_bucket_on_long_fall', trigger: 'falling', action: 'drink_water', cooldownMs: 1500 })
-    if (this.autoElytra) R.register({ name: 'glide_on_long_fall', trigger: 'falling', action: 'elytra', cooldownMs: 3000 })
+    R.register({ name: 'glide_on_long_fall', trigger: 'falling', action: 'elytra', cooldownMs: 3000 })
     R.register({ name: 'swim_up', trigger: 'in_water', action: 'swim', cooldownMs: 0 })
   }
 
@@ -1045,7 +1046,7 @@ class System1 {
     const top = Math.floor(feet.y)
     for (let i = 0; i <= max; i++) {
       let b = null
-      try { b = bot.blockAt({ x, y: top - i, z }, false) } catch { b = null }
+      try { b = bot.blockAt(new Vec3(x, top - i, z), false) } catch { b = null }
       if (!b) continue
       if (b.name === 'water') return { drop: Math.max(0, feet.y - (top - i + 1)), block: b, water: true }
       if (b.boundingBox === 'block') return { drop: Math.max(0, feet.y - (top - i + 1)), block: b, water: false }
@@ -1185,7 +1186,7 @@ class System1 {
     if (!e?.position || !bot.blockAt) return false
     if (e.isInWater === false) return false
     try {
-      const eye = bot.blockAt({ x: Math.floor(e.position.x), y: Math.floor(e.position.y + 1.5), z: Math.floor(e.position.z) }, false)
+      const eye = bot.blockAt(new Vec3(Math.floor(e.position.x), Math.floor(e.position.y + 1.5), Math.floor(e.position.z)), false)
       return eye?.name === 'water'
     } catch { return false }
   }
@@ -1213,18 +1214,18 @@ class System1 {
     ]
     for (const [x, y, z] of probes) {
       let b = null
-      try { b = bot.blockAt({ x, y, z }, false) } catch { b = null }
+      try { b = bot.blockAt(new Vec3(x, y, z), false) } catch { b = null }
       if (b && DIRECT_RE.test(b.name || '')) return b.name
     }
     try {
-      const below = bot.blockAt({ x: fx, y: fy - 1, z: fz }, false)
+      const below = bot.blockAt(new Vec3(fx, fy - 1, fz), false)
       if (below && /^(magma_block|campfire|soul_campfire|lava|flowing_lava)$/.test(below.name || '') && !e.isSneaking) {
         return below.name
       }
     } catch { /* ignore */ }
     for (const [dx, dz] of [[0.34, 0], [-0.34, 0], [0, 0.34], [0, -0.34]]) {
       try {
-        const b = bot.blockAt({ x: Math.floor(p.x + dx), y: fy, z: Math.floor(p.z + dz) }, false)
+        const b = bot.blockAt(new Vec3(Math.floor(p.x + dx), fy, Math.floor(p.z + dz)), false)
         if (b && /^(cactus|lava|flowing_lava|fire|soul_fire)$/.test(b.name || '')) return b.name
       } catch { /* ignore */ }
     }
@@ -1237,8 +1238,8 @@ class System1 {
       const az = Math.floor(p.z + (vz / hSpeed) * 0.85)
       if (ax !== fx || az !== fz) {
         try {
-          const aheadFeet = bot.blockAt({ x: ax, y: fy, z: az }, false)
-          const aheadBelow = bot.blockAt({ x: ax, y: fy - 1, z: az }, false)
+          const aheadFeet = bot.blockAt(new Vec3(ax, fy, az), false)
+          const aheadBelow = bot.blockAt(new Vec3(ax, fy - 1, az), false)
           if (aheadFeet && /^(lava|flowing_lava|fire|soul_fire|cactus|powder_snow)$/.test(aheadFeet.name || '')) {
             return `ahead_${aheadFeet.name}`
           }
@@ -1268,9 +1269,9 @@ class System1 {
             const x = ox + dx; const y = oy + dy; const z = oz + dz
             let ground = null; let feet = null; let head = null
             try {
-              ground = bot.blockAt({ x, y: y - 1, z }, false)
-              feet = bot.blockAt({ x, y, z }, false)
-              head = bot.blockAt({ x, y: y + 1, z }, false)
+              ground = bot.blockAt(new Vec3(x, y - 1, z), false)
+              feet = bot.blockAt(new Vec3(x, y, z), false)
+              head = bot.blockAt(new Vec3(x, y + 1, z), false)
             } catch { continue }
             if (!ground || !feet || !head) continue
             if (preferWater && (feet.name === 'water' || ground.name === 'water') && !BAD_RE.test(head.name || '')) {

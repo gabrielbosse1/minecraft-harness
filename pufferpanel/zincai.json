@@ -7,7 +7,7 @@
       "type": "string",
       "value": "https://github.com/gabrielbosse1/minecraft-harness.git",
       "display": "Repository",
-      "desc": "Clone URL of the repository the panel installs from. The default is this project's public repo and needs no credentials. Point it at YOUR fork if you have one — the box is editable, and a fork is the normal way to run your own copy. For a PRIVATE repository use SSH (git@github.com:owner/repo.git) with a deploy key on the node, or the install will fail asking for a password.",
+      "desc": "Clone URL of the repository the panel installs from. Point it at your fork if you maintain one; for a private repository use SSH with a deploy key on the node.",
       "required": true,
       "userEdit": true
     },
@@ -15,7 +15,7 @@
       "type": "string",
       "value": "main",
       "display": "Branch",
-      "desc": "Git branch to run. Install again to update the server to the newest commit of this branch.",
+      "desc": "Git branch to run. Re-run Install or type `update` in the console to pull new commits.",
       "required": true,
       "userEdit": true
     },
@@ -23,7 +23,7 @@
       "type": "string",
       "value": "zincai/index.js",
       "display": "Entry Point",
-      "desc": "The bot's main file.",
+      "desc": "The bot entry file.",
       "required": true,
       "userEdit": false,
       "internal": true
@@ -32,15 +32,15 @@
       "type": "string",
       "value": "",
       "display": "Node.js Version",
-      "desc": "Leave EMPTY to use the node's own Node.js/npm — that is what this template expects, and what requirements.binaries checks at create time. Setting a major version (e.g. 22) runs PufferPanel's nodejsdl, which downloads Node.js into the panel's binaries folder and creates node22/npm22 there. That folder is NOT on PATH on most nodes, so the alias can fail with \"npm22: command not found\". Only set this if your node's PATH already includes the panel binaries folder.",
+      "desc": "Leave empty to use the node's installed Node.js/npm. Only set a major version if your node PATH includes PufferPanel's nodejsdl binaries directory.",
       "required": false,
       "userEdit": true
     },
     "apikey": {
       "type": "string",
       "value": "",
-      "display": "AMD Radeon Cloud API Key",
-      "desc": "Your rc-... Token Factory key. Passed in as the AMD_API_KEY environment variable, never written to disk, so it stays out of the console and out of git.",
+      "display": "Inference API Key",
+      "desc": "API key passed as AMD_API_KEY in the process environment (never written to disk).",
       "required": true,
       "userEdit": true
     },
@@ -48,7 +48,7 @@
       "type": "string",
       "value": "Qwen3.8-Flash-Next",
       "display": "Model",
-      "desc": "Model alias served by the endpoint. DeepSeek-V4-Flash-0731 also works.",
+      "desc": "Model alias served by the OpenAI-compatible endpoint.",
       "required": true,
       "userEdit": true
     },
@@ -56,7 +56,7 @@
       "type": "string",
       "value": "https://developer.amd.com.cn/radeon/api/v1",
       "display": "API Base URL",
-      "desc": "OpenAI-compatible base URL. Change it only to point at a proxy.",
+      "desc": "OpenAI-compatible chat completions base URL.",
       "required": true,
       "userEdit": true
     },
@@ -64,7 +64,7 @@
       "type": "string",
       "value": "127.0.0.1",
       "display": "Minecraft Server Address",
-      "desc": "Address the bot joins. If the Minecraft server runs on this same node, use the host gateway (host.docker.internal in Docker) and the port below.",
+      "desc": "Hostname or IP of the Minecraft server to join.",
       "required": true,
       "userEdit": true
     },
@@ -72,7 +72,7 @@
       "type": "integer",
       "value": 25565,
       "display": "Minecraft Server Port",
-      "desc": "Port the bot joins — the Minecraft server's port, not this server's panel port.",
+      "desc": "Port of the Minecraft server to join.",
       "required": true,
       "userEdit": true
     },
@@ -80,7 +80,7 @@
       "type": "string",
       "value": "",
       "display": "Minecraft Version",
-      "desc": "Pin a protocol version (1.21.4) or leave empty to auto-detect it from the server.",
+      "desc": "Pin a protocol version (for example 1.21.4 or 26.3) or leave empty to auto-detect.",
       "required": false,
       "userEdit": true
     },
@@ -88,7 +88,7 @@
       "type": "string",
       "value": "offline",
       "display": "Authentication",
-      "desc": "offline joins a private/cracked server with the fixed name ZincAI whitelisted. microsoft needs a premium account and an interactive device-code login on the first run.",
+      "desc": "offline joins a private/offline-mode server as ZincAI; microsoft uses a Microsoft account via device-code login.",
       "required": true,
       "userEdit": true,
       "options": [
@@ -102,27 +102,11 @@
         }
       ]
     },
-    "scaffolding": {
-      "type": "boolean",
-      "value": false,
-      "display": "Allow Scaffolding",
-      "desc": "Let the bot place and remove scaffolding blocks while building.",
-      "required": true,
-      "userEdit": true
-    },
-    "elytra": {
-      "type": "boolean",
-      "value": true,
-      "display": "Auto Elytra",
-      "desc": "Glide across long gaps with a carried elytra and fireworks instead of walking around.",
-      "required": true,
-      "userEdit": true
-    },
     "rpm": {
       "type": "integer",
       "value": 18,
       "display": "Calls Per Minute",
-      "desc": "Shared model-call budget. Part of it is reserved for chat so a long task can never starve replies.",
+      "desc": "Shared inference API rate limit across chat and action lanes.",
       "required": true,
       "userEdit": true
     },
@@ -130,31 +114,23 @@
       "type": "integer",
       "value": 3000,
       "display": "Minimum Call Spacing (ms)",
-      "desc": "Shortest gap between two action-lane calls.",
+      "desc": "Shortest gap between consecutive action-lane model calls.",
       "required": true,
       "userEdit": true
     },
     "loop": {
       "type": "integer",
       "value": 8000,
-      "display": "Loop pause (ms)",
-      "desc": "How soon the next turn starts by itself after one ends. Lower = more attentive and more model calls (always within Calls Per Minute); while the bot keeps choosing to do nothing the pause doubles up to Longest idle gap. 0 turns the loop off.",
+      "display": "Loop Pause (ms)",
+      "desc": "Delay after a turn finishes before starting the next turn; backs off up to Heartbeat when idle.",
       "required": true,
       "userEdit": true
     },
     "heartbeat": {
       "type": "integer",
       "value": 90000,
-      "display": "Longest idle gap (ms)",
-      "desc": "The bot runs in a loop: after each turn the next one starts by itself a few seconds later (Loop pause), and while it keeps choosing to do nothing that gap doubles up to this value. 0 turns the loop off: the bot then only thinks when someone talks to it or the world changes.",
-      "required": true,
-      "userEdit": true
-    },
-    "reconnect": {
-      "type": "boolean",
-      "value": true,
-      "display": "Reconnect",
-      "desc": "After a session that spawned, retry a dropped link or a server restart with back-off under the same name. A rejected FIRST join is still fatal.",
+      "display": "Longest Idle Gap (ms)",
+      "desc": "Maximum wait between turns while idle (0 runs strictly on world/chat events).",
       "required": true,
       "userEdit": true
     },
@@ -162,15 +138,7 @@
       "type": "integer",
       "value": 40,
       "display": "Reconnect Attempts",
-      "desc": "How many times a dropped connection is retried before the process exits.",
-      "required": true,
-      "userEdit": true
-    },
-    "joinonstart": {
-      "type": "boolean",
-      "value": true,
-      "display": "Join On Start",
-      "desc": "Join the server when the process starts. Off = the process comes up idle and waits for \"join\" on the console.",
+      "desc": "How many times a dropped connection is retried with back-off before exiting.",
       "required": true,
       "userEdit": true
     },
@@ -178,7 +146,7 @@
       "type": "string",
       "value": "info",
       "display": "Log Level",
-      "desc": "debug adds packet detail; warn and error quieten the console.",
+      "desc": "Console log verbosity (debug, info, warn, error).",
       "required": true,
       "userEdit": true,
       "options": [
@@ -204,7 +172,7 @@
       "type": "string",
       "value": "data",
       "display": "Data Directory",
-      "desc": "Where memories, places, goals and metrics live. Relative to the server directory, so it is included in a normal backup.",
+      "desc": "Directory storing session telemetry (events + continuation snapshots), memories, places, goals, and journal.",
       "required": true,
       "userEdit": false
     },
@@ -212,7 +180,7 @@
       "type": "string",
       "value": "node:22-bookworm-slim",
       "display": "Docker Image",
-      "desc": "Only used when the server runs in Docker: the image must already contain Node.js and npm. Host, tty and standard nodes ignore this and use the node's own node/npm.",
+      "desc": "Docker image used only on Docker nodes (must include Node.js and npm).",
       "required": false,
       "userEdit": true
     }
@@ -220,7 +188,7 @@
   "groups": [
     {
       "display": "Endpoint",
-      "description": "Where the model runs and which key it uses. The key only ever exists as an environment variable.",
+      "description": "Model endpoint configuration and API key.",
       "variables": [
         "apikey",
         "model",
@@ -230,7 +198,7 @@
     },
     {
       "display": "Minecraft Server",
-      "description": "The server the bot joins.",
+      "description": "Target Minecraft server connection.",
       "variables": [
         "host",
         "port",
@@ -240,39 +208,21 @@
       "order": 2
     },
     {
-      "display": "Behaviour",
-      "description": "How the bot plays and speaks. There are no modes, no alias list and no reply language: every tool is always available and the model chooses its own words.",
-      "variables": [
-        "scaffolding",
-        "elytra"
-      ],
-      "order": 3
-    },
-    {
-      "display": "Limits",
-      "description": "Model budget, recovery and logging.",
+      "display": "Pacing & Recovery",
+      "description": "API rate pacing, reconnect attempts, and console log level. Every gameplay tool is always available without modes or behavior switches.",
       "variables": [
         "rpm",
         "mininterval",
         "loop",
         "heartbeat",
-        "reconnect",
         "maxattempts",
         "log"
       ],
-      "order": 4
-    },
-    {
-      "display": "Operator Control",
-      "description": "Who may control the running bot. Console only, no prefix: pause, stop, shutdown, status, config — and `update`, which pulls the newest source from GitHub and restarts the bot on it (no reinstall needed; `update check` only looks, `restart` only restarts). Nothing typed in game chat is a command.",
-      "variables": [
-        "joinonstart"
-      ],
-      "order": 5
+      "order": 3
     },
     {
       "display": "Installation",
-      "description": "Where the bot comes from and which runtime it uses. Host nodes use their own node/npm; Docker uses the image below.",
+      "description": "Source repository, runtime, and persistent data directory.",
       "variables": [
         "repo",
         "branch",
@@ -280,7 +230,7 @@
         "datadir",
         "dockerimage"
       ],
-      "order": 6
+      "order": 4
     }
   ],
   "install": [
@@ -288,7 +238,7 @@
       "if": "!in_path('git')",
       "type": "command",
       "commands": [
-        "echo 'git is required: install git on the node (apt install git / dnf install git) and run Install again' && exit 1"
+        "echo 'git is required: install git on the node and run Install again' && exit 1"
       ]
     },
     {
@@ -349,15 +299,11 @@
       "MC_PORT": "${port}",
       "MC_VERSION": "${mcversion}",
       "MC_AUTH": "${auth}",
-      "MC_ALLOW_SCAFFOLDING": "${scaffolding}",
-      "MC_AUTO_ELYTRA": "${elytra}",
       "INFERENCE_RPM": "${rpm}",
       "INFERENCE_MIN_INTERVAL_MS": "${mininterval}",
       "INFERENCE_LOOP_MS": "${loop}",
       "INFERENCE_HEARTBEAT_MS": "${heartbeat}",
-      "RECONNECT": "${reconnect}",
       "RECONNECT_MAX_ATTEMPTS": "${maxattempts}",
-      "ZINC_JOIN_ON_START": "${joinonstart}",
       "ZINC_DATA_DIR": "${datadir}",
       "LOG_LEVEL": "${log}"
     },

@@ -40,6 +40,8 @@
  */
 'use strict'
 
+const { Vec3 } = require('vec3')
+
 /** A tiny binary heap ordered by `key`. */
 class Heap {
   constructor () { this.a = [] }
@@ -141,7 +143,7 @@ function standableCache (bot) {
   if (!bot || typeof bot.blockAt !== 'function') return null
   const cache = new Map()
   const HAZARD = /lava|fire|magma|cactus|sweet_berry|powder_snow|wither_rose|campfire/
-  const at = (x, y, z) => { try { return bot.blockAt({ x, y, z }, false) } catch { return null } }
+  const at = (x, y, z) => { try { return bot.blockAt(new Vec3(x, y, z), false) } catch { return null } }
   const solid = (b) => Boolean(b) && b.boundingBox === 'block'
   return (x, y, z) => {
     const key = x + ',' + y + ',' + z
@@ -194,7 +196,7 @@ function surveyGround (bot, opts = {}) {
   const dirs = opts.dirs ?? 16
   const step = opts.step ?? 4
   const mobs = Array.isArray(opts.mobs) ? opts.mobs : []
-  const at = (x, y, z) => { try { return bot.blockAt({ x: Math.floor(x), y, z: Math.floor(z) }, false) } catch { return null } }
+  const at = (x, y, z) => { try { return bot.blockAt(new Vec3(Math.floor(x), y, Math.floor(z)), false) } catch { return null } }
   const solid = (b) => Boolean(b) && b.boundingBox === 'block'
   const y0 = Math.floor(pos.y + 0.01)
   const out = []
@@ -543,7 +545,7 @@ function clearToRun (bot, dir, { blocks = 3, maxDrop = 3 } = {}) {
   if (!pos || !dir || !bot.blockAt) return true
   const HAZARD = /lava|fire|magma|cactus|sweet_berry|powder_snow|wither_rose|campfire/
   let y = Math.floor(pos.y + 0.01)
-  const at = (x, yy, z) => { try { return bot.blockAt({ x: Math.floor(x), y: yy, z: Math.floor(z) }, false) } catch { return null } }
+  const at = (x, yy, z) => { try { return bot.blockAt(new Vec3(Math.floor(x), yy, Math.floor(z)), false) } catch { return null } }
   const solid = (b) => Boolean(b) && b.boundingBox === 'block'
   for (let i = 1; i <= blocks; i++) {
     const x = pos.x + dir.x * i; const z = pos.z + dir.z * i

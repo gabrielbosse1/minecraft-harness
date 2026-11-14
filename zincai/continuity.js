@@ -20,7 +20,7 @@
 const fs = require('node:fs')
 const path = require('node:path')
 const { Vec3 } = require('vec3')
-const { visibleBlocks, detectStructures, clusterBlocks } = require('./perception')
+const { visibleBlocks, clusterBlocks } = require('./perception')
 
 const SCHEMA_VERSION = 1
 const MAX_CONSTRUCTIONS = 24
@@ -137,7 +137,6 @@ class ContinuityStore {
       activity: 'idle',
       activeGoalId: null,
       why: '',
-      mode: 'explorer',
       location: null,
       immediateAction: null,
       interruptedAction: null
@@ -896,17 +895,16 @@ class ContinuityStore {
       }
     }
 
-    // 2. Sample nearby visible blocks & classify structures / opportunities.
+    // 2. Sample nearby visible blocks factually (no heuristic structure labels).
     const seen = visibleBlocks(bot, { range: 12, fovDegrees: 360, heightUp: 6, heightDown: 4 })
-    const structures = detectStructures(seen)
     const clustered = clusterBlocks(seen)
     let redstoneCount = 0; let redstonePos = null
     let oreCount = 0; let oreName = null; let orePos = null
     let waterCount = 0; let waterPos = null
     let cropCount = 0
-    let wallCount = 0; let wallPos = null
+    let craftedCount = 0
     let treeCount = 0
-    let chestCount = 0
+    let chestCount = 0; let chestPos = null
     for (const b of seen) {
       const n = b.name || ''
       const bp = { x: p.x + (b.dx || 0), y: p.y + (b.dy || 0), z: p.z + (b.dz || 0) }
@@ -915,13 +913,9 @@ class ContinuityStore {
       if (WATER_RE.test(n)) { waterCount++; if (!waterPos) waterPos = bp }
       if (CROP_RE.test(n)) cropCount++
       if (/_log$|_stem$/.test(n)) treeCount++
-      if (/planks|bricks|cobblestone|oak_log|spruce_log|stone_bricks|glass|door|stairs/.test(n)) {
-        wallCount++
-        if (!wallPos && /planks|bricks|glass|door|stairs/.test(n)) wallPos = bp
-      }
-      if (/chest|barrel|shulker_box/.test(n)) chestCount++
+      if (/planks|bricks|cobblestone|oak_log|spruce_log|stone_bricks|glass|door|stairs/.test(n)) craftedCount++
+      if (/chest|barrel|shulker_box/.test(n)) { chestCount++; if (!chestPos) chestPos = bp }
     }
-    const structPos = wallPos || p
 
     // 3. Check nearby self-built constructions for damage / missing blocks.
     for (const c of this.identity.constructions) {
@@ -941,39 +935,34 @@ class ContinuityStore {
       }
     }
 
-    // 4. Update 16x16 chunk frontier cell & detect environmental changes.
+    // 4. Update 16x16 chunk frontier cell & record factual block changes.
     const cx = Math.floor(p.x / 16)
     const cz = Math.floor(p.z / 16)
     const cellKey = `${dim}:${cx},${cz}`
     const now = this.now()
     const prevCell = this.frontier[cellKey]
     const tags = []
-    for (const s of structures.slice(0, 2)) tags.push(s.kind)
     if (redstoneCount >= 2) tags.push('redstone')
     if (waterCount >= 6) tags.push('water')
     if (oreCount >= 1) tags.push(`ore:${oreName}`)
     if (cropCount >= 4) tags.push('crops')
+    if (chestCount >= 1) tags.push(`containers:${chestCount}`)
 
     if (prevCell && (now - (prevCell.lastAt || 0)) > 20_000) {
-      if (wallCount - (prevCell.walls || 0) >= 8) {
-        const msg = `new construction activity near (${p.x},${p.y},${p.z})`
-        if (this.recordChange('new_construction', msg)) newlyNoticed.push(msg)
-      } else if ((prevCell.walls || 0) - wallCount >= 8) {
-        const msg = `blocks removed/modified near (${p.x},${p.y},${p.z})`
-        if (this.recordChange('modified_structure', msg)) newlyNoticed.push(msg)
+      if (craftedCount - (prevCell.walls || 0) >= 8) {
+        const msg = `blocks added near (${p.x},${p.y},${p.z})`
+        if (this.recordChange('blocks_added', msg)) newlyNoticed.push(msg)
+      } else if ((prevCell.walls || 0) - craftedCount >= 8) {
+        const msg = `blocks removed near (${p.x},${p.y},${p.z})`
+        if (this.recordChange('blocks_removed', msg)) newlyNoticed.push(msg)
       }
       if (chestCount > (prevCell.chests || 0)) {
         const msg = `new container spotted near (${p.x},${p.y},${p.z})`
         if (this.recordChange('new_container', msg)) newlyNoticed.push(msg)
       }
     } else if (!prevCell) {
-      if (structures.length > 0) {
-        const s = structures[0]
-        const msg = `spotted ${s.kind} near (${structPos.x},${structPos.y},${structPos.z})`
-        if (this.recordChange('discovered_structure', msg)) newlyNoticed.push(msg)
-      }
       if (redstoneCount >= 2 && redstonePos) {
-        const msg = `spotted redstone mechanism near (${redstonePos.x},${redstonePos.y},${redstonePos.z})`
+        const msg = `spotted redstone blocks near (${redstonePos.x},${redstonePos.y},${redstonePos.z})`
         if (this.recordChange('discovered_redstone', msg)) newlyNoticed.push(msg)
       }
     }
@@ -982,26 +971,23 @@ class ContinuityStore {
       visits: (prevCell?.visits || 0) + ((!prevCell || (now - (prevCell.lastAt || 0)) > 15_000) ? 1 : 0),
       firstAt: prevCell?.firstAt || now,
       lastAt: now,
-      walls: wallCount,
+      walls: craftedCount,
       chests: chestCount,
       redstone: redstoneCount,
       crops: cropCount,
       tags: tags.slice(0, 4)
     }
 
-    // 5. Build compact 1-line scene summary + unexplored adjacent directions.
+    // 5. Build compact 1-line factual observation summary + unexplored adjacent directions.
     const features = []
-    for (const s of structures.slice(0, 2)) {
-      const claim = this.claimAt(structPos, dim)
-      const ownerTag = claim ? (claim.kind === 'own' ? ' [yours]' : claim.kind === 'player' ? ` [${claim.owner || 'player'}'s]` : claim.kind === 'shared' ? ' [shared]' : ' [unknown owner]') : ''
-      features.push(`${s.kind}@(${structPos.x},${structPos.y},${structPos.z})${ownerTag}`)
-    }
+    if (chestCount > 0 && chestPos) features.push(`containers(${chestCount})@(${chestPos.x},${chestPos.y},${chestPos.z})`)
     if (redstoneCount > 0 && redstonePos) features.push(`redstone(${redstoneCount})@(${redstonePos.x},${redstonePos.y},${redstonePos.z})`)
     if (waterCount >= 4 && waterPos) features.push(`water(${waterCount})@(${waterPos.x},${waterPos.y},${waterPos.z})`)
     if (oreCount > 0 && orePos) features.push(`${oreName}@(${orePos.x},${orePos.y},${orePos.z})`)
     if (cropCount >= 3) features.push(`crops(${cropCount})`)
-    if (treeCount >= 2 && features.length < 5) features.push(`trees(${treeCount})`)
-    if (p.y < 52) features.push(`underground(y=${p.y})`)
+    if (treeCount >= 2 && features.length < 5) features.push(`logs(${treeCount})`)
+    if (clustered.text && features.length < 4) features.push(`blocks[${clustered.text}]`)
+    if (p.y < 52) features.push(`y=${p.y}`)
 
     const unexplored = this._computeUnexplored(bot, p, dim, cx, cz)
     this._lastSceneSummary = features.slice(0, 5).join(', ')

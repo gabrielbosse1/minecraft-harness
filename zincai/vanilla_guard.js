@@ -57,40 +57,56 @@ function assertVanillaAction (action) {
  * @returns {{blocked:number, uninstall:Function}}
  */
 function installVanillaGuard (bot, { logger = null, onBlocked = null } = {}) {
-  if (!bot || typeof bot.chat !== 'function') return { blocked: 0, uninstall: () => {} }
+  if (!bot) return { blocked: 0, whispers: 0, whisper: () => false, uninstall: () => {} }
   if (bot.__zincaiVanillaGuard) return bot.__zincaiVanillaGuard
 
-  const originalChat = bot.chat.bind(bot)
-  const state = { blocked: 0, whispers: 0, uninstall: () => { bot.chat = originalChat; delete bot.__zincaiVanillaGuard } }
+  let originalChat = null
+  let installed = false
 
-  /**
-   * Private message to one online player. Returns false (and sends nothing)
-   * when the name is not a plain username of someone online or the text is
-   * empty.
-   */
-  state.whisper = (player, text) => {
-    const name = String(player || '').trim()
-    const body = String(text || '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200)
-    if (!/^[A-Za-z0-9_]{1,16}$/.test(name) || !body) return false
-    const players = bot.players ? Object.keys(bot.players) : null
-    if (players && !players.some((p) => p.toLowerCase() === name.toLowerCase())) return false
-    state.whispers++
-    originalChat(`/msg ${name} ${body}`)
-    return true
-  }
-
-  bot.chat = (message, ...rest) => {
-    if (isCommandLine(message)) {
-      state.blocked++
-      logger?.warn?.('vanilla', `blocked command-shaped chat: ${String(message).slice(0, 80)}`)
-      try { onBlocked?.(String(message)) } catch { /* observer must not break chat */ }
-      try { bot.emit?.('vanilla_command_blocked', String(message)) } catch { /* no emitter */ }
-      return false
+  const state = {
+    blocked: 0,
+    whispers: 0,
+    whisper: (player, text) => {
+      const name = String(player || '').trim()
+      const body = String(text || '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200)
+      if (!/^[A-Za-z0-9_]{1,16}$/.test(name) || !body) return false
+      const players = bot.players ? Object.keys(bot.players) : null
+      if (players && !players.some((p) => p.toLowerCase() === name.toLowerCase())) return false
+      if (!originalChat && typeof bot.chat !== 'function') return false
+      state.whispers++
+      ;(originalChat || bot.chat.bind(bot))(`/msg ${name} ${body}`)
+      return true
+    },
+    uninstall: () => {
+      if (originalChat) bot.chat = originalChat
+      delete bot.__zincaiVanillaGuard
     }
-    return originalChat(message, ...rest)
   }
+
+  const wrap = () => {
+    if (installed || typeof bot.chat !== 'function') return
+    installed = true
+    originalChat = bot.chat.bind(bot)
+    bot.chat = (message, ...rest) => {
+      if (isCommandLine(message)) {
+        state.blocked++
+        logger?.warn?.('vanilla', `blocked command-shaped chat: ${String(message).slice(0, 80)}`)
+        try { onBlocked?.(String(message)) } catch { /* observer must not break chat */ }
+        try { bot.emit?.('vanilla_command_blocked', String(message)) } catch { /* no emitter */ }
+        return false
+      }
+      return originalChat(message, ...rest)
+    }
+    logger?.info?.('vanilla', 'guard installed — no RCON, no slash commands, client packets only')
+  }
+
   bot.__zincaiVanillaGuard = state
-  logger?.info?.('vanilla', 'guard installed — no RCON, no slash commands, client packets only')
+  if (typeof bot.chat === 'function') {
+    wrap()
+  } else if (typeof bot.once === 'function') {
+    bot.once('inject_allowed', wrap)
+    bot.once('login', wrap)
+  }
   return state
 }
 

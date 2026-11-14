@@ -268,14 +268,7 @@ class ConnectionManager extends EventEmitter {
       this.emit('fatal', { reason: 'fatal-error', text: this.lastError })
       return false
     }
-    // 3. Automatic reconnection turned off.
-    if (!this.config.get('connection.autoReconnect')) {
-      this.log('warn', `link down (${this.lastError}); automatic reconnection is off (connection.autoReconnect)`)
-      this._transition(STATES.DISCONNECTED, 'auto reconnect off')
-      this.emit('sleep', { reason: 'auto-reconnect-off' })
-      return false
-    }
-    // 4. Attempt ceiling.
+    // 3. Attempt ceiling.
     const maxRetries = Number(this.config.get('connection.maxRetries'))
     this.attempts += 1
     if (this.attempts > maxRetries) {
@@ -284,8 +277,7 @@ class ConnectionManager extends EventEmitter {
       this._transition(STATES.DISCONNECTED, 'retries exhausted')
       return false
     }
-    // 5. Exponential back-off bounded by the configured floor/ceiling, so the
-    //    maximum retry frequency is a parameter and never a tight loop.
+    // 4. Exponential back-off bounded by the configured floor/ceiling.
     const base = Number(this.config.get('connection.retryDelayMs'))
     const floor = Number(this.config.get('connection.minRetryDelayMs'))
     const ceiling = Number(this.config.get('connection.maxRetryDelayMs'))
@@ -296,8 +288,6 @@ class ConnectionManager extends EventEmitter {
 
   _scheduleRetry (delayMs) {
     this._cancelRetry()
-    // Clamp at the single place that schedules, so no caller (including the
-    // public policyChanged) can turn the back-off into a tight loop.
     const floor = Number(this.config.get('connection.minRetryDelayMs'))
     const ceiling = Number(this.config.get('connection.maxRetryDelayMs'))
     delayMs = Math.max(floor, Math.min(ceiling, Number(delayMs) || floor))
@@ -308,7 +298,6 @@ class ConnectionManager extends EventEmitter {
       this.retryTimer = null
       this.nextRetryAt = null
       if (this.destroyed || this.detached) return
-      if (!this.config.get('connection.autoReconnect')) return
       this.join({ reason: `auto retry ${this.attempts}` })
     }, delayMs)
   }
@@ -322,16 +311,10 @@ class ConnectionManager extends EventEmitter {
   }
 
   /**
-   * Reconnection settings changed: restart the pending timer with the new
-   * policy instead of waiting out the old delay.
+   * Reconnection timing changed: restart the pending timer with the new delay.
    */
   policyChanged () {
     if (this.state !== STATES.RECONNECTING || this.retryTimer === null) return false
-    if (!this.config.get('connection.autoReconnect')) {
-      this._cancelRetry()
-      this._transition(STATES.DISCONNECTED, 'auto reconnect turned off')
-      return true
-    }
     const base = Number(this.config.get('connection.retryDelayMs'))
     const floor = Number(this.config.get('connection.minRetryDelayMs'))
     const ceiling = Number(this.config.get('connection.maxRetryDelayMs'))
@@ -348,7 +331,6 @@ class ConnectionManager extends EventEmitter {
       everConnected: this.everConnected,
       attempts: this.attempts,
       maxRetries: Number(this.config.get('connection.maxRetries')),
-      autoReconnect: this.config.get('connection.autoReconnect') === true,
       lastError: this.lastError,
       nextRetryAt: this.nextRetryAt,
       connectedForMs: this.connectedAt ? this.now() - this.connectedAt : 0,

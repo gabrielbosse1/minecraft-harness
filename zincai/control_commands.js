@@ -113,14 +113,13 @@ const COMMANDS = Object.freeze([
 const COMMAND_NAMES = new Set(COMMANDS.map((c) => c.name))
 
 /** The full help block, built from the live configuration. */
-function helpText ({ allowConsole = true } = {}) {
+function helpText () {
   const lines = ['commands (console only, no prefix — type the word and press enter):']
   for (const c of COMMANDS) {
     lines.push(`  ${c.name}${c.args ? ` ${c.args}` : ''}`)
     lines.push(`      ${c.summary}`)
   }
-  lines.push(`console: ${allowConsole ? 'enabled (stdin)' : 'disabled by control.allowConsole'}`)
-  lines.push('authorisation: whoever holds this process\'s console. In-game chat is not a command channel.')
+  lines.push('console: stdin (in-game chat is not a command channel).')
   return lines.join('\n')
 }
 

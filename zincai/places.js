@@ -1,30 +1,24 @@
 /**
  * places.js — the bot's memory of WHERE things are.
  *
- * Two kinds of knowledge, both persisted to zincai-data/places.json:
+ * Two kinds of knowledge, both persisted to data/places.json:
  *
  *   1. Named places the model (or a player, through the model) asked to keep:
- *      "home", "mina", "casa do Steve" → coordinates.
+ *      "home", "mine", "house" -> coordinates.
  *   2. An index of useful blocks seen while walking around: chests, barrels,
  *      shulker boxes, furnaces, beds, work stations and signs — each with its
- *      coordinates, the text of the sign next to it (people label chests),
- *      and the contents last seen when the bot looked inside.
+ *      coordinates, the text of adjacent signs, and the contents last seen.
  *
- * The prompt gets a compact summary grouped by floor and by room-sized
- * cluster ("y64 6m NE: chest1 'diamantes' [diamond x12], furnace1, bed1"),
- * and tools address things by the short ids shown there — never by raw
- * coordinates the model would have to invent.
- *
- * A STORAGE ROOM (more containers in one cluster than fit on a line) is shown
- * as a summary instead: how many, the nearest few with their ids, and every
- * label — because a label is an address (`where: "Diamantes"`). The full list
- * is one `find {what:"storage"}` away. It used to collapse into nine sign
- * texts and "+77 more", with no chest id in sight.
+ * The prompt gets a compact summary grouped by floor and spatial cluster,
+ * and tools address things by short ids or sign labels. Large clusters show
+ * their nearest containers with ids and every sign label (`find {what:"storage"}`
+ * lists all containers).
  *
  * Pure w.r.t. the network; `scan()` only reads the already-loaded world.
  */
 'use strict'
 
+const { Vec3 } = require('vec3')
 const { findBlocksFast } = require('./block_search')
 const fs = require('fs')
 const path = require('path')
@@ -252,7 +246,7 @@ class PlaceIndex {
       if (e.dim !== dim || seen.has(key)) continue
       if (Math.hypot(e.x - pos.x, e.y - pos.y, e.z - pos.z) > radius - 2) continue
       let block = null
-      try { block = bot.blockAt({ x: e.x, y: e.y, z: e.z }) } catch { block = null }
+      try { block = bot.blockAt(new Vec3(e.x, e.y, e.z)) } catch { block = null }
       if (block && kindOf(block.name) === e.kind) continue
       if (!block) continue // chunk not loaded: keep the memory
       this.blocks.delete(key)
@@ -546,7 +540,7 @@ class PlaceIndex {
         const nearest = containers.slice(0, 4).map((e) => `${e.id}${e.label ? ` "${e.label}"` : ''} ${whereIs(pos, e)}`)
         const labels = [...new Set(labelled.map((e) => e.label))].sort((x, y) => fold(x).localeCompare(fold(y)))
         const shown = labels.slice(0, maxLabels)
-        let line = `${head}: STORAGE ROOM — ${containers.length} containers (${labelled.length} labelled, ${opened.length} opened). Nearest: ${nearest.join(', ')}.`
+        let line = `${head}: ${containers.length} containers (${labelled.length} labelled, ${opened.length} opened). Nearest: ${nearest.join(', ')}.`
         if (shown.length) line += ` Labels: ${shown.join(', ')}${labels.length > shown.length ? `, +${labels.length - shown.length} more` : ''}.`
         line += ' A label or an id works as `where`; find {what:"<label or item>"} looks one up, find {what:"storage"} lists them all.'
         const extra = [...rest, ...stations, ...signNote]

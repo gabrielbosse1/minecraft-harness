@@ -28,6 +28,7 @@
  */
 'use strict'
 
+const { Vec3 } = require('vec3')
 const fs = require('fs')
 const path = require('path')
 
@@ -176,7 +177,7 @@ function perceive (bot, { x, y, z, radius = 3, maxNodes = MAX_NODES } = {}) {
       for (let dx = -radius - 1; dx <= radius + 1; dx++) {
         const bx = x + dx; const by = y + dy; const bz = z + dz
         let b = null
-        try { b = bot.blockAt({ x: bx, y: by, z: bz }) } catch { unknown.push({ x: bx, y: by, z: bz, reason: 'unreadable' }); continue }
+        try { b = bot.blockAt(new Vec3(bx, by, bz)) } catch { unknown.push({ x: bx, y: by, z: bz, reason: 'unreadable' }); continue }
         if (!b) { unloaded++; unknown.push({ x: bx, y: by, z: bz, reason: 'unloaded' }); continue }
         const name = String(b.name || '')
         if (!name || name === 'air' || name === 'cave_air' || name === 'void_air') continue
@@ -2147,13 +2148,26 @@ function checkDesign (design) {
  * @param {object} plan from planPlacement
  * @param {{ inventory?: Record<string,number>, canWrite?: (p:{x,y,z}) => boolean, existing?: (p) => string|null }} env
  */
+const BLOCK_TO_ITEM = Object.freeze({
+  redstone_wire: 'redstone',
+  redstone_wall_torch: 'redstone_torch',
+  wall_torch: 'torch',
+  soul_wall_torch: 'soul_torch',
+  tripwire: 'string'
+})
+
+function itemNameForBlock (blockName) {
+  return BLOCK_TO_ITEM[blockName] || blockName
+}
+
 function preflight (plan, { inventory = {}, canWrite = null, existing = null } = {}) {
   if (!plan || !plan.ok) return { ok: false, msg: 'invalid plan' }
   const missing = []
   const missingMaterials = {}
   for (const [name, need] of Object.entries(plan.materials)) {
-    const have = Number(inventory[name] || 0)
-    if (have < need) { missingMaterials[name] = need - have }
+    const itemName = itemNameForBlock(name)
+    const have = Number(inventory[itemName] || inventory[name] || 0)
+    if (have < need) { missingMaterials[itemName] = (missingMaterials[itemName] || 0) + (need - have) }
   }
   for (const [name, short] of Object.entries(missingMaterials)) missing.push(`${name} ×${short}`)
   const blocked = []
@@ -2191,20 +2205,40 @@ async function placePlan (executor, plan, { canWrite = null, onStep = null } = {
   const failed = []
   const skipped = []
   const { Vec3 } = require('vec3')
-  for (const p of plan.placements) {
-    if (canWrite && !canWrite(p)) { skipped.push(`${p.x},${p.y},${p.z} (not yours)`); continue }
-    const target = new Vec3(p.x, p.y, p.z)
-    try {
-      const cur = executor.bot?.blockAt?.(target)
-      if (cur && cur.name === p.name) { skipped.push(`${p.x},${p.y},${p.z} (already present)`); placed++; continue }
-      if (cur && cur.name !== 'air') { skipped.push(`${p.x},${p.y},${p.z} (occupied by ${cur.name})`); continue }
-    } catch { /* unloaded: try anyway */ }
-    try {
-      if (typeof executor._approach === 'function') await executor._approach(target, 3)
-      const ok = await executor._placeAt(target, p.name)
-      if (ok) { placed++; if (onStep) onStep({ ...p, placed }) } else failed.push(`${p.name}@${p.x},${p.y},${p.z}`)
-    } catch (err) {
-      failed.push(`${p.name}@${p.x},${p.y},${p.z} (${err.message || err})`)
+  const prevCancel = executor.cancelRequested
+  executor.cancelRequested = false
+  if (executor.hands && typeof executor.hands.acquire === 'function') {
+    executor.hands.acquire({ ttlMs: Math.max(60_000, plan.placements.length * 10_000), reason: 'redstone_place' })
+  }
+  try {
+    for (const p of plan.placements) {
+      if (executor.cancelRequested || !executor.bot?.entity) {
+        failed.push(`${p.name}@${p.x},${p.y},${p.z} (cancelled)`)
+        break
+      }
+      if (canWrite && !canWrite(p)) { skipped.push(`${p.x},${p.y},${p.z} (not yours)`); continue }
+      const target = new Vec3(p.x, p.y, p.z)
+      try {
+        const cur = executor.bot?.blockAt?.(target)
+        if (cur && cur.name === p.name) { skipped.push(`${p.x},${p.y},${p.z} (already present)`); placed++; continue }
+        if (cur && cur.name !== 'air') { skipped.push(`${p.x},${p.y},${p.z} (occupied by ${cur.name})`); continue }
+      } catch { /* unloaded: try anyway */ }
+      try {
+        if (typeof executor._approach === 'function') await executor._approach(target, 3)
+        if (executor.cancelRequested || !executor.bot?.entity) {
+          failed.push(`${p.name}@${p.x},${p.y},${p.z} (cancelled)`)
+          break
+        }
+        const ok = await executor._placeAt(target, itemNameForBlock(p.name), p.name)
+        if (ok) { placed++; if (onStep) onStep({ ...p, placed }) } else failed.push(`${p.name}@${p.x},${p.y},${p.z}`)
+      } catch (err) {
+        failed.push(`${p.name}@${p.x},${p.y},${p.z} (${err.message || err})`)
+      }
+    }
+  } finally {
+    executor.cancelRequested = prevCancel
+    if (executor.hands && typeof executor.hands.release === 'function') {
+      try { executor.hands.release() } catch { /* ignore */ }
     }
   }
   return { ok: failed.length === 0, placed, failed, skipped, total: plan.placements.length }
@@ -2661,7 +2695,7 @@ class RedstoneEngineer {
       const plan = planPlacement(chosen, origin, { rotate: ['north', 'south', 'east', 'west'].includes(args.rotate) ? args.rotate : 'north' })
       if (!plan.ok) return plan
       const existing = (pos) => {
-        try { const b = this.bot.blockAt({ x: pos.x, y: pos.y, z: pos.z }); return b ? b.name : null } catch { return null }
+        try { const b = this.bot.blockAt(new Vec3(pos.x, pos.y, pos.z)); return b ? b.name : null } catch { return null }
       }
       const pre = preflight(plan, { inventory: this._inventoryCounts(), canWrite: this.canWrite, existing })
       if (!pre.ok) {

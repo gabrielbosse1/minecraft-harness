@@ -296,14 +296,8 @@ class Host extends EventEmitter {
 
   // ============================================================= lifecycle ==
 
-  /**
-   * Start the link according to the configuration. Called once by main().
-   */
+  /** Start the Minecraft server connection. Called once by main(). */
   boot () {
-    if (this.config.get('connection.joinOnStart') === false) {
-      this.log('info', 'connection.joinOnStart is false — the process is up and waiting for "join"')
-      return { ok: true, state: this.connection.state, waiting: true }
-    }
     return this.connection.join({ reason: 'startup' })
   }
 
@@ -664,42 +658,14 @@ class Host extends EventEmitter {
     return 'idle'
   }
 
-  /** Every effective limit, defaults included. */
+  /** Operational rate limits. */
   limits () {
     return {
-      actions: {
-        movement: this.config.get('actions.allowMovement'),
-        dig: this.config.get('actions.allowDig'),
-        place: this.config.get('actions.allowPlace'),
-        attack: this.config.get('actions.allowAttack'),
-        containers: this.config.get('actions.allowContainers'),
-        use: this.config.get('actions.allowUse'),
-        equip: this.config.get('actions.allowEquip'),
-        eat: this.config.get('actions.allowEat'),
-        toss: this.config.get('actions.allowToss'),
-        craft: this.config.get('actions.allowCraft'),
-        scripts: this.config.get('actions.allowScripts')
-      },
-      communication: {
-        publicChat: this.config.get('communication.publicChat'),
-        privateMessages: this.config.get('communication.privateMessages'),
-        replyToChat: this.config.get('communication.replyToChat')
-      },
       rates: {
         maxPhysicalActionsPerMinute: this.config.get('limits.maxPhysicalActionsPerMinute'),
         maxConcurrentJobs: this.config.get('limits.maxConcurrentJobs'),
         maxGoalRuntimeMinutes: this.config.get('limits.maxGoalRuntimeMinutes')
-      },
-      boundary: this.config.get('boundary.enabled')
-        ? {
-            dimension: this.config.get('boundary.dimension'),
-            centre: [this.config.get('boundary.centerX'), this.config.get('boundary.centerZ')],
-            radius: this.config.get('boundary.radius'),
-            blockOutside: this.config.get('boundary.blockOutside'),
-            home: [this.config.get('boundary.homeX'), this.config.get('boundary.homeY'), this.config.get('boundary.homeZ')],
-            returnHomeOnDeath: this.config.get('boundary.returnHomeOnDeath')
-          }
-        : 'off'
+      }
     }
   }
 
@@ -719,9 +685,7 @@ class Host extends EventEmitter {
       L.push(`jobs: ${active.length} active${active.length ? ` — ${active.slice(0, 4).map((j) => `${j.id} ${j.tool || j.kind}${j.goalId ? `(${j.goalId})` : ''}`).join(', ')}` : ''}`)
     } else L.push('jobs: 0 active')
     const limits = st.limits
-    const off = Object.entries(limits.actions).filter(([, v]) => v === false).map(([k]) => k)
-    L.push(`limits: ${st.boundary.actionsLastMinute}/${limits.rates.maxPhysicalActionsPerMinute} physical actions last minute; public chat ${limits.communication.publicChat ? 'on' : 'off'}; private messages ${limits.communication.privateMessages ? 'on' : 'off'}; permissions off: ${off.length ? off.join(',') : 'none'}`)
-    L.push(`boundary: ${st.boundary.boundary ? `${st.boundary.boundary.dimension} r=${st.boundary.boundary.radius} around ${st.boundary.boundary.center.join(',')}${limits.boundary.blockOutside ? '' : ' (report only)'}` : 'off'}`)
+    L.push(`limits: ${st.boundary.actionsLastMinute}/${limits.rates.maxPhysicalActionsPerMinute} physical actions last minute; max jobs ${limits.rates.maxConcurrentJobs}`)
     const wd = this.watchdog || null
     if (wd) L.push(`health: ${wd.describe()}`)
     if (st.pendingConfig.length) L.push(`pending config: ${st.pendingConfig.join(', ')} (apply at the next safe boundary)`)
@@ -868,9 +832,8 @@ class Host extends EventEmitter {
     return `\npending (waiting for a safe boundary): ${pending.map((p) => `${p.name}=${formatConfigValue(p.value)}`).join(', ')}`
   }
 
-  /** React to a parameter that changes how the runtime behaves right now. */
   _afterConfigChange (name, oldValue, value) {
-    if (name.startsWith('connection.') || name === 'connection.autoReconnect') {
+    if (name.startsWith('connection.')) {
       try { this.connection.policyChanged() } catch { /* no retry timer */ }
     }
     try { this.subsystems?.onConfigChange?.(name, oldValue, value) } catch (err) { this.log('debug', `config hook: ${err?.message || err}`) }

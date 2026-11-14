@@ -1,31 +1,17 @@
 /**
- * journal.js — compaction with goal continuation.
+ * journal.js — deterministic compaction with goal continuation.
  *
- * THE PROBLEM (live log, 2026-11-14)
- *   Every action turn is rebuilt from scratch: system prompt + one world
- *   snapshot + the last four results. Nothing carried the THREAD. So the model
- *   re-derived its plan on every call (800–2500 reasoning tokens to decide
- *   `craft oak_planks`), crafted planks nine separate times, started "the
- *   base" at four different coordinates, and after each death spent a
- *   whole call on `goal resume` only to be told the goal "has no executable
- *   checkpoint". The goal survived; what had been done for it did not.
+ * Maintains a persistent work journal compacted deterministically (without
+ * extra model calls) into:
+ *   - recent steps: latest tool calls with identical repeats merged.
+ *   - digest: older work folded per goal into counted successes, failures,
+ *     deaths, and active locations.
+ *   - plan: the model's ordered steps for a goal, with done marks and a next
+ *     pointer (`goal {steps, done, next}`).
  *
- * WHAT THIS IS
- *   A small persistent work journal that is compacted deterministically — no
- *   model call (a call costs a minute here) and no free-text summary that can
- *   drift or hallucinate:
- *
- *     recent steps   the last few tool calls with their results, verbatim-ish,
- *                    identical repeats merged ("craft oak_planks ×3").
- *     digest         everything older, folded per goal into counted facts:
- *                    what succeeded (×n, last result), what keeps failing and
- *                    why, deaths (where, of what), places worked at.
- *     plan           the model's own ordered steps for a goal, with done
- *                    marks and a `next` pointer (`goal {steps, done, next}`).
- *
- *   From those, `continuation()` renders the block that lets ANY fresh turn —
- *   after a death, a restart, a context reset or just the next loop tick —
- *   pick the goal up exactly where it stopped instead of planning it again.
+ * `continuation()` renders a compact continuation block so any fresh turn
+ * (after death, restart, context reset, or loop tick) picks up where work
+ * left off. `compactSteps()` trims older multi-step turn results in memory.
  *
  * Also here: `compactSteps()`, the in-turn compaction for a multi-step turn
  * (older tool results are shortened and old screenshots dropped once the turn's
@@ -40,7 +26,7 @@ const clean = (s, max = 160) => String(s ?? '').replace(/\s+/g, ' ').trim().slic
 const NO_GOAL = '-'
 
 /** Tools whose calls say nothing about progress (reads, talk, bookkeeping). */
-const QUIET = new Set(['idle', 'say', 'reply', 'recall', 'goal', 'social', 'note', 'hold', 'stop', 'inspect_block', 'inspect_region', 'find', 'look_in', 'screenshot', 'redstone_scan', 'redstone_component', 'dig_policy', 'remember_here'])
+const QUIET = new Set(['idle', 'say', 'reply', 'recall', 'goal', 'social', 'note', 'hold', 'stop', 'inspect_block', 'inspect_region', 'find', 'look_in', 'screenshot', 'redstone_scan', 'redstone_component', 'remember_here'])
 
 /** Stable short signature of a call: tool + the arguments that identify WHAT, not where exactly. */
 function signature (tool, args = {}) {

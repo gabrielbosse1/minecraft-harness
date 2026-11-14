@@ -1,282 +1,112 @@
 # Minecraft Harness — ZincAI
 
-One autonomous Minecraft Java agent: **ZincAI**. A Mineflayer body, a local
-survival reflex layer, and an AMD Radeon Cloud (OpenAI-compatible) model split
-into two lanes that share one call budget:
+**ZincAI** is an autonomous Minecraft Java Edition agent built on [Mineflayer](https://github.com/PrismarineJS/mineflayer) and backed by an OpenAI-compatible LLM API (configured for AMD Radeon Cloud by default).
 
-| Lane | What it does |
+The harness connects to any vanilla Minecraft Java server (including 1.21.4 and patched 26.x builds) as a normal client player (`ZincAI`) with **no RCON, no server plugins, no slash commands, and no behavioral modes**.
+
+---
+
+## Core Design
+
+| Principle | How it works |
 | --- | --- |
-| **Chat** | Reads the last few seconds of chat as one IRC-style window, answers whoever (if anyone) it judges needs an answer — in that person's language — and may hand the body a task and a fact to remember. |
-| **Action** | One structured function-tool call per turn: move, gather, craft, build, fight, sleep, remember. |
+| **Model freedom** | No personas (`explorer`/`builder`/`hunter`), no hidden tool gating, no hardcoded gather whitelists, and no language or chat-relevance filters. All **39 tools** are exposed on every action turn with an identical JSON schema for prefix-cache efficiency. |
+| **Reflexes flee; the model decides** | Local `System1` survival reflexes handle immediate self-preservation (eating, fleeing real threats via BFS escape planning, hazard exit, water clutch, armor upgrades) without waiting on the API. The model decides whether to keep fleeing, fight (`attack`), move elsewhere (`go_to`/`follow`), or stand ground (`hold`). |
+| **Two concurrent LLM lanes** | **Chat lane** reads batched IRC-style chat windows and replies naturally in the speaker's language — without blocking ongoing movement or building — and can trigger immediate simple actions (`reply.do`) or hand tasks to the action lane (`reply.task`). **Action lane** runs a multi-step tool loop (`think → tool → observe → think`) up to `maxStepsPerTurn`. |
+| **Strict vanilla client boundary** | `installVanillaGuard` blocks command-shaped chat (`/...`) from ever leaving the client (except guarded `/msg` whispers), and `installPhysicalGuard` gates all 19 Mineflayer movement/world primitives behind lifecycle state (`connected`, `alive`, `paused`) and an anti-flood rate ceiling (`limits.maxPhysicalActionsPerMinute`). |
+| **Full session telemetry in `data/`** | Every session writes structured NDJSON event logs (`events.jsonl`), live continuation state (`continuation.json`), and a session index (`latest.json`) under `data/` alongside persistent goals, memory, journal, places, and circuit stores. |
 
-The agent does not decide to attack on its own. A local reflex layer flees from
-real danger; the model decides whether to keep fleeing, move, or start a fight.
-A player is attacked only after the model names that exact username. There is no
-friend list, no “attack nearby player” reflex, and no server-side control. The
-bot uses normal client packets; the only deliberate command exception is a
-guarded private `/msg` when the model asks to whisper.
+---
 
-## Complete model freedom
+## Quick Start (Local)
 
-The model is not steered by the harness. Concretely:
-
-- **No modes.** `explorer` / `hunter` / `builder` and the `set_mode` tool are
-  gone. Every tool — build, `build_shape`, `logic_test`, `circuit_project`,
-  combat, redstone inspection, everything — is in the schema on **every** turn.
-  The per-turn schema is byte-identical, which also keeps prefix caching cheap.
-  Movement posture (cautious while placing blocks, parkour while fleeing) is
-  chosen by the wrapper from what the body is doing, never by a persona.
-- **No relevance filter.** A chat line is not scored for whether it mentions
-  the bot's name, whether a question “must” be for it, or whether that player
-  has spoken too often. Every attributable line is logged, remembered and given
-  to the model, which decides what concerns it.
-- **A real agent loop.** A turn is *think → call tools → read what they
-  returned → think again*, not one model call and one tool call. An answer may
-  carry several calls (`say` + `follow`), each result goes straight back to
-  the model as tool output, and the turn ends when the model calls `idle` or
-  has put the body to work — at most `inference.maxStepsPerTurn` (6) model
-  calls. The next turn then starts **by itself** `inference.loopMs` (8 s) after
-  the last one ended; while the model keeps idling the gap doubles up to
-  `heartbeatMs`, and anything that happens resets it. While the body is busy
-  the loop looks in every `loopBusyMs` (30 s).
-- **Talking never waits for the body.** Chat has its own lane and is answered
-  while the body walks, builds or follows; `say` is not a body action and does
-  not interrupt one. When the chat lane agrees to "follow me", "come here" or
-  "stop", it starts that itself (`reply.do`) the moment it answers; any other
-  request (`reply.task`) goes to the action lane ahead of whatever that lane was
-  thinking about. Ordinary chat no longer cancels the action thought — only a
-  request handed to the body does.
-- **IRC-style log.** Lines are collected in a ~6 s window
-  (`inference.chatBatchMs`) and delivered as **one chunk**: several speakers, in
-  arrival order. Both prompts show the same timestamped log, chat and events
-  interleaved in the order they happened —
-  `[14:02:07] <Steve> zinc vem aqui`, `[14:02:09] -Steve- a whisper`,
-  `[14:02:11] <ZincAI> to indo`, `[14:02:15] * hurt: hit by a zombie` — with
-  the time *now* in the header and a marker where the unread lines begin. A
-  burst of eight lines is one model call, not eight, and nothing in the window
-  is dropped for volume.
-- **Language is free.** There is no language guard, no retry, and no canned
-  replacement line. The model answers in whatever language the person it is
-  talking to is using, and the words it chooses are the words that go out.
-- **No trust lists.** `trust.owners` / `trust.trusted` are gone. The model
-  forms its own view of every player from evidence — the system prompt still
-  tells it that nobody, including its creator, has automatic authority.
-- **The only limits left** are not policy about what the model may think or do:
-  the **API budget** (`inference.rpm`, `minIntervalMs`, `heartbeatMs`,
-  `chatReserve`), a **self-protection rate** on physical actions that keeps the
-  server's anti-cheat from kicking the bot
-  (`limits.maxPhysicalActionsPerMinute`, default 600), one-line-per-second
-  speech pacing (a Minecraft server limit, not a cap on what may be said), and
-  the **emergency stop**: `pause` / `stop` and `shutdown` on the console.
-  Owner and property protection remain, because those protect *other players'*
-  builds from damage, not the model from its own judgement.
-
-It ships with a **PufferPanel template**: the panel clones the repository,
-installs Node.js and the dependencies, passes every setting in as an environment
-variable, and runs the bot. There is no `.env`, no committed key, and nothing to
-configure by hand.
-
-## Quick start (PufferPanel)
-
-1. Get the template into the panel — PufferPanel 3 takes it either from a git
-   repository or pasted into the web UI; it has no template folder and no
-   "Import" button:
-
-   ```sh
-   node pufferpanel/import.js            # validate + explain both paths
-   node pufferpanel/import.js --print    # the JSON to paste into Templates → New
-   ```
-
-   **Easiest:** in the panel, **Templates → Add repo** with this repository's
-   URL and branch — the template in `pufferpanel/` is already laid out the way
-   the panel scans (`<subfolder>/<name>.json`). See
-   [`pufferpanel/README.md`](pufferpanel/README.md#1-get-the-template-into-the-panel),
-   and the step-by-step walkthrough is in [`docs/pufferpanel-guide.md`](docs/pufferpanel-guide.md).
-
-2. **Servers → New server**, pick the **zincai** template, and fill in the
-   variables:
-
-   | Variable | What to put |
-   | --- | --- |
-   | `apikey` | your `rc-...` Radeon Cloud key — becomes `AMD_API_KEY`, never a file |
-   | `host` / `port` | the Minecraft server the bot joins (not the panel port) |
-   | `auth` | `offline` for a private server with the name `ZincAI` whitelisted, `microsoft` for a premium account |
-   | `mcversion` | a version like `1.21.4`, or empty to auto-detect |
-
-   The rest have working defaults: model, call budget, digging/scaffolding/
-   elytra switches, reconnection, log level. There is no `mode`, no alias list
-   and no reply language to configure — see **Complete model freedom** below.
-
-3. Press **Install**, then **Start**. Install clones the branch, installs
-   dependencies and creates `data/`; every start first runs
-   `node zincai/index.js --dry-run`, so a bad variable is reported in the
-   console before the bot ever touches the network.
-
-Details, the full variable list and the environment overrides are in
-[`pufferpanel/README.md`](pufferpanel/README.md).
-
-## Quick start (no panel)
-
-Requirements: Node.js 18 or newer and an AMD Radeon Cloud Token Factory key
-(or a compatible OpenAI-style endpoint).
+**Requirements:** Node.js 18+ (tested on Node 22) and an API key for your OpenAI-compatible model endpoint.
 
 ```sh
-npm ci
-export AMD_API_KEY=rc-...
-export MC_HOST=play.example.net MC_PORT=25565 MC_AUTH=offline
-npm start                      # == node zincai/index.js
+git clone https://github.com/gabrielbosse1/minecraft-harness.git
+cd minecraft-harness
+npm install
+
+cp .env.example .env
+# Edit .env with AMD_API_KEY, MC_HOST, MC_PORT, MC_AUTH, MC_VERSION
+set -a; . ./.env; set +a
+
+# Validate configuration without connecting
+npm run dry-run
+
+# Launch ZincAI
+npm start
 ```
 
-Everything is configured through environment variables — the same names the
-template uses; [`.env.example`](.env.example) lists them with empty values and
-explains how to export them locally. `zincai/defaults.json` holds defaults only,
-and its `amd.apiKey` stays empty on purpose: the key is never a file. See
-[`zincai/README.md`](zincai/README.md#configuration-and-operation) for the full
-table.
+### Quick Start (PufferPanel v3)
 
-## Controlling a running bot
+ZincAI ships a ready-to-use PufferPanel v3 template at `pufferpanel/zincai.json`:
 
-No restart is needed to stop, pause or reconfigure the bot.
+1. In PufferPanel, go to **Templates → Add repo** and point it at this repository (`branch: main`), or run `node pufferpanel/import.js --print` and paste into **Templates → New → Json**.
+2. Create a server from template **`zincai`** and set `apikey`, `host`, `port`, `auth`, and `mcversion`.
+3. Click **Install**, then **Start**. Every start runs `node zincai/index.js --dry-run` before connecting.
 
-**The console is the only control surface, and there is no prefix.** Type the
-command alone — `status`, `pause`, `stop`, `resume`, `leave`, `join`,
-`restart-connection`, `goals`, `jobs`, `cancel <goal-id>`,
-`config show boundary`, `config set boundary.radius 48`, `help` — and the two
-emergency ones: `pause` (stop the body, keep everything) and `shutdown`
-(save state, leave the server, exit the process).
+See [`docs/pufferpanel-guide.md`](docs/pufferpanel-guide.md) and [`pufferpanel/README.md`](pufferpanel/README.md) for the full walkthrough.
 
-**`update` — push, type one word, test.** `update` fetches the branch the
-checkout is on from GitHub, fast-forwards to it, runs `npm ci` only if
-`package.json` / the lockfile / an install script changed, proves the new
-source loads (`--check`), and only then saves state, leaves the server and
-restarts the process on the new code. If any step fails the checkout is rolled
-back and the running bot is not touched. `update check` only reports whether
-there is something to pull; `update force` discards local edits to tracked
-files; `restart` restarts on the source that is on disk without pulling.
-Memory, goals, places and the dig policy are on disk and are picked up again.
+---
 
-The restart works because `node zincai/index.js` is two processes: a tiny
-supervisor (`zincai/supervisor.js`, no state) and the bot as its child; the
-child exits with code 75 and the supervisor starts a fresh one. If systemd or
-Docker already restarts the process, set `ZINCAI_NO_SUPERVISOR=1` (or pass
-`--no-supervisor`) and let that do it.
+## Runtime Control & Data Layout
 
-Nothing typed in **game chat** is a command, for anyone: not with a `!prefix`,
-not from a server operator, not from the account's creator. Chat is conversation
-and reaches the model like any other line. There is no UUID allow-list and no
-command prefix to configure, because there is nothing in chat to authorise.
+Operator control is **console-only** (process `stdin`, bare words with no prefix; in-game chat is never a command channel):
 
-- `pause` (alias `stop`) stops the body and suspends — never deletes — open
-  goals; `resume`
-  reconciles the real world before handing work back; `leave` drops the link but
-  keeps the process, memory, goals and the interface alive; `join` reconnects
-  that same process once, without duplicate listeners or jobs.
-- Every limit (`boundary.*`, `actions.allow*`, `limits.*`, `communication.*`,
-  `connection.*`, `death.*`, `control.*`) is a typed, validated, persisted
-  parameter. `config show` lists the effective values and the defaults.
-- One enforcement boundary (`zincai/boundary.js`) sits in front of every
-  physical route — scheduler lanes, reflexes, the builder, tool dispatch, and
-  the Mineflayer primitives themselves — so no path can press a key, dig, place
-  or attack while the body is paused, disconnected, dead or outside the
-  permitted area. Reasoning, memory and (if allowed) chat keep working.
-- Death is not a crash: the body suspends its physical work, waits for the
-  respawn, inspects the real position/inventory and only then resumes what is
-  still valid. A route that is blocked or outside the permitted area is
-  reported, never retried forever.
-
-Details: [`zincai/README.md#operator-control-runtime-no-restart`](zincai/README.md#operator-control-runtime-no-restart).
-
-## Behavior and safety
-
-- **Flee first.** The survival body recognizes hostile mobs that can see or
-  reach the bot, immediate hazards such as lit creepers, and entities that
-  recently hurt it. Pets, named mobs, decorative entities, and peaceful players
-  merely nearby are not threats. A player who hits the bot triggers a flee and a
-  named wake-up, not retaliation. The escape route is planned over ground the bot
-  can actually walk, and the model is told what the body did by itself.
-- **The model owns the fight decision.** `idle` keeps the bot fleeing; `attack`
-  is the only way a fight starts. Mob attacks require the exact type or `any`
-  (hostiles only), line of sight, and a non-protected target. PvP requires an
-  explicit exact player name.
-- **One owner for movement.** Survival, combat and task lanes arbitrate
-  movement goals and keys (`survival > combat > task`), so concurrent behavior
-  cannot leave controls held or cancel a more urgent flee.
-- **Vanilla-only operation.** No RCON, no server console commands, no
-  teleporting. The operator interface is the panel's own stdin — it needs no
-  admin rights on the Minecraft server, and nothing in game chat can reach it.
-- **A follow survives a scare.** With a walk under way (`follow`, `go_to`, any
-  errand) the escape reflex only *dodges*: it starts when something hostile is
-  within 6 blocks, sidesteps toward where the walk was heading, ends as soon as
-  nothing is within 9, and the same walk carries on — the model does not have to
-  ask again, and is told the task is paused, not over. `follow` itself keeps
-  going through lost sight (it walks to where the player was last seen, up to
-  45 s) and unreachable stretches (it retries for 60 s), and only ends by
-  itself when the player leaves the game. At low health the full escape applies.
-- **Routes keep away from mobs.** Every path step pays for coming near a
-  hostile: inside its standoff ring (creeper 7 blocks, shooters 8, melee 5), at
-  the spot it will reach in the next two seconds, and on its line to the bot. A
-  route that is already being walked is planned again when a mob moves onto it
-  (`threat.routeReplan*`). It is a cost, never a wall: a boxed-in bot still
-  gets out.
-- **Digging is the model's standing rule.** What a walk may break on its own
-  is a persistent flag and a list the model edits with the `dig_policy` tool:
-  `can_dig` on/off, `mode` `list` or `all`, `add` / `remove` block ids
-  (`*_leaves` wildcards), `reset`. It starts with soft terrain only — dirt,
-  grass, sand, gravel, snow, leaves — so one block of dirt is no longer "no
-  path", while stone, ores and wood are broken only once the model adds them.
-  The rule is shown on every turn (`digging: …`), saved in
-  `<data dir>/dig-policy.json`, and survives restarts. Whatever it says, a walk
-  never breaks a block that touches a crafted block (someone's build) or lies in
-  a claim, doors are never broken, and the operator switch `actions.allowDig`
-  turns all of it off. The `dig` tool remains for one deliberate corridor
-  (`materials` / `avoid`).
-- **Reconnects.** A failed first join (including a whitelist rejection) is
-  fatal. After a successful spawn, a dropped connection or server restart is
-  retried with backoff under the same name.
-- **Panel-friendly logging.** Plain ISO-timestamped lines, no ANSI colours,
-  secrets never printed, `SIGINT`/`SIGTERM` handled for a graceful stop that
-  saves memory and places first.
-
-## Layout
-
-```
-zincai/            the agent: index, prompts, tools, memory, perception, reflexes
-  custom_mineflayer/   door/gate handling, escape planner, pathfinder wrapper
-  scripts/             local scripts the model can invoke with run_script
-src/               shared modules: AMD client, combat, recipes, reconnect, logger, settings
-pufferpanel/       the PufferPanel template + importer
-scripts/           install helpers (26.3 data patch), ping, endpoint canary
-test/              the automated suite (mock bots, scripted model, no network)
-vendor/            vendored Minecraft 26.3 data, installed by `npm ci`
+```text
+status | pause | stop | resume | leave | join | restart-connection
+goals | jobs | cancel <id> | config [show|set|reset] | update | restart | shutdown | help
 ```
 
-## Checks and tests
+All runtime persistence and telemetry lives under `ZINC_DATA_DIR` (default: `./data/`):
+
+```text
+data/
+├── latest.json                         # pointer to the most recent session + summary stats
+├── sessions/<sessionId>/
+│   ├── events.jsonl                    # NDJSON stream: lifecycle, world, reflex, chat, model, tools, goals
+│   └── continuation.json               # live/final snapshot: botState, openGoals, activeGoal, plan, lastModelThought
+├── goals.json                          # persistent goal registry
+├── memories.json                       # episodic & semantic memory store
+├── continuity.json                     # social relationships, norms & self-model
+├── journal.json                        # structured plans & session digest
+├── places.json                         # remembered coordinates & discovered POIs
+├── preferences.json                    # learned preferences
+├── circuit_projects.json               # saved redstone & logic-test projects
+├── redstone_library.json               # learned/verified redstone designs
+└── runtime-config.json                 # live operator overrides (10 runtime parameters)
+```
+
+---
+
+## Verification & Real-Server Simulation Tests
+
+All tests run against **real local Minecraft 1.21.4 servers (`flying-squid`)** over localhost TCP sockets with a real Mineflayer client and a local OpenAI-compatible HTTP endpoint — no mocked `bot` objects.
 
 ```sh
-npm test              # 409 tests: mock bots + a scripted local model
-npm run check         # syntax-check every module
-npm run dry-run       # resolve config, print it, no network
-npm run ping          # server reachability/version, no join, no model call
+npm run check                # syntax check every JS module in zincai/, src/, scripts/, pufferpanel/
+npm test                     # run all 7 real-server simulation test suites (test/01..07)
+npm run dry-run              # verify env/config resolution & tool schema without connecting
+npm run pufferpanel:validate # validate pufferpanel/zincai.json against PufferPanel v3 rules
 ```
 
-The suite never calls the real AMD endpoint and never joins a production
-server. `test/settings.test.js` covers the template → environment → config path
-that a panel deployment depends on.
+| Test suite | Coverage |
+| --- | --- |
+| `test/01-connection-perception-movement.test.js` | Real server join, physical boundary, world/inventory perception, 39-tool schema, `inspect_block`, `inspect_region`, `find`, `remember_here`, `screenshot`, obstacle pathfinding |
+| `test/02-gathering-digging-building.test.js` | Real `gather` (`oak_log` + arbitrary vanilla blocks like `amethyst_block`), `build`, `build_shape`, `dig` |
+| `test/03-chat-social-lanes.test.js` | Real second player (`Alice`), TCP chat lane reply, immediate `reply.do: "come"`, `social`, `note`, `say`, runtime `vanilla_guard` blocking `/op` |
+| `test/04-reflexes-combat-survival.test.js` | `ArmorKeeper` auto-equip & manual slot hold, `System1` flee reflex against real zombie, `attack` killing a real zombie on server |
+| `test/05-redstone-inspection-engineering.test.js` | Real redstone circuit scan, `redstone_component`, `redstone_engineer` (`analyze`, `design`, `place`), `logic_test` (XOR), `circuit_project` |
+| `test/06-goals-continuity-recovery-control.test.js` | Persistent goal continuity across real death & automatic respawn, `Host` operator commands (`status`, `config`, `pause`, `resume`, `leave`, `join`) |
+| `test/07-telemetry-and-persistence.test.js` | End-to-end NDJSON `events.jsonl` stream, verbatim `reasoning_content` capture, `continuation.json`, `latest.json`, and `data/` store persistence |
 
-Optional, with a real key:
+---
 
-```sh
-AMD_API_KEY=rc-... npm run canary    # 60-second endpoint/auth/tool-call proof
-```
+## Documentation Map
 
-## Notes
-
-- Runtime memory, places, goals and metrics go to `ZINC_DATA_DIR`
-  (`data/` in the template, `zincai-data/` by default) — gitignored.
-- `npm ci` also runs `scripts/apply-26.3-data.js`, which installs vendored,
-  unmerged `minecraft-data` files into `node_modules`. The data is unofficial;
-  prefer version auto-detection or a server version you have verified.
-- [`zincai/README.md`](zincai/README.md) documents the tool/action and survival
-  policies in depth.
-
-MIT License.
+- [`docs/architecture.md`](docs/architecture.md) — System architecture, control arbitration, reflex loop, tool execution, telemetry, and persistence.
+- [`zincai/README.md`](zincai/README.md) — Module-by-module guide to `zincai/` and the 39-tool surface.
+- [`docs/pufferpanel-guide.md`](docs/pufferpanel-guide.md) — Step-by-step PufferPanel v3 setup guide.
+- [`pufferpanel/README.md`](pufferpanel/README.md) — Template specification, variables, and diagnostics.
+- [`AGENTS.md`](AGENTS.md) & [`docs/AGENT_REFERENCE.md`](docs/AGENT_REFERENCE.md) — Dense technical reference and invariants for AI coding agents and contributors.

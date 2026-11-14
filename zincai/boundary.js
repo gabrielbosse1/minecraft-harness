@@ -1,424 +1,269 @@
 /**
- * boundary.js — the one place every physical Minecraft action is allowed or
- * refused, regardless of which subsystem asked for it.
+ * boundary.js — lifecycle and anti-flood execution guard for physical actions.
  *
- * WHY THIS EXISTS
- *   Before this module, a physical act could enter the bot through at least six
- *   independent doors:
- *
- *     1. the action lane          executeAction() → skills / builder / combat
- *     2. background jobs          JobRegistry → startMain / startSide
- *     3. survival reflexes        System1: flee keys, eat (equip+consume), MLG
- *                                 water bucket, elytra deploy
- *     4. the pathfinder wrapper   scaffolding/digging/wind-charge helpers that
- *                                 press keys and place blocks directly
- *     5. combat                   AdvancedCombat swings through the arbiter lane
- *     6. redstone / scripts       RedstoneEngineer, run_script, scripts/*
- *
- *   A pause, a permission or an area limit that is enforced in only some of
- *   those places is not a control. So THIS module is a single gate, and every
- *   one of the six routes calls it:
- *
- *     - `check()`   — may this tool (or this raw act) run right now? Called by
- *                     executeAction, startMain, startSide, skills, builder,
- *                     combat, redstone, scripts.
- *     - `net()`     — a raw network-level primitive on the live bot
- *                     (setControlState, dig, placeBlock, activateItem, attack,
- *                     equip, consume, toss, activateBlock). Even code that
- *                     forgets to ask is stopped by the guard.
- *
- *   There is no standing exception for any subsystem. A permission the
- *   operator switched off is off for the survival reflex, for a background
- *   build and for a script alike; the difference is only in who hears about it.
- *
- *   Decisions are deny-by-default for a missing subsystem and recorded in
- *   `log` so `status` can say why the body is not moving.
- *
- *   It holds NO world state of its own beyond a recent-action counter: the
- *   pause flag, the permissions, the boundary and the limits live in the
- *   RuntimeConfig + ControlState this gate reads through small accessors.
+ * Ensures physical Minecraft actions only run while connected, alive, and not
+ * paused by console `pause`, and enforces the sliding-window anti-flood ceiling
+ * (`limits.maxPhysicalActionsPerMinute`). Does not restrict gameplay tools,
+ * block types, or world regions.
  */
 'use strict'
 
 const { EventEmitter } = require('events')
-const { TOOL_LANES, LANES } = require('./lanes')
 const { asLogger } = require('./runtime_config')
 
-/**
- * What category of physical capability does a tool need?
- *
- * A tool may need several (`place` needs movement to reach the spot), so the
- * value is a list. Every entry must be permitted.
- */
-const TOOL_CAPS = Object.freeze({
-  // movement
+const ACTION_CAPABILITIES = Object.freeze({
   go_to: ['move'],
+  follow: ['move'],
+  step_back: ['move'],
+  stop_moving: [],
   dig: ['move', 'dig'],
   gather: ['move', 'dig'],
-  follow: ['move'],
-  corpse_run: ['move'],
-  go_home: ['move'],
-  // building
+  place: ['move', 'place'],
   build: ['move', 'place'],
   build_shape: ['move', 'place'],
-  place: ['move', 'place'],
-  shelter: ['move', 'place', 'dig'],
+  shelter: ['move', 'place'],
+  attack: ['move', 'attack'],
+  take: ['move', 'container'],
+  put: ['move', 'container'],
+  look_in: ['move', 'container'],
+  smelt: ['move', 'container'],
+  use_block: ['move', 'use'],
   light_up: ['move', 'place', 'use'],
-  // fighting
-  attack: ['attack', 'move'],
-  // containers & interaction
-  take: ['container', 'move'],
-  put: ['container', 'move'],
-  look_in: ['container', 'move'],
-  smelt: ['container', 'move', 'use'],
-  use_block: ['use', 'move'],
-  sleep: ['use', 'move'],
-  give: ['move', 'toss'],
+  sleep: ['move', 'use'],
   equip: ['equip'],
   eat: ['eat'],
-  craft: ['craft', 'move'],
+  give: ['move', 'toss'],
+  craft: ['move', 'craft'],
   run_script: ['script'],
-  redstone_engineer: ['place', 'dig', 'use', 'move']
+  screenshot: [],
+  find: [],
+  inspect_block: [],
+  inspect_region: [],
+  redstone_scan: [],
+  redstone_component: [],
+  redstone_engineer: [],
+  logic_test: [],
+  circuit_project: [],
+  recall: [],
+  remember_here: [],
+  note: [],
+  social: [],
+  goal: [],
+  hold: [],
+  stop: [],
+  say: [],
+  idle: []
 })
 
-/** Capability → RuntimeConfig parameter. */
-const CAP_PARAM = Object.freeze({
-  move: 'actions.allowMovement',
-  dig: 'actions.allowDig',
-  place: 'actions.allowPlace',
-  attack: 'actions.allowAttack',
-  container: 'actions.allowContainers',
-  use: 'actions.allowUse',
-  equip: 'actions.allowEquip',
-  eat: 'actions.allowEat',
-  toss: 'actions.allowToss',
-  craft: 'actions.allowCraft',
-  script: 'actions.allowScripts'
+const BOT_METHOD_CAPS = Object.freeze({
+  setControlState: 'move',
+  setGoal: 'move',
+  goto: 'move',
+  dig: 'dig',
+  placeBlock: 'place',
+  attack: 'attack',
+  activateBlock: 'use',
+  openContainer: 'container',
+  openFurnace: 'container',
+  openChest: 'container',
+  equip: 'equip',
+  unequip: 'equip',
+  consume: 'eat',
+  toss: 'toss',
+  tossStack: 'toss',
+  craft: 'craft',
+  sleep: 'use',
+  elytraFly: 'move'
 })
 
-/** Default capabilities implied by a raw primitive (control.js KEYS + bot methods). */
-const NET_CAPS = Object.freeze({
-  setControlState: ['move'],
-  clearControlStates: [],
-  setGoal: ['move'],
-  dig: ['dig', 'move'],
-  placeBlock: ['place', 'move'],
-  equip: ['equip'],
-  unequip: ['equip'],
-  consume: ['eat'],
-  toss: ['toss', 'move'],
-  tossStack: ['toss', 'move'],
-  craft: ['craft'],
-  activateItem: ['use', 'move'],
-  activateBlock: ['use', 'move'],
-  attack: ['attack', 'move'],
-  swingArm: [],
-  look: [],
-  lookAt: [],
-  chat: [],
-  whisper: [],
-  openContainer: ['container', 'move'],
-  openFurnace: ['container', 'move'],
-  respawn: [],
-  elytraFly: ['move'],
-  setQuickBarSlot: []
-})
-
-/** Reasons that are about the person asking to see them — never the raw internals. */
-const REASON_TEXT = Object.freeze({
-  paused: 'the body is paused by an operator (resume to continue)',
-  disconnected: 'not connected to the server',
-  dying: 'dead; waiting for respawn',
-  busy: 'the body is busy with another physical action',
-  rate: 'physical action limit reached for this minute',
-  boundary: 'that is outside the permitted area',
-  boundary_unknown: 'position unknown, so the permitted area cannot be checked',
-  emergency: 'an emergency reflex is driving the body'
-})
+const PRIMITIVES_PROBE = ['setControlState', 'dig', 'placeBlock', 'attack', 'equip']
+const PROMISE_PRIMITIVES = new Set([
+  'dig', 'placeBlock', 'equip', 'unequip', 'consume', 'toss', 'tossStack',
+  'craft', 'activateBlock', 'elytraFly', 'goto', 'attack', 'sleep'
+])
 
 class PhysicalBoundary extends EventEmitter {
-  /**
-   * @param {{
-   *   config: import('./runtime_config').RuntimeConfig,
-   *   state?: object,               // ControlState (paused / connection / death)
-   *   logger?: (level:string, msg:string) => void,
-   *   now?: () => number,
-   *   getPosition?: () => {x:number,y:number,z:number}|null,
-   *   getDimension?: () => string,
-   *   isPhysicalBusy?: () => boolean,
-   *   isEmergency?: () => boolean
-   * }} opts
-   */
-  constructor ({ config, state = null, logger = () => {}, now = () => Date.now(), getPosition = null, getDimension = null, isPhysicalBusy = null, isEmergency = null } = {}) {
+  constructor ({
+    config,
+    state = null,
+    now = () => Date.now(),
+    logger = () => {},
+    getState = null
+  } = {}) {
     super()
+    if (!config) throw new Error('PhysicalBoundary requires a RuntimeConfig')
     this.config = config
-    this.state = state
-    this.log = asLogger(logger)
+    this.state = state || null
+    this.getState = getState || null
     this.now = now
-    this.getPosition = getPosition
-    this.getDimension = getDimension
-    this.isPhysicalBusy = isPhysicalBusy || (() => false)
-    this.isEmergency = isEmergency || (() => false)
-    /** Recent physical action timestamps (sliding window for the rate limit). */
-    this.recent = []
-    this.refused = 0
-    this.allowed = 0
-    /** Last few refusals, for `status` and the prompts. */
-    this.lastRefusals = []
-    /** Per-act capability list: actId → caps, so `status` can say what was authorised. */
-    this._actCaps = new Map()
+    this.log = asLogger(logger)
+
+    this.paused = false
+    this.pausedReason = null
+    this.pausedAt = 0
+
+    this._actionStamps = []
+    this.refusals = []
+    this._lastRefusalLog = new Map()
   }
 
-  // ----------------------------------------------------------- decisions --
-
-  /**
-   * May `tool` run now?
-   * @param {string} tool tool name, `script <name>`, or a raw primitive name
-   * @param {{ actId?: string, action?: object, caps?: string[], strict?: boolean }} [opts]
-   * @returns {{ ok:boolean, why?:string, caps:string[], detail?:string }}
-   */
-  check (tool, { actId = null, action = null, caps = null, strict = false } = {}) {
-    const needed = caps || capsForTool(tool)
-    const refusal = this._refusal(needed, { tool, strict })
-    if (refusal) {
-      this._deny(tool, refusal, { actId })
-      return { ok: false, why: refusal, caps: needed }
-    }
-    if (actId) this._actCaps.set(actId, new Set(needed))
-    // A permitted physical act counts against the sliding window here, once
-    // per act — not once per packet, which would make the ceiling meaningless.
-    if (needed.length) this._count()
-    return { ok: true, caps: needed }
-  }
-
-  /**
-   * Gate for a raw network primitive (used by the wrapped bot).
-   * Never records a refusal into the sliding window and never counts as a
-   * "physical action" — only a permitted actuation does.
-   */
-  net (primitive, { scoped = null } = {}) {
-    const needed = NET_CAPS[primitive] || []
-    const refusal = this._refusal(needed, { tool: primitive, primitive: true })
-    if (refusal) { this._deny(primitive, refusal, {}); return { ok: false, why: refusal } }
-    return { ok: true }
-  }
-
-  /** Was this act already authorised, and did it need the given capability? */
-  actCaps (actId) {
-    const caps = actId ? this._actCaps.get(actId) : null
-    return caps || null
-  }
-
-  consumeAct (actId) {
-    if (actId) this._actCaps.delete(actId)
-  }
-
-  /**
-   * The area check for one position. Returns null when the act is allowed.
-   * A pending join (position unknown) is NOT treated as "outside": the wrapper
-   * would otherwise refuse the very first movement after a reconnect.
-   */
-  areaRefusal (pos = null, dim = null) {
-    if (!this.config.get('boundary.enabled')) return null
-    const p = pos || (this.getPosition ? this.getPosition() : null)
-    if (!p || !Number.isFinite(p.x) || !Number.isFinite(p.z)) return null
-    const wanted = String(this.config.get('boundary.dimension') || 'overworld')
-    const here = String(dim || (this.getDimension ? this.getDimension() : wanted) || 'overworld').replace(/^minecraft:/, '')
-    if (here !== wanted) {
-      return this.config.get('boundary.blockOutside')
-        ? `boundary: this is the ${here}, and permission to act applies to the ${wanted}`
-        : null
-    }
-    const cx = Number(this.config.get('boundary.centerX'))
-    const cz = Number(this.config.get('boundary.centerZ'))
-    const r = Number(this.config.get('boundary.radius'))
-    const distance = Math.hypot(p.x - cx, p.z - cz)
-    if (distance > r) {
-      return this.config.get('boundary.blockOutside')
-        ? `boundary: ${Math.round(distance)} blocks from the centre of the permitted area (radius ${r})`
-        : null
-    }
-    return null
-  }
-
-  /**
-   * Is a DESTINATION inside the permitted area? A walk, a dig or a build whose
-   * target lies outside it is refused before anything starts — checking only
-   * where the body stands would let it walk out one step at a time.
-   * @param {{x?:number,z?:number}|null} target
-   */
-  destinationRefusal (target = null) {
-    if (!target) return null
-    const x = Number(target.x)
-    const z = Number(target.z)
-    if (!Number.isFinite(x) || !Number.isFinite(z)) return null
-    return this.areaRefusal({ x, y: Number(target.y) || 0, z })
-  }
-
-  /** Does a target position (e.g. a build origin) fall inside the permitted area? */
-  targetRefusal (target = null) {
-    if (!target || !this.config.get('boundary.enabled')) return null
-    return this.areaRefusal(target)
-  }
-
-  // ------------------------------------------------------------ internals --
-
-  _refusal (needed, { tool = '', strict = false, primitive = false } = {}) {
-    if (!needed || !needed.length) return null
-    // 1. The pause / connection / death gate comes first: none of the other
-    //    checks matter when no physical action may happen at all.
-    const state = this.state
-    if (state) {
-      const hard = typeof state.physicalRefusal === 'function'
-        ? state.physicalRefusal()
-        : (state.isPaused?.() ? 'paused' : (state.connectionRefusal?.() || (state.isDead?.() ? 'dying' : null)))
-      if (hard) return hard
-    }
-    // 2. Per-capability permissions. No subsystem has a standing exception:
-    //    a permission the operator switched off is off for the survival reflex,
-    //    a background build and a script alike.
-    for (const cap of needed) {
-      const param = CAP_PARAM[cap]
-      if (!param) continue // unknown capability: nothing to enforce
-      if (this.config.get(param) === false) return `refused: ${param} is off`
-    }
-    // 3. The permitted area.
-    if (needed.some((c) => c === 'move' || c === 'dig' || c === 'place')) {
-      const area = this.areaRefusal()
-      if (area) return area
-    }
-    // 4. The sliding-window ceiling. Not applied to a primitive: one tool call
-    //    legitimately becomes many packets (a build is hundreds of blocks) and
-    //    counting packets would make the limit meaningless.
-    if (!primitive) {
-      const perMinute = Number(this.config.get('limits.maxPhysicalActionsPerMinute'))
-      if (perMinute > 0) {
-        const cutoff = this.now() - 60_000
-        this.recent = this.recent.filter((t) => t >= cutoff)
-        if (this.recent.length >= perMinute) return REASON_TEXT.rate
-      }
-    }
-    return null
-  }
-
-  _count () {
-    this.recent.push(this.now())
-    if (this.recent.length > 2_000) this.recent.splice(0, this.recent.length - 1_000)
-  }
-
-  _deny (what, why, { actId = null } = {}) {
-    this.refused++
-    const entry = { at: this.now(), what: String(what || '?').slice(0, 60), why: String(why || '').slice(0, 120), actId }
-    this.lastRefusals.push(entry)
-    if (this.lastRefusals.length > 12) this.lastRefusals.shift()
-    this.emit('refused', entry)
-    return entry
-  }
-
-  /** Note that a permitted physical action started (for the rate window). */
-  noteAction (what = 'action') {
-    this.allowed++
-    this._count()
-    this.emit('action', { what: String(what).slice(0, 60), at: this.now() })
-  }
-
-  /** A compact view for `status` and the prompts. */
-  snapshot () {
-    const cutoff = this.now() - 60_000
-    const recent = this.recent.filter((t) => t >= cutoff)
-    return {
-      paused: Boolean(this.state?.isPaused?.()),
-      connection: this.state?.connection?.() || 'CONNECTED',
-      dead: Boolean(this.state?.isDead?.()),
-      physicalBusy: Boolean(this.isPhysicalBusy()),
-      emergency: Boolean(this.isEmergency?.()),
-      allowed: this.allowed,
-      refused: this.refused,
-      actionsLastMinute: recent.length,
-      maxActionsPerMinute: Number(this.config.get('limits.maxPhysicalActionsPerMinute')),
-      boundary: this.config.get('boundary.enabled')
-        ? {
-            center: [Number(this.config.get('boundary.centerX')), Number(this.config.get('boundary.centerZ'))],
-            radius: Number(this.config.get('boundary.radius')),
-            dimension: this.config.get('boundary.dimension')
-          }
-        : null,
-      lastRefusals: this.lastRefusals.slice(-4)
-    }
-  }
-}
-
-/** Capability list for a tool name (never throws; unknown = conservative). */
-function capsForTool (tool) {
-  const raw = String(tool || '').trim()
-  if (!raw) return []
-  if (raw.startsWith('script')) return TOOL_CAPS.run_script.slice()
-  const head = raw.split(' ')[0]
-  if (TOOL_CAPS[head]) return TOOL_CAPS[head].slice()
-  // An unknown tool that the scheduler would put on the BODY lane is assumed to
-  // be able to move and to change the world: conservative by default.
-  if (TOOL_LANES[head] === LANES.BODY) return ['move', 'dig', 'place']
-  if (TOOL_LANES[head]) return [] // read-only / computation / interaction
-  // Unknown tool: the scheduler puts it on the BODY lane (laneOf defaults to it),
-  // so assume the same capabilities the body lane implies.
-  return ['move', 'dig', 'place']
-}
-
-/**
- * Install the network-level barrier on a live bot.
- *
- * Every physical primitive Mineflayer exposes is wrapped so it is checked
- * against the boundary at the moment it would hit the wire. This is what turns
- * the boundary from "most callers ask" into "no caller can bypass it": a
- * reflex, a background builder or a script that forgot to call check() is still
- * stopped here.
- *
- * Releasing control is never blocked — setControlState(key, false),
- * clearControlStates(), setGoal(null), stop() and deactivateItem() always work,
- * because a pause that cannot let go of the keys is worse than no pause.
- *
- * Idempotent per bot: installPhysicalGuard(bot) twice is a no-op, and a new bot
- * (a reconnect) gets its own installation.
- *
- * @param {object} bot mineflayer bot
- * @param {PhysicalBoundary} boundary
- * @param {{ logger?: (level:string,msg:string)=>void, onRefused?: Function }} [opts]
- * @returns {{ uninstall: Function, refused: number }}
- */
-function installPhysicalGuard (bot, boundary, { logger = () => {}, onRefused = null } = {}) {
-  if (!bot) return { uninstall: () => {}, refused: 0 }
-  const log = asLogger(logger)
-  if (bot.__zincaiPhysicalGuard) return bot.__zincaiPhysicalGuard
-  const originals = new Map()
-  const state = { refused: 0, gated: 0, uninstall }
-
-  const gate = (obj, name, optional = null) => {
-    const original = obj?.[name]
-    if (typeof original !== 'function') return false
-    originals.set(`${name}`, { obj, name, original })
-    const wrapped = function (...args) {
-      if (optional && optional(...args)) return original.apply(this, args) // a release
-      const verdict = boundary.net(name)
-      if (!verdict.ok) {
-        state.refused++
-        log('debug', `physical guard refused ${name}: ${verdict.why}`)
-        try { onRefused?.({ primitive: name, why: verdict.why }) } catch { /* observer must not throw */ }
-        return refuseValue(name)
-      }
-      return original.apply(this, args)
-    }
-    obj[name] = wrapped
+  pause (reason = 'paused by operator') {
+    if (this.paused) return false
+    this.paused = true
+    this.pausedReason = String(reason || 'paused')
+    this.pausedAt = this.now()
+    this.emit('paused', { reason: this.pausedReason, at: this.pausedAt })
     return true
   }
 
+  resume () {
+    if (!this.paused) return false
+    this.paused = false
+    const was = this.pausedReason
+    this.pausedReason = null
+    this.pausedAt = 0
+    this.emit('resumed', { was, at: this.now() })
+    return true
+  }
+
+  capabilitiesFor (tool) {
+    return ACTION_CAPABILITIES[tool] || []
+  }
+
+  isPhysical (tool) {
+    return this.capabilitiesFor(tool).length > 0
+  }
+
+  check (tool, { caps = null, count = false } = {}) {
+    const needed = Array.isArray(caps) ? caps : this.capabilitiesFor(tool)
+    if (!needed.length) return { ok: true }
+
+    const refusal = this._lifecycleRefusal()
+    if (refusal) return this._refuse(tool, refusal.code, refusal.reason)
+
+    const rateMax = Number(this.config.get('limits.maxPhysicalActionsPerMinute'))
+    if (rateMax > 0) {
+      const recent = this._pruneRate()
+      if (recent >= rateMax) {
+        return this._refuse(tool, 'rate-limit', `physical action rate limit reached (${rateMax}/min)`)
+      }
+    }
+
+    if (count) this._actionStamps.push(this.now())
+    return { ok: true }
+  }
+
+  recordAction () {
+    this._actionStamps.push(this.now())
+    this._pruneRate()
+  }
+
+  destinationRefusal () {
+    return null
+  }
+
+  net (method) {
+    const cap = BOT_METHOD_CAPS[method]
+    if (!cap) return { ok: true }
+    const refusal = this._lifecycleRefusal()
+    if (refusal) return { ok: false, code: refusal.code, reason: refusal.reason, why: refusal.reason }
+    return { ok: true }
+  }
+
+  snapshot () {
+    return {
+      paused: this._isPaused(),
+      pausedReason: this.pausedReason,
+      actionsLastMinute: this._pruneRate(),
+      maxActionsPerMinute: Number(this.config.get('limits.maxPhysicalActionsPerMinute')),
+      lastRefusals: this.refusals.slice(-5)
+    }
+  }
+
+  _isPaused () {
+    if (this.paused) return true
+    try { return Boolean(this.state?.isPaused?.()) } catch { return false }
+  }
+
+  _lifecycleRefusal () {
+    if (this.state) {
+      try {
+        if (typeof this.state.physicalRefusal === 'function') {
+          const msg = this.state.physicalRefusal()
+          if (msg) {
+            const code = /paused/i.test(msg) ? 'paused' : /dead/i.test(msg) ? 'dead' : 'disconnected'
+            return { code, reason: msg }
+          }
+        }
+        if (this.state.isDead?.()) return { code: 'dead', reason: 'body is dead; waiting for respawn' }
+        if (this.state.isPaused?.()) return { code: 'paused', reason: 'body is paused by operator (resume to continue)' }
+      } catch { /* fall through */ }
+    }
+    if (this.getState) {
+      try {
+        const st = this.getState() || {}
+        if (st.connected === false) return { code: 'disconnected', reason: 'not connected to the server' }
+        if (st.alive === false) return { code: 'dead', reason: 'body is dead; waiting for respawn' }
+      } catch { /* fall through */ }
+    }
+    if (this.paused) return { code: 'paused', reason: `body is paused (${this.pausedReason})` }
+    return null
+  }
+
+  _pruneRate () {
+    const cutoff = this.now() - 60_000
+    while (this._actionStamps.length && this._actionStamps[0] < cutoff) this._actionStamps.shift()
+    return this._actionStamps.length
+  }
+
+  _refuse (tool, code, reason) {
+    const entry = { at: this.now(), tool, what: tool, code, reason, why: reason }
+    this.refusals.push(entry)
+    if (this.refusals.length > 30) this.refusals.shift()
+    const key = `${tool}:${code}`
+    const last = this._lastRefusalLog.get(key) || 0
+    if (entry.at - last >= 5_000) {
+      this._lastRefusalLog.set(key, entry.at)
+      this.log('warn', `action refused [${code}] ${tool}: ${reason}`)
+    }
+    this.emit('refused', entry)
+    return { ok: false, code, reason, why: reason }
+  }
+}
+
+function refuseValue (primitive, reason) {
+  if (primitive === 'openContainer' || primitive === 'openFurnace' || primitive === 'openChest') {
+    return Promise.reject(Object.assign(new Error(`refused: ${reason || 'body unavailable'}`), { refused: true, boundary: true }))
+  }
+  if (PROMISE_PRIMITIVES.has(primitive)) return Promise.resolve(undefined)
+  return undefined
+}
+
+function installPhysicalGuard (bot, boundary, { logger = () => {} } = {}) {
+  if (!bot || !boundary) return { gated: 0, uninstall: () => {} }
+  if (bot.__zincaiPhysicalGuard) return bot.__zincaiPhysicalGuard
+  const log = asLogger(logger)
+  const originals = new Map()
+  const state = { gated: 0, uninstall }
+
+  const gate = (obj, name, isRelease = null) => {
+    if (!obj || typeof obj[name] !== 'function') return
+    const key = `${obj === bot ? 'bot' : 'pf'}.${name}`
+    if (originals.has(key)) return
+    const original = obj[name]
+    originals.set(key, { obj, name, original })
+    obj[name] = function guardedPrimitive (...args) {
+      if (isRelease && isRelease(...args)) return original.apply(this, args)
+      const verdict = boundary.net(name)
+      if (!verdict.ok) return refuseValue(name, verdict.reason)
+      return original.apply(this, args)
+    }
+  }
+
   const installNow = () => {
-    // Movement and control-state writes; releasing a key is always allowed.
-    gate(bot, 'setControlState', (key, value) => value === false)
-    gate(bot, 'clearControlStates', () => true)
-    // World mutation.
+    gate(bot, 'setControlState', (_ctrl, val) => val === false)
     gate(bot, 'dig')
     gate(bot, 'placeBlock')
-    gate(bot, 'activateItem')
     gate(bot, 'activateBlock')
     gate(bot, 'attack')
     gate(bot, 'equip')
@@ -427,28 +272,20 @@ function installPhysicalGuard (bot, boundary, { logger = () => {}, onRefused = n
     gate(bot, 'toss')
     gate(bot, 'tossStack')
     gate(bot, 'craft')
+    gate(bot, 'sleep')
     gate(bot, 'openContainer')
     gate(bot, 'openFurnace')
+    gate(bot, 'openChest')
     gate(bot, 'elytraFly')
-    // Pathfinder: dropping a goal releases the body, setting one drives it.
     if (bot.pathfinder) {
       gate(bot.pathfinder, 'setGoal', (goal) => goal === null || goal === undefined)
       gate(bot.pathfinder, 'goto')
       gate(bot.pathfinder, 'stop', () => true)
     }
     state.gated = originals.size
-    log(originals.size ? 'info' : 'warn', originals.size
-      ? `physical boundary installed — ${originals.size} primitives gated`
-      : 'physical boundary: this bot exposes none of the primitives to gate — pause and permissions are enforced at the tool level only')
+    log(originals.size ? 'info' : 'debug', `physical boundary installed — ${originals.size} primitives gated`)
   }
 
-  // mineflayer adds dig/placeBlock/setControlState/… (and the pathfinder) when
-  // its plugins are injected, which happens one timer AFTER createBot returns.
-  // Installing straight away on a real bot therefore gated nothing at all
-  // ("0 primitives gated") and left the network-level barrier out of every
-  // real session; only a simulated bot, which is born complete, was covered.
-  // So: now if the body is already there, otherwise right after injection (this
-  // listener is added after mineflayer's own, so the plugins are in by then).
   let pending = null
   const ready = PRIMITIVES_PROBE.some((name) => typeof bot[name] === 'function')
   if (ready || typeof bot.once !== 'function') installNow()
@@ -473,29 +310,9 @@ function installPhysicalGuard (bot, boundary, { logger = () => {}, onRefused = n
   return state
 }
 
-/** Any of these on the bot means its plugins are in. */
-const PRIMITIVES_PROBE = ['setControlState', 'dig', 'placeBlock', 'attack', 'equip']
-
-/** A refused primitive resolves like a no-op, so `await` callers do not throw. */
-function refuseValue (primitive) {
-  if (primitive === 'openContainer' || primitive === 'openFurnace') {
-    return Promise.reject(Object.assign(new Error('refused: containers are not permitted'), { refused: true, boundary: true }))
-  }
-  if (PROMISE_PRIMITIVES.has(primitive)) return Promise.resolve(undefined)
-  return undefined
-}
-
-const PROMISE_PRIMITIVES = new Set([
-  'dig', 'placeBlock', 'equip', 'unequip', 'consume', 'toss', 'tossStack',
-  'craft', 'activateBlock', 'elytraFly', 'goto', 'attack'
-])
-
 module.exports = {
   PhysicalBoundary,
   installPhysicalGuard,
-  capsForTool,
-  TOOL_CAPS,
-  NET_CAPS,
-  CAP_PARAM,
-  REASON_TEXT
+  ACTION_CAPABILITIES,
+  BOT_METHOD_CAPS
 }

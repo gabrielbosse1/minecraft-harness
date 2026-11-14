@@ -37,8 +37,6 @@
  *      3–5 block gap or a ≤4 block wall, the bot equips `wind_charge`, aims
  *      along a computed ballistic angle, right-clicks, then jumps. Chaining
  *      is allowed while more charges remain.
- *   7. scoutSafeAnchor(): pure 30×30 safe-anchor search used by the startup
- *      "Scout & Relocate" routine. Client-side only — no commands, no /tp.
  */
 'use strict'
 
@@ -48,8 +46,29 @@ const TICK_MS = 50
 
 const { Vec3 } = require('vec3')
 const doors = require('./doors')
-const { NEVER_DIG: NEVER_DIG_NAMES } = require('../dig_policy')
 const { planEscape } = require('./escape')
+
+/** Blocks that cannot be broken in vanilla survival or hold protected world structures. */
+const UNBREAKABLE_BLOCKS = Object.freeze([
+  'bedrock', 'barrier', 'structure_void', 'light',
+  'command_block', 'chain_command_block', 'repeating_command_block',
+  'structure_block', 'jigsaw', 'end_portal', 'end_portal_frame', 'end_gateway',
+  'nether_portal', 'reinforced_deepslate', 'spawner', 'trial_spawner', 'vault',
+  'water', 'lava', 'bubble_column'
+])
+
+/** Soft natural terrain that ordinary walking may clear when no short detour exists. */
+const PASSIVE_WALK_SOFT_BLOCKS = Object.freeze([
+  'dirt', 'grass_block', 'coarse_dirt', 'rooted_dirt', 'podzol', 'mycelium',
+  'mud', 'sand', 'red_sand', 'gravel', 'clay', 'snow', 'snow_block', 'powder_snow',
+  'vine', 'tall_grass', 'short_grass', 'fern', 'large_fern', 'dead_bush',
+  'bush', 'leaf_litter', 'seagrass', 'tall_seagrass'
+])
+
+const isSoftWalkBlock = (name) => {
+  const n = String(name || '')
+  return PASSIVE_WALK_SOFT_BLOCKS.includes(n) || n.endsWith('_leaves')
+}
 
 const isDoorOrTrapdoorName = (name) => (/_door$/i.test(name) || /_trapdoor$/i.test(name)) && !/iron/i.test(name)
 
@@ -751,10 +770,6 @@ function findGroundY (bot, x, z, { up = 3, down = 6 } = {}) {
 }
 
 const HAZARD_NAMES = /lava|fire|magma|cactus|sweet_berry|powder_snow|wither_rose|campfire/
-/** The six face neighbours. */
-const NEIGHBOURS = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]
-/** Crafted blocks: terrain that touches one of these is part of a build. */
-const BUILT_NEIGHBOUR = /(_planks$|_bricks$|^bricks$|_door$|_trapdoor$|glass|^chest$|^trapped_chest$|^barrel$|shulker_box$|_bed$|furnace$|^smoker$|^crafting_table$|_sign$|_stairs$|_slab$|_fence$|_fence_gate$|_wall$|^repeater$|^comparator$|piston|^redstone_wire$|^rail$|_rail$|lantern$|^bookshelf$|^torch$|_torch$|_concrete$|_terracotta$|_wool$|_carpet$|^hopper$|^dispenser$|^dropper$|^observer$|^lever$|_button$|_pressure_plate$|^farmland$|^anvil$|^beacon$|^ladder$|^scaffolding$)/
 /** Blocks that burn whoever stands on them. */
 const FLOOR_HAZARD = /^(magma_block|campfire|soul_campfire)$/
 /** Blocks a player must not walk INTO (upstream already avoids fire, lava and cobwebs). */
@@ -874,218 +889,35 @@ function makeEscapePlanner (bot, { Movements } = {}) {
   }
 }
 
-/**
- * Evaluate a 30×30 (radius 15) neighbourhood and pick the best organic anchor:
- *   - as far as possible from hostile *projected* positions (vector away),
- *   - no lava/fire/cactus/cliff within 2 blocks,
- *   - open sky + standable ground preferred,
- *   - not welded to the spawn point (prefer 8–20 blocks out).
- * Pure: only `bot.blockAt`, `bot.entity`, `bot.entities` are touched.
- *
- * @param {{radius?:number, step?:number, maxThreatDistance?:number,
- *   horizonTicks?:number, minRadius?:number, preferRadius?:number,
- *   avoid?:Array<{x:number,z:number,radius?:number}>}} [opts]
- *   `avoid` excludes cells near recent death points / known bad spots.
- * @returns {null | {x:number,y:number,z:number,score:number,reasons:string[],
- *   threats:number, away:{x:number,z:number}, hostiles:Array}}
- */
-function scoutSafeAnchor (bot, {
-  radius = 15,
-  step = 3,
-  maxThreatDistance = 24,
-  horizonTicks = 40,
-  minRadius = 5,
-  preferRadius = 12,
-  avoid = []
-} = {}) {
-  const pos = bot?.entity?.position
-  if (!pos) return null
-
-  // --- hostile field: current + projected positions -----------------------
-  const hostiles = []
-  for (const id of Object.keys(bot.entities || {})) {
-    const e = bot.entities[id]
-    if (!e || !e.position || e === bot.entity) continue
-    if (e.type === 'player' || !isHostileName(e.name)) continue
-    const velocity = e.velocity || { x: 0, y: 0, z: 0 }
-    const future = projectFuture(e.position, velocity, horizonTicks)
-    hostiles.push({
-      name: String(e.name || 'hostile').toLowerCase(),
-      position: { x: e.position.x, y: e.position.y, z: e.position.z },
-      future,
-      speed: Math.hypot(velocity.x || 0, velocity.z || 0)
-    })
-  }
-
-  // Vector away from the mob centroid (mandate: "a vector away from the mobs").
-  let away = { x: 1, z: 0 }
-  if (hostiles.length) {
-    let cx = 0
-    let cz = 0
-    for (const h of hostiles) { cx += h.future.x; cz += h.future.z }
-    cx /= hostiles.length
-    cz /= hostiles.length
-    const ax = pos.x - cx
-    const az = pos.z - cz
-    const len = Math.hypot(ax, az)
-    away = len > 0.01 ? { x: ax / len, z: az / len } : { x: 1, z: 0 }
-  }
-
-  let best = null
-  const bx = Math.floor(pos.x)
-  const bz = Math.floor(pos.z)
-  for (let dx = -radius; dx <= radius; dx += step) {
-    for (let dz = -radius; dz <= radius; dz += step) {
-      const x = bx + dx
-      const z = bz + dz
-      const distFromBot = Math.hypot(dx, dz)
-      if (distFromBot < minRadius) continue // don't "relocate" onto our own feet
-      // Never re-anchor in the kill zone that just killed us.
-      let blacklisted = false
-      for (const a of avoid) {
-        if (!a || !Number.isFinite(a.x) || !Number.isFinite(a.z)) continue
-        if (Math.hypot(x - a.x, z - a.z) < (a.radius ?? 10)) { blacklisted = true; break }
-      }
-      if (blacklisted) continue
-      const y = findGroundY(bot, x, z)
-      if (y === null) continue
-      const candidate = { x, y, z }
-      const reasons = []
-
-      // Threat integral over projected hostile positions.
-      let threat = 0
-      for (const h of hostiles) {
-        const d = Math.hypot(x - h.future.x, z - h.future.z)
-        if (d < maxThreatDistance) threat += (1 - d / maxThreatDistance) * (1 + h.speed * 2)
-      }
-      if (threat === 0) reasons.push('no nearby threats')
-
-      // Local hazards — feet level AND the block we would stand on/step into.
-      let hazard = 0
-      let sky = 0
-      let water = 0
-      for (let oy = -1; oy <= 1; oy++) {
-        for (let ox = -2; ox <= 2; ox++) {
-          for (let oz = -2; oz <= 2; oz++) {
-            const b = (() => {
-              try {
-                const { Vec3 } = require('vec3')
-                return bot.blockAt(new Vec3(x + ox, y + oy, z + oz))
-              } catch { return null }
-            })()
-            if (!b) continue
-            if (HAZARD_NAMES.test(b.name || '')) hazard += oy === 0 ? 2 : 1
-            if (oy === 0 && (ox !== 0 || oz !== 0) && /water/.test(b.name || '')) water += 1
-          }
-        }
-      }
-      for (let oy = 1; oy <= 4; oy++) {
-        const b = (() => {
-          try {
-            const { Vec3 } = require('vec3')
-            return bot.blockAt(new Vec3(x, y + oy, z))
-          } catch { return null }
-        })()
-        if (b && b.boundingBox === 'block') sky += 1 // ceiling
-      }
-      // Ledge probe: a 2-block walk in each cardinal direction must still have
-      // floor within 3 blocks of our feet, otherwise the "safe" cell is a cliff.
-      let ledges = 0
-      for (const [ldx, ldz] of [[2, 0], [-2, 0], [0, 2], [0, -2]]) {
-        let hasFloor = false
-        for (let drop = 1; drop <= 3; drop++) {
-          const b = (() => {
-            try {
-              const { Vec3 } = require('vec3')
-              return bot.blockAt(new Vec3(x + ldx, y - drop, z + ldz))
-            } catch { return null }
-          })()
-          if (b && b.boundingBox === 'block') { hasFloor = true; break }
-        }
-        if (!hasFloor) ledges += 1
-      }
-      if (hazard > 0) reasons.push('hazard nearby')
-      if (ledges > 0) reasons.push('ledge nearby')
-      if (sky >= 4) reasons.push('enclosed')
-      if (water > 0) reasons.push('water access')
-
-      // Heads-away alignment with the hostile centroid.
-      const heading = distFromBot > 0.01 ? (dx * away.x + dz * away.z) / distFromBot : 0
-      if (heading > 0.5) reasons.push('away from mobs')
-
-      const score =
-        -threat * 10 -
-        hazard * 6 -
-        ledges * 2.5 -
-        sky * 1.5 +
-        water * 0.8 +
-        heading * 4 -
-        Math.abs(distFromBot - preferRadius) * 0.25
-
-      if (!best || score > best.score) {
-        best = {
-          x,
-          y,
-          z,
-          score: Math.round(score * 100) / 100,
-          reasons: reasons.length ? reasons : ['open ground'],
-          threats: hostiles.length,
-          away,
-          hostiles: hostiles.slice(0, 6)
-        }
-      }
-    }
-  }
-  return best
-}
-
 // ===========================================================================
 // PathfinderWrapper
 // ===========================================================================
 class PathfinderWrapper {
   /**
    * @param {import('mineflayer').Bot} bot
-   * @param {{ allowScaffolding?: boolean, doorCost?: number,
-   *           jitterDegrees?: number, logger?: (level:string,msg:string)=>void,
-   *           threat?: object, windCharge?: object, enableWindCharge?: boolean,
+   * @param {{ doorCost?: number, jitterDegrees?: number,
+   *           logger?: (level:string,msg:string)=>void,
+   *           threat?: object, windCharge?: object,
+   *           isProtected?: (pos:object) => boolean,
    *           isUrgent?: () => boolean }} [opts]
    */
   constructor (bot, opts = {}) {
     this.bot = bot
-    // Digging is not an operator switch any more: planning never breaks blocks,
-    // and a `dig` request grants the pathfinder a corridor for exactly one walk.
-    // { canDig: Set<blockId|null>, cantDig: Set<blockId|null>, expiresAt } | null
+    // Explicit `dig` corridor grants pathfinder permission to break any breakable block along the route.
     this._digWindow = null
     this._digTimer = null
-    // The STANDING rule for ordinary walks (dig_policy.js): the model's own
-    // can-dig switch and block list. A `dig` corridor, while open, replaces it.
-    //   digPolicy     { resolve(registry) → null | { all, names, never }, version }
-    //   digAllowed    () => boolean — the operator's switch (actions.allowDig)
-    //   isProtected   (pos) => boolean — a cell inside somebody's build/claim
-    this.digPolicy = opts.digPolicy || null
-    this.digAllowed = typeof opts.digAllowed === 'function' ? opts.digAllowed : () => true
     this.isProtected = typeof opts.isProtected === 'function' ? opts.isProtected : null
-    // Breaking costs more than walking around: a detour of a few blocks beats
-    // a hole in the ground. (The explicit corridor keeps upstream's price.)
     this.policyDigCost = Number.isFinite(opts.policyDigCost) ? Math.max(1, opts.policyDigCost) : 2
-    this._policyCache = null // { version, registry, all, ids:Set, never:Set }
-    // Pillaring up and bridging with dirt/cobblestone is upstream's default.
-    // Around other people's builds that is griefing, so it is OFF unless the
-    // operator opts in (behavior.allowScaffolding) for wilderness travel.
-    this.allowScaffolding = opts.allowScaffolding === true
+    this._softIdsCache = null
     this.doorCost = Number.isFinite(opts.doorCost) ? opts.doorCost : 4
     this.jitterRad = ((opts.jitterDegrees ?? 2) * DEG)
     this.log = typeof opts.logger === 'function' ? opts.logger : () => {}
-    // "Urgent" = someone is fleeing or fighting. The humanizer (pauses, walk
-    // phases, look jitter) must never slow that down.
     this.isUrgent = typeof opts.isUrgent === 'function' ? opts.isUrgent : () => false
-    // Doors and gates THIS bot opened: key → { position, kind, name, restoreOpen, at, lastClick }.
-    // Only these are ever closed again.
     this._opened = new Map()
-    this._doorClicks = new Map() // key → { at, open, tries }
-    this._jammed = new Map() // key → until (ms): would not open, routed around
-    this.lastJam = null // { x, y, z, name, at } — for "why is there no path"
-    this._path = null // the pathfinder's live path (same array it consumes)
+    this._doorClicks = new Map()
+    this._jammed = new Map()
+    this.lastJam = null
+    this._path = null
     this._onPathSeen = null
     this._jitterTimer = null
     this._sprintTimer = null
@@ -1093,34 +925,18 @@ class PathfinderWrapper {
     this._lastHeading = null
     this._pauseUntil = 0
     this._applied = []
-    this._tickHandlers = [] // physicsTick listeners we own — removed in stop()
+    this._tickHandlers = []
 
-    // Movement posture, chosen by the WRAPPER from what the body is doing, not
-    // by the model picking a persona:
-    //
-    //   'balanced' (default)  normal sprint-walk rhythm, drops up to 4
-    //   'careful'             steady, no sprint, drops of 1 — while placing blocks
-    //                         or carrying something it must not lose
-    //   'urgent'              sprint-jump parkour — while fleeing or fighting
-    //
-    // There is no `set_mode` tool any more. Prefer `setCareful(bool)` and let
-    // isUrgent() win, which is what the body already knows how to do.
-    this.mode = 'balanced'
-    this._careful = false
     this.fleeRadius = Number.isFinite(opts.fleeRadius) ? opts.fleeRadius : 8
     this._jumpSprintTimer = null
 
-    // --- predictive threat + wind charge ----------------------------------
     this.threat = opts.threat instanceof PredictiveThreatMap
       ? opts.threat
       : new PredictiveThreatMap({ ...(opts.threat || {}), logger: this.log })
     this.windCharge = opts.windCharge instanceof WindChargeTraversal
       ? opts.windCharge
-      : new WindChargeTraversal(bot, { enabled: opts.enableWindCharge !== false, logger: this.log, ...(opts.windCharge || {}) })
-    this.enableWindCharge = opts.enableWindCharge !== false
+      : new WindChargeTraversal(bot, { enabled: true, logger: this.log, ...(opts.windCharge || {}) })
     this._threatTimer = null
-    // Route watcher (see _watchRoute): re-plan when the steps ahead cost at
-    // least `routeReplanCost` AND `routeReplanRise` more than at planning time.
     const tcfg = (opts.threat && !(opts.threat instanceof PredictiveThreatMap)) ? opts.threat : {}
     this.routeReplanMs = Number.isFinite(tcfg.routeReplanMs) ? tcfg.routeReplanMs : 1200
     this.routeReplanCost = Number.isFinite(tcfg.routeReplanCost) ? tcfg.routeReplanCost : 12
@@ -1128,7 +944,6 @@ class PathfinderWrapper {
     this._routeBaseline = 0
     this._routeBaselineAt = 0
     this._lastRouteReplanAt = 0
-    /** How many times a route was planned again because of what walked onto it. */
     this.threatReplans = 0
     this._windBusy = false
     this._windAttempts = 0
@@ -1136,38 +951,7 @@ class PathfinderWrapper {
     this._appliedOnce = false
   }
 
-  /**
-   * Ask for the careful posture (steady, no sprint, shallow drops). Builders and
-   * item-carriers want this; nothing needs to be unlocked to get it. An urgent
-   * situation overrides it — see isUrgent().
-   */
-  setCareful (on = true) {
-    this._careful = Boolean(on)
-    this._refreshPosture()
-    return this._careful
-  }
-
-  /** Recompute the posture from `_careful`; 'urgent' still wins at apply time. */
-  _refreshPosture () {
-    this.mode = this._careful ? 'careful' : 'balanced'
-    const m = this._movements()
-    if (m) {
-      this._applyMode(m)
-      this.threat.attachToMovements(m)
-    }
-    return this.mode
-  }
-
-  /** Back-compat: old persona names map onto a posture. Kept for tests/scripts. */
-  setMode (mode) {
-    return this.setCareful(mode === 'builder')
-  }
-
-  _applyMode (m) {
-    if (this._careful && !this.isUrgent()) { m.allowSprinting = false; m.maxDropDown = 1 } else { m.allowSprinting = true; m.maxDropDown = 4 }
-  }
-
-  /** Register one of OUR physicsTick handlers (named so stop() can remove it). */
+  /** Register one physicsTick handler owned by this wrapper (removed on stop()). */
   _onTick (fn) {
     this._tickHandlers.push(fn)
     this.bot.on('physicsTick', fn)
@@ -1176,7 +960,7 @@ class PathfinderWrapper {
   /** Idempotent prototype patch helper. */
   _patch (target, name, factory) {
     const key = `${name}`
-    if (target[PATCH_MARK] && target[PATCH_MARK].has(key)) return // already patched
+    if (target[PATCH_MARK] && target[PATCH_MARK].has(key)) return
     const original = target[name]
     if (typeof original !== 'function') {
       this.log('warn', `pathfinder hook ${name} missing — skipping patch`)
@@ -1187,17 +971,9 @@ class PathfinderWrapper {
     this._applied.push(key)
   }
 
-  /**
-   * Configure ONE Movements object completely: digging guard, scaffolding
-   * policy, door routing, movement mode and threat costs.
-   *
-   * index.js creates a fresh Movements on every spawn. The old apply() only
-   * re-attached the threat hook to it, so after the first death the bot lost
-   * door routing and its mode settings while still reporting the old mode.
-   */
+  /** Configure one Movements instance with digging, door routing, hazards, and threat costs. */
   configureMovements (movements = this._movements()) {
     if (!movements) return false
-    // The prototype patch calls this after every collision-index rebuild.
     movements._zincaiAfterCollisionIndex = () => this._applyBreakPolicy(movements)
     this._applyBreakPolicy(movements)
     this._configureBreakGuard(movements)
@@ -1205,10 +981,9 @@ class PathfinderWrapper {
     this._configureDoors(movements)
     this._configureWalkableSurfaces(movements)
     this._configureHazards(movements)
-    this._applyMode(movements)
+    movements.allowSprinting = true
+    movements.maxDropDown = 4
     this.threat.attachToMovements(movements)
-    // Build the escape planner's own Movements now, not in the first tick of
-    // the first escape (it costs a few tens of milliseconds once).
     if (movements === this._movements()) { try { this._escapeMovements() } catch { /* built on demand instead */ } }
     return true
   }
@@ -1311,9 +1086,8 @@ class PathfinderWrapper {
     // Sample immediately so the first path is already threat-aware.
     try { this.threat.sample(this.bot, true) } catch { /* no entity yet */ }
 
-    if (this.enableWindCharge && !this._onPathUpdate) {
+    if (!this._onPathUpdate) {
       this._onPathUpdate = (result) => {
-        // A* admitted defeat: is the blocker a gap/wall a wind charge can beat?
         if (!result || result.status !== 'noPath') return
         this._windChargeRecovery().catch((err) => this.log('debug', `wind recovery failed: ${err.message || err}`))
       }
@@ -1482,90 +1256,27 @@ class PathfinderWrapper {
     return { canDig: w.canDig ? [...w.canDig] : null, cantDig: [...w.cantDig], expiresAt: w.expiresAt }
   }
 
-  /**
-   * The standing dig policy, resolved to block ids for this registry — or null
-   * when an ordinary walk may not break anything (policy off, the operator's
-   * switch off, or no policy at all). Cached per policy version.
-   */
-  _passivePolicy () {
-    const policy = this.digPolicy
-    if (!policy) return null
-    let allowed = true
-    try { allowed = this.digAllowed() !== false } catch { allowed = true }
-    if (!allowed) return null
+  /** Soft natural block ids that ordinary walking may break when no detour exists. */
+  _softTerrainIds () {
     const registry = this.bot?.registry
-    const c = this._policyCache
-    if (c && c.version === policy.version && c.registry === registry) return c.value
-    let value = null
-    try {
-      const r = policy.resolve(registry)
-      if (r) {
-        const idOf = (name) => registry?.blocksByName?.[name]?.id
-        const ids = new Set()
-        for (const n of r.names || []) { const id = idOf(n); if (id !== undefined) ids.add(id) }
-        const never = new Set()
-        for (const n of r.never || []) { const id = idOf(n); if (id !== undefined) never.add(id) }
-        value = { all: Boolean(r.all), ids, never }
-      }
-    } catch (err) { this.log('debug', `dig policy unreadable: ${err.message || err}`); value = null }
-    this._policyCache = { version: policy.version, registry, value }
-    return value
+    if (!registry?.blocksArray) return null
+    if (this._softIdsCache && this._softIdsCache.registry === registry) return this._softIdsCache.ids
+    const ids = new Set()
+    for (const b of registry.blocksArray) {
+      if (isSoftWalkBlock(b.name)) ids.add(b.id)
+    }
+    this._softIdsCache = { registry, ids }
+    return ids
   }
 
-  /** The model edited its dig policy: plan the next step with the new rule. */
-  refreshDigPolicy () {
-    this._policyCache = null
-    const movements = this._movements()
-    if (movements) this._applyBreakPolicy(movements)
-    // A route that is being walked right now was planned under the old rule.
-    try {
-      const pf = this.bot?.pathfinder
-      if (movements && pf?.goal && typeof pf.isMoving === 'function' && pf.isMoving() && pf.movements === movements) pf.setMovements(movements)
-    } catch { /* the next plan picks it up */ }
-    return this._passivePolicy()
-  }
-
-  /** What an ordinary walk may break right now, for prompts and tests. */
-  get passiveDigging () {
-    if (this._digWindow && Date.now() <= this._digWindow.expiresAt) return null
-    const p = this._passivePolicy()
-    return p ? { all: p.all, ids: [...p.ids] } : null
-  }
-
-  /**
-   * Two different questions live here, and only one of them may be waived by
-   * the model's own `dig` corridor.
-   *
-   *   1. "Is this block part of something somebody built?" — a heuristic over
-   *      neighbouring block names. The model aiming a corridor at a wall of
-   *      stone is making a deliberate choice, so `dig` is allowed to suspend
-   *      this and tunnel through what it was pointed at.
-   *   2. "Is this block inside a claim that is not ours?" — not a heuristic,
-   *      and not the model's to override. A claim is another player's property;
-   *      the corridor is where the model wants to go, not a licence to cut
-   *      through somebody's house. This check therefore runs in EVERY mode,
-   *      including an open dig window.
-   *
-   * Conflating the two was the bug: one early return disabled both.
-   */
+  /** Protect other players' claimed regions from pathfinder breaking. */
   _configureBreakGuard (movements) {
     if (!Array.isArray(movements.exclusionAreasBreak) || movements.exclusionAreasBreak.some((f) => f && f._zincaiBreakGuard)) return
-    const bot = this.bot
     const guard = (block) => {
       if (!block?.position) return 0
-      // Claim first, unconditionally: no dig window, no policy switch, nothing
-      // the model can say makes another player's property fair game.
       try {
         if (this.isProtected && this.isProtected(block.position)) return 100
-      } catch { /* a broken claim lookup must not turn into a free pass */ return 100 }
-      if (this._digWindow && Date.now() <= this._digWindow.expiresAt) return 0
-      if (!this._passivePolicy()) return 0
-      try {
-        for (const [dx, dy, dz] of NEIGHBOURS) {
-          const nb = bot.blockAt(block.position.offset(dx, dy, dz), false)
-          if (nb && BUILT_NEIGHBOUR.test(nb.name || '')) return 100
-        }
-      } catch { return 0 }
+      } catch { return 100 }
       return 0
     }
     guard._zincaiBreakGuard = true
@@ -1581,75 +1292,44 @@ class PathfinderWrapper {
   }
 
   /**
-   * The whole break policy for one Movements, recomputed from scratch.
-   *
-   * It is recomputed, not patched: upstream's updateCollisionIndex() rebuilds
-   * blocksCantBreak on every plan, so anything added once disappears at the
-   * next replan. updateCollisionIndex is patched (once) to call back here, and
-   * beginDigging/endDigging call it directly.
+   * Recompute break policy for one Movements instance:
+   *  - Explicit `dig` corridor: any breakable block except unbreakables and doors.
+   *  - Ordinary walking (`go_to`): soft natural terrain only (higher cost so detours win).
    */
   _applyBreakPolicy (movements) {
     const open = Boolean(this._digWindow) && Date.now() <= this._digWindow.expiresAt
     const w = open ? this._digWindow : null
-    // No corridor open: the standing policy decides (the model's switch + list).
-    const policy = w ? null : this._passivePolicy()
-    const allowed = Boolean(w || policy)
-    // Upstream's own digCost (1) prices a break by its dig time, and its
-    // per-move cost cap (100) is what stops a very hard block from being an
-    // option at all. Raising digCost much would make a two-block-high tunnel
-    // through stone unaffordable, so the corridor keeps the default, the
-    // standing policy pays a little more (walk around when it is close), and
-    // "nothing allowed" is what makes breaking impossible.
-    movements.canDig = allowed
-    movements.digCost = w ? 1 : (policy ? this.policyDigCost : 1000)
-    // Never carve into a liquid wall, never mine what holds gravel or a mob up.
+    movements.canDig = true
+    movements.digCost = w ? 1 : this.policyDigCost
     movements.dontCreateFlow = true
     movements.dontMineUnderFallingBlock = true
 
     const set = movements.blocksCantBreak
     if (!set) return
-    // Upstream's own defaults (chests and friends) are captured once, so a
-    // lapsed window cannot leave an allowlist behind or erase that list.
     if (!movements._zincaiBaseCantBreak) movements._zincaiBaseCantBreak = new Set(set)
     set.clear()
     for (const id of movements._zincaiBaseCantBreak) set.add(id)
-    // Doors and gates are opened, never broken — in every window.
     for (const id of this._doorBlockIds()) set.add(id)
     const cant = (id) => { if (id !== undefined && id !== null) set.add(id) }
 
-    // The never-break list applies in EVERY mode: standing policy, `all`, and
-    // an open `dig` corridor. A corridor used to be narrowed to five names
-    // (bedrock and friends), which meant the one call the prompt recommends
-    // "when go_to reports no path" could tunnel straight through a barrel or a
-    // furnace. Whatever the model aims at, it is not aiming at somebody's
-    // storage.
-    {
-      const registry = this.bot?.registry
-      for (const name of NEVER_DIG_NAMES) cant(registry?.blocksByName?.[name]?.id)
-    }
+    const registry = this.bot?.registry
+    for (const name of UNBREAKABLE_BLOCKS) cant(registry?.blocksByName?.[name]?.id)
 
-    if (policy) {
-      const registry = this.bot?.registry
-      // The list is an allowlist: everything not on it is unbreakable. In mode
-      // "all" only the never-broken blocks are.
-      if (!policy.all && registry?.blocksArray) for (const b of registry.blocksArray) if (!policy.ids.has(b.id)) cant(b.id)
-      for (const id of policy.never) cant(id)
-    }
     if (w) {
-      const registry = this.bot?.registry
-      if (w.canDig) {
-        // An allowlist: everything not named is unbreakable.
-        if (registry?.blocksArray) for (const b of registry.blocksArray) if (!w.canDig.has(b.id)) cant(b.id)
+      // Explicit dig corridor: unlock containers/workstations too if the model intentionally digs through them;
+      // only unbreakable blocks, doors, and explicit cantDig exclusions stay blocked.
+      if (w.canDig && registry?.blocksArray) {
+        for (const b of registry.blocksArray) if (!w.canDig.has(b.id)) cant(b.id)
       }
       for (const id of w.cantDig) cant(id)
+    } else {
+      const softIds = this._softTerrainIds()
+      if (softIds && registry?.blocksArray) {
+        for (const b of registry.blocksArray) if (!softIds.has(b.id)) cant(b.id)
+      }
     }
   }
 
-  /**
-   * Upstream rebuilds blocksCantBreak inside updateCollisionIndex(), which runs
-   * on every plan — so the break policy has to be re-asserted after it, not
-   * before it. One prototype patch per loaded package, per instance hook.
-   */
   _patchCollisionIndex () {
     try {
       const { Movements } = require('mineflayer-pathfinder')
@@ -1663,11 +1343,10 @@ class PathfinderWrapper {
     }
   }
 
-  // --------------------------------------------------------- scaffolding--
+  // Ordinary walking never places scaffolding blocks; explicit build tools handle placement.
   _configureScaffolding (movements) {
-    if (this.allowScaffolding) return
     movements.allow1by1towers = false
-    movements.scafoldingBlocks = [] // (sic) upstream's spelling
+    movements.scafoldingBlocks = []
   }
 
   /**
@@ -2010,7 +1689,6 @@ module.exports = {
   makeEscapePlanner,
   configureHazards,
   WindChargeTraversal,
-  scoutSafeAnchor,
   findGroundY,
   projectFuture,
   pointSegmentDistance,
@@ -2019,5 +1697,7 @@ module.exports = {
   standoffFor,
   isDoorOrTrapdoorName,
   HOSTILE_RE,
-  WIND_CHARGE_ITEM
+  WIND_CHARGE_ITEM,
+  UNBREAKABLE_BLOCKS,
+  PASSIVE_WALK_SOFT_BLOCKS
 }

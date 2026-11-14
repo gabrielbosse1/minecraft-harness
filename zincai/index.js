@@ -67,7 +67,7 @@ const settings = require('../src/settings')
 
 const ROOT = path.join(__dirname, '..')
 const ZINC_DIR = __dirname
-const DATA_DIR = settings.str('ZINC_DATA_DIR', path.join(ROOT, 'zincai-data'))
+const DATA_DIR = settings.str('ZINC_DATA_DIR', path.join(ROOT, 'data'))
 const SYSTEM_PROMPT = fs.readFileSync(path.join(ZINC_DIR, 'system_prompt.txt'), 'utf8').trim()
 const CHAT_PROMPT = fs.readFileSync(path.join(ZINC_DIR, 'chat_prompt.txt'), 'utf8').trim()
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
@@ -76,6 +76,7 @@ const { stamp: ircStamp, ago: ircAgo, formatLine: ircLine, LEGEND: IRC_LEGEND } 
 const { FailGate } = require('./failgate')
 const { ContinuityStore } = require('./continuity')
 const { LaneScheduler, JobRegistry, laneOf, LANES } = require('./lanes')
+const { TelemetryRecorder } = require('./telemetry')
 const ZINC_TOOLS = createZincTools()
 
 // logger.js is plain text with ISO timestamps — Pufferpanel-safe by design.
@@ -126,16 +127,13 @@ function loadConfig () {
       apiKey: settings.apiKey() || raw.amd.apiKey || null,
       baseUrl: settings.str(['AMD_API_BASE_URL', 'amd.baseUrl'], raw.amd.baseUrl).replace(/\/+$/, ''),
       model: settings.str(['AMD_MODEL', 'amd.model'], raw.amd.model),
-      maxTokens: settings.int(['AMD_MAX_TOKENS', 'amd.maxTokens'], raw.amd.maxTokens ?? 256, { min: 16, max: 4096 }),
+      maxTokens: settings.int(['AMD_MAX_TOKENS', 'amd.maxTokens'], raw.amd.maxTokens ?? 1024, { min: 16, max: 8192 }),
       temperature: settings.float(['AMD_TEMPERATURE', 'amd.temperature'], raw.amd.temperature ?? 0.25, { min: 0, max: 1.5 }),
-      timeoutMs: settings.int(['AMD_API_TIMEOUT_MS', 'amd.timeoutMs'], raw.amd.timeoutMs ?? 20_000, { min: 1_000, max: 600_000 }),
+      timeoutMs: settings.int(['AMD_API_TIMEOUT_MS', 'amd.timeoutMs'], raw.amd.timeoutMs ?? 120_000, { min: 1_000, max: 600_000 }),
       maxRetries: settings.int(['AMD_API_MAX_RETRIES', 'amd.maxRetries'], raw.amd.maxRetries ?? 2, { min: 0, max: 5 }),
       maxConcurrent: settings.int(['AMD_MAX_CONCURRENT', 'amd.maxConcurrent'], raw.amd.maxConcurrent ?? 2, { min: 1, max: 8 }),
       chatTimeoutMs: settings.int(['AMD_CHAT_TIMEOUT_MS', 'amd.chatTimeoutMs'], raw.amd.chatTimeoutMs ?? null, { min: 1_000, max: 600_000 }),
-      chatMaxRetries: settings.int(['AMD_CHAT_MAX_RETRIES', 'amd.chatMaxRetries'], raw.amd.chatMaxRetries ?? 1, { min: 0, max: 5 }),
-      // Room for the ONE retry of an answer the output limit cut off (never less than maxTokens).
-      rescueMaxTokens: settings.int(['AMD_RESCUE_MAX_TOKENS', 'amd.rescueMaxTokens'], raw.amd.rescueMaxTokens ?? 1024, { min: 64, max: 8192 }),
-      thinkMaxTokens: settings.int(['AMD_THINK_MAX_TOKENS', 'amd.thinkMaxTokens'], raw.amd.thinkMaxTokens ?? 1536, { min: 64, max: 8192 })
+      chatMaxRetries: settings.int(['AMD_CHAT_MAX_RETRIES', 'amd.chatMaxRetries'], raw.amd.chatMaxRetries ?? 1, { min: 0, max: 5 })
     },
     inference: raw.inference || {},
     memory: raw.memory || {},
@@ -146,31 +144,23 @@ function loadConfig () {
     combat: raw.combat || {},
     threat: raw.threat || {},
     traversal: raw.traversal || {},
-    scout: raw.scout || {},
     reconnect: raw.reconnect || {},
     places: raw.places || {},
     goals: raw.goals || {},
     vision: raw.vision || {},
-    compaction: raw.compaction || {}
+    compaction: raw.compaction || {},
+    telemetry: raw.telemetry || {}
   }
-  // Reasoning control and the screenshot switch are worth a panel/env variable:
-  // they are the two knobs that depend on which model the endpoint serves.
-  cfg.inference.thinking = opt(option('INFERENCE_THINKING', 'inference.thinking', cfg.inference.thinking || 'adaptive', ['adaptive', 'auto', 'on', 'off']))
-  cfg.inference.chatThinking = opt(option('INFERENCE_CHAT_THINKING', 'inference.chatThinking', cfg.inference.chatThinking || 'off', ['auto', 'on', 'off']))
-  cfg.vision.enabled = settings.bool('VISION_ENABLED', cfg.vision.enabled ?? true)
 
-  // A handful of behaviour knobs are worth exposing to the panel without a
-  // defaults.json edit; they win over the file only when actually set.
-  cfg.behavior.allowScaffolding = settings.bool('MC_ALLOW_SCAFFOLDING', cfg.behavior.allowScaffolding ?? false)
-  cfg.behavior.autoElytra = settings.bool('MC_AUTO_ELYTRA', cfg.behavior.autoElytra ?? true)
   cfg.inference.rpm = settings.int('INFERENCE_RPM', cfg.inference.rpm, { min: 1, max: 600 })
   cfg.inference.minIntervalMs = settings.int('INFERENCE_MIN_INTERVAL_MS', cfg.inference.minIntervalMs, { min: 0 })
   cfg.inference.heartbeatMs = settings.int('INFERENCE_HEARTBEAT_MS', cfg.inference.heartbeatMs, { min: 0 })
   cfg.inference.loopMs = settings.int('INFERENCE_LOOP_MS', cfg.inference.loopMs ?? 8000, { min: 0 })
   cfg.inference.chatBatchMs = settings.int('INFERENCE_CHAT_BATCH_MS', cfg.inference.chatBatchMs ?? 6000, { min: 0 })
-  cfg.reconnect.enabled = settings.bool('RECONNECT', cfg.reconnect.enabled ?? true)
   cfg.reconnect.maxAttempts = settings.int('RECONNECT_MAX_ATTEMPTS', cfg.reconnect.maxAttempts, { min: 1 })
   cfg.reconnect.keepAliveTimeoutMs = settings.int('KEEPALIVE_TIMEOUT_MS', cfg.reconnect.keepAliveTimeoutMs ?? 60_000, { min: 20_000 })
+  cfg.telemetry.flushIntervalMs = settings.int('TELEMETRY_FLUSH_MS', cfg.telemetry.flushIntervalMs ?? 5000, { min: 250, max: 60_000 })
+  cfg.telemetry.maxBuffer = settings.int('TELEMETRY_MAX_BUFFER', cfg.telemetry.maxBuffer ?? 50, { min: 1, max: 1000 })
 
   // Used by validateConfig() and the --dry-run summary; never logged with values.
   Object.defineProperty(cfg, '_rejectedOptions', { value: rejected, enumerable: false })
@@ -200,7 +190,7 @@ function makeShared (cfg, { dataDir = DATA_DIR } = {}) {
   const { PlaceIndex } = require('./places')
   const { BlueprintParser } = require('./builder')
   const { GoalRegistry } = require('./goals')
-  const at = (configured, fallback) => path.join(dataDir, String(configured || fallback).replace(/^zincai-data[/\\]/, ''))
+  const at = (configured, fallback) => path.join(dataDir, String(configured || fallback).replace(/^(?:zincai-data|data)[/\\]/, ''))
   const memoryFile = at(cfg.memory.file, 'memories.json')
   const shared = {
     cfg,
@@ -214,8 +204,6 @@ function makeShared (cfg, { dataDir = DATA_DIR } = {}) {
       ephemeralMs: cfg.memory.ephemeralMs ?? 30_000
     }),
     places: new PlaceIndex({ file: at(cfg.places.file, 'places.json'), logger: (level, msg) => logger[level]?.(TAG, msg) }),
-    // Durable objectives: the agenda below is session RAM, this is the record
-    // that survives a context reset, a death and a restart (goals.js).
     goals: new GoalRegistry({
       file: at(cfg.goals?.file, 'goals.json'),
       logger: (level, msg) => logger[level]?.(TAG, msg),
@@ -236,36 +224,24 @@ function makeShared (cfg, { dataDir = DATA_DIR } = {}) {
       maxTokens: cfg.amd.maxTokens,
       maxConcurrent: cfg.amd.maxConcurrent ?? 2,
       chatTimeoutMs: cfg.amd.chatTimeoutMs ?? null,
-      chatMaxRetries: cfg.amd.chatMaxRetries ?? 1,
-      thinking: cfg.inference?.thinking ?? 'adaptive',
-      thinkMaxTokens: cfg.amd.thinkMaxTokens ?? null,
-      chatThinking: cfg.inference?.chatThinking ?? 'off',
-      rescueMaxTokens: cfg.amd.rescueMaxTokens ?? null
+      chatMaxRetries: cfg.amd.chatMaxRetries ?? 1
     }),
     parser: new BlueprintParser({ scaffoldBlocks: cfg.build.scaffoldBlocks, reach: cfg.build.reach }),
-    // Durable perception journal: undelivered important events survive a
-    // context reset AND a process restart; already-processed ones never replay.
     events: new (require('./events').EventPipeline)({ file: at(cfg.events?.journalFile, 'events-journal.json') }),
     redstoneLibrary: new (require('./redstone_engine').RedstoneLibrary)(at(cfg.redstone?.libraryFile, 'redstone-library.json')),
-    /** per-player conversation, oldest first: name -> [{ who:'them'|'me', text, ts }] */
     convo: new Map(),
-    /** everything said in public recently, both sides */
     chatLog: [],
-    /** chat AND events as one timestamped IRC-style log (irc.js) — what the prompts show */
     timeline: new (require('./irc').Timeline)({ max: cfg.inference?.timelineMax ?? 80 }),
-    /** the model's standing rule for what a walk may break (dig_policy.js); persisted */
-    digPolicy: new (require('./dig_policy').DigPolicy)({
-      file: path.join(dataDir, 'dig-policy.json'),
-      enabled: cfg.behavior?.digging?.enabled !== false,
-      mode: cfg.behavior?.digging?.mode || 'list',
-      allow: Array.isArray(cfg.behavior?.digging?.allow) ? cfg.behavior.digging.allow : null,
-      logger: (level, msg) => logger[level]?.(TAG, msg)
-    }),
-    /** compaction with goal continuation (journal.js): what was done for each goal, its plan and next step; persisted */
     journal: new (require('./journal').WorkJournal)({
       file: path.join(dataDir, 'journal.json'),
       keepRecent: cfg.compaction?.keepRecent ?? 10,
       maxDigest: cfg.compaction?.maxDigest ?? 8,
+      logger: (level, msg) => logger[level]?.(TAG, msg)
+    }),
+    telemetry: new TelemetryRecorder({
+      dataDir,
+      flushIntervalMs: cfg.telemetry?.flushIntervalMs ?? 5000,
+      maxBuffer: cfg.telemetry?.maxBuffer ?? 50,
       logger: (level, msg) => logger[level]?.(TAG, msg)
     }),
     shuttingDown: false,
@@ -305,7 +281,7 @@ function makeShared (cfg, { dataDir = DATA_DIR } = {}) {
  */
 function main () {
   if (process.argv.includes('--check')) {
-    for (const m of ['./api_wrapper', './memory', './perception', './filter', './builder', './continuity', './custom_mineflayer/pathfinder_wrapper', './custom_mineflayer/doors', './custom_mineflayer/escape', './system1', './tactics', './reflex_registry', './vanilla_guard', './control', './threats', './places', './skills', './observe', './brain', './events', './redstone_engine', './runtime_config', './boundary', './connection', './death_recovery', './host', './control_commands', './irc', './dig_policy', './updater', './supervisor', './watchdog', './protocol_keepalive', './block_search', './armor', './lanes', './goals']) require(m)
+    for (const m of ['./api_wrapper', './memory', './perception', './filter', './builder', './continuity', './custom_mineflayer/pathfinder_wrapper', './custom_mineflayer/doors', './custom_mineflayer/escape', './system1', './tactics', './reflex_registry', './vanilla_guard', './control', './threats', './places', './skills', './observe', './brain', './events', './redstone_engine', './runtime_config', './boundary', './connection', './death_recovery', './host', './control_commands', './irc', './telemetry', './updater', './supervisor', './watchdog', './protocol_keepalive', './block_search', './armor', './lanes', './goals']) require(m)
     require('minecraft-data')('26.3') // postinstall patch must be in place
     logger.info(TAG, '--check OK — all modules load, 26.3 data present')
     return
@@ -317,17 +293,13 @@ function main () {
     const errors = validateConfig(cfg)
     logger.info(TAG, `config: host=${cfg.server.host} port=${cfg.server.port} user=${cfg.server.username} auth=${cfg.server.auth} version=${cfg.server.version || 'auto'}`)
     logger.info(TAG, `amd: model=${cfg.amd.model} base=${cfg.amd.baseUrl} key=${cfg.amd.apiKey ? 'present' : 'MISSING'}`)
-    logger.info(TAG, `data dir: ${DATA_DIR} (memories, places, goals, metrics, runtime-config)`)
-    logger.info(TAG, `behaviour: elytra=${cfg.behavior.autoElytra ? 'yes' : 'no'} limits=${cfg.inference.rpm}/min`)
+    logger.info(TAG, `data dir: ${DATA_DIR} (sessions telemetry, memories, places, goals, journal, runtime-config)`)
     logger.info(TAG, `agent loop: ${cfg.inference.heartbeatMs > 0 && cfg.inference.loopMs > 0 ? `every ${cfg.inference.loopMs}ms, backing off to ${cfg.inference.heartbeatMs}ms while idle` : 'off (events only)'}; up to ${cfg.inference.maxStepsPerTurn ?? 6} model steps per turn; chat window ${cfg.inference.chatBatchMs}ms`)
-    logger.info(TAG, `limits: rpm=${cfg.inference.rpm} minInterval=${cfg.inference.minIntervalMs}ms heartbeat=${cfg.inference.heartbeatMs}ms reconnect=${cfg.reconnect.enabled ? `${cfg.reconnect.maxAttempts} attempts` : 'off'} serverTrafficTimeout=${cfg.reconnect.keepAliveTimeoutMs}ms`)
+    logger.info(TAG, `limits: rpm=${cfg.inference.rpm} minInterval=${cfg.inference.minIntervalMs}ms heartbeat=${cfg.inference.heartbeatMs}ms reconnect=${cfg.reconnect.maxAttempts} attempts serverTrafficTimeout=${cfg.reconnect.keepAliveTimeoutMs}ms`)
     logger.info(TAG, `prompts: action ${SYSTEM_PROMPT.split(/\s+/).length} words, chat ${CHAT_PROMPT.split(/\s+/).length} words (static), ${ZINC_TOOLS.length} tools`)
-    logger.info(TAG, 'policy: flee from real threats until the model decides; no PvP unless the model names a player; no friend list')
-    // The control plane is part of the preflight: an empty operator list and a
-    // prefix nobody knows are configuration mistakes, not surprises at runtime.
     try {
       const rc = new (require('./runtime_config').RuntimeConfig)({ file: path.join(DATA_DIR, 'runtime-config.json') })
-      logger.info(TAG, `control: console=${rc.get('control.allowConsole') ? 'stdin' : 'off'} (no chat commands; no prefix) joinOnStart=${rc.get('connection.joinOnStart') ? 'yes' : 'no'}`)
+      logger.info(TAG, `control: console=${rc.get('control.allowConsole') ? 'stdin' : 'off'} (no chat commands; no prefix)`)
     } catch (err) { logger.warn(TAG, `control: could not read the runtime config: ${err?.message || err}`) }
     for (const e of errors) logger.error(TAG, e)
     process.exitCode = errors.length ? 1 : 0
@@ -342,6 +314,12 @@ function main () {
 
   const shared = makeShared(cfg)
   const { memoryFile } = shared
+  shared.telemetry.start({
+    host: cfg.server.host,
+    port: cfg.server.port,
+    model: cfg.amd.model,
+    version: cfg.server.version || 'auto'
+  })
 
   function summary () {
     const s = shared.amd.getStats()
@@ -350,9 +328,6 @@ function main () {
     logger.info(TAG, `memory: long-term ${shared.memory.longTerm.entries.length} entries saved to ${memoryFile}; places ${shared.places.blocks.size} blocks, ${shared.places.named.size} named`)
   }
 
-  // One Host for the whole process: it owns the runtime configuration, the
-  // physical boundary, the link state machine and the command interface.
-  // A session is something the Host creates, not something main() is.
   const host = shared.host || (shared.host = createHost(shared, cfg))
 
   function shutdown (code, reason) {
@@ -363,32 +338,29 @@ function main () {
     try { shared.memory.save() } catch { /* best effort */ }
     try { shared.places.save(true) } catch { /* best effort */ }
     try { shared.saveConvo() } catch { /* best effort */ }
+    try { shared.telemetry.close(reason) } catch { /* best effort */ }
     summary()
-    // Hard-exit safety net: the process must die with `code` even if the
-    // socket never closes (join failure before spawn, etc.).
     setTimeout(() => process.exit(code), 1_000)
   }
   shared.shutdown = shutdown
 
-  // A link that cannot be retried (a rejected first join, a ban, an exhausted
-  // retry budget) ends the process — the same rule as before, now decided by
-  // the connection manager instead of a setTimeout chain.
   host.on('fatal', (info) => {
     for (const line of fatalLines(info)) logger.error(TAG, line)
     shutdown(info?.reason === 'retries-exhausted' || info?.reason === 'fatal-error' || info?.reason === 'join-failed' ? 1 : 0, info?.reason || 'fatal')
   })
-  host.on('ended' in host ? 'ended' : 'detach', () => { try { shared.memory.save(); shared.places.save(true) } catch { /* best effort */ } })
-  host.connection.on('ended', () => { try { shared.memory.save(); shared.places.save(true) } catch { /* best effort */ } })
+  host.on('ended' in host ? 'ended' : 'detach', () => { try { shared.memory.save(); shared.places.save(true); shared.telemetry.flush({ reason: 'detach' }) } catch { /* best effort */ } })
+  host.connection.on('ended', () => { try { shared.memory.save(); shared.places.save(true); shared.telemetry.flush({ reason: 'connection_ended' }) } catch { /* best effort */ } })
 
   process.on('SIGINT', () => shutdown(0, 'SIGINT'))
   process.on('SIGTERM', () => shutdown(0, 'SIGTERM'))
-  // The supervisor was killed outright (panel Kill, kill -9, OOM) and could not
-  // pass a signal on: leave the server and exit instead of running on unowned.
   require('./supervisor').watchParent({ onGone: () => shutdown(0, 'the supervisor process is gone') })
-  process.on('unhandledRejection', (err) => logger.error(TAG, `unhandled rejection: ${err?.message || err}`))
+  process.on('unhandledRejection', (err) => {
+    logger.error(TAG, `unhandled rejection: ${err?.message || err}`)
+    try { shared.telemetry.error('unhandledRejection', err) } catch { /* noop */ }
+  })
   process.on('exit', (code) => {
     try { shared.memory.save() } catch { /* best effort */ }
-    // 75 is not a failure: it is `update` / `restart` asking the supervisor for a fresh process.
+    try { shared.telemetry.close(`exit_${code}`) } catch { /* best effort */ }
     if (code === require('./supervisor').RESTART_CODE) logger.info(TAG, 'exiting to restart on the source on disk')
     else if (code !== 0) logger.error(TAG, `exit code ${code}`)
   })
@@ -466,15 +438,14 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   const journal = shared.journal
   const { compactSteps } = require('./journal')
   const vision = require('./vision')
-  const { decideEffort, QUESTION_TOOLS } = require('./effort')
   const VISION = cfg.vision || {}
-  // One timestamped IRC-style log of chat and events (irc.js), and the model's
-  // standing dig policy. Both live on `shared` so they outlive a reconnect.
   const timeline = shared.timeline || (shared.timeline = new (require('./irc').Timeline)())
-  const digPolicy = shared.digPolicy || (shared.digPolicy = new (require('./dig_policy').DigPolicy)({ file: null }))
-  // The host is the process-level shell. When a session is started directly
-  // (the test harness), a minimal one is created so the boundary, the control
-  // interface and the pause flag behave exactly as in production.
+  const telemetry = shared.telemetry || (shared.telemetry = new TelemetryRecorder({
+    dataDir: shared.dataDir || DATA_DIR,
+    flushIntervalMs: cfg.telemetry?.flushIntervalMs ?? 5000,
+    maxBuffer: cfg.telemetry?.maxBuffer ?? 50,
+    logger: (level, msg) => logger[level]?.(TAG, msg)
+  }))
   const owner = host || shared.host || null
   // The shared enforcement boundary. It is consulted by the lane scheduler,
   // by every lane's key/goal write, by each physical tool and by the bot-level
@@ -512,7 +483,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   const { buildVisionBlock, VISION_LEGEND } = require('./perception')
   const filter = require('./filter')
   const { BuilderExecutor, generateShape, normalizeStage } = require('./builder')
-  const { PathfinderWrapper, scoutSafeAnchor } = require('./custom_mineflayer/pathfinder_wrapper')
+  const { PathfinderWrapper } = require('./custom_mineflayer/pathfinder_wrapper')
   const { installVanillaGuard, assertVanillaAction } = require('./vanilla_guard')
   const { System1 } = require('./system1')
   const { ReflexRegistry, runScript } = require('./reflex_registry')
@@ -597,15 +568,9 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   // a lane that would drive the body while it is paused or forbidden stays
   // silent instead of pressing keys into a wall.
   arbiter.setGate((cap) => boundary.check('__lane__', { caps: [cap] }))
-  // Wears the best armor carried (armor.js). It looks at the inventory when
-  // something changes — it never reads an item out of an entity, which is how
-  // the plugin it replaces crashed the process — and it leaves alone every
-  // slot the model dressed or emptied itself. The model's choice (auto on/off,
-  // held slots) lives on `shared`, so a reconnect does not forget it.
-  const armorPrefs = shared.armorPrefs || (shared.armorPrefs = { auto: cfg.behavior.useArmorManager !== false, held: new Set() })
+  const armorPrefs = shared.armorPrefs || (shared.armorPrefs = { held: new Set() })
   const armor = new ArmorKeeper(bot, {
     prefs: armorPrefs,
-    // Through the hand lock: one click sequence at a time, never across an eat or a swap.
     equip: (item, dest) => arbiter.useHand('armor', item, async () => {}, { dest, restore: false, priority: PRIORITY.task }),
     log: (level, msg) => logger[level]?.(TAG, msg),
     onWorn: (list) => note({ type: 'armor', msg: list.map((w) => `put on ${w.on}${w.off ? ` (was ${w.off})` : ''}`).join(', ') })
@@ -617,19 +582,11 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     reachable: makeReachabilityCheck(bot, { Movements, goals })
   })
   const wrapper = new PathfinderWrapper(bot, {
-    allowScaffolding: cfg.behavior.allowScaffolding === true,
     logger: wrapperLog,
-    // A* only pays for threats that are real (line of sight / reachable / hit us).
     threat: { ...(cfg.threat || {}), entityFilter: (e) => sense.isThreat(e) },
     isUrgent: () => arbiter.owner() === 'survival' || arbiter.owner() === 'combat',
-    enableWindCharge: cfg.traversal?.windCharge !== false,
     windCharge: cfg.traversal || {},
-    // What an ordinary walk may break: the model's standing policy, under the
-    // operator's switch, and never inside somebody else's build.
-    digPolicy,
-    digAllowed: () => config.get('actions.allowDig') !== false && config.get('actions.allowMovement') !== false,
-    isProtected: (pos) => { try { return !continuity.propertyGuardAt(pos, dim(), {}).ok } catch { return false } },
-    policyDigCost: cfg.behavior?.digging?.cost
+    isProtected: (pos) => { try { return !continuity.propertyGuardAt(pos, dim(), {}).ok } catch { return false } }
   })
 
   let spawned = false
@@ -735,6 +692,18 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         importance: spec.importance
       }, bot)
     } catch (err) { logger.debug(TAG, `event record failed: ${err.message || err}`) }
+    try {
+      telemetry.worldEvent({
+        eventType: spec.eventType || spec.type || 'misc',
+        source: spec.source || 'world',
+        reactionClass: spec.reactionClass || 'ambient',
+        summary: spec.summary || spec.text || spec.msg || '',
+        where: spec.where === undefined ? here() : (spec.where || null),
+        entities: spec.entities || [],
+        delta: spec.delta || null,
+        importance: spec.importance ?? 0
+      })
+    } catch { /* telemetry best effort */ }
     if (spec.remember !== false) {
       note({
         type: spec.memoryType || spec.eventType || 'event',
@@ -813,32 +782,12 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     shared.chatLog.push({ who, text, ts: Date.now() })
     if (shared.chatLog.length > 12) shared.chatLog.splice(0, shared.chatLog.length - 12)
   }
-  /** The bot's own nick in the IRC log. */
   const selfNick = () => bot.username || cfg.server?.username || 'Zinc'
-  /**
-   * Communication permissions. These are permission checks, not instructions:
-   * they do not tell Zinc what to say or whom to trust — they decide only
-   * whether a line may leave the process.
-   */
-  function maySpeak ({ to = null } = {}) {
-    if (to) return config.get('communication.privateMessages') !== false
-    return config.get('communication.publicChat') !== false
-  }
 
-  /** May the bot answer a player who addressed it at all? */
-  function canReplyToChat () { return config.get('communication.replyToChat') !== false }
-
-  /** Queue a chat line. Lines are spaced out, never dropped. */
+  /** Queue a chat line. Lines are spaced out at 1 line/sec, never dropped. */
   function speak (text, { to = null, about = null } = {}) {
     const t = String(text || '').replace(/\s+/g, ' ').trim().replace(/^\/+/, '').slice(0, 200)
     if (!t) return false
-    if (!maySpeak({ to })) {
-      logger.warn(TAG, `speech refused: ${to ? 'communication.privateMessages' : 'communication.publicChat'} is off`)
-      // Tell the model the line did not go out, so it does not believe a
-      // refusal is a delivery.
-      report('say', { ok: false, msg: `NOT SENT — ${to ? 'private messages' : 'public chat'} are switched off by the operator (${to ? 'communication.privateMessages' : 'communication.publicChat'})` }, { wake: false })
-      return false
-    }
     sayQueue.push({ text: t, to, about })
     if (sayQueue.length > 6) sayQueue.splice(0, sayQueue.length - 6)
     flushSay()
@@ -846,18 +795,6 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   }
   function flushSay () {
     if (!sayQueue.length || ended) return
-    // Two things used to happen here and no longer do: a per-minute cap on
-    // public lines (limits.maxPublicChatPerMinute) that DROPPED the text once
-    // reached, and a `behavior.chatCooldownMs` gap that throttled speech. A cap
-    // that discards what the model decided to say is the harness overriding its
-    // judgement; a dropped line is also invisible to the model.
-    //
-    // What remains is a pacing floor of one line per second. That is the
-    // Minecraft server's own chat-rate behaviour (and most plugins mute a
-    // burst), written where the model can see it: the line waits in the queue
-    // and goes out, and `say` reports that it was queued. Nothing is discarded
-    // for being the fifth line of the minute — the only budget left is the
-    // model's API calls, not its words.
     const wait = 1000 - (Date.now() - lastSayAt)
     if (wait > 0) { const t = setTimeout(() => { timers.delete(t); flushSay() }, wait + 20); timers.add(t); return }
     const { text, to, about } = sayQueue.shift()
@@ -866,6 +803,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       const whispered = to ? guard.whisper(to, text) : false
       if (to && !whispered) {
         logger.warn(TAG, `private message to ${to} not sent (recipient unavailable or invalid); never falling back to public chat`)
+        try { telemetry.chatOut({ text, to, about, sent: false, reason: 'recipient_unavailable' }) } catch { /* noop */ }
         if (sayQueue.length) flushSay()
         return
       }
@@ -874,12 +812,13 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       timeline.said(text, { to: whispered ? to : null })
       if (to || about) pushConvo(to || about, 'me', text)
       note({ type: 'said', msg: `I said${whispered ? ` to ${to}` : ''}: ${text}` })
+      try { telemetry.chatOut({ text, to: whispered ? to : null, about, sent: true }) } catch { /* noop */ }
     } catch (err) { logger.debug(TAG, `chat failed: ${err.message || err}`) }
     if (sayQueue.length) flushSay()
   }
 
   // ------------------------------------------------------ action results --
-  const INFORMATIONAL = new Set(['find', 'look_in', 'inspect_block', 'inspect_region', 'screenshot', 'logic_test', 'redstone_scan', 'redstone_component', 'redstone_engineer', 'recall', 'circuit_project', 'goal', 'note', 'social', 'remember_here', 'dig_policy'])
+  const INFORMATIONAL = new Set(['find', 'look_in', 'inspect_block', 'inspect_region', 'screenshot', 'logic_test', 'redstone_scan', 'redstone_component', 'redstone_engineer', 'recall', 'circuit_project', 'goal', 'note', 'social', 'remember_here'])
   // stop the model re-issuing a call the body keeps refusing.
   const failGate = new FailGate({
     windowMs: cfg.inference?.failWindowMs ?? 120_000,
@@ -966,16 +905,21 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     logger.info(TAG, `${label}: ${r.ok ? 'ok' : 'FAILED'} — ${msg}`)
     note({ type: 'result', msg: `${label}: ${msg}` })
     // The work journal: what was done for which goal (compacted, persisted).
+    const execArgs = gateCtx && String(gateCtx.a) === label ? goalArgs(gateCtx) : (agenda.main?.tool === label ? (agenda.main.detail?.args || {}) : {})
+    const execGoalId = agenda.main?.goalId || journal.focus || null
     try {
       journal.record({
         tool: label,
-        args: gateCtx && String(gateCtx.a) === label ? goalArgs(gateCtx) : (agenda.main?.tool === label ? (agenda.main.detail?.args || {}) : {}),
+        args: execArgs,
         ok: Boolean(r.ok),
         msg,
-        goalId: agenda.main?.goalId || journal.focus || null,
+        goalId: execGoalId,
         pos: here()
       })
     } catch { /* the journal never breaks reporting */ }
+    try {
+      telemetry.toolExec({ tool: label, args: execArgs, ok: Boolean(r.ok), msg, goalId: execGoalId })
+    } catch { /* telemetry best effort */ }
     // Promote durable world/exploration findings (not ephemeral walk/eat failures) to long-term memory.
     if (r.ok) {
       try {
@@ -1130,11 +1074,19 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     if (r?.progress) goalReg.progress(goalId, r.progress)
     if (/\b(replaced|paused|cancelled)\b/i.test(msg)) {
       goalReg.suspend(goalId, { reason: msg.slice(0, 100), by: 'task' })
+      try { telemetry.goalEvent({ op: 'suspend', goalId, description: goal.label, status: 'suspended', note: msg }); syncContinuation('goal_suspend') } catch { /* noop */ }
       return
     }
-    if (r && r.ok && r.complete !== false) goalReg.complete(goalId, { note: msg })
-    else if (r && r.ok) goalReg.suspend(goalId, { reason: `stopped before finishing: ${msg.slice(0, 90)}`, by: 'task' })
-    else goalReg.fail(goalId, { error: msg || 'failed' })
+    if (r && r.ok && r.complete !== false) {
+      goalReg.complete(goalId, { note: msg })
+      try { telemetry.goalEvent({ op: 'complete', goalId, description: goal.label, status: 'completed', note: msg }); syncContinuation('goal_complete') } catch { /* noop */ }
+    } else if (r && r.ok) {
+      goalReg.suspend(goalId, { reason: `stopped before finishing: ${msg.slice(0, 90)}`, by: 'task' })
+      try { telemetry.goalEvent({ op: 'suspend', goalId, description: goal.label, status: 'suspended', note: msg }); syncContinuation('goal_suspend') } catch { /* noop */ }
+    } else {
+      goalReg.fail(goalId, { error: msg || 'failed' })
+      try { telemetry.goalEvent({ op: 'fail', goalId, description: goal.label, status: 'failed', note: msg }); syncContinuation('goal_fail') } catch { /* noop */ }
+    }
   }
 
   /** Start (or restart after a pause) the main task. */
@@ -1422,7 +1374,6 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   // or resurrect a task that another controller already replaced.
   const QUIET_TASKS = new Set(['build', 'build_shape', 'gather', 'take', 'put', 'smelt', 'sleep', 'use_block', 'craft', 'look_in', 'light_up', 'shelter', 'follow', 'go_to', 'dig', 'run_script'])
   function staleActionReason (action, snap) {
-    if (GOALS.staleGuard === false) return null // opt out from config (debugging)
     if (!snap || !QUIET_TASKS.has(action.a)) return null
     const known = new Set(snap.threatIds || [])
     const fresh = [...(sense.last?.dangerIds || [])].filter((id) => !known.has(id))
@@ -2018,17 +1969,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     return `${label} (IRC style, oldest first; it is now ${ircStamp(Date.now())}; ${IRC_LEGEND}; you are <${selfNick()}>)`
   }
 
-  /** What a walk may break right now — the model's own standing rule. */
-  function diggingLine () {
-    if (config.get('actions.allowDig') === false) return 'digging: OFF by the operator (actions.allowDig) — nothing can be broken'
-    return `digging: ${digPolicy.describe()}`
-  }
-
-  /**
-   * Is the body holding something you *build* with? The 3D cross-section used
-   * to be builder-mode-only; the grid is now offered whenever the situation
-   * looks like building, so the model is never handed a build job blind.
-   */
+  /** True when the bot is holding a placeable block or running a build task. */
   // A name regex here meant a quartz, blackstone, tuff or prismarine builder
   // was handed no grid at all while a dirt builder got one — the prompt promises
   // "never handed a build blind". Ask the registry instead: it knows exactly
@@ -2133,7 +2074,6 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       named ? `places: ${named}` : null,
       prefs || null,
       recalled || null,
-      diggingLine(),
       chat ? `${logHeader('log')}:\n${chat}` : null,
       res ? `results (your last actions):\n${res}` : null,
       perceived.text ? `perceived (timestamped; [NEW] = not yet delivered, "(scanned_diff)" = you discovered it late, exact time unknown):\n${perceived.text}` : null,
@@ -2142,22 +2082,14 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       justNow,
       `why now: ${reasons.join('; ')}`
     ]
-    // The 3D grid used to be builder-only. Building is something the model
-    // chooses, so the sense it builds WITH must not be locked behind a persona:
-    // if it is holding blocks (or something it made), it gets the grid.
     if (holdingBuildMaterials()) {
-      // behavior.perceptionRange / behavior.perception3D are the operator's
-      // knobs for this block, and nothing read them for a long time. The radius
-      // is the horizontal span; perception3D adds height on both sides (the
-      // cross-section) instead of the shallow default.
       const bRange = Math.max(2, Math.min(12, Math.trunc(Number(cfg.behavior?.perceptionRange)) || 6))
-      const vertical = cfg.behavior?.perception3D === true
       try {
         lines.push(`grid (legend: ${VISION_LEGEND}):\n${buildVisionBlock(bot, {
           range: bRange,
           radius: bRange,
-          heightUp: vertical ? Math.max(4, bRange) : 5,
-          heightDown: vertical ? Math.max(4, bRange) : 2
+          heightUp: 5,
+          heightDown: 2
         })}`)
       } catch { /* cosmetic */ }
     }
@@ -2365,9 +2297,6 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
    *     step / rate budget ran out.
    * Between turns the scheduler (brain.js) starts the next one by itself.
    */
-  /** Consecutive action calls made without a reasoning phase (effort.js: periodic review). */
-  let quickStreak = 0
-
   async function act (reasons, meta = null) {
     if (!alive || ended) return { idle: true }
     const snap = buildActionPrompt(reasons)
@@ -2376,39 +2305,12 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     logger.debug(TAG, `action turn (${reasons.join(' | ')})`)
     const tools = ALL_TOOLS
     const maxSteps = Math.max(1, Math.min(12, Math.trunc(Number(cfg.inference.maxStepsPerTurn ?? 6)) || 1))
-    // How much thought this call deserves (effort.js): most turns continue a
-    // plan and need none; a new request, a failure or a missing plan do.
-    const effortFor = (stepNo, prev = null) => {
-      const goal = focusGoal()
-      let hasNext = false; let loop = false
-      try { hasNext = Boolean(goal && journal.nextStep(goal.id)) } catch { hasNext = false }
-      try { loop = Boolean(journal.loopHint()) } catch { loop = false }
-      const hp = Number(bot.health)
-      const last = results[results.length - 1]
-      return decideEffort({
-        mode: cfg.inference?.thinking || 'adaptive',
-        step: stepNo,
-        reasons,
-        danger: Boolean(snap.threatIds?.length || system1?.fleeing || (Number.isFinite(hp) && hp > 0 && hp <= 8)),
-        lastFailed: Boolean(last && last.ok === false),
-        stepFailed: Boolean(prev?.some((c) => /^(FAILED|NOT RUN)|: FAILED — /.test(String(c.result)))),
-        stepAsked: Boolean(prev?.some((c) => QUESTION_TOOLS.has(c.name))),
-        loop,
-        hasGoal: Boolean(goal),
-        hasNext,
-        quickStreak
-      })
-    }
-    let effort = effortFor(1)
     const head = [
       { role: 'system', content: SYSTEM_PROMPT },
-      { role: 'user', content: effort.line ? `${snap.text}\n${effort.line}` : snap.text }
+      { role: 'user', content: snap.text }
     ]
     /** What each earlier step of this turn called and got back: [{ calls, content }]. */
     const history = []
-    // In-turn compaction: every step re-sends all earlier tool results, so once
-    // they pass the budget the oldest are cut to a headline and only the newest
-    // screenshot keeps its image.
     const buildMessages = () => [...head, ...compactSteps(history, { maxChars: cfg.compaction?.turnMaxChars ?? 6000 }).flatMap((h) => toolTurnMessages(h.calls, { format: toolResultFormat, content: h.content, images: h.images || [] }))]
     shotsThisTurn = 0
     /** Every action this turn executed, in order. */
@@ -2421,10 +2323,6 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       if (step === 1 && meta && Number.isFinite(meta.queuedMono)) {
         latency.record('queueToModelMs', Math.max(0, (meta.invokeMono || invokeMono) - meta.queuedMono))
       }
-      // The call is abortable — but not by ordinary chat any more (the chat lane
-      // answers on its own). It is cancelled when a player's request has just
-      // been handed to the body (brain.preempt): what this thought is deciding
-      // is then already out of date.
       const controller = new AbortController()
       brain.inflightAbort = (why) => {
         if (controller.signal.aborted) return false
@@ -2432,33 +2330,54 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         controller.abort()
         return true
       }
+      const msgs = buildMessages()
+      const posNow = here()
+      try {
+        telemetry.modelRequest({
+          lane: 'action',
+          step,
+          reasons,
+          prompt: step === 1 ? snap.text : JSON.stringify(msgs.slice(-2)),
+          toolCount: tools.length,
+          goalId: snap.goalId || null,
+          position: posNow ? { x: Math.floor(posNow.x), y: Math.floor(posNow.y), z: Math.floor(posNow.z) } : null
+        })
+      } catch { /* telemetry best effort */ }
       let result
-      if (effort.think) quickStreak = 0; else quickStreak++
-      logger.debug(TAG, `effort: ${effort.think ? 'think' : 'quick'} (${effort.why})`)
-      const effortTag = effort.think ? `think: ${effort.why}` : 'quick'
       try {
         try {
-          result = await amd.chatWithTools(buildMessages(), tools, { signal: controller.signal, think: effort.think })
+          result = await amd.chatWithTools(msgs, tools, { signal: controller.signal })
         } catch (err) {
-          // An endpoint whose chat template rejects tool messages: say the same
-          // thing in plain text, for the rest of the session.
           if (step > 1 && toolResultFormat === 'tool' && [400, 404, 415, 422].includes(Number(err?.status))) {
             logger.warn(TAG, `endpoint rejected tool-result messages (HTTP ${err.status}); sending tool results as text from now on`)
             toolResultFormat = 'text'
-            result = await amd.chatWithTools(buildMessages(), tools, { signal: controller.signal, think: effort.think })
+            result = await amd.chatWithTools(buildMessages(), tools, { signal: controller.signal })
           } else throw err
         }
       } catch (err) {
+        try { telemetry.error(`action_step_${step}`, err) } catch { /* noop */ }
         if (step === 1) throw err
-        // What already ran, ran. Its results are still queued as wake-ups.
         logger.warn(TAG, `turn step ${step} failed (${err?.message || err}); the turn ends here`)
         break
       } finally {
         if (brain) brain.inflightAbort = null
       }
       const actions = Array.isArray(result.actions) && result.actions.length ? result.actions : [result.action]
+      const elapsedMs = Date.now() - t0
       latency.record('modelInferenceMs', performance.now() - invokeMono)
-      logUsage('action', `[${effortTag}] ${step > 1 ? `step ${step}: ` : ''}${reasons.join(' | ')}`, result.usage, Date.now() - t0, actions.map((x) => x?.a).join('+'))
+      try {
+        telemetry.modelResponse({
+          lane: 'action',
+          step,
+          reasoning: result.reasoning || '',
+          content: result.content || '',
+          actions,
+          usage: result.usage,
+          ms: elapsedMs,
+          finishReason: result.finishReason || null
+        })
+      } catch { /* telemetry best effort */ }
+      logUsage('action', `${step > 1 ? `step ${step}: ` : ''}${reasons.join(' | ')}`, result.usage, elapsedMs, actions.map((x) => x?.a).join('+'))
       if (ended) return { idle: true }
       // A turn cancelled mid-thought is not a failure and not an idle: nothing
       // it "decided" may run. On the first step, ask again; on a later one the
@@ -2532,11 +2451,8 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       if (step >= maxSteps) { logger.info(TAG, `turn reached its step limit (${maxSteps}); the next turn continues`); break }
       if (brain.preempted || epoch !== decisionEpoch || life !== lifeEpoch) break
       if (!brain.takeCall('action')) { logger.debug(TAG, 'turn paused: model budget for this minute is spent'); break }
-      // These results are handed back right now, as tool output: they must not
-      // also wake a second turn about the same thing.
       brain.unwake(consumedWakes)
       history.push({ calls, content: result.content || '', images: stepImages })
-      effort = effortFor(step + 1, calls)
     }
 
     // Player requests are optional proposals. Once Zinc has completed a non-inspect
@@ -2601,24 +2517,36 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       latency.record('architectureOverheadMs', Math.max(0, (meta.invokeMono || chatInvokeMono) - meta.queuedMono))
     }
     const epoch = lifeEpoch
-    const { reply, usage: chatUsage } = await amd.chatReply(messages, { maxTokens })
+    try {
+      telemetry.modelRequest({
+        lane: 'chat',
+        step: 1,
+        reasons: [`chat from ${sender}: ${lines.map((l) => l.text).join(' / ').slice(0, 120)}`],
+        prompt: text,
+        toolCount: 1
+      })
+    } catch { /* telemetry best effort */ }
+    const { reply, reasoning: chatReasoning, finishReason: chatFinish, usage: chatUsage } = await amd.chatReply(messages, { maxTokens })
+    const chatElapsed = Date.now() - tChat0
     latency.record('modelInferenceMs', performance.now() - chatInvokeMono)
+    try {
+      telemetry.modelResponse({
+        lane: 'chat',
+        step: 1,
+        reasoning: chatReasoning || '',
+        reply,
+        usage: chatUsage,
+        ms: chatElapsed,
+        finishReason: chatFinish || null
+      })
+    } catch { /* telemetry best effort */ }
     if (ended || epoch !== lifeEpoch) return
-    logUsage('chat', `${sender}: ${lines.map((l) => l.text).join(' / ').slice(0, 60)}`, chatUsage, Date.now() - tChat0, 'reply')
+    logUsage('chat', `${sender}: ${lines.map((l) => l.text).join(' / ').slice(0, 60)}`, chatUsage, chatElapsed, 'reply')
     if (ended || epoch !== lifeEpoch) return
-    // Who this answer is for: the player the model named, else the last speaker.
     const target = replyTarget(reply, sender, lines)
-    // A chunk may mix whispers and public lines. Answer the loudest constraint:
-    // if any line in it was whispered to the bot, the reply stays private, so a
-    // private question is never answered in public just because someone else
-    // said something in the same few seconds.
     const whisper = lines.some((l) => l.whisper)
     const whisperTo = whisper ? (lines.some((l) => l.whisper && l.sender === target) ? target : lines.find((l) => l.whisper).sender) : null
-    if (reply.text && !canReplyToChat()) {
-      logger.warn(TAG, `chat reply to ${target} not sent: communication.replyToChat is off`)
-    } else if (reply.text) {
-      // The answer itself is not "new" to the next window — unless someone
-      // spoke while it was being written, in which case their line stays new.
+    if (reply.text) {
       const unseen = timeline.tail({ max: 400, afterSeq: chatSeenSeq }).some((e) => e.kind === 'chat' || e.kind === 'whisper')
       speak(reply.text, { to: whisperTo, about: target })
       if (!unseen) chatSeenSeq = timeline.seq
@@ -2680,6 +2608,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
 
   function onCombatEvent (evt) {
     note({ type: 'combat', msg: evt.msg })
+    try { telemetry.combatEvent(evt) } catch { /* noop */ }
     if (!evt.result) return
     const f = fight
     if (!f) return
@@ -2844,7 +2773,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       }
     })
     let scaffoldNote = ''
-    if (!regional && cfg.build.autoRemoveScaffold !== false) {
+    if (!regional) {
       try {
         const { removed } = await executor.removeScaffolds()
         if (removed > 0) scaffoldNote = `, scaffold cleared ${removed}`
@@ -2970,7 +2899,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     }
     return leaseContext.run({ lease: laneLease, claimed: false }, async () => {
     gateCtx = action
-    const IMMEDIATE_TRACKED = new Set(['say', 'stop', 'hold', 'equip', 'dig_policy', 'redstone_scan', 'redstone_component', 'redstone_engineer', 'recall', 'circuit_project', 'logic_test', 'inspect_region', 'inspect_block', 'screenshot', 'find', 'remember_here', 'note', 'social', 'goal'])
+    const IMMEDIATE_TRACKED = new Set(['say', 'stop', 'hold', 'equip', 'redstone_scan', 'redstone_component', 'redstone_engineer', 'recall', 'circuit_project', 'logic_test', 'inspect_region', 'inspect_block', 'screenshot', 'find', 'remember_here', 'note', 'social', 'goal'])
     currentActId = IMMEDIATE_TRACKED.has(a)
       ? continuity.beginAction({ tool: a, summary: `${a} ${JSON.stringify(goalArgs(action)).slice(0, 80)}`, sig: `${a}:${JSON.stringify(goalArgs(action))}`, goalId: agenda.main?.goalId || null, args: goalArgs(action) })
       : null
@@ -3012,18 +2941,6 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         const where = action.player || action.place || (Number.isFinite(Number(action.x)) ? `${Math.round(Number(action.x))},${Math.round(Number(action.z))}` : 'somewhere')
         const limit = Array.isArray(action.materials) && action.materials.length ? ` breaking only ${action.materials.join('/')}` : ''
         return startMain({ tool: 'dig', label: `dig to ${where}${limit}`, askedBy, detail: goalDetailFor('dig', target), decision: decided(snap, { label: 'dig' }), run: () => skills.dig(target) })
-      }
-      case 'dig_policy': {
-        // The model's own standing rule for what a walk may break. Read it,
-        // switch it, edit the list — and the route in progress re-plans with it.
-        const change = { can_dig: action.can_dig, mode: action.mode, add: action.add, remove: action.remove, reset: action.reset }
-        const r = digPolicy.apply(change, { registry: bot.registry })
-        if (r.changed) {
-          try { wrapper.refreshDigPolicy() } catch { /* next plan picks it up */ }
-          note({ type: 'dig_policy', msg: r.msg.slice(0, 160) })
-        }
-        const gated = config.get('actions.allowDig') === false ? ' (NOTE: the operator has digging switched off — actions.allowDig — so nothing is broken until that changes)' : ''
-        return report('dig_policy', { ok: r.ok, msg: `${r.msg}${gated}` }, { wake: false })
       }
       case 'follow': {
         const askedBy = resolveActionAttribution('follow', action, snap)
@@ -3167,22 +3084,11 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       case 'eat':
         return background('eat', adoptLease(skills.eat({ item: action.item }), 'eat finished'))
       case 'equip': {
-        // `auto` is the model's switch for the armor keeper; it may come alone
-        // or with an item.
-        let autoNote = ''
-        if (typeof action.auto === 'boolean') {
-          autoNote = `armor is now ${armor.setAuto(action.auto)}`
-          if (!String(action.item || '').trim()) return report('equip', { ok: true, msg: autoNote }, { wake: null })
-        }
         const res = await skills.equip({ item: action.item, where: action.where })
-        // What the model put on or took off by hand stays as it left it —
-        // which only needs saying (and holding) when the autopilot would have
-        // chosen differently: wearing the best piece anyway changes nothing.
-        if (res.ok && res.slot && res.slot !== 'hand' && armorPrefs.auto && armor.plan().some((step) => step.slot === res.slot)) {
+        if (res.ok && res.slot && res.slot !== 'hand' && armor.plan().some((step) => step.slot === res.slot)) {
           armor.hold(res.slot)
-          res.msg += ` — ${res.slot} stays as you set it (equip {auto:true} lets the best armor be put on by itself again)`
+          res.msg += ` — ${res.slot} stays as you set it`
         }
-        if (autoNote) res.msg += `; ${autoNote}`
         return report('equip', res, { wake: null })
       }
       case 'redstone_engineer': {
@@ -3252,10 +3158,6 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       case 'inspect_region':
         return report('inspect_region', require('./region_inspect').inspectRegion(bot, action))
       case 'screenshot': {
-        // A picture for a model that can see (vision.js renders it from the
-        // loaded chunks; there is no game window to grab). The text summary is
-        // always returned, so the call is useful even where images are not.
-        if (VISION.enabled === false) return report('screenshot', { ok: false, msg: 'screenshots are switched off (vision.enabled) — use inspect_region / find / the grid instead' })
         const maxPerTurn = Math.max(1, Math.min(4, Math.trunc(Number(VISION.maxPerTurn ?? 2)) || 2))
         if (shotsThisTurn >= maxPerTurn) {
           return report('screenshot', { ok: false, msg: `already ${shotsThisTurn} screenshot(s) this turn — act on what you saw. For exact blocks and coordinates use inspect_block / inspect_region / find` })
@@ -3476,45 +3378,48 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   // `shutdown` functions the supervisor already calls. Bare words, no prefix —
   // see control_commands.js and host.attachStdin().
 
-  // ------------------------------------------ optional Scout & Relocate --
-  async function scoutAndRelocate () {
-    const sc = cfg.scout || {}
-    if (sc.enabled !== true || !here()) return
-    const deadline = Date.now() + (sc.waitForWorldMs ?? 6000)
-    while (Date.now() < deadline && !ended) {
-      try {
-        const below = bot.blockAt(here().floored().offset(0, -1, 0))
-        if (below && below.boundingBox === 'block') break
-      } catch { /* chunk not loaded yet */ }
-      await sleep(250)
-    }
-    sense.assess()
-    wrapper.threat.sample(bot, true)
-    const result = scoutSafeAnchor(bot, {
-      radius: sc.radius ?? 15, step: sc.step ?? 3, minRadius: sc.minRadius ?? 5, preferRadius: sc.preferRadius ?? 12,
-      horizonTicks: wrapper.threat.horizonTicks, avoid: []
-    })
-    if (!result) return
-    logger.info(TAG, `scout: anchor ${result.x},${result.y},${result.z} (${result.reasons.join(', ')})`)
+  function buildLiveContinuation () {
     const p = here()
-    // Don't walk away from a spot we just died at (deathAvoidRadius), and give
-    // the walk a deadline (relocateTimeoutMs) instead of leaving a background
-    // job to run for as long as the pathfinder feels like. Both were config
-    // keys that nothing read.
-    const death = deathRecovery?.lastDeath?.position || null
-    if (death && Number.isFinite(death.x) && Number.isFinite(death.z)) {
-      const d = Math.hypot(result.x - death.x, result.z - death.z)
-      if (d < (sc.deathAvoidRadius ?? 12)) {
-        logger.info(TAG, `scout: skipping anchor ${result.x},${result.z} — ${Math.round(d)} blocks from the last death`)
-        return
-      }
+    const items = (bot?.inventory?.items?.() || []).slice(0, 36).map((i) => ({ name: i.name, count: i.count }))
+    const active = focusGoal()
+    return {
+      botState: {
+        connected: Boolean(spawned && !ended),
+        alive: Boolean(alive),
+        dimension: (() => { try { return dim() } catch { return 'overworld' } })(),
+        position: p ? { x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z) } : null,
+        health: Number.isFinite(Number(bot?.health)) ? Number(bot.health) : null,
+        food: Number.isFinite(Number(bot?.food)) ? Number(bot.food) : null,
+        activity: (() => { try { return activityText() } catch { return '' } })(),
+        inventory: items,
+        recentChat: shared.chatLog.slice(-8)
+      },
+      activeGoal: active ? { id: active.id, status: active.status, kind: active.kind, description: active.description, label: active.description, origin: active.origin, progress: active.progress || null } : null,
+      openGoals: (typeof goalReg.list === 'function'
+        ? goalReg.list().filter((g) => !['completed', 'failed', 'cancelled'].includes(g.status))
+        : goalReg.openGoals()
+      ).slice(0, 12).map((g) => ({
+        id: g.id,
+        status: g.status,
+        kind: g.kind,
+        description: g.description,
+        label: g.description,
+        origin: g.origin,
+        progress: g.progress || null
+      })),
+      plan: active ? (() => { try { return journal.planOf?.(active.id) || null } catch { return null } })() : null,
+      journalDigest: (() => { try { return journal.continuation?.({ focusGoal: active }) || null } catch { return null } })(),
+      pendingProposals: (agenda.asked || []).slice(-6)
     }
-    const far = Math.hypot(result.x - p.x, result.y - p.y, result.z - p.z) > (sc.relocateAboveBlocks ?? 6)
-    if (!far) return
-    const walk = skills.goTo({ x: result.x, y: result.y, z: result.z })
-    const limit = Math.max(1_000, Number(sc.relocateTimeoutMs) || 25_000)
-    const timeout = sleep(limit).then(() => ({ ok: false, msg: `scout: relocation did not finish in ${Math.round(limit / 1000)}s` }))
-    background('scout', Promise.race([walk, timeout]))
+  }
+
+  telemetry.setContinuationProvider(buildLiveContinuation)
+
+  function syncContinuation (reason = 'tick') {
+    try {
+      telemetry._dirtyContinuation = true
+      telemetry.flush({ reason })
+    } catch { /* telemetry continuation best effort */ }
   }
 
   /**
@@ -3628,11 +3533,21 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       const p = here()
       logger.info(TAG, 'respawned')
       owner?.markDead?.(false)
+      try {
+        const p = here()
+        telemetry.lifecycle('respawn', { pos: p ? { x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z) } : null, dim: dim() })
+        syncContinuation('respawn')
+      } catch { /* noop */ }
       reconcileAfterRespawn().catch((err) => logger.warn(TAG, `respawn reconcile failed: ${err?.message || err}`))
       return
     }
     systemsReady = true
     logger.info(TAG, `spawn OK — model=${cfg.amd.model}`)
+    try {
+      const p = here()
+      telemetry.lifecycle('spawn', { first, pos: p ? { x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z) } : null, dim: dim(), version: bot.version || cfg.server?.version || null })
+      syncContinuation('spawn')
+    } catch { /* noop */ }
 
     // Entity metadata is read by key name from the server's game data, so a
     // version that reorders it (26.x moved the tame flag) cannot turn pets wild.
@@ -3651,8 +3566,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       hands: arbiter.lane('combat', PRIORITY.combat),
       // Running away is the survival layer's job here.
       fleeOnDisengage: false,
-      // The model's armor choices cover the fight's shield too.
-      mayTakeShield: () => armorPrefs.auto && !armorPrefs.held.has('off-hand'),
+      mayTakeShield: () => !armorPrefs.held.has('off-hand'),
       // During a fight, also dodge any other player who hit the bot lately.
       watch: () => {
         const out = []
@@ -3707,9 +3621,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       fleeDistance: cfg.system1.fleeDistance ?? 14,
       releaseRadius: cfg.system1.releaseRadius ?? 22,
       calmMs: cfg.system1.calmMs ?? 4000,
-      // With a walk under way (follow, go_to, any errand) an escape is a short
-      // dodge that comes back, not a retreat that abandons it.
-      tether: () => (cfg.system1.tether === false ? null : (skills?.tether?.() || null)),
+      tether: () => skills?.tether?.() || null,
       tetherTriggerRadius: cfg.system1.tetherTriggerRadius ?? 6,
       tetherReleaseRadius: cfg.system1.tetherReleaseRadius ?? 9,
       tetherCalmMs: cfg.system1.tetherCalmMs ?? 1200,
@@ -3717,12 +3629,10 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       stillFleeingMs: cfg.system1.stillFleeingMs ?? 30_000,
       recallMs: cfg.system1.recallMs ?? 180_000,
       tickMs: cfg.system1.tickMs ?? 200,
-      autoElytra: cfg.behavior.autoElytra !== false,
       escalate: (event) => brain.wake(`${event.type} ${event.item || event.text || ''}`.trim()),
-      // The reflex reports; the model decides. The start of an escape (and
-      // anything that makes it worse) may jump the queue; its end may not.
       onEvent: (evt) => {
         note({ type: evt.type, msg: evt.text })
+        try { telemetry.reflexEvent(evt) } catch { /* noop */ }
         if (evt.wake && evt.urgent === true) decisionEpoch++
         if (evt.wake) brain.wake(evt.text, { external: true, urgent: evt.urgent === true })
         // A new danger on screen changes the world: what failed a moment ago
@@ -3784,11 +3694,10 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         }
       } catch { /* partial world */ }
     })
-    every(60_000, () => { try { memory.save(); places.save(); continuity.save(); shared.saveConvo?.() } catch { /* best effort */ } })
+    every(10_000, () => { syncContinuation('periodic') })
+    every(60_000, () => { try { memory.save(); places.save(); continuity.save(); shared.saveConvo?.(); telemetry.flush() } catch { /* best effort */ } })
     every(GOALS.tickMs ?? 15_000, () => { try { goalTick() } catch (err) { logger.debug(TAG, `goal tick: ${err.message || err}`) } })
 
-    // The inventory window exists from here on (mineflayer adds it when its
-    // plugins are injected, after createBot returned): listen, and look once.
     try { armor.attach(); armor.poke() } catch (err) { logger.debug(TAG, `armor keeper: ${err.message || err}`) }
     logger.info(TAG, 'ZincAI ready — reflexes flee, the model decides; chat lane + action lane on demand')
     if (first) {
@@ -3810,7 +3719,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         : ''
       brain.wake(`joined the server — orient yourself, check open goals or surroundings, or idle if content${carried}`)
       if (restored) logger.info(TAG, `goals: re-checked ${restored} restored objective(s) at startup`)
-      scoutAndRelocate().catch((err) => logger.warn(TAG, `scout failed: ${err.message || err}`))
+      syncContinuation('first_spawn')
     }
   })
 
@@ -3825,9 +3734,8 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       if (hitMatch) {
         try { continuity.recordPlayerObservation(hitMatch[1], `${cause.text} (hp ${hp})`) } catch { /* noop */ }
       }
-      // do NOT clear the fail gate here — being hit is exactly the
-      // state in which "too hurt to fight" keeps failing; clearing re-armed
-      // the churn loop (repro 05). Death and new threats still clear it.
+      // Do not clear the fail gate on damage — repeated damage during a failed
+      // combat retry would otherwise re-arm a failure churn loop. Death and new threats still clear it.
       const now = Date.now()
       if (hp > 0 && (cause.text !== lastHurt.text || now - lastHurt.at > 4000)) brain.wake(`hurt: ${cause.text} (hp ${hp})`, { external: true })
       lastHurt = { at: now, text: cause.text }
@@ -4202,13 +4110,14 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       deathRecovery.onDeath({ position: p, dimension: dim(), inventory: bot.inventory?.items?.() || [] })
       owner?.markDead?.(true)
     } catch (err) { logger.debug(TAG, `death record: ${err.message || err}`) }
-    if (config.get('death.autoRespawn') === false) {
-      logger.warn(TAG, 'death.autoRespawn is off — the body stays on the death screen until "join" or a config change')
-    } else {
-      const delay = deathRecovery.respawnDelayMs()
-      const t = setTimeout(() => { timers.delete(t); try { bot.respawn() } catch { /* not on death screen */ } }, delay)
-      timers.add(t)
-    }
+    try {
+      telemetry.lifecycle('death', { pos: p ? { x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z) } : null, dim: dim() })
+      syncContinuation('death')
+      telemetry.flush()
+    } catch { /* noop */ }
+    const delay = deathRecovery.respawnDelayMs()
+    const t = setTimeout(() => { timers.delete(t); try { bot.respawn() } catch { /* not on death screen */ } }, delay)
+    timers.add(t)
   })
 
   onBot('wake', () => {
@@ -4255,6 +4164,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     logChat(sender, whisper ? `(whisper) ${text}` : text)
     timeline.chat(sender, text, { whisper })
     note({ type: 'chat', sender, text: `${sender}: ${text}` })
+    try { telemetry.chatIn({ sender, text, whisper }) } catch { /* noop */ }
     perceive({
       source: 'mineflayer', eventType: 'chat', reactionClass: 'fast',
       summary: `${sender}: ${text}`,
@@ -4329,6 +4239,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     // on disk before the sockets close.
     try { goalReg.suspendAll({ reason: quit ? 'shutdown' : 'connection ended' }); goalReg.save({ force: true }) } catch { /* best effort */ }
     try { continuity.save() } catch { /* best effort */ }
+    try { syncContinuation(quit ? 'quit' : 'dispose'); telemetry.flush() } catch { /* best effort */ }
     for (const t of timers) { clearInterval(t); clearTimeout(t) }
     timers.clear()
     try { protocolKeepAlive?.stop() } catch { /* noop */ }
@@ -4398,15 +4309,11 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     continuity,
     memory,
     parser,
+    telemetry,
     checkRoute: (from, to) => checkRouteHome(from, to),
     reconcileEngine: async () => ({ deaths: deathRecovery.deaths, lastRecovery: deathRecovery.lastRecovery }),
-    onConfigChange: (name, oldValue, value) => {
-      // A parameter that changes how the body behaves takes effect here, with no
-      // restart and no behavioural "mode" change.
-      if (name === 'boundary.enabled' && value === true) {
-        logger.info(TAG, `boundary on: ${config.get('boundary.dimension')} radius ${config.get('boundary.radius')} around ${config.get('boundary.centerX')},${config.get('boundary.centerZ')}`)
-      }
-      if (name === 'connection.autoReconnect') logger.info(TAG, `auto reconnect is now ${value ? 'on' : 'off'}`)
+    onConfigChange: (name, _oldValue, value) => {
+      logger.info(TAG, `config updated: ${name} = ${JSON.stringify(value)}`)
     },
     activity: () => activityText(),
     stopGoal: (goalId) => stopGoalIfRunning(goalId),
@@ -4474,7 +4381,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       return reconcileGoal(goal)
     },
     internals: () => ({
-      arbiter, sense, wrapper, combat, system1, skills, brain, results, agenda,
+      arbiter, sense, wrapper, combat, system1, skills, brain, results, agenda, telemetry,
       events: pipeline, latency, redstoneEngineer, redstoneLibrary: shared.redstoneLibrary,
       goals: goalReg, continuity, journal, focusGoal, continuationBlock, resetContext, executeAction, buildActionPrompt, buildChatPrompt,
       lanes, jobs, laneOf: (tool) => laneOf(tool), LANES, footprintOf,

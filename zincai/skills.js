@@ -85,12 +85,17 @@ const HARVEST_NEED = {
   gold_ore: 2, deepslate_gold_ore: 2, diamond_ore: 2, deepslate_diamond_ore: 2, emerald_ore: 2, deepslate_emerald_ore: 2, redstone_ore: 2, deepslate_redstone_ore: 2,
   obsidian: 3, ancient_debris: 3
 }
-/** Loose blocks that need no pickaxe (shovel families + stone-family with any pick handled by tier 0). */
-const GATHER_SOILS = new Set(['dirt', 'grass_block', 'sand', 'red_sand', 'gravel', 'clay', 'snow_block', 'snow', 'mud', 'soul_sand', 'soul_soil', 'netherrack'])
-const GATHER_STONE = new Set(['stone', 'cobblestone', 'deepslate', 'cobbled_deepslate', 'andesite', 'diorite', 'granite', 'tuff', 'sandstone', 'blackstone'])
-/** Friendly aliases the model (or a player) actually says → block ids. */
+const UNGATHERABLE_BLOCKS = new Set([
+  'air', 'cave_air', 'void_air', 'water', 'lava', 'bubble_column',
+  'bedrock', 'barrier', 'structure_void', 'light',
+  'command_block', 'chain_command_block', 'repeating_command_block',
+  'structure_block', 'jigsaw', 'end_portal', 'end_portal_frame', 'end_gateway',
+  'nether_portal', 'reinforced_deepslate'
+])
+
+/** Friendly aliases mapped to vanilla block ids. Any diggable vanilla block id also works directly. */
 const GATHER_ALIASES = {
-  wood: null, // resolved per-registry: any *_log present
+  wood: null, // resolved per-registry: any *_log or *_stem present
   log: null,
   logs: null,
   coal: ['coal_ore', 'deepslate_coal_ore'],
@@ -107,25 +112,35 @@ const GATHER_ALIASES = {
 }
 
 /**
- * Which blocks may be dug for a requested resource name.
- * @returns {null | { names: string[], ids: number[] }} null = NOT allowed to dig for this.
+ * Resolve a requested block/resource name to vanilla block ids.
+ * Accepts common aliases or any diggable block present in the Minecraft registry.
+ * @returns {null | { names: string[], ids: number[] }}
  */
 function resolveGatherTargets (registry, want) {
   if (!want || !registry?.blocksByName) return null
   const byName = registry.blocksByName
+  const isDiggable = (name) => {
+    const def = byName[name]
+    if (!def || UNGATHERABLE_BLOCKS.has(name)) return false
+    if (def.diggable === false) return false
+    return true
+  }
   let names = null
-  if (GATHER_ALIASES[want] === null) { // log families
-    names = Object.keys(byName).filter((n) => /_log$|_stem$/.test(n))
-  } else if (Array.isArray(GATHER_ALIASES[want])) names = GATHER_ALIASES[want]
-  else if (/^copper(_ore)?$/.test(want)) names = ['copper_ore', 'deepslate_copper_ore']
-  else if (/_log$|_stem$|_hyphae$/.test(want) && byName[want]) names = [want]
-  else if (/^([a-z]+)_wood$/.test(want)) names = [want.replace(/_wood$/, '_log')].filter((n) => byName[n])
-  else if (GATHER_SOILS.has(want) || GATHER_STONE.has(want)) names = [want]
-  else if (Object.prototype.hasOwnProperty.call(HARVEST_NEED, want)) names = [want]
+  if (GATHER_ALIASES[want] === null) {
+    names = Object.keys(byName).filter((n) => /_log$|_stem$/.test(n) && isDiggable(n))
+  } else if (Array.isArray(GATHER_ALIASES[want])) {
+    names = GATHER_ALIASES[want].filter(isDiggable)
+  } else if (/^copper(_ore)?$/.test(want)) {
+    names = ['copper_ore', 'deepslate_copper_ore'].filter(isDiggable)
+  } else if (/^([a-z]+)_wood$/.test(want) && !isDiggable(want)) {
+    names = [want.replace(/_wood$/, '_log')].filter(isDiggable)
+  } else if (isDiggable(want)) {
+    names = [want]
+  }
   if (!names || !names.length) return null
   const ids = names.map((n) => byName[n]?.id).filter((id) => id !== undefined)
   if (!ids.length) return null
-  return { names: names.filter((n) => byName[n]), ids }
+  return { names, ids }
 }
 
 class Skills {
@@ -565,7 +580,7 @@ class Skills {
           if (r.why === 'no path') {
             if (!stuckAt) stuckAt = Date.now()
             if (Date.now() - stuckAt > stuckMs) {
-              return fail(`cannot reach ${name}: no path for ${Math.round(stuckMs / 1000)}s (they are at ${at(lastSeen)})${this._recentJamHint()}; stopped following — dig to them, widen dig_policy, or ask them to come back`)
+              return fail(`cannot reach ${name}: no path for ${Math.round(stuckMs / 1000)}s (they are at ${at(lastSeen)})${this._recentJamHint()}; stopped following — use dig to clear a path or ask them to come back`)
             }
             await sleep(1500)
             continue
@@ -1045,33 +1060,9 @@ class Skills {
   }
 
   /**
-   * True when a non-ore resource block at `p` directly adjoins crafted
-   * architectural blocks (planks, doors, glass, stairs, chests, redstone, etc.),
-   * indicating it is part of a built structure rather than wild terrain.
-   */
-  _isStructuralResourceBlock (p, blockName = '') {
-    if (/_ore$|^ancient_debris$/.test(blockName)) return false
-    const STRUCTURAL_NEIGHBOR_RE = /(_planks|_bricks|_door|_trapdoor|^glass|_stained_glass|_pane$|^chest$|^trapped_chest$|^barrel$|shulker_box|_bed$|^furnace$|^blast_furnace$|^smoker$|^crafting_table$|_sign$|_stairs$|_slab$|_fence$|_fence_gate$|cobblestone_wall|brick_wall|stone_brick_wall|repeater|comparator|piston|redstone_wire|lantern|bookshelf)/
-    const offsets = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]
-    for (const [dx, dy, dz] of offsets) {
-      let nb = null
-      try { nb = this.bot.blockAt(p.offset ? p.offset(dx, dy, dz) : { x: p.x + dx, y: p.y + dy, z: p.z + dz }) } catch { nb = null }
-      if (nb && STRUCTURAL_NEIGHBOR_RE.test(nb.name || '')) return true
-    }
-    return false
-  }
-
-  /**
-   * Gather a raw resource by digging it: logs, ores, soils. The ONLY blocks
-   * ever dug are blocks whose identity IS the requested resource (or the
-   * whitelisted alias for it), skipping blocks attached to crafted structures
-   * or protected player claims.
-   */
-  /**
-   * "None within R blocks" is a dead end unless it says where there IS some.
-   * Looks once over everything the client has loaded: the same resource further
-   * out (with coordinates to walk to), else its relatives that are close (asked
-   * for oak, standing in a birch forest), else an honest "not around here".
+   * When no target block is found within `radius`, scout loaded chunks up to
+   * GATHER_SCOUT_RADIUS and report coordinates (or related wood families) so
+   * the model knows where the block exists.
    */
   _gatherMiss (want, targets, radius) {
     const bot = this.bot
@@ -1112,7 +1103,7 @@ class Skills {
     return this._run('gather', async (token) => {
       const want = fold(item).replace(/\s+/g, '_')
       const targets = resolveGatherTargets(bot.registry, want)
-      if (!targets) return fail(`"${item || ''}" is not gatherable — name a raw resource block like oak_log, coal_ore, iron_ore, stone, sand, dirt. (Never dug: anything else, by rule.)`)
+      if (!targets) return fail(`"${item || ''}" is not a diggable vanilla block — pass a Minecraft block id (e.g. oak_log, iron_ore, stone, clay, sandstone) or alias (wood, coal, iron, diamond).`)
       token.label = `gathering ${want}`
       // Harvest-level honesty: an ore whose tier exceeds every pickaxe in the
       // inventory cannot be mined — say so BEFORE walking anywhere.
@@ -1155,19 +1146,12 @@ class Skills {
             if (!protectedReason) protectedReason = g.reason || 'protected player property'
             continue
           }
-          const preBlock = bot.blockAt(p)
-          if (preBlock && this._isStructuralResourceBlock(p, preBlock.name)) {
-            skippedKeys.add(k)
-            skippedProtected++
-            if (!protectedReason) protectedReason = 'attached to an existing built structure'
-            continue
-          }
           positions.push(p)
           if (positions.length >= 8) break
         }
         if (!positions.length) {
           if (dug > 0) return ok(`${progress()}; remaining nearby ${want} skipped (${protectedReason})`)
-          return fail(`refused to mine ${want} here: nearby ${want} is ${protectedReason || 'part of a structure'} — move to natural terrain first`)
+          return fail(`cannot gather ${want} here: nearby targets are ${protectedReason || 'protected'}`)
         }
         for (const p of positions) {
           if (dug >= wanted || token.cancelled || Date.now() >= deadline) break

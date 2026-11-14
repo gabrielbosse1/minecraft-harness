@@ -53,30 +53,23 @@ const ACTION_TOOLS = [
     text: STR('The line, max 200 chars. In the language of the conversation.'),
     to: STR('Recipient player (optional).')
   }, ['text']),
-  tool('go_to', 'Walk to a player, saved place, nearby id (chest2, bed1), or [x,y,z]. Routes around mobs and hazards; may break blocks your dig_policy allows.', {
+  tool('go_to', 'Walk to a player, saved place, nearby id (chest2, bed1), or [x,y,z]. Routes around mobs and hazards; ordinary walks only clear soft terrain if no detour exists.', {
     player: STR('Player name.'),
     place: STR('Saved place or nearby id.'),
     x: INT('X.'),
     y: INT('Y (optional).'),
     z: INT('Z.')
   }),
-  tool('dig', 'ONE deliberate corridor: walks to [x,y,z] (or a player/place) breaking what stands in the path, including blocks your dig_policy does not allow (stone, wood…). Use it when go_to reports no path.', {
+  tool('dig', 'ONE deliberate corridor: walks to [x,y,z] (or a player/place) breaking any breakable blocks in the path. Use when go_to reports no path or when tunneling intentionally.', {
     player: STR('Target player name.'),
     place: STR('Saved place or nearby id.'),
     x: INT('X of the destination.'),
     y: INT('Y of the destination (optional).'),
     z: INT('Z of the destination.'),
-    materials: { type: 'array', description: 'Only these block ids may be broken (e.g. [oak_log, dirt]); default: whatever is in the way, within reach.', items: STR('Block id.'), minItems: 1, maxItems: 16 },
+    materials: { type: 'array', description: 'Only these block ids may be broken (e.g. [oak_log, dirt]); default: any breakable block in the way.', items: STR('Block id.'), minItems: 1, maxItems: 16 },
     avoid: { type: 'array', description: 'Never break these block ids.', items: STR('Block id.'), minItems: 1, maxItems: 16 }
   }),
   tool('follow', 'Follow a player until you call stop. Keeps going by itself: it dodges mobs and comes back, waits for a path, and walks to where the player was last seen. Call it ONCE — it does not need repeating.', { player: STR('Player name.') }, ['player']),
-  tool('dig_policy', 'Your standing rule for what WALKING (go_to, follow, every errand) may break. No arguments = show it. It is yours to edit and it persists.', {
-    can_dig: { type: 'boolean', description: 'Master switch. false = walking never breaks a block.' },
-    mode: { type: 'string', enum: ['list', 'all'], description: 'list = only blocks on your list (default: soft terrain). all = any natural block in the way. Doors are opened and containers, workstations, machines, liquids and bedrock are NEVER broken in any mode.' },
-    add: { type: 'array', description: 'Block ids to allow, e.g. [stone, cobblestone, oak_log]. `*` is a wildcard (*_planks).', items: STR('Block id.'), minItems: 1, maxItems: 24 },
-    remove: { type: 'array', description: 'Block ids to take off the list.', items: STR('Block id.'), minItems: 1, maxItems: 24 },
-    reset: { type: 'boolean', description: 'true = back to the shipped soft-block list.' }
-  }),
   tool('stop', 'Cancel current task, follow, fight and paused tasks.'),
   tool('goal', 'Manage persistent objectives (survive death/restart/context reset): list|show|add|resume|suspend|cancel|complete|update|combine|verify.', {
     operation: { type: 'string', enum: ['list', 'show', 'add', 'resume', 'suspend', 'cancel', 'complete', 'update', 'combine', 'verify'] },
@@ -124,11 +117,10 @@ const ACTION_TOOLS = [
     count: INT('Amount (default 1).')
   }, ['player', 'item']),
   tool('eat', 'Eat safe food now (empty = best carried).', { item: STR('Food id (optional).') }),
-  tool('equip', 'Equip a carried item by name (armor goes to its own slot), or take one off. Better armor you carry is put on for you; a slot you dress or empty yourself is then left as you set it.', {
-    item: STR('Item id. "none" + where takes off what is worn there.'),
-    where: { type: 'string', enum: ['hand', 'off-hand', 'head', 'torso', 'legs', 'feet'] },
-    auto: { type: 'boolean', description: 'Armor autopilot: false = never put armor on for you; true = on again, and every slot you set by hand is handed back. May be sent alone.' }
-  }),
+  tool('equip', 'Equip a carried item by name (armor goes to its own slot), or unequip one. Better carried armor is equipped automatically, while slots you dress or empty manually stay as you set them.', {
+    item: STR('Item id, or "none" with where to unequip what is worn there.'),
+    where: { type: 'string', enum: ['hand', 'off-hand', 'head', 'torso', 'legs', 'feet'] }
+  }, ['item']),
   tool('use_block', 'Walk to nearest matching block and right-click it.', { what: STR('Block id.') }, ['what']),
   tool('inspect_block', 'Read one loaded block and state; no power inferred.', { x: INT('X.'), y: INT('Y.'), z: INT('Z.') }, ['x', 'y', 'z']),
   tool('inspect_region', 'Read-only paginated 3D block snapshot around [x,y,z]; no circuit trace.', { x: INT('X.'), y: INT('Y.'), z: INT('Z.'), radius: INT('0–2, default 1.'), page: INT('Page, default 1.') }, ['x', 'y', 'z']),
@@ -166,8 +158,8 @@ const ACTION_TOOLS = [
     decision: { type: 'string', enum: ['accept', 'decline', 'ignore', 'negotiate', 'delay'] }
   }, ['operation']),
   tool('craft', 'Craft item (walks to a nearby table if needed, or puts down one you carry). A failure names the ingredients and how many you have.', { item: STR('Item id.'), count: INT('How many of the item you want in total (the recipe repeats; default one batch). Ask once, not once per batch.') }, ['item']),
-  tool('gather', 'Dig named raw logs/ores/soils nearby (avoid unauthorized builds; ores need pickaxe). If none is in range the result says where the nearest is, or which other kind is close.', {
-    item: STR('Resource id/alias (oak_log, iron, stone…; "log" = any wood).'),
+  tool('gather', 'Dig named blocks nearby (any diggable vanilla block id or alias such as log/wood/coal/iron/diamond/stone/clay; ores require an appropriate pickaxe). If none is in range the result reports the nearest loaded coordinates.', {
+    item: STR('Block id or alias (oak_log, iron, stone, clay, sand…; "log" = any wood).'),
     count: INT('Count 1–64 (default 1).'),
     radius: INT('Radius 1–64 (default 32).')
   }, ['item']),
@@ -509,55 +501,33 @@ function toolTurnMessages (calls, { format = 'tool', content = '', images = [] }
 }
 
 /**
- * Pure: build the request body. Exported for tests.
- *
- * tool_choice is "required" by default: with "auto" a model that answered in
- * prose produced an idle turn and nobody was told. Endpoints that reject
- * "required" are handled in the client (it falls back to "auto" once).
+ * Pure: build the OpenAI-compatible chat completion request body.
  */
-function buildToolsPayload ({ model, messages, temperature, maxTokens, tools, toolChoice = 'required', parallelToolCalls = true, thinking = null, thinkingFields = true }) {
-  const payload = {
+function buildToolsPayload ({ model, messages, temperature, maxTokens, tools, toolChoice = 'required', parallelToolCalls = true }) {
+  return {
     model,
-    messages: thinking === false ? withNoThinkSwitch(messages) : messages,
+    messages,
     temperature,
     max_tokens: maxTokens,
     stream: false,
     tools,
     tool_choice: toolChoice,
-    // Several calls in one answer are allowed (and executed in order): the
-    // one-call-per-turn limit made "answer AND act" take two model calls.
     parallel_tool_calls: parallelToolCalls !== false
   }
-  // `thinking: false` = answer without a reasoning phase. There is no single
-  // OpenAI-compatible spelling for that, so all three known ones are sent: the
-  // chat-template switch (vLLM / llama.cpp / SGLang), the top-level flag
-  // (DashScope-style Qwen APIs) and Qwen's in-prompt soft switch. An endpoint
-  // that rejects the two fields gets only the soft switch from then on.
-  if (thinking === false && thinkingFields) {
-    payload.chat_template_kwargs = { enable_thinking: false }
-    payload.enable_thinking = false
-  }
-  return payload
 }
 
-const NO_THINK = '/no_think'
-/** Append Qwen's soft "do not reason first" switch to the last user message (text or text part). Pure. */
-function withNoThinkSwitch (messages) {
-  const list = Array.isArray(messages) ? messages.slice() : []
-  for (let i = list.length - 1; i >= 0; i--) {
-    const m = list[i]
-    if (!m || m.role !== 'user') continue
-    if (typeof m.content === 'string') {
-      if (!m.content.includes(NO_THINK)) list[i] = { ...m, content: `${m.content}\n${NO_THINK}` }
-    } else if (Array.isArray(m.content)) {
-      const parts = m.content.slice()
-      const t = parts.findIndex((part) => part && part.type === 'text')
-      if (t >= 0) { if (!String(parts[t].text).includes(NO_THINK)) parts[t] = { ...parts[t], text: `${parts[t].text}\n${NO_THINK}` } } else parts.unshift({ type: 'text', text: NO_THINK })
-      list[i] = { ...m, content: parts }
-    }
-    break
+/** Extract model reasoning trace from OpenAI-compatible fields or <think> tags. */
+function extractReasoning (message) {
+  if (!message || typeof message !== 'object') return ''
+  if (typeof message.reasoning_content === 'string' && message.reasoning_content.trim()) {
+    return message.reasoning_content.trim()
   }
-  return list
+  if (typeof message.reasoning === 'string' && message.reasoning.trim()) {
+    return message.reasoning.trim()
+  }
+  const text = contentText(message.content)
+  const m = /<think>([\s\S]*?)<\/think>/i.exec(text)
+  return m ? m[1].trim() : ''
 }
 
 /** Does any message carry an image part? */
@@ -602,9 +572,8 @@ class AmdToolsClient {
    * Drop-in replacement for AmdClient at the call site, with the same
    * constructor contract and the same getStats() shape (plus tool metrics).
    */
-  constructor ({ apiKey, baseUrl, model, timeoutMs = 20_000, maxRetries = 2, temperature = 0.25, maxTokens = 512, toolChoice = 'required', maxConcurrent = 2, chatTimeoutMs = null, chatMaxRetries = 1, thinking = 'auto', chatThinking = 'auto', rescueMaxTokens = null, thinkMaxTokens = null }) {
+  constructor ({ apiKey, baseUrl, model, timeoutMs = 20_000, maxRetries = 2, temperature = 0.25, maxTokens = 1024, toolChoice = 'required', maxConcurrent = 2, chatTimeoutMs = null, chatMaxRetries = 1 }) {
     if (!apiKey) {
-      // Never include the (missing) key in the error — only the variable name.
       throw new Error('AMD API key missing: set AMD_API_KEY (or API_KEY / RADEON_API_KEY)')
     }
     this.baseUrl = String(baseUrl).replace(/\/+$/, '')
@@ -629,60 +598,15 @@ class AmdToolsClient {
       chatReplies: 0
     }
     this.toolChoice = toolChoice
-    // Several tool calls per answer: true = ask for them, null = the endpoint
-    // rejected the field (it is then left out). At most this many are executed.
     this.parallelToolCalls = true
     this.maxToolCalls = 6
-    // 2 = one call per lane at a time. 1 = strictly one call at a time (for an
-    // endpoint that refuses parallel requests); chat still jumps the queue.
     this.maxConcurrent = Math.max(1, Math.trunc(Number(maxConcurrent)) || 1)
-    // Chat gets a slightly tighter budget than action, without starving slow endpoints.
     this.chatTimeoutMs = Number.isFinite(chatTimeoutMs) && chatTimeoutMs > 0 ? chatTimeoutMs : Math.min(timeoutMs, 90_000)
     this.chatMaxRetries = Math.max(0, Math.min(maxRetries, Math.trunc(Number(chatMaxRetries)) || 0))
-    this._queue = [] // { lane, run, resolve, reject }
-    this._running = new Set() // lanes with a call in flight
-    this._latencies = [] // recent successful call durations (ms) for adaptive timeout scaling
-    // REASONING CONTROL. A reasoning model spends output tokens thinking BEFORE
-    // the tool call; when the budget runs out mid-thought the answer contains
-    // no call at all (finish_reason "length"). `thinking`:
-    //   'on'   always let it reason first,
-    //   'off'  never (fastest: a tool call is ~60 tokens),
-    //   'auto' reason first, but a cut-off answer is asked for again WITHOUT
-    //          reasoning, and after two cut-offs in a row the next calls skip
-    //          reasoning up front instead of paying for the cut-off each time.
-    //   'adaptive' the caller says per call (`think` option of chatWithTools,
-    //          see effort.js): quick calls skip reasoning, the ones that need
-    //          it get `thinkMaxTokens` of room. Otherwise it behaves as 'auto'.
-    const mode = (v) => (['on', 'off', 'auto', 'adaptive'].includes(String(v)) ? String(v) : 'auto')
-    this.thinkMaxTokens = Number.isFinite(thinkMaxTokens) && thinkMaxTokens > 0 ? Math.trunc(thinkMaxTokens) : null
-    this.thinking = mode(thinking)
-    this.chatThinking = mode(chatThinking)
-    this.thinkingFields = true // false once the endpoint rejected enable_thinking / chat_template_kwargs
-    this.rescueMaxTokens = Number.isFinite(rescueMaxTokens) && rescueMaxTokens > 0 ? Math.trunc(rescueMaxTokens) : null
-    this._truncStreak = 0
-    this._noThinkCalls = 0 // action calls that still skip reasoning (auto mode cool-down)
-    // Images: null = not tried yet, true = accepted, false = the endpoint refused them.
+    this._queue = []
+    this._running = new Set()
+    this._latencies = []
     this.visionSupported = null
-  }
-
-  /** Should this action call reason first? */
-  _thinkFirst () {
-    if (this.thinking === 'off') return false
-    if (this.thinking === 'on') return true
-    if (this._noThinkCalls > 0) { this._noThinkCalls--; return false }
-    return true
-  }
-
-  /** Bookkeeping for auto mode: what the first call of an answer turned out to be. */
-  _noteTruncation (truncated) {
-    if (!truncated) { this._truncStreak = 0; return }
-    this.stats.truncatedAnswers = (this.stats.truncatedAnswers || 0) + 1
-    if (this.thinking !== 'auto' && this.thinking !== 'adaptive') return
-    if (++this._truncStreak >= 2 && this._noThinkCalls === 0) {
-      this._noThinkCalls = 10
-      this._truncStreak = 0
-      logger.warn(TAG, `the model ran out of output tokens before its tool call twice in a row (max_tokens ${this.maxTokens}) — the next 10 action calls skip the reasoning phase. Set inference.thinking "off" to make that permanent, or raise amd.maxTokens.`)
-    }
   }
 
   _recordLatency (ms) {
@@ -729,9 +653,9 @@ class AmdToolsClient {
    * `maxConcurrent`), and a waiting chat call is always started first.
    * @returns {Promise<{message:object, usage:object, raw:object}>}
    */
-  _complete ({ messages, tools, maxTokens = this.maxTokens, temperature = this.temperature, lane = 'action', timeoutMs = this.timeoutMs, maxRetries = this.maxRetries, signal = null, thinking = null, parallel = lane !== 'chat' }) {
+  _complete ({ messages, tools, maxTokens = this.maxTokens, temperature = this.temperature, lane = 'action', timeoutMs = this.timeoutMs, maxRetries = this.maxRetries, signal = null, parallel = lane !== 'chat' }) {
     return new Promise((resolve, reject) => {
-      this._queue.push({ lane, resolve, reject, run: () => this._completeNow({ messages, tools, maxTokens, temperature, timeoutMs, maxRetries, signal, parallel, thinking }) })
+      this._queue.push({ lane, resolve, reject, run: () => this._completeNow({ messages, tools, maxTokens, temperature, timeoutMs, maxRetries, signal, parallel }) })
       this._pump()
     })
   }
@@ -751,7 +675,7 @@ class AmdToolsClient {
     }
   }
 
-  async _completeNow ({ messages, tools, maxTokens, temperature, timeoutMs = this.timeoutMs, maxRetries = this.maxRetries, signal = null, parallel = true, thinking = null }) {
+  async _completeNow ({ messages, tools, maxTokens, temperature, timeoutMs = this.timeoutMs, maxRetries = this.maxRetries, signal = null, parallel = true }) {
     const url = `${this.baseUrl}/chat/completions`
     const headers = {
       Authorization: `Bearer ${this._apiKey}`,
@@ -769,11 +693,10 @@ class AmdToolsClient {
       attempt += 1
       this.stats.requests += 1
       const withImages = hasImages(messages)
-      const payload = buildToolsPayload({ model: this.model, messages, temperature, maxTokens, tools, toolChoice: this.toolChoice, parallelToolCalls: parallel && this.parallelToolCalls !== false, thinking, thinkingFields: this.thinkingFields })
-      if (this.parallelToolCalls === null) delete payload.parallel_tool_calls // endpoint does not know the field
+      const payload = buildToolsPayload({ model: this.model, messages, temperature, maxTokens, tools, toolChoice: this.toolChoice, parallelToolCalls: parallel && this.parallelToolCalls !== false })
+      if (this.parallelToolCalls === null) delete payload.parallel_tool_calls
       const startedAt = Date.now()
       try {
-        // An aborted call is a decision, not a failure: it must not be retried.
         if (signal?.aborted) { const err = new Error('aborted'); err.name = 'AbortError'; throw err }
         const res = await this._fetchWithTimeout(url, { method: 'POST', headers, body: JSON.stringify(payload) }, timeoutMs, signal)
 
@@ -786,35 +709,21 @@ class AmdToolsClient {
 
         if (!res.ok) {
           const snippet = redactSecrets((await res.text().catch(() => '')).slice(0, 300), this._apiKey)
-          // Some OpenAI-compatible servers only know tool_choice "auto"/"none".
-          // (Judged by what THIS request sent: the other lane may have switched already.)
           if (res.status === 400 && payload.tool_choice === 'required' && /tool_choice|required/i.test(snippet)) {
             if (this.toolChoice === 'required') logger.warn(TAG, 'endpoint rejected tool_choice "required" — falling back to "auto" for this session')
             this.toolChoice = 'auto'
-            attempt -= 1 // not the model's fault: do not burn a retry
+            attempt -= 1
             continue
           }
-          // Same for parallel_tool_calls: an endpoint that rejects the field
-          // gets requests without it from then on.
           if (res.status === 400 && 'parallel_tool_calls' in payload && /parallel_tool_calls|parallel/i.test(snippet)) {
             if (this.parallelToolCalls !== null) logger.warn(TAG, 'endpoint rejected parallel_tool_calls — omitting the field for this session')
             this.parallelToolCalls = null
             attempt -= 1
             continue
           }
-          // The reasoning switches are not standard fields: an endpoint that
-          // rejects them keeps only the in-prompt soft switch.
-          if (res.status === 400 && ('enable_thinking' in payload || 'chat_template_kwargs' in payload) && /enable_thinking|chat_template_kwargs|unknown (field|parameter)|unrecognized|extra (fields|inputs)/i.test(snippet)) {
-            if (this.thinkingFields) logger.warn(TAG, 'endpoint rejected enable_thinking / chat_template_kwargs — using only the /no_think prompt switch for this session')
-            this.thinkingFields = false
-            attempt -= 1
-            continue
-          }
           this.stats.failures += 1
           const failure = new Error(`HTTP ${res.status}: ${snippet}`)
           failure.status = res.status
-          // A request that carried an image and was refused as a request (not
-          // as a rate limit): the caller resends it without the image.
           if (withImages && [400, 404, 415, 422].includes(res.status)) failure.imagesRejected = true
           throw failure
         }
@@ -862,84 +771,62 @@ class AmdToolsClient {
   }
 
 
-/**
- * One tool-enabled completion for the ACTION lane.
+  /**
+   * One tool-enabled completion for the ACTION lane.
    * @param {{role:string, content:string}[]} messages
    * @param {object[]} tools OpenAI-format tools (see createZincTools)
-   * @returns {Promise<{action:object, content:string, usage:object, raw:object}>}
+   * @returns {Promise<{action:object, actions:object[], reasoning:string, content:string, finishReason:string|null, usage:object, raw:object}>}
    */
-  async chatWithTools (messages, tools = createZincTools(), { signal = null, think = null } = {}) {
-    // Images go only to an endpoint that has not refused them.
+  async chatWithTools (messages, tools = createZincTools(), { signal = null } = {}) {
     if (this.visionSupported === false && hasImages(messages)) messages = stripImages(messages)
-    // `think` (adaptive mode): false = this call needs no reasoning; true = it
-    // does, and gets room for it. 'off' and the cut-off cool-down still win.
-    const adaptive = this.thinking === 'adaptive' && typeof think === 'boolean'
-    const thinkFirst = adaptive && think === false ? false : this._thinkFirst()
-    const firstMax = adaptive && thinkFirst && this.thinkMaxTokens ? Math.max(this.thinkMaxTokens, this.maxTokens || 0) : undefined
-    this.stats.thinkingCalls = (this.stats.thinkingCalls || 0) + (thinkFirst ? 1 : 0)
-    this.stats.quickCalls = (this.stats.quickCalls || 0) + (thinkFirst ? 0 : 1)
-    const ask = (msgs, extra = {}) => this._complete({ messages: msgs, tools, lane: 'action', ...(firstMax ? { maxTokens: firstMax } : {}), timeoutMs: this._effectiveTimeoutMs(this.timeoutMs, 180_000), ...extra })
+    const ask = (msgs, extra = {}) => this._complete({ messages: msgs, tools, lane: 'action', timeoutMs: this._effectiveTimeoutMs(this.timeoutMs, 180_000), ...extra })
     let first
     try {
       try {
-        first = await ask(messages, { signal, thinking: thinkFirst ? null : false })
+        first = await ask(messages, { signal })
       } catch (err) {
         if (!err?.imagesRejected) throw err
-        // The endpoint (or this model alias) takes no images: say so once, and
-        // answer the same question from the text that came with the picture.
         if (this.visionSupported !== false) logger.warn(TAG, `endpoint rejected the image input (HTTP ${err.status}) — screenshots are text-only for this session`)
         this.visionSupported = false
         messages = stripImages(messages)
-        first = await ask(messages, { signal, thinking: thinkFirst ? null : false })
+        first = await ask(messages, { signal })
       }
     } catch (err) {
       if (err && (err.name === 'AbortError' || /abort/i.test(String(err.message)))) {
         this.stats.aborted = (this.stats.aborted || 0) + 1
         const interrupted = { a: 'idle', _interrupted: true }
-        return { action: interrupted, actions: [interrupted], message: null, content: '', usage: null, raw: null }
+        return { action: interrupted, actions: [interrupted], message: null, reasoning: '', content: '', finishReason: 'aborted', usage: null, raw: null }
       }
       throw err
     }
-    // Every call of the answer, in order. `action` (the first) is what the
-    // rescue logic below judges: an answer whose FIRST call is broken is retried
-    // with feedback; later broken calls are simply reported to the model.
-    const offeredNames = new Set(tools.map((t) => t.function?.name))
-    const all = coerceActions(first.message, { max: this.maxToolCalls }).map((a) => (a._via && !offeredNames.has(a.a) ? { a: 'idle', _unknownTool: a.a, _callId: a._callId } : a))
-    let action = all[0]
+
     const offered = new Set(tools.map((t) => t.function?.name))
+    const all = coerceActions(first.message, { max: this.maxToolCalls }).map((a) => (a._via && !offered.has(a.a) ? { a: 'idle', _unknownTool: a.a, _callId: a._callId } : a))
+    let action = all[0]
     if (action._via && !offered.has(action.a)) action = { a: 'idle', _unknownTool: action.a }
-    // An answer that executed NOTHING in a broken way — an invented tool
-    // name, broken JSON arguments, an empty message, or finish_reason 'length'
-    // truncating the call — gets rescue retries with explicit feedback.
-    // Plain prose with a non-length finish_reason is NOT retried here so the
-    // executor's prose feedback test contract stays intact.
+
     const describeFailure = (a, finish) => finish === 'length'
       ? 'truncated (length)'
       : a._unknownTool ? `unknown "${a._unknownTool}"` : a._badArgs ? `bad args (${a._badArgs})` : a._prose ? 'prose' : 'empty'
-    // A cut-off answer that nevertheless carries a complete, valid call is fine.
     const usable = (a) => Boolean(a._via && offered.has(a.a) && !a._unknownTool && !a._badArgs)
     const isBroke = (a, finish) => Boolean(a._unknownTool || a._badArgs || (!a._via && a._fallback && !a._prose) || (finish === 'length' && !usable(a)))
 
     let current = first
     let totalUsage = first.usage
+    const thoughts = []
+    const r0 = extractReasoning(first.message)
+    if (r0) thoughts.push(r0)
     const firstTruncated = first.finishReason === 'length' && !usable(action)
-    this._noteTruncation(firstTruncated)
+    if (firstTruncated) this.stats.truncatedAnswers = (this.stats.truncatedAnswers || 0) + 1
+
     if (isBroke(action, current.finishReason)) {
       let rescueMessages = [...messages]
-      // WHAT THE RESCUE USED TO DO WRONG (live log, 2026-11-14): a cut-off
-      // answer was asked for again with reasoning still ON and a budget capped
-      // at min(1024, 2×max) — with amd.maxTokens 1536 that was LESS room than
-      // the call that had just been cut off — and then a third time. Three
-      // ~12.6k-token prompts and 3–6 minutes for no tool call, twenty times in
-      // one session. A cut-off answer now gets ONE retry, with the reasoning
-      // phase switched off and at least as much room as before.
       const maxAttempts = firstTruncated ? 1 : 2
       for (let attempt = 1; attempt <= maxAttempts && isBroke(action, current.finishReason); attempt++) {
         const truncated = current.finishReason === 'length'
         const nudge = truncated
-          ? 'Your previous answer ran out of output tokens while you were still reasoning, so no tool was called. Do not reason this time: reply NOW with the tool call(s) only.'
-          : 'That answer did nothing: no valid tool was called. Call exactly ONE of the listed tools now (use say to just talk, idle to wait) — plain text, markdown fences and other names are not accepted.'
-        // Half a thought is not worth re-sending (and re-reading costs tokens).
+          ? 'Your previous answer ran out of output tokens before calling a tool. Return your tool call(s) now.'
+          : 'No valid tool was called. Call one of the declared tools now (use say to talk or idle to wait).'
         const badText = !truncated && typeof current.message?.content === 'string' && current.message.content.trim()
           ? current.message.content.trim().slice(0, 300)
           : null
@@ -950,11 +837,12 @@ class AmdToolsClient {
         ]
         try {
           const next = await ask(rescueMessages, {
-            ...(truncated ? { maxTokens: Math.max(this.rescueMaxTokens || 0, this.maxTokens || 512, 1024) } : {}),
-            thinking: truncated && this.thinking !== 'on' ? false : (thinkFirst ? null : false)
+            ...(truncated ? { maxTokens: Math.max((this.maxTokens || 1024) * 2, 1536) } : {})
           })
           totalUsage = mergeUsage(totalUsage, next.usage)
           current = next
+          const rNext = extractReasoning(next.message)
+          if (rNext) thoughts.push(rNext)
           let retry = coerceAction(next.message)
           if (retry._via && !offered.has(retry.a)) retry = { a: 'idle', _unknownTool: retry.a }
           action = retry
@@ -963,7 +851,17 @@ class AmdToolsClient {
             if (retry._via === 'tool') this.stats.toolCalls += 1
             else this.stats.jsonFallbacks += 1
             const rescued = coerceActions(next.message, { max: this.maxToolCalls }).map((a) => (a._via && !offered.has(a.a) ? { a: 'idle', _unknownTool: a.a, _callId: a._callId } : a))
-            return { action, actions: rescued.length ? rescued : [action], message: next.message, content: typeof next.message.content === 'string' ? next.message.content.trim() : '', usage: totalUsage, raw: next.raw, rescued: true }
+            return {
+              action,
+              actions: rescued.length ? rescued : [action],
+              message: next.message,
+              reasoning: thoughts.join('\n---\n'),
+              content: typeof next.message.content === 'string' ? next.message.content.trim() : '',
+              finishReason: next.finishReason,
+              usage: totalUsage,
+              raw: next.raw,
+              rescued: true
+            }
           }
         } catch (err) {
           logger.debug(TAG, `action retry ${attempt} failed: ${err.message || err}`)
@@ -971,8 +869,6 @@ class AmdToolsClient {
         }
       }
       logger.warn(TAG, `model retry still produced no valid tool call (${describeFailure(action, current.finishReason)})`)
-      // Say what really happened: "you returned no tool call" blamed the model
-      // for an answer the output limit cut off.
       if (current.finishReason === 'length' && !usable(action)) action = { ...action, _truncated: true }
     }
     if (action._via === 'tool') this.stats.toolCalls += 1
@@ -980,39 +876,49 @@ class AmdToolsClient {
     if (action._unknownTool) this.stats.unknownToolCalls += 1
     const actions = current === first ? all : [action]
     if (actions.length > 1) this.stats.multiToolAnswers = (this.stats.multiToolAnswers || 0) + 1
-    return { action, actions, message: current.message, content: typeof current.message.content === 'string' ? current.message.content.trim() : '', usage: totalUsage, raw: current.raw }
+    return {
+      action,
+      actions,
+      message: current.message,
+      reasoning: thoughts.join('\n---\n'),
+      content: typeof current.message.content === 'string' ? current.message.content.trim() : '',
+      finishReason: current.finishReason,
+      usage: totalUsage,
+      raw: current.raw
+    }
   }
 
   /**
-   * One completion for the CHAT lane: a short reply, optionally a task for
-   * the action lane.
-   * @returns {Promise<{reply:{text:string, task:string}, usage:object}>}
+   * One completion for the CHAT lane: a short reply, optionally handing a task
+   * to the action lane.
+   * @returns {Promise<{reply:{text:string, task:string}, reasoning:string, finishReason:string|null, usage:object}>}
    */
-  async chatReply (messages, { maxTokens = 120 } = {}) {
-    // A chat line is one sentence: by default ('off' in the shipped config) it
-    // is written without a reasoning phase, which is the difference between a
-    // 10 s answer and the 120 s cut-off one of the live log.
-    const thinkFirst = this.chatThinking === 'on' || (this.chatThinking === 'auto' && this.thinking !== 'off')
-    const ask = (budget, think = thinkFirst) => this._complete({
-      messages, tools: createChatTools(), maxTokens: budget, temperature: Math.max(this.temperature, 0.5),
-      lane: 'chat', timeoutMs: this._effectiveTimeoutMs(this.chatTimeoutMs, 120_000), maxRetries: this.chatMaxRetries,
-      thinking: think ? null : false
+  async chatReply (messages, { maxTokens = 400 } = {}) {
+    const ask = (budget) => this._complete({
+      messages,
+      tools: createChatTools(),
+      maxTokens: budget,
+      temperature: Math.max(this.temperature, 0.5),
+      lane: 'chat',
+      timeoutMs: this._effectiveTimeoutMs(this.chatTimeoutMs, 120_000),
+      maxRetries: this.chatMaxRetries
     })
     let { message, usage, finishReason } = await ask(maxTokens)
     this.stats.chatReplies += 1
     let reply = coerceReply(message)
-    // An answer with no reply call AND no text is not "the model chose to stay
-    // silent" (that is a reply call with empty text): the output was cut off —
-    // a model that reasons first can spend the whole budget before the call —
-    // or the endpoint returned nothing usable. Ask once more with room to
-    // finish, and if that fails too, say which it was instead of "(silent)".
+    const thoughts = []
+    const r0 = extractReasoning(message)
+    if (r0) thoughts.push(r0)
+
     if (reply._via !== 'tool' && !reply.text) {
       const cutOff = finishReason === 'length'
       try {
-        // A cut-off answer is asked for again without reasoning (unless the operator forced it on).
-        const again = await ask(Math.max(maxTokens * 3, 480), cutOff && this.chatThinking !== 'on' ? false : thinkFirst)
+        const again = await ask(Math.max(maxTokens * 2, 800))
         this.stats.chatRetries = (this.stats.chatRetries || 0) + 1
         usage = mergeUsage(usage, again.usage)
+        finishReason = again.finishReason
+        const r1 = extractReasoning(again.message)
+        if (r1) thoughts.push(r1)
         const second = coerceReply(again.message)
         if (second._via === 'tool' || second.text) reply = second
         else reply._empty = again.finishReason === 'length' || cutOff ? 'cut_off' : 'no_call'
@@ -1021,10 +927,10 @@ class AmdToolsClient {
         reply._empty = cutOff ? 'cut_off' : 'no_call'
       }
     }
-    return { reply, usage }
+    return { reply, reasoning: thoughts.join('\n---\n'), finishReason, usage }
   }
 
-  /** Telemetry compatible with the v1 session report + tool metrics. */
+  /** Telemetry compatible with the session report + tool metrics. */
   getStats () {
     const s = this.stats
     const hitRate = s.cachedTokens > 0 && s.promptTokens > 0 ? s.cachedTokens / s.promptTokens : null
@@ -1040,4 +946,4 @@ class AmdToolsClient {
   _startedAt = Date.now()
 }
 
-module.exports = { AmdToolsClient, createZincTools, createChatTools, coerceAction, coerceActions, coerceReply, buildToolsPayload, toolTurnMessages, withNoThinkSwitch, hasImages, stripImages, contentText, ACTION_TOOLS, CHAT_TOOLS }
+module.exports = { AmdToolsClient, createZincTools, createChatTools, coerceAction, coerceActions, coerceReply, buildToolsPayload, toolTurnMessages, extractReasoning, hasImages, stripImages, contentText, ACTION_TOOLS, CHAT_TOOLS }

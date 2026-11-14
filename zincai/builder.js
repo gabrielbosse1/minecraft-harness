@@ -329,10 +329,19 @@ class BuilderExecutor {
    * Place ONE block at the target position against a known good reference.
    * Resolves true on success (verified), false otherwise.
    */
-  async _placeAt (target, itemName) {
+  async _placeAt (target, itemName, expectedBlockName = null) {
     const bot = this.bot
     const item = bot.inventory.items().find((i) => i.name === itemName)
     if (!item) return false
+    const matchesPlaced = (b) => {
+      if (!b || b.name === 'air' || b.name === 'cave_air') return false
+      if (expectedBlockName && b.name === expectedBlockName) return true
+      if (b.name === itemName) return true
+      if (itemName === 'redstone' && b.name === 'redstone_wire') return true
+      if (itemName === 'redstone_torch' && (b.name === 'redstone_torch' || b.name === 'redstone_wall_torch')) return true
+      if (itemName === 'torch' && (b.name === 'torch' || b.name === 'wall_torch')) return true
+      return false
+    }
     try { await bot.equip(item, 'hand') } catch { return false }
     const refOffsets = [
       { ref: target.offset(0, -1, 0), face: { x: 0, y: 1, z: 0 } },  // place on top of the block below
@@ -358,15 +367,15 @@ class BuilderExecutor {
         const deadline = Date.now() + 6000
         while (Date.now() < deadline) {
           const placed = bot.blockAt(target)
-          if (placed && placed.name === itemName) return true
+          if (matchesPlaced(placed)) return true
           const outcome = await Promise.race([placePromise.then(() => 'ok', (err) => err), new Promise((r) => setTimeout(() => r('pending'), 200))])
           if (outcome !== 'pending') {
             const after = bot.blockAt(target)
-            if (!(after && after.name === itemName) && !(outcome && outcome.message)) {
+            if (!matchesPlaced(after) && !(outcome && outcome.message)) {
               this.log('debug', `face ${face.x},${face.y},${face.z} placed but target reads ${after?.name ?? 'unknown'}`)
             }
             if (outcome && outcome.message) this.log('debug', `face ${face.x},${face.y},${face.z} rejected: ${outcome.message}`)
-            if (after && after.name === itemName) return true
+            if (matchesPlaced(after)) return true
             break
           }
         }

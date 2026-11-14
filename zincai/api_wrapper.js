@@ -32,6 +32,7 @@
 'use strict'
 
 const { parseUsage, redactSecrets } = require('../src/amdClient')
+const { ContextBudget, measureMessages, measureTools, compactMessagesFallback, trimIncompleteSentence, positiveInt } = require('./context_budget')
 const logger = require('../src/logger')
 
 const TAG = 'amd'
@@ -269,6 +270,16 @@ function createZincTools () {
 function createChatTools () { return toOpenAi(CHAT_TOOLS) }
 
 /**
+ * Compact core tool subset used ONLY during Stage 3 graceful degradation after
+ * full-tool Stage 1 & 2 recovery still hit token/context limits. Cuts schema
+ * overhead by ~80% (~5.6k tok -> ~1k tok) while keeping essential verbs.
+ */
+const RECOVERY_TOOL_NAMES = new Set(['idle', 'say', 'go_to', 'stop', 'hold', 'goal', 'note', 'eat', 'attack', 'gather'])
+function createRecoveryTools () {
+  return toOpenAi(ACTION_TOOLS.filter((t) => RECOVERY_TOOL_NAMES.has(t.name)))
+}
+
+/**
  * Map tool args -> the harness's internal action shape. Arguments keep their
  * own names; the single-letter fields are legacy aliases for older call sites.
  */
@@ -502,18 +513,31 @@ function toolTurnMessages (calls, { format = 'tool', content = '', images = [] }
 
 /**
  * Pure: build the OpenAI-compatible chat completion request body.
+ * `max_tokens` is omitted when null/undefined so endpoints apply the model's
+ * standard output limit rather than an arbitrary harness cap.
+ * `tools` / `tool_choice` are omitted when no tools are provided (used by
+ * plain-text graceful degradation).
  */
-function buildToolsPayload ({ model, messages, temperature, maxTokens, tools, toolChoice = 'required', parallelToolCalls = true }) {
-  return {
+function buildToolsPayload ({ model, messages, temperature, maxTokens = null, tools = null, toolChoice = 'required', parallelToolCalls = true, extraParams = null }) {
+  const payload = {
     model,
     messages,
     temperature,
-    max_tokens: maxTokens,
-    stream: false,
-    tools,
-    tool_choice: toolChoice,
-    parallel_tool_calls: parallelToolCalls !== false
+    stream: false
   }
+  const explicitMax = positiveInt(maxTokens, 16, 500_000)
+  if (explicitMax !== null) payload.max_tokens = explicitMax
+  if (Array.isArray(tools) && tools.length > 0) {
+    payload.tools = tools
+    payload.tool_choice = toolChoice
+    if (parallelToolCalls !== null) payload.parallel_tool_calls = parallelToolCalls !== false
+  }
+  if (extraParams && typeof extraParams === 'object') {
+    for (const [k, v] of Object.entries(extraParams)) {
+      if (v !== undefined && !(k in payload)) payload[k] = v
+    }
+  }
+  return payload
 }
 
 /** Extract model reasoning trace from OpenAI-compatible fields or <think> tags. */
@@ -570,9 +594,28 @@ function mergeUsage (a, b) {
 class AmdToolsClient {
   /**
    * Drop-in replacement for AmdClient at the call site, with the same
-   * constructor contract and the same getStats() shape (plus tool metrics).
+   * constructor contract and the same getStats() shape (plus tool metrics,
+   * standard model limit awareness, proactive compaction, and multi-stage
+   * graceful degradation).
    */
-  constructor ({ apiKey, baseUrl, model, timeoutMs = 20_000, maxRetries = 2, temperature = 0.25, maxTokens = 1024, toolChoice = 'required', maxConcurrent = 2, chatTimeoutMs = null, chatMaxRetries = 1 }) {
+  constructor ({
+    apiKey,
+    baseUrl,
+    model,
+    timeoutMs = 20_000,
+    maxRetries = 2,
+    temperature = 0.25,
+    maxTokens = null,
+    contextWindow = null,
+    maxOutputTokens = null,
+    proactiveRatio = 0.75,
+    reserveOutputRatio = 0.25,
+    discoverModels = true,
+    toolChoice = 'required',
+    maxConcurrent = 2,
+    chatTimeoutMs = null,
+    chatMaxRetries = 1
+  }) {
     if (!apiKey) {
       throw new Error('AMD API key missing: set AMD_API_KEY (or API_KEY / RADEON_API_KEY)')
     }
@@ -581,8 +624,16 @@ class AmdToolsClient {
     this.timeoutMs = timeoutMs
     this.maxRetries = maxRetries
     this.temperature = temperature
-    this.maxTokens = maxTokens
+    this.maxTokens = positiveInt(maxTokens, 16, 500_000)
     this._apiKey = String(apiKey)
+
+    this.budget = new ContextBudget({
+      model,
+      contextWindow,
+      maxOutputTokens,
+      proactiveRatio,
+      reserveOutputRatio
+    })
 
     this.stats = {
       requests: 0,
@@ -595,7 +646,12 @@ class AmdToolsClient {
       toolCalls: 0,
       jsonFallbacks: 0,
       unknownToolCalls: 0,
-      chatReplies: 0
+      chatReplies: 0,
+      compactions: 0,
+      proactiveCompactions: 0,
+      reactiveCompactions: 0,
+      degradedRecoveries: 0,
+      contextOverflows: 0
     }
     this.toolChoice = toolChoice
     this.parallelToolCalls = true
@@ -607,6 +663,40 @@ class AmdToolsClient {
     this._running = new Set()
     this._latencies = []
     this.visionSupported = null
+    this.reasoningEffortSupported = null
+    this._discoverModels = discoverModels !== false
+    this._modelsDiscoveryPromise = null
+  }
+
+  /**
+   * Lazily query `GET {baseUrl}/models` once per client to discover endpoint-
+   * advertised `context_length` / `max_model_len` / `max_output_tokens`.
+   * Fails silently on 404/network error so tests and non-standard proxies work.
+   */
+  discoverModelLimits () {
+    if (!this._discoverModels) return Promise.resolve(false)
+    if (this._modelsDiscoveryPromise) return this._modelsDiscoveryPromise
+    const url = `${this.baseUrl}/models`
+    const headers = {
+      Authorization: `Bearer ${this._apiKey}`,
+      'User-Agent': 'mineflayer-zincai/3.0'
+    }
+    const timeout = Math.min(2_500, Math.max(500, this.timeoutMs || 2_500))
+    this._modelsDiscoveryPromise = (async () => {
+      try {
+        const res = await this._fetchWithTimeout(url, { method: 'GET', headers }, timeout)
+        if (!res.ok) return false
+        const data = await res.json().catch(() => null)
+        const updated = this.budget.applyModelMetadata(data)
+        if (updated) {
+          logger.info(TAG, `discovered model limits for ${this.model}: context=${this.budget.contextWindow}, maxOutput=${this.budget.maxOutputTokens} (via /models)`)
+        }
+        return updated
+      } catch {
+        return false
+      }
+    })()
+    return this._modelsDiscoveryPromise
   }
 
   _recordLatency (ms) {
@@ -653,9 +743,26 @@ class AmdToolsClient {
    * `maxConcurrent`), and a waiting chat call is always started first.
    * @returns {Promise<{message:object, usage:object, raw:object}>}
    */
-  _complete ({ messages, tools, maxTokens = this.maxTokens, temperature = this.temperature, lane = 'action', timeoutMs = this.timeoutMs, maxRetries = this.maxRetries, signal = null, parallel = lane !== 'chat' }) {
+  _complete ({
+    messages,
+    tools,
+    maxTokens = this.maxTokens,
+    temperature = this.temperature,
+    lane = 'action',
+    timeoutMs = this.timeoutMs,
+    maxRetries = this.maxRetries,
+    signal = null,
+    parallel = lane !== 'chat',
+    toolChoice = null,
+    extraParams = null
+  }) {
     return new Promise((resolve, reject) => {
-      this._queue.push({ lane, resolve, reject, run: () => this._completeNow({ messages, tools, maxTokens, temperature, timeoutMs, maxRetries, signal, parallel }) })
+      this._queue.push({
+        lane,
+        resolve,
+        reject,
+        run: () => this._completeNow({ messages, tools, maxTokens, temperature, timeoutMs, maxRetries, signal, parallel, toolChoice, extraParams })
+      })
       this._pump()
     })
   }
@@ -675,7 +782,18 @@ class AmdToolsClient {
     }
   }
 
-  async _completeNow ({ messages, tools, maxTokens, temperature, timeoutMs = this.timeoutMs, maxRetries = this.maxRetries, signal = null, parallel = true }) {
+  async _completeNow ({
+    messages,
+    tools,
+    maxTokens,
+    temperature,
+    timeoutMs = this.timeoutMs,
+    maxRetries = this.maxRetries,
+    signal = null,
+    parallel = true,
+    toolChoice = null,
+    extraParams = null
+  }) {
     const url = `${this.baseUrl}/chat/completions`
     const headers = {
       Authorization: `Bearer ${this._apiKey}`,
@@ -685,6 +803,10 @@ class AmdToolsClient {
 
     let attempt = 0
     let lastError = null
+    let effectiveMaxTokens = positiveInt(maxTokens, 16, 500_000)
+    let effectiveExtra = extraParams && typeof extraParams === 'object' ? { ...extraParams } : null
+    let clampedOutputOnce = false
+
     while (attempt <= maxRetries) {
       if (attempt > 0) {
         this.stats.retries += 1
@@ -693,8 +815,18 @@ class AmdToolsClient {
       attempt += 1
       this.stats.requests += 1
       const withImages = hasImages(messages)
-      const payload = buildToolsPayload({ model: this.model, messages, temperature, maxTokens, tools, toolChoice: this.toolChoice, parallelToolCalls: parallel && this.parallelToolCalls !== false })
-      if (this.parallelToolCalls === null) delete payload.parallel_tool_calls
+      const activeToolChoice = toolChoice || this.toolChoice
+      const payload = buildToolsPayload({
+        model: this.model,
+        messages,
+        temperature,
+        maxTokens: effectiveMaxTokens,
+        tools,
+        toolChoice: activeToolChoice,
+        parallelToolCalls: this.parallelToolCalls === null ? null : (parallel && this.parallelToolCalls !== false),
+        extraParams: effectiveExtra
+      })
+      const promptChars = measureMessages(messages).chars + measureTools(tools)
       const startedAt = Date.now()
       try {
         if (signal?.aborted) { const err = new Error('aborted'); err.name = 'AbortError'; throw err }
@@ -708,7 +840,7 @@ class AmdToolsClient {
         }
 
         if (!res.ok) {
-          const snippet = redactSecrets((await res.text().catch(() => '')).slice(0, 300), this._apiKey)
+          const snippet = redactSecrets((await res.text().catch(() => '')).slice(0, 350), this._apiKey)
           if (res.status === 400 && payload.tool_choice === 'required' && /tool_choice|required/i.test(snippet)) {
             if (this.toolChoice === 'required') logger.warn(TAG, 'endpoint rejected tool_choice "required" — falling back to "auto" for this session')
             this.toolChoice = 'auto'
@@ -721,10 +853,28 @@ class AmdToolsClient {
             attempt -= 1
             continue
           }
+          const limitInfo = res.status === 400 ? this.budget.learnFromError(snippet) : null
+          if (res.status === 400 && effectiveExtra && (limitInfo?.isUnsupportedParam || /reasoning_effort|enable_thinking|chat_template_kwargs/i.test(snippet))) {
+            this.reasoningEffortSupported = false
+            effectiveExtra = null
+            attempt -= 1
+            continue
+          }
+          if (res.status === 400 && limitInfo?.isOutputLimitError && !limitInfo?.isContextOverflow && effectiveMaxTokens !== null && !clampedOutputOnce) {
+            clampedOutputOnce = true
+            effectiveMaxTokens = limitInfo.learnedOutput
+              ? Math.min(effectiveMaxTokens, limitInfo.learnedOutput)
+              : null
+            attempt -= 1
+            continue
+          }
           this.stats.failures += 1
           const failure = new Error(`HTTP ${res.status}: ${snippet}`)
           failure.status = res.status
           if (withImages && [400, 404, 415, 422].includes(res.status)) failure.imagesRejected = true
+          if (limitInfo?.isContextOverflow) failure.contextOverflow = true
+          if (limitInfo?.isOutputLimitError) failure.outputLimitExceeded = true
+          if (limitInfo) failure.limitInfo = limitInfo
           throw failure
         }
 
@@ -746,6 +896,7 @@ class AmdToolsClient {
         if (usage.promptTokens !== null) {
           this.stats.promptTokens += usage.promptTokens
           this.stats.completionTokens += usage.completionTokens || 0
+          this.budget.observeUsage({ promptChars, promptTokens: usage.promptTokens })
           if (usage.cachedTokens !== null) {
             this.stats.cachedTokens += usage.cachedTokens
             this.stats.callsWithCacheInfo += 1
@@ -770,46 +921,237 @@ class AmdToolsClient {
     throw lastError || new Error('AMD request failed after retries')
   }
 
+  /**
+   * Apply a compaction level via caller-provided domain compactor (preserving
+   * memories/goals) or fall back to generic message-level compaction.
+   */
+  _applyCompaction (messages, tools, level, { compact = null, reason = 'compaction', lane = 'action', beforeTokens = 0, budget = null } = {}) {
+    if (level <= 0) return { messages, tools }
+    if (typeof compact === 'function') {
+      const built = compact(level, { reason, lane, beforeTokens, budget })
+      if (Array.isArray(built)) {
+        return { messages: built, tools }
+      }
+      if (built && typeof built === 'object') {
+        return {
+          messages: Array.isArray(built.messages) ? built.messages : messages,
+          tools: built.tools !== undefined ? built.tools : tools
+        }
+      }
+    }
+    return {
+      messages: compactMessagesFallback(messages, { level }),
+      tools
+    }
+  }
 
   /**
-   * One tool-enabled completion for the ACTION lane.
+   * Pre-flight proactive compaction: checks estimated prompt size against the
+   * model's standard context window minus output/reasoning headroom and compacts
+   * BEFORE hitting the limit, stepping up only as far as needed so memories stay
+   * intact.
+   */
+  async _prepareMessages (messages, tools, { lane = 'action', explicitMaxTokens = null, initialLevel = 0, compact = null, onCompaction = null } = {}) {
+    await this.discoverModelLimits()
+    let activeMessages = messages
+    let activeTools = tools
+    let est = this.budget.estimateTokens(activeMessages, activeTools)
+    const plan = this.budget.planCompaction({
+      estimatedTokens: est.totalTokens,
+      floor: initialLevel,
+      lane,
+      explicitMaxTokens
+    })
+
+    let level = 0
+    if (plan.level > 0) {
+      const beforeTokens = est.totalTokens
+      for (let lvl = plan.level; lvl <= 4; lvl++) {
+        const next = this._applyCompaction(activeMessages, activeTools, lvl, {
+          compact,
+          reason: plan.reason,
+          lane,
+          beforeTokens,
+          budget: plan
+        })
+        activeMessages = this.visionSupported === false && hasImages(next.messages)
+          ? stripImages(next.messages)
+          : next.messages
+        activeTools = next.tools
+        level = lvl
+        est = this.budget.estimateTokens(activeMessages, activeTools)
+        if (est.totalTokens <= plan.hardPromptBudget) break
+      }
+      // If even survival-level user compaction cannot leave minimum output headroom
+      // because the endpoint's context window is too small for all 39 tool schemas,
+      // proactively degrade to the compact core toolset before hitting HTTP 400.
+      const minFitLimit = plan.contextWindow - Math.max(1_024, Math.min(plan.outputReserve, 2_048))
+      if (lane === 'action' && est.totalTokens > minFitLimit && Array.isArray(activeTools) && activeTools.length > 15) {
+        activeTools = createRecoveryTools()
+        est = this.budget.estimateTokens(activeMessages, activeTools)
+      }
+      this.stats.compactions += 1
+      if (plan.proactive) this.stats.proactiveCompactions += 1
+      const info = {
+        phase: 'proactive',
+        lane,
+        level,
+        reason: plan.reason,
+        beforeTokens,
+        afterTokens: est.totalTokens,
+        contextWindow: plan.contextWindow,
+        softCompactAt: plan.softCompactAt,
+        hardPromptBudget: plan.hardPromptBudget,
+        outputReserve: plan.outputReserve
+      }
+      logger.info(TAG, `proactive compaction (${lane}, L${level}, ${plan.reason}): ~${beforeTokens} -> ~${est.totalTokens} tok (budget ${plan.hardPromptBudget} / ctx ${plan.contextWindow}, output headroom ${plan.outputReserve})`)
+      if (typeof onCompaction === 'function') {
+        try { onCompaction(info) } catch { /* telemetry best effort */ }
+      }
+    }
+
+    return {
+      messages: activeMessages,
+      tools: activeTools,
+      level,
+      estimatedTokens: est.totalTokens,
+      plan
+    }
+  }
+
+  /**
+   * One tool-enabled completion for the ACTION lane, with proactive pre-limit
+   * compaction, HTTP 400 context-overflow recovery, and 3-stage graceful
+   * degradation on truncation (`finish_reason === 'length'`) or invalid calls.
+   *
    * @param {{role:string, content:string}[]} messages
    * @param {object[]} tools OpenAI-format tools (see createZincTools)
-   * @returns {Promise<{action:object, actions:object[], reasoning:string, content:string, finishReason:string|null, usage:object, raw:object}>}
+   * @returns {Promise<{action:object, actions:object[], reasoning:string, content:string, finishReason:string|null, usage:object, raw:object, compactionLevel:number, degraded:boolean}>}
    */
-  async chatWithTools (messages, tools = createZincTools(), { signal = null } = {}) {
+  async chatWithTools (messages, tools = createZincTools(), { signal = null, compact = null, onCompaction = null, initialLevel = 0 } = {}) {
     if (this.visionSupported === false && hasImages(messages)) messages = stripImages(messages)
-    const ask = (msgs, extra = {}) => this._complete({ messages: msgs, tools, lane: 'action', timeoutMs: this._effectiveTimeoutMs(this.timeoutMs, 180_000), ...extra })
+
+    const prepared = await this._prepareMessages(messages, tools, {
+      lane: 'action',
+      explicitMaxTokens: this.maxTokens,
+      initialLevel,
+      compact,
+      onCompaction
+    })
+    let activeMessages = prepared.messages
+    let activeTools = prepared.tools
+    let compactionLevel = prepared.level
+    let degraded = false
+    let recoveryStage = 0
+
+    const ask = (msgs, activeSet, extra = {}) => this._complete({
+      messages: msgs,
+      tools: activeSet,
+      lane: 'action',
+      timeoutMs: this._effectiveTimeoutMs(this.timeoutMs, 180_000),
+      ...extra
+    })
+
+    const notifyReactive = (info) => {
+      this.stats.compactions += 1
+      this.stats.reactiveCompactions += 1
+      if (typeof onCompaction === 'function') {
+        try { onCompaction({ phase: 'reactive', lane: 'action', ...info }) } catch { /* noop */ }
+      }
+    }
+
     let first
+    let primaryMaxTokens = this.maxTokens
     try {
       try {
-        first = await ask(messages, { signal })
+        first = await ask(activeMessages, activeTools, { signal, maxTokens: primaryMaxTokens })
       } catch (err) {
-        if (!err?.imagesRejected) throw err
-        if (this.visionSupported !== false) logger.warn(TAG, `endpoint rejected the image input (HTTP ${err.status}) — screenshots are text-only for this session`)
-        this.visionSupported = false
-        messages = stripImages(messages)
-        first = await ask(messages, { signal })
+        if (err?.imagesRejected) {
+          if (this.visionSupported !== false) logger.warn(TAG, `endpoint rejected the image input (HTTP ${err.status}) — screenshots are text-only for this session`)
+          this.visionSupported = false
+          activeMessages = stripImages(activeMessages)
+          first = await ask(activeMessages, activeTools, { signal, maxTokens: primaryMaxTokens })
+        } else if (err?.contextOverflow) {
+          // Reactive HTTP 400 context-overflow recovery: compact progressively and
+          // degrade tool schema size if survival compaction is still over the window.
+          this.stats.contextOverflows += 1
+          let overflowErr = err
+          let recovered = null
+          for (let stage = 1; stage <= 3 && !recovered; stage++) {
+            const beforeTok = this.budget.estimateTokens(activeMessages, activeTools).totalTokens
+            const targetLevel = Math.min(4, Math.max(compactionLevel + 1, stage === 1 ? 2 : stage + 1))
+            const shrunk = this._applyCompaction(activeMessages, activeTools, targetLevel, {
+              compact,
+              reason: 'context_overflow',
+              lane: 'action',
+              beforeTokens: beforeTok
+            })
+            activeMessages = this.visionSupported === false && hasImages(shrunk.messages) ? stripImages(shrunk.messages) : shrunk.messages
+            compactionLevel = targetLevel
+            if (stage >= 2) {
+              activeTools = createRecoveryTools()
+              degraded = true
+            }
+            const afterTok = this.budget.estimateTokens(activeMessages, activeTools).totalTokens
+            const safeOut = primaryMaxTokens !== null
+              ? Math.min(primaryMaxTokens, this.budget.room({ lane: 'action' }).availableOutputFor(afterTok))
+              : null
+            recoveryStage = stage
+            logger.warn(TAG, `context overflow (HTTP 400) — reactive compaction stage ${stage} (L${compactionLevel}${degraded ? ', compact-tools' : ''}): ~${beforeTok} -> ~${afterTok} tok (ctx ${this.budget.contextWindow})`)
+            notifyReactive({ stage, level: compactionLevel, reason: 'context_overflow', beforeTokens: beforeTok, afterTokens: afterTok, degraded })
+            try {
+              recovered = await ask(activeMessages, activeTools, {
+                signal,
+                maxTokens: safeOut,
+                ...(degraded ? { toolChoice: 'auto', parallel: false } : {})
+              })
+              if (degraded) this.stats.degradedRecoveries += 1
+            } catch (retryErr) {
+              overflowErr = retryErr
+              if (!retryErr?.contextOverflow) throw retryErr
+            }
+          }
+          if (!recovered) throw overflowErr
+          first = recovered
+        } else {
+          throw err
+        }
       }
     } catch (err) {
       if (err && (err.name === 'AbortError' || /abort/i.test(String(err.message)))) {
         this.stats.aborted = (this.stats.aborted || 0) + 1
         const interrupted = { a: 'idle', _interrupted: true }
-        return { action: interrupted, actions: [interrupted], message: null, reasoning: '', content: '', finishReason: 'aborted', usage: null, raw: null }
+        return {
+          action: interrupted,
+          actions: [interrupted],
+          message: null,
+          reasoning: '',
+          content: '',
+          finishReason: 'aborted',
+          usage: null,
+          raw: null,
+          compactionLevel,
+          degraded
+        }
       }
       throw err
     }
 
-    const offered = new Set(tools.map((t) => t.function?.name))
-    const all = coerceActions(first.message, { max: this.maxToolCalls }).map((a) => (a._via && !offered.has(a.a) ? { a: 'idle', _unknownTool: a.a, _callId: a._callId } : a))
-    let action = all[0]
-    if (action._via && !offered.has(action.a)) action = { a: 'idle', _unknownTool: action.a }
+    const extractFrom = (msg, toolSet) => {
+      const offered = new Set(toolSet.map((t) => t.function?.name))
+      const all = coerceActions(msg, { max: this.maxToolCalls }).map((a) => (a._via && !offered.has(a.a) ? { a: 'idle', _unknownTool: a.a, _callId: a._callId } : a))
+      let primary = all[0]
+      if (primary._via && !offered.has(primary.a)) primary = { a: 'idle', _unknownTool: primary.a }
+      return { offered, all, primary }
+    }
+
+    let { offered, all, primary: action } = extractFrom(first.message, activeTools)
 
     const describeFailure = (a, finish) => finish === 'length'
       ? 'truncated (length)'
       : a._unknownTool ? `unknown "${a._unknownTool}"` : a._badArgs ? `bad args (${a._badArgs})` : a._prose ? 'prose' : 'empty'
-    const usable = (a) => Boolean(a._via && offered.has(a.a) && !a._unknownTool && !a._badArgs)
-    const isBroke = (a, finish) => Boolean(a._unknownTool || a._badArgs || (!a._via && a._fallback && !a._prose) || (finish === 'length' && !usable(a)))
+    const usable = (a, set = offered) => Boolean(a._via && set.has(a.a) && !a._unknownTool && !a._badArgs)
+    const isBroke = (a, finish, set = offered) => Boolean(a._unknownTool || a._badArgs || (!a._via && a._fallback && !a._prose) || (finish === 'length' && !usable(a, set)))
 
     let current = first
     let totalUsage = first.usage
@@ -820,57 +1162,147 @@ class AmdToolsClient {
     if (firstTruncated) this.stats.truncatedAnswers = (this.stats.truncatedAnswers || 0) + 1
 
     if (isBroke(action, current.finishReason)) {
-      let rescueMessages = [...messages]
-      const maxAttempts = firstTruncated ? 1 : 2
-      for (let attempt = 1; attempt <= maxAttempts && isBroke(action, current.finishReason); attempt++) {
+      let lastMaxTokens = primaryMaxTokens
+      let rescueMessages = [...activeMessages]
+      let rescueTools = activeTools
+      let rescueOffered = offered
+      const maxAttempts = firstTruncated ? 3 : 2
+
+      for (let attempt = 1; attempt <= maxAttempts && isBroke(action, current.finishReason, rescueOffered); attempt++) {
         const truncated = current.finishReason === 'length'
-        const nudge = truncated
-          ? 'Your previous answer ran out of output tokens before calling a tool. Return your tool call(s) now.'
-          : 'No valid tool was called. Call one of the declared tools now (use say to talk or idle to wait).'
-        const badText = !truncated && typeof current.message?.content === 'string' && current.message.content.trim()
-          ? current.message.content.trim().slice(0, 300)
-          : null
-        rescueMessages = [
-          ...rescueMessages,
-          ...(badText ? [{ role: 'assistant', content: badText }] : []),
-          { role: 'user', content: nudge }
-        ]
-        try {
-          const next = await ask(rescueMessages, {
-            ...(truncated ? { maxTokens: Math.max((this.maxTokens || 1024) * 2, 1536) } : {})
+        let nextMessages
+        let nextTools = rescueTools
+        let nextToolChoice = null
+        let nextParallel = true
+        let nextExtra = null
+        let nextMaxTokens = lastMaxTokens
+
+        if (truncated) {
+          // Reactive compaction even when hitting `length`: shrink prompt to free
+          // context & reasoning headroom while preserving memories and goals.
+          const beforeTok = this.budget.estimateTokens(rescueMessages, rescueTools).totalTokens
+          const targetLevel = Math.min(4, Math.max(compactionLevel + 1, attempt))
+          const shrunk = this._applyCompaction(activeMessages, activeTools, targetLevel, {
+            compact,
+            reason: 'length_truncated',
+            lane: 'action',
+            beforeTokens: beforeTok
           })
+          compactionLevel = targetLevel
+          let baseMsgs = this.visionSupported === false && hasImages(shrunk.messages) ? stripImages(shrunk.messages) : shrunk.messages
+
+          // Stage 3 graceful degradation: drop non-essential tool schemas (~80%
+          // smaller tool block) with tool_choice='auto' so the model breaks free.
+          if (attempt >= 3) {
+            nextTools = createRecoveryTools()
+            nextToolChoice = 'auto'
+            nextParallel = false
+            degraded = true
+          }
+
+          const nudge = attempt >= 3
+            ? 'Context was compacted for recovery. Call ONE essential tool now without lengthy reasoning.'
+            : attempt === 2
+              ? 'Your answer hit the token limit while reasoning. Decide in one short line and emit the tool call FIRST.'
+              : 'Your previous answer ran out of output tokens before calling a tool. Return your tool call(s) immediately.'
+
+          nextMessages = [...baseMsgs, { role: 'user', content: nudge }]
+          const afterTok = this.budget.estimateTokens(nextMessages, nextTools).totalTokens
+          nextMaxTokens = this.budget.escalatedMaxTokens({
+            previousMaxTokens: lastMaxTokens,
+            completionTokens: current.usage?.completionTokens || 0,
+            estimatedPromptTokens: afterTok,
+            attempt,
+            lane: 'action'
+          })
+          if (attempt >= 2 && this.reasoningEffortSupported !== false) {
+            nextExtra = { reasoning_effort: 'low' }
+          }
+          recoveryStage = attempt
+          logger.warn(TAG, `action truncation recovery stage ${attempt} (L${compactionLevel}${degraded ? ', compact-tools' : ''}): ~${beforeTok} -> ~${afterTok} tok, max_tokens=${nextMaxTokens}`)
+          notifyReactive({ stage: attempt, level: compactionLevel, reason: 'length_truncated', beforeTokens: beforeTok, afterTokens: afterTok, maxTokens: nextMaxTokens, degraded })
+        } else {
+          // Non-truncation broken call (unknown tool, bad args, empty response).
+          const nudge = 'No valid tool was called. Call one of the declared tools now (use say to talk or idle to wait).'
+          const badText = typeof current.message?.content === 'string' && current.message.content.trim()
+            ? current.message.content.trim().slice(0, 300)
+            : null
+          if (attempt >= 2 && compactionLevel < 2) {
+            const beforeTok = this.budget.estimateTokens(rescueMessages, rescueTools).totalTokens
+            const targetLevel = Math.min(4, compactionLevel + 1)
+            const shrunk = this._applyCompaction(activeMessages, activeTools, targetLevel, {
+              compact,
+              reason: 'invalid_tool_retry',
+              lane: 'action',
+              beforeTokens: beforeTok
+            })
+            compactionLevel = targetLevel
+            rescueMessages = this.visionSupported === false && hasImages(shrunk.messages) ? stripImages(shrunk.messages) : shrunk.messages
+            const afterTok = this.budget.estimateTokens(rescueMessages, rescueTools).totalTokens
+            notifyReactive({ stage: attempt, level: compactionLevel, reason: 'invalid_tool_retry', beforeTokens: beforeTok, afterTokens: afterTok, degraded: false })
+          }
+          nextMessages = [
+            ...rescueMessages,
+            ...(badText ? [{ role: 'assistant', content: badText }] : []),
+            { role: 'user', content: nudge }
+          ]
+          recoveryStage = attempt
+        }
+
+        try {
+          const next = await ask(nextMessages, nextTools, {
+            signal,
+            maxTokens: nextMaxTokens,
+            ...(nextToolChoice ? { toolChoice: nextToolChoice } : {}),
+            parallel: nextParallel,
+            ...(nextExtra ? { extraParams: nextExtra } : {})
+          })
+          lastMaxTokens = nextMaxTokens
+          rescueMessages = nextMessages
+          rescueTools = nextTools
           totalUsage = mergeUsage(totalUsage, next.usage)
           current = next
           const rNext = extractReasoning(next.message)
           if (rNext) thoughts.push(rNext)
-          let retry = coerceAction(next.message)
-          if (retry._via && !offered.has(retry.a)) retry = { a: 'idle', _unknownTool: retry.a }
-          action = retry
-          if (retry._via && offered.has(retry.a)) {
+
+          const parsed = extractFrom(next.message, nextTools)
+          rescueOffered = parsed.offered
+          action = parsed.primary
+
+          if (usable(action, rescueOffered)) {
             this.stats.rescuedToolCalls = (this.stats.rescuedToolCalls || 0) + 1
-            if (retry._via === 'tool') this.stats.toolCalls += 1
+            if (degraded) this.stats.degradedRecoveries += 1
+            if (action._via === 'tool') this.stats.toolCalls += 1
             else this.stats.jsonFallbacks += 1
-            const rescued = coerceActions(next.message, { max: this.maxToolCalls }).map((a) => (a._via && !offered.has(a.a) ? { a: 'idle', _unknownTool: a.a, _callId: a._callId } : a))
             return {
               action,
-              actions: rescued.length ? rescued : [action],
+              actions: parsed.all.length ? parsed.all : [action],
               message: next.message,
               reasoning: thoughts.join('\n---\n'),
               content: typeof next.message.content === 'string' ? next.message.content.trim() : '',
               finishReason: next.finishReason,
               usage: totalUsage,
               raw: next.raw,
-              rescued: true
+              rescued: true,
+              degraded,
+              recoveryStage,
+              compactionLevel
             }
           }
         } catch (err) {
+          if (err?.contextOverflow && attempt < maxAttempts) {
+            this.stats.contextOverflows += 1
+            compactionLevel = Math.min(4, compactionLevel + 1)
+            continue
+          }
           logger.debug(TAG, `action retry ${attempt} failed: ${err.message || err}`)
           break
         }
       }
       logger.warn(TAG, `model retry still produced no valid tool call (${describeFailure(action, current.finishReason)})`)
-      if (current.finishReason === 'length' && !usable(action)) action = { ...action, _truncated: true }
+      if (current.finishReason === 'length' && !usable(action, rescueOffered)) action = { ...action, _truncated: true }
     }
+
     if (action._via === 'tool') this.stats.toolCalls += 1
     else if (action._fallback || action._badArgs) this.stats.jsonFallbacks += 1
     if (action._unknownTool) this.stats.unknownToolCalls += 1
@@ -884,50 +1316,222 @@ class AmdToolsClient {
       content: typeof current.message.content === 'string' ? current.message.content.trim() : '',
       finishReason: current.finishReason,
       usage: totalUsage,
-      raw: current.raw
+      raw: current.raw,
+      compactionLevel,
+      degraded,
+      recoveryStage
     }
   }
 
   /**
    * One completion for the CHAT lane: a short reply, optionally handing a task
    * to the action lane.
-   * @returns {Promise<{reply:{text:string, task:string}, reasoning:string, finishReason:string|null, usage:object}>}
+   *
+   * Uses the model's standard output limit when `maxTokens` is null/unset,
+   * compacts proactively before hitting context limits, detects partial
+   * mid-sentence length cutoffs, and degrades gracefully to plain-text + clean
+   * sentence boundary salvage instead of dropping replies or sending half-words.
+   *
+   * @returns {Promise<{reply:{text:string, task:string}, reasoning:string, finishReason:string|null, usage:object, compactionLevel:number, degraded:boolean}>}
    */
-  async chatReply (messages, { maxTokens = 400 } = {}) {
-    const ask = (budget) => this._complete({
-      messages,
-      tools: createChatTools(),
+  async chatReply (messages, { maxTokens = null, compact = null, onCompaction = null, initialLevel = 0 } = {}) {
+    const explicitBudget = positiveInt(maxTokens, 16, 500_000)
+    const chatTools = createChatTools()
+    const prepared = await this._prepareMessages(messages, chatTools, {
+      lane: 'chat',
+      explicitMaxTokens: explicitBudget,
+      initialLevel,
+      compact,
+      onCompaction
+    })
+    let activeMessages = prepared.messages
+    let compactionLevel = prepared.level
+    let degraded = false
+
+    const ask = (msgs, { budget = explicitBudget, tools = chatTools, extraParams = null } = {}) => this._complete({
+      messages: msgs,
+      tools,
       maxTokens: budget,
       temperature: Math.max(this.temperature, 0.5),
       lane: 'chat',
       timeoutMs: this._effectiveTimeoutMs(this.chatTimeoutMs, 120_000),
-      maxRetries: this.chatMaxRetries
+      maxRetries: this.chatMaxRetries,
+      ...(extraParams ? { extraParams } : {})
     })
-    let { message, usage, finishReason } = await ask(maxTokens)
+
+    const notifyReactive = (info) => {
+      this.stats.compactions += 1
+      this.stats.reactiveCompactions += 1
+      if (typeof onCompaction === 'function') {
+        try { onCompaction({ phase: 'reactive', lane: 'chat', ...info }) } catch { /* noop */ }
+      }
+    }
+
+    const isIncomplete = (rep, finish) => {
+      if (rep._via !== 'tool' && !rep.text) return true
+      if (finish === 'length') {
+        const t = String(rep.text || '').trim()
+        if (!t) return true
+        // Detect mid-sentence cutoff (e.g. "pensando em montar uma ") when the
+        // server stopped strictly because of token length.
+        if (rep._via !== 'tool' || !/[.!?…]["')\]»”’]?$/.test(t)) return true
+      }
+      return false
+    }
+
+    let first
+    try {
+      first = await ask(activeMessages, { budget: explicitBudget, tools: chatTools })
+    } catch (err) {
+      if (!err?.contextOverflow) throw err
+      this.stats.contextOverflows += 1
+      const beforeTok = this.budget.estimateTokens(activeMessages, chatTools).totalTokens
+      const targetLevel = Math.min(4, Math.max(compactionLevel + 1, 2))
+      const shrunk = this._applyCompaction(activeMessages, chatTools, targetLevel, {
+        compact,
+        reason: 'context_overflow',
+        lane: 'chat',
+        beforeTokens: beforeTok
+      })
+      activeMessages = shrunk.messages
+      compactionLevel = targetLevel
+      const afterTok = this.budget.estimateTokens(activeMessages, chatTools).totalTokens
+      notifyReactive({ stage: 1, level: compactionLevel, reason: 'context_overflow', beforeTokens: beforeTok, afterTokens: afterTok, degraded: false })
+      first = await ask(activeMessages, { budget: explicitBudget, tools: chatTools })
+    }
+
+    let { message, usage, finishReason } = first
     this.stats.chatReplies += 1
     let reply = coerceReply(message)
+    let bestPartial = reply.text ? { ...reply } : null
     const thoughts = []
     const r0 = extractReasoning(message)
     if (r0) thoughts.push(r0)
 
-    if (reply._via !== 'tool' && !reply.text) {
+    if (isIncomplete(reply, finishReason)) {
       const cutOff = finishReason === 'length'
+      let recovered = false
+
+      // Stage 1: Compact chat context (keeping player memories) + escalate output
+      // budget + retry the `reply` tool cleanly.
       try {
-        const again = await ask(Math.max(maxTokens * 2, 800))
+        const beforeTok = this.budget.estimateTokens(activeMessages, chatTools).totalTokens
+        const targetLevel = Math.min(4, compactionLevel + 1)
+        const shrunk = this._applyCompaction(activeMessages, chatTools, targetLevel, {
+          compact,
+          reason: cutOff ? 'length_truncated' : 'empty_chat_retry',
+          lane: 'chat',
+          beforeTokens: beforeTok
+        })
+        activeMessages = shrunk.messages
+        compactionLevel = targetLevel
+        const afterTok = this.budget.estimateTokens(activeMessages, chatTools).totalTokens
+        const nextBudget = this.budget.escalatedMaxTokens({
+          previousMaxTokens: explicitBudget,
+          completionTokens: usage?.completionTokens || 0,
+          estimatedPromptTokens: afterTok,
+          attempt: 1,
+          lane: 'chat'
+        })
+        notifyReactive({ stage: 1, level: compactionLevel, reason: cutOff ? 'length_truncated' : 'empty_chat_retry', beforeTokens: beforeTok, afterTokens: afterTok, maxTokens: nextBudget, degraded: false })
+        const again = await ask(activeMessages, {
+          budget: nextBudget,
+          tools: chatTools,
+          ...(cutOff && this.reasoningEffortSupported !== false ? { extraParams: { reasoning_effort: 'low' } } : {})
+        })
         this.stats.chatRetries = (this.stats.chatRetries || 0) + 1
         usage = mergeUsage(usage, again.usage)
         finishReason = again.finishReason
         const r1 = extractReasoning(again.message)
         if (r1) thoughts.push(r1)
         const second = coerceReply(again.message)
-        if (second._via === 'tool' || second.text) reply = second
-        else reply._empty = again.finishReason === 'length' || cutOff ? 'cut_off' : 'no_call'
+        if (second.text && (!bestPartial || second.text.length > bestPartial.text.length)) bestPartial = { ...second }
+        if (!isIncomplete(second, again.finishReason)) {
+          reply = second
+          recovered = true
+        }
       } catch (err) {
-        logger.debug(TAG, `chat retry failed: ${err.message || err}`)
-        reply._empty = cutOff ? 'cut_off' : 'no_call'
+        logger.debug(TAG, `chat recovery stage 1 failed: ${err.message || err}`)
+      }
+
+      // Stage 2: Plain-text graceful degradation (drop tool schema overhead so
+      // the model writes the direct chat reply immediately without JSON/tool
+      // framing eating output budget).
+      if (!recovered) {
+        try {
+          const beforeTok = this.budget.estimateTokens(activeMessages, null).totalTokens
+          const targetLevel = Math.min(4, compactionLevel + 1)
+          const shrunk = this._applyCompaction(activeMessages, null, targetLevel, {
+            compact,
+            reason: 'chat_plain_degradation',
+            lane: 'chat',
+            beforeTokens: beforeTok
+          })
+          compactionLevel = targetLevel
+          const plainMessages = [
+            ...shrunk.messages,
+            { role: 'user', content: 'Answer the player directly in 1–2 short natural sentences (plain text only, no JSON or tool syntax).' }
+          ]
+          const afterTok = this.budget.estimateTokens(plainMessages, null).totalTokens
+          const plainBudget = this.budget.escalatedMaxTokens({
+            previousMaxTokens: explicitBudget,
+            completionTokens: usage?.completionTokens || 0,
+            estimatedPromptTokens: afterTok,
+            attempt: 2,
+            lane: 'chat'
+          })
+          degraded = true
+          notifyReactive({ stage: 2, level: compactionLevel, reason: 'chat_plain_degradation', beforeTokens: beforeTok, afterTokens: afterTok, maxTokens: plainBudget, degraded: true })
+          const plain = await ask(plainMessages, {
+            budget: plainBudget,
+            tools: null,
+            ...(this.reasoningEffortSupported !== false ? { extraParams: { reasoning_effort: 'low' } } : {})
+          })
+          this.stats.chatRetries = (this.stats.chatRetries || 0) + 1
+          usage = mergeUsage(usage, plain.usage)
+          finishReason = plain.finishReason
+          const r2 = extractReasoning(plain.message)
+          if (r2) thoughts.push(r2)
+          const third = coerceReply(plain.message)
+          if (third.text) {
+            if (plain.finishReason === 'length') third.text = trimIncompleteSentence(third.text)
+            if (third.text) {
+              reply = { ...third, _degraded: true }
+              this.stats.degradedRecoveries += 1
+              recovered = true
+            }
+          }
+        } catch (err) {
+          logger.debug(TAG, `chat recovery stage 2 (plain-text) failed: ${err.message || err}`)
+        }
+      }
+
+      // Stage 3: Clean sentence-boundary salvage if we had partial text rather
+      // than dropping the answer or sending a broken half-word.
+      if (!recovered) {
+        if (bestPartial?.text) {
+          const salvaged = trimIncompleteSentence(bestPartial.text)
+          if (salvaged) {
+            reply = { ...bestPartial, text: salvaged, _degraded: true }
+            degraded = true
+            this.stats.degradedRecoveries += 1
+            recovered = true
+          }
+        }
+        if (!recovered) {
+          reply._empty = finishReason === 'length' || cutOff ? 'cut_off' : 'no_call'
+        }
       }
     }
-    return { reply, reasoning: thoughts.join('\n---\n'), finishReason, usage }
+
+    return {
+      reply,
+      reasoning: thoughts.join('\n---\n'),
+      finishReason,
+      usage,
+      compactionLevel,
+      degraded
+    }
   }
 
   /** Telemetry compatible with the session report + tool metrics. */
@@ -939,6 +1543,7 @@ class AmdToolsClient {
       avgPromptTokensPerCall: s.requests ? Math.round(s.promptTokens / s.requests) : 0,
       avgCompletionTokensPerCall: s.requests ? Math.round(s.completionTokens / s.requests) : 0,
       kvCacheHitRate: hitRate,
+      budget: this.budget.snapshot(),
       uptimeMinutes: Math.round((Date.now() - this._startedAt) / 60_000) || 0
     }
   }
@@ -946,4 +1551,4 @@ class AmdToolsClient {
   _startedAt = Date.now()
 }
 
-module.exports = { AmdToolsClient, createZincTools, createChatTools, coerceAction, coerceActions, coerceReply, buildToolsPayload, toolTurnMessages, extractReasoning, hasImages, stripImages, contentText, ACTION_TOOLS, CHAT_TOOLS }
+module.exports = { AmdToolsClient, createZincTools, createChatTools, createRecoveryTools, coerceAction, coerceActions, coerceReply, buildToolsPayload, toolTurnMessages, extractReasoning, hasImages, stripImages, contentText, ACTION_TOOLS, CHAT_TOOLS }

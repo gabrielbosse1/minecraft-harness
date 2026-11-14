@@ -67,7 +67,8 @@ CLI: node zincai/index.js [--dry-run | --check]
 | File | Key Exports / Role |
 | --- | --- |
 | `index.js` | Entrypoint, `loadConfig`, `makeShared`, `createHost`, `startSession`, 39-tool switch, `buildLiveContinuation` |
-| `api_wrapper.js` | `ApiWrapper`, `ACTION_TOOLS` (39), `extractReasoning`, `parseToolCalls`, `chatCompletion` |
+| `api_wrapper.js` | `AmdToolsClient`, `ACTION_TOOLS` (39), `createRecoveryTools`, `extractReasoning`, `coerceActions`, `buildToolsPayload` |
+| `context_budget.js` | `ContextBudget`, `resolveModelLimits`, `/models` discovery, HTTP 400 limit learning, proactive/reactive compaction, `trimIncompleteSentence` |
 | `brain.js` | `Brain` — multi-step action loop (`maxStepsPerTurn: 6`), `wake(reason, opts)`, `situationVersion` staleness guard |
 | `lanes.js` | `LaneScheduler` — concurrent `chat` + `action` lanes sharing `rpm` (18) with `chatReserve` (4) |
 | `irc.js` | `IrcTimeline` — unified chronological log of chat, whispers, and world events |
@@ -86,14 +87,14 @@ CLI: node zincai/index.js [--dry-run | --check]
 | `logic_test.js` | Abstract Boolean combinational logic truth-table verifier |
 | `circuit_projects.js` | `CircuitProjectStore` (`data/circuit_projects.json`) |
 | `perception.js` | `buildVisionBlock`, `VISION_LEGEND` — grounded text world summary |
-| `vision.js` | Software renderer for `screenshot` (`look`, `panorama`, `map`) |
+| `vision.js` | Lightweight chunk-column software voxel renderer for `screenshot` (`look`, `panorama`, `map`) with procedural 16×16 Minecraft block textures, AO, translucent water/glass, sky/sun/clouds, and blocky entities |
 | `places.js` | `PlaceIndex` (`places.named`, containers, workstations; `data/places.json`) |
 | `block_search.js`, `block_inspect.js`, `region_inspect.js` | Fast block lookup and honest paginated inspection |
 | `goals.js` | `GoalRegistry` (`STATUS`: `active`, `queued`, `waiting`, `resumable`, `blocked`, `completed`, `failed`, `cancelled`; `list()`, `openGoals()`, `suspendAll()`) |
 | `memory.js` | `MemoryStore` (working, short-term, episodic/procedural; `data/memories.json`) |
 | `continuity.js` | `ContinuityStore` (`getRelationship`, social stances, evidence; `data/continuity.json`) |
 | `journal.js` | `Journal` (goal plans & session digest; `data/journal.json`) |
-| `telemetry.js` | `TelemetryRecorder`, `makeSessionId`, `setContinuationProvider`, `lifecycle`, `worldEvent`, `reflexEvent`, `chatIn`, `chatOut`, `modelRequest`, `modelResponse`, `toolExec`, `goalEvent`, `combatEvent`, `operatorCommand`, `error`, `flush`, `close` |
+| `telemetry.js` | `TelemetryRecorder`, `makeSessionId`, `setContinuationProvider`, `lifecycle`, `worldEvent`, `reflexEvent`, `chatIn`, `chatOut`, `modelRequest`, `modelResponse`, `toolExec`, `screenshot` (archives session PNGs under `sessions/<id>/screenshots/`), `goalEvent`, `combatEvent`, `operatorCommand`, `error`, `flush`, `close` |
 | `runtime_config.js` | `RuntimeConfig`, `SCHEMA` (10 validated parameters) |
 | `control_commands.js` | `COMMANDS` (15 console commands), `parseCommand`, `helpText` |
 | `connection.js` | `ConnectionManager` — exponential backoff reconnect state machine |
@@ -230,7 +231,7 @@ All tests run against **real local Minecraft 1.21.4 servers (`flying-squid@^1.12
 ### Commands
 ```sh
 npm run check                # syntax check every JS module
-npm test                     # node --test test/*.test.js (all 7 suites, 11 end-to-end tests)
+npm test                     # node --test test/*.test.js (all 9 suites, 18 end-to-end tests)
 AMD_API_KEY=rc-test npm run dry-run
 npm run pufferpanel:validate
 ```

@@ -56,7 +56,7 @@ In PufferPanel, open **Templates → New**, switch to the **Json** tab, paste `z
 | `port` | Yes | `25565` | Target Minecraft server port |
 | `auth` | Yes | `offline` | `offline` (whitelisted/cracked/private) or `microsoft` (premium account) |
 | `mcversion` | No | `""` | Minecraft version (e.g. `1.21.4`), or blank to auto-detect |
-| `model` | Yes | `Qwen3.8-Flash-Next` | LLM model identifier |
+| `model` | Yes | `Qwen3.8-27B` | LLM model identifier |
 | `amdurl` | Yes | `https://developer.amd.com.cn/radeon/api/v1` | OpenAI-compatible API base URL |
 | `repo` | Yes | `https://github.com/gabrielbosse1/minecraft-harness.git` | Git URL cloned during Install |
 | `branch` | Yes | `main` | Git branch cloned during Install |

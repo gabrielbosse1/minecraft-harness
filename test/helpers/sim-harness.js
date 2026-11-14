@@ -22,7 +22,7 @@ const { loadConfig, makeShared, startSession, createHost } = require('../../zinc
  * deterministic scripted model turns (supporting tool_calls, reasoning_content,
  * content, usage, and finish_reason).
  */
-async function startScriptedLlmServer () {
+async function startScriptedLlmServer ({ models = null } = {}) {
   const requests = []
   const actionQueue = []
   const chatQueue = []
@@ -36,9 +36,16 @@ async function startScriptedLlmServer () {
     chatQueue.push(response)
   }
 
-  function formatCompletion (spec, isChat) {
+  function formatCompletion (spec, isChat, body, reqInfo) {
     const id = `chatcmpl-sim-${++seq}`
-    if (typeof spec === 'function') spec = spec()
+    if (typeof spec === 'function') spec = spec(body, reqInfo)
+    if (spec && Number.isInteger(spec.httpStatus) && spec.httpStatus !== 200) {
+      return {
+        _httpStatus: spec.httpStatus,
+        _rawBody: typeof spec.rawBody === 'string' ? spec.rawBody : JSON.stringify(spec.body || { error: { message: spec.error || 'error' } })
+      }
+    }
+    if (spec?.rawCompletion) return spec.rawCompletion
     // Tool-call response (standard OpenAI format)
     if (spec?.toolCalls || spec?.tool_calls) {
       const list = (spec.toolCalls || spec.tool_calls).map((tc, idx) => ({
@@ -52,7 +59,7 @@ async function startScriptedLlmServer () {
       return {
         id,
         object: 'chat.completion',
-        model: 'sim-model',
+        model: body?.model || 'sim-model',
         choices: [{
           index: 0,
           finish_reason: spec.finishReason || 'tool_calls',
@@ -66,14 +73,32 @@ async function startScriptedLlmServer () {
         usage: spec.usage || { prompt_tokens: 420, completion_tokens: 48, total_tokens: 468 }
       }
     }
+    // Explicit plain-text / truncated response (no tool_calls)
+    if (spec && (spec.plain || spec.finishReason === 'length' || (typeof spec.content === 'string' && !spec.reply))) {
+      return {
+        id,
+        object: 'chat.completion',
+        model: body?.model || 'sim-model',
+        choices: [{
+          index: 0,
+          finish_reason: spec.finishReason || 'stop',
+          message: {
+            role: 'assistant',
+            content: spec.content ?? null,
+            reasoning_content: spec.reasoning || ''
+          }
+        }],
+        usage: spec.usage || { prompt_tokens: 320, completion_tokens: spec.finishReason === 'length' ? 1024 : 40, total_tokens: 360 }
+      }
+    }
     if (isChat && spec?.reply) {
       return {
         id,
         object: 'chat.completion',
-        model: 'sim-model',
+        model: body?.model || 'sim-model',
         choices: [{
           index: 0,
-          finish_reason: 'tool_calls',
+          finish_reason: spec.finishReason || 'tool_calls',
           message: {
             role: 'assistant',
             content: '',
@@ -98,7 +123,7 @@ async function startScriptedLlmServer () {
     return {
       id,
       object: 'chat.completion',
-      model: 'sim-model',
+      model: body?.model || 'sim-model',
       choices: [{
         index: 0,
         finish_reason: 'tool_calls',
@@ -114,6 +139,16 @@ async function startScriptedLlmServer () {
   }
 
   const server = http.createServer((req, res) => {
+    if (req.method === 'GET' && req.url.endsWith('/models')) {
+      if (models) {
+        res.writeHead(200, { 'Content-Type': 'application/json', Connection: 'close' })
+        res.end(JSON.stringify(Array.isArray(models) ? { object: 'list', data: models } : models))
+        return
+      }
+      res.writeHead(404)
+      res.end('not found')
+      return
+    }
     if (req.method !== 'POST' || !req.url.endsWith('/chat/completions')) {
       res.writeHead(404)
       res.end('not found')
@@ -125,16 +160,24 @@ async function startScriptedLlmServer () {
       let body = {}
       try { body = JSON.parse(raw) } catch { /* ignore */ }
       const toolNames = (body.tools || []).map((t) => t?.function?.name).filter(Boolean)
-      const isChat = toolNames.length === 1 && toolNames[0] === 'reply'
-      requests.push({
+      const sysText = String(body.messages?.[0]?.content || '')
+      const isChat = (toolNames.length === 1 && toolNames[0] === 'reply') ||
+        (toolNames.length === 0 && /chat|conversation|reply/i.test(sysText))
+      const reqInfo = {
         ts: Date.now(),
         lane: isChat ? 'chat' : 'action',
         body,
         toolNames,
         messages: body.messages || []
-      })
+      }
+      requests.push(reqInfo)
       const next = isChat ? chatQueue.shift() : actionQueue.shift()
-      const payload = formatCompletion(next, isChat)
+      const payload = formatCompletion(next, isChat, body, reqInfo)
+      if (payload && payload._httpStatus) {
+        res.writeHead(payload._httpStatus, { 'Content-Type': 'application/json', Connection: 'close' })
+        res.end(payload._rawBody)
+        return
+      }
       res.writeHead(200, { 'Content-Type': 'application/json', Connection: 'close' })
       res.end(JSON.stringify(payload))
     })
@@ -171,22 +214,25 @@ async function startScriptedLlmServer () {
 async function startSimulation ({
   cfgOverrides = {},
   autoStartHost = false,
-  keepDataDir = false
+  keepDataDir = false,
+  llmModels = null
 } = {}) {
   const mc = await startMcServer()
-  const llm = await startScriptedLlmServer()
+  const llm = await startScriptedLlmServer({ models: llmModels })
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zincai-sim-'))
 
   const baseCfg = loadConfig()
   const cfg = {
     ...baseCfg,
+    ...cfgOverrides,
     server: {
       ...baseCfg.server,
       host: mc.host,
       port: mc.port,
       username: 'ZincAI',
       auth: 'offline',
-      version: MC_VERSION
+      version: MC_VERSION,
+      ...(cfgOverrides.server || {})
     },
     amd: {
       ...baseCfg.amd,
@@ -194,7 +240,8 @@ async function startSimulation ({
       baseUrl: llm.baseUrl,
       model: 'sim-model',
       timeoutMs: 15_000,
-      retries: 0
+      retries: 0,
+      ...(cfgOverrides.amd || {})
     },
     inference: {
       ...baseCfg.inference,
@@ -227,10 +274,7 @@ async function startSimulation ({
     telemetry: {
       flushIntervalMs: 250,
       maxBuffer: 20
-    },
-    ...cfgOverrides,
-    // Always preserve server/amd connection fields
-    ...(cfgOverrides.server ? { server: { ...baseCfg.server, host: mc.host, port: mc.port, username: 'ZincAI', auth: 'offline', version: MC_VERSION, ...cfgOverrides.server } } : {})
+    }
   }
 
   // Silence logger noise during tests unless DEBUG_ZINCAI=1

@@ -45,7 +45,8 @@ const ok = (name, cond, detail = '') => {
     timeoutMs: cfg.amd?.timeoutMs ?? 20_000,
     maxRetries: cfg.amd?.maxRetries ?? 2,
     temperature: cfg.amd?.temperature ?? 0.25,
-    maxTokens: 128
+    maxTokens: cfg.amd?.maxTokens ?? null,
+    contextWindow: cfg.amd?.contextWindow ?? null
   })
   let all = true
 
@@ -56,7 +57,7 @@ const ok = (name, cond, detail = '') => {
     reply = await client.chatReply([
       { role: 'system', content: 'You are a tool-calling test probe for a Minecraft bot. Always call the reply tool.' },
       { role: 'user', content: 'state: hp 20 | day\nplayer Steve says: oi! tudo bem?\nAnswer with exactly one reply tool call.' }
-    ], { maxTokens: 120 })
+    ], { maxTokens: cfg.inference?.chatMaxTokens ?? null })
   } catch (err) {
     ok('endpoint reachable + tool-capable', false, String(err.message || err).slice(0, 200))
     console.log('\nNothing else can be checked without a working call. Fix endpoint/key/model first.')

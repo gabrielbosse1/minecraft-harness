@@ -9,8 +9,9 @@
   "amd": {
     "apiKey": "",
     "baseUrl": "https://developer.amd.com.cn/radeon/api/v1",
-    "model": "Qwen3.8-Flash-Next",
-    "maxTokens": 1024,
+    "model": "Qwen3.8-27B",
+    "maxTokens": null,
+    "contextWindow": null,
     "temperature": 0.25,
     "timeoutMs": 120000,
     "maxRetries": 2,
@@ -31,7 +32,7 @@
     "maxStepsPerTurn": 6,
     "timelineMax": 80,
     "maxSelfChain": 12,
-    "chatMaxTokens": 400,
+    "chatMaxTokens": null,
     "failGateAfter": 2,
     "failWindowMs": 120000
   },
@@ -134,9 +135,9 @@
     }
   },
   "vision": {
-    "width": 448,
-    "height": 252,
-    "maxDistance": 64,
+    "width": 512,
+    "height": 288,
+    "maxDistance": 128,
     "mapRadius": 32,
     "maxPerTurn": 2,
     "save": true
@@ -144,7 +145,9 @@
   "compaction": {
     "keepRecent": 10,
     "maxDigest": 8,
-    "turnMaxChars": 6000
+    "turnMaxChars": 6000,
+    "proactiveRatio": 0.75,
+    "reserveOutputRatio": 0.25
   },
   "telemetry": {
     "flushIntervalMs": 5000,

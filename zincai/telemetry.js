@@ -12,6 +12,8 @@
  * Output layout under `dataDir` (default: `<repo>/data`):
  *   - `sessions/<sessionId>/events.jsonl`       newline-delimited chronological events
  *   - `sessions/<sessionId>/continuation.json`  latest structured continuation state
+ *   - `sessions/<sessionId>/screenshots/*.png`  chronological archive of every screenshot Zinc captured
+ *   - `screenshots/last-<view>.png`             quick pointer to the most recent screenshot per view
  *   - `latest.json`                             pointer to the latest session and summary stats
  *
  * Buffered events flush periodically during runtime, whenever the buffer reaches
@@ -84,6 +86,8 @@ class TelemetryRecorder {
     this.sessionDir = path.join(this.dataDir, 'sessions', this.sessionId)
     this.eventsFile = path.join(this.sessionDir, 'events.jsonl')
     this.continuationFile = path.join(this.sessionDir, 'continuation.json')
+    this.screenshotsDir = path.join(this.sessionDir, 'screenshots')
+    this.latestScreenshotsDir = path.join(this.dataDir, 'screenshots')
     this.latestFile = path.join(this.dataDir, 'latest.json')
 
     this.flushIntervalMs = Math.max(250, Number(flushIntervalMs) || 5000)
@@ -91,6 +95,7 @@ class TelemetryRecorder {
     this.maxPromptChars = Math.max(512, Number(maxPromptChars) || 24_000)
 
     this._seq = 0
+    this._screenshotSeq = 0
     this._buffer = []
     this._timer = null
     this._closed = false
@@ -107,6 +112,7 @@ class TelemetryRecorder {
       modelResponses: 0,
       toolExecutions: 0,
       toolFailures: 0,
+      screenshots: 0,
       goalEvents: 0,
       combatEvents: 0,
       chatIn: 0,
@@ -121,6 +127,7 @@ class TelemetryRecorder {
     this._lastModelRequest = null
     this._lastModelThought = null
     this._recentTools = []
+    this._recentScreenshots = []
     this._recentEvents = []
   }
 
@@ -324,6 +331,81 @@ class TelemetryRecorder {
     })
   }
 
+  /**
+   * Archive a captured screenshot PNG into the session log folder (and update
+   * `screenshots/last-<view>.png`), and record a structured `screenshot` event
+   * in `events.jsonl` + `continuation.json`.
+   */
+  screenshot (shot, { save = true, sentToModel = true, direction = null, at = null } = {}) {
+    this.stats.screenshots++
+    this._screenshotSeq++
+    const view = String(shot?.view || 'look').replace(/[^a-z0-9_-]/gi, '').toLowerCase() || 'look'
+    const nowMs = this.now()
+    const ts = new Date(nowMs).toISOString().replace(/[:.]/g, '-')
+    const seqPad = String(this._screenshotSeq).padStart(4, '0')
+    let file = null
+    let relativeFile = null
+    let latestFile = null
+    let saveError = null
+
+    if (save !== false && Buffer.isBuffer(shot?.png) && shot.png.length > 0) {
+      try {
+        fs.mkdirSync(this.screenshotsDir, { recursive: true })
+        file = path.join(this.screenshotsDir, `${seqPad}_${ts}_${view}.png`)
+        fs.writeFileSync(file, shot.png)
+        relativeFile = path.relative(this.dataDir, file)
+      } catch (err) {
+        saveError = String(err?.message || err)
+      }
+      try {
+        fs.mkdirSync(this.latestScreenshotsDir, { recursive: true })
+        latestFile = path.join(this.latestScreenshotsDir, `last-${view}.png`)
+        fs.writeFileSync(latestFile, shot.png)
+      } catch { /* best-effort latest pointer */ }
+    }
+
+    const rec = {
+      seq: this._screenshotSeq,
+      view,
+      width: Number(shot?.width) || null,
+      height: Number(shot?.height) || null,
+      bytes: Buffer.isBuffer(shot?.png) ? shot.png.length : (Number(shot?.bytes) || 0),
+      renderMs: Number.isFinite(shot?.renderMs) ? Math.round(shot.renderMs) : null,
+      chunksLoaded: Number.isFinite(shot?.chunksLoaded) ? shot.chunksLoaded : null,
+      chunksInView: Number.isFinite(shot?.chunksInView) ? shot.chunksInView : null,
+      maxDist: Number.isFinite(shot?.maxDist) ? shot.maxDist : null,
+      bearing: Number.isFinite(shot?.bearing) ? shot.bearing : null,
+      pitch: Number.isFinite(shot?.pitch) ? shot.pitch : null,
+      pos: shot?.pos || null,
+      direction: direction ? String(direction) : null,
+      at: at && Number.isFinite(at.x) ? { x: Math.floor(at.x), y: Math.floor(at.y), z: Math.floor(at.z) } : null,
+      entitiesSeen: Number.isFinite(shot?.entitiesSeen) ? shot.entitiesSeen : null,
+      sentToModel: Boolean(sentToModel),
+      file: relativeFile,
+      latestFile: latestFile ? path.relative(this.dataDir, latestFile) : null,
+      saveError,
+      summary: clip(shot?.summary || '', 800)
+    }
+
+    this._recentScreenshots.push({
+      at: new Date(nowMs).toISOString(),
+      seq: rec.seq,
+      view: rec.view,
+      width: rec.width,
+      height: rec.height,
+      bytes: rec.bytes,
+      renderMs: rec.renderMs,
+      chunksLoaded: rec.chunksLoaded,
+      chunksInView: rec.chunksInView,
+      pos: rec.pos,
+      file: rec.file
+    })
+    if (this._recentScreenshots.length > 10) this._recentScreenshots.shift()
+
+    const entry = this.record('screenshot', rec)
+    return { file, relativeFile, latestFile, saveError, entry }
+  }
+
   error (where, err) {
     this.stats.errors++
     return this.record('error', {
@@ -357,6 +439,7 @@ class TelemetryRecorder {
       lastModelRequest: this._lastModelRequest,
       lastModelThought: this._lastModelThought,
       recentTools: this._recentTools.slice(-10),
+      recentScreenshots: this._recentScreenshots.slice(-10),
       recentEvents: this._recentEvents.slice(-12),
       stats: { ...this.stats }
     }
@@ -385,6 +468,7 @@ class TelemetryRecorder {
           endedAt: continuation.endedAt,
           eventsFile: path.relative(this.dataDir, this.eventsFile),
           continuationFile: path.relative(this.dataDir, this.continuationFile),
+          screenshotsDir: path.relative(this.dataDir, this.screenshotsDir),
           stats: continuation.stats
         })
         this._dirtyContinuation = false
@@ -437,6 +521,7 @@ function summarizeEntry (entry) {
     case 'model_request': return `${d.lane}#${d.step} (${(d.reasons || []).join('; ')})`
     case 'model_response': return `${d.lane}#${d.step} -> ${Array.isArray(d.actions) ? d.actions.map((a) => a.tool).join('+') : (d.reply?.text ? 'reply' : 'silent')}`
     case 'tool_exec': return `${d.tool}: ${d.ok ? 'ok' : 'FAILED'} — ${d.msg || ''}`
+    case 'screenshot': return `screenshot(${d.view} ${d.width}x${d.height}, ${d.renderMs ?? '?'}ms, chunks=${d.chunksInView ?? '?'}/${d.chunksLoaded ?? '?'})${d.file ? ` -> ${d.file}` : ''}`
     case 'goal_event': return `${d.op} ${d.goalId || ''}: ${d.description || d.note || ''}`
     case 'combat_event': return d.msg || d.result || 'combat'
     default: return d.reason || d.message || entry.type

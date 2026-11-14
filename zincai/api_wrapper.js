@@ -119,10 +119,11 @@ const ACTION_TOOLS = [
     count: INT('Amount (default 1).')
   }, ['player', 'item']),
   tool('eat', 'Eat safe food now (empty = best carried).', { item: STR('Food id (optional).') }),
-  tool('equip', 'Equip carried item by name.', {
-    item: STR('Item id.'),
-    where: { type: 'string', enum: ['hand', 'off-hand', 'head', 'torso', 'legs', 'feet'] }
-  }, ['item']),
+  tool('equip', 'Equip a carried item by name (armor goes to its own slot), or take one off. Better armor you carry is put on for you; a slot you dress or empty yourself is then left as you set it.', {
+    item: STR('Item id. "none" + where takes off what is worn there.'),
+    where: { type: 'string', enum: ['hand', 'off-hand', 'head', 'torso', 'legs', 'feet'] },
+    auto: { type: 'boolean', description: 'Armor autopilot: false = never put armor on for you; true = on again, and every slot you set by hand is handed back. May be sent alone.' }
+  }),
   tool('use_block', 'Walk to nearest matching block and right-click it.', { what: STR('Block id.') }, ['what']),
   tool('inspect_block', 'Read one loaded block and state; no power inferred.', { x: INT('X.'), y: INT('Y.'), z: INT('Z.') }, ['x', 'y', 'z']),
   tool('inspect_region', 'Read-only paginated 3D block snapshot around [x,y,z]; no circuit trace.', { x: INT('X.'), y: INT('Y.'), z: INT('Z.'), radius: INT('0–2, default 1.'), page: INT('Page, default 1.') }, ['x', 'y', 'z']),

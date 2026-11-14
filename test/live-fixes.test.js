@@ -191,25 +191,251 @@ test('the fast block search finds what mineflayer finds, without scanning empty 
   assert.deepEqual(findBlocksFast(sim, [B.oak_log.id], { maxDistance: 20, count: 3 }), ['asked 20/3'])
 })
 
-test('a plugin handler that throws is contained instead of killing the process', () => {
-  const src = fs.readFileSync(path.join(root, 'zincai', 'index.js'), 'utf8')
-  assert.match(src, /bot\.loadPlugin\(containedPlugin\(armorManager, 'armor manager'\)\)/)
-  // The wrapper itself, exercised the way mineflayer calls a plugin.
-  const fnSrc = /function containedPlugin \(plugin, name\) \{[\s\S]*?\n\}\n/.exec(src)[0]
-  const warnings = []
-  // eslint-disable-next-line no-new-func
-  const containedPlugin = new Function('logger', 'TAG', `${fnSrc}; return containedPlugin`)({ warn: (tag, msg) => warnings.push(msg) }, 'zincai')
+// --------------------------------------------------------------- armor ---
+
+const { ArmorKeeper, armorScore, armorInfo } = require('../zincai/armor')
+
+/** A bot with a real-shaped inventory: slots 5-8 armor, 9-44 carried, 45 off hand. */
+function armorBot (carried = [], worn = {}) {
   const bot = new EventEmitter()
-  const plugin = (b) => { b.on('playerCollect', () => { throw new TypeError("Cannot read properties of undefined (reading 'present')") }) }
-  containedPlugin(plugin, 'armor manager')(bot, {})
-  assert.ok(!Object.prototype.hasOwnProperty.call(bot, 'on'), 'bot.on is the real one again')
-  assert.doesNotThrow(() => bot.emit('playerCollect', {}, {}))
-  bot.emit('playerCollect', {}, {})
-  assert.equal(warnings.length, 1, 'said once, not per event')
-  assert.match(warnings[0], /armor manager: a "playerCollect" handler failed/)
-  // Listeners added outside the plugin are untouched.
-  bot.on('other', () => { throw new Error('mine') })
-  assert.throws(() => bot.emit('other'), /mine/)
+  const inv = new EventEmitter()
+  inv.slots = new Array(46).fill(null)
+  const DEST = { head: 5, torso: 6, legs: 7, feet: 8, 'off-hand': 45 }
+  const mk = (name, extra = {}) => ({ name, count: 1, type: name.length, ...extra })
+  carried.forEach((it, i) => { inv.slots[9 + i] = typeof it === 'string' ? mk(it) : mk(it.name, it) })
+  for (const [dest, name] of Object.entries(worn)) inv.slots[DEST[dest]] = mk(name)
+  inv.items = () => inv.slots.slice(9, 45).filter(Boolean)
+  bot.inventory = inv
+  bot.username = 'ZincAI'
+  bot.entity = { id: 1, username: 'ZincAI' }
+  bot.health = 20
+  bot.currentWindow = null
+  bot.getEquipmentDestSlot = (dest) => DEST[dest]
+  bot.equips = []
+  bot.equip = async (item, dest) => {
+    const from = inv.slots.indexOf(item)
+    const to = DEST[dest]
+    if (from < 0 || to === undefined) throw new Error('bad equip')
+    bot.equips.push(`${item.name}@${dest}`)
+    const old = inv.slots[to]
+    inv.slots[to] = item
+    inv.slots[from] = old
+    inv.emit('updateSlot', to, old, item)
+  }
+  bot.unequip = async (dest) => {
+    const from = DEST[dest]
+    const free = inv.slots.findIndex((x, i) => i >= 9 && i < 45 && !x)
+    inv.slots[free] = inv.slots[from]
+    inv.slots[from] = null
+    inv.emit('updateSlot', from, inv.slots[free], null)
+  }
+  bot.give = (name, extra) => {
+    const free = inv.slots.findIndex((x, i) => i >= 9 && i < 45 && !x)
+    inv.slots[free] = mk(name, extra)
+    inv.emit('updateSlot', free, null, inv.slots[free])
+    return inv.slots[free]
+  }
+  bot.wearing = () => Object.fromEntries(Object.entries(DEST).map(([d, i]) => [d, inv.slots[i]?.name || null]))
+  return bot
+}
+
+test('picking up an item whose entity has no data does not crash, and the armor is still put on', async () => {
+  // The exact failure of the old plugin: playerCollect for an item entity
+  // without metadata — reading the dropped item threw inside the packet handler.
+  const bot = armorBot(['dirt', 'iron_chestplate'])
+  const logs = []
+  const keeper = new ArmorKeeper(bot, { delayMs: 10, log: (level, msg) => logs.push(msg) }).attach()
+  const noData = { name: 'item', metadata: [], getDroppedItem () { throw new TypeError("Cannot read properties of undefined (reading 'present')") } }
+  assert.doesNotThrow(() => bot.emit('playerCollect', bot.entity, noData))
+  await sleep(60)
+  assert.equal(bot.wearing().torso, 'iron_chestplate', 'worn from the inventory, not from the entity')
+  assert.match(logs.join('\n'), /armor: put on iron_chestplate \(torso\)/)
+  // Someone else's pickup is not ours to react to.
+  bot.equips.length = 0
+  bot.give('diamond_boots')
+  keeper.detach()
+  bot.emit('playerCollect', { id: 9, username: 'Steve' }, noData)
+  await sleep(40)
+  assert.deepEqual(bot.equips, [], 'detached: no listeners left behind')
+})
+
+test('armor that arrives any way is worn when it protects more — by the game\'s numbers', async () => {
+  const bot = armorBot([], { head: 'leather_helmet', torso: 'chainmail_chestplate' })
+  const worn = []
+  const keeper = new ArmorKeeper(bot, { delayMs: 5, onWorn: (list) => worn.push(...list) }).attach()
+  // From a chest, a craft, a gift: only an inventory slot changes.
+  bot.give('iron_chestplate') // 6 points beats chainmail's 5 (the old plugin ranked chainmail higher)
+  bot.give('golden_helmet') // 2 beats leather's 1
+  bot.give('leather_boots')
+  bot.give('golden_leggings')
+  await sleep(80)
+  assert.deepEqual(bot.wearing(), { head: 'golden_helmet', torso: 'iron_chestplate', legs: 'golden_leggings', feet: 'leather_boots', 'off-hand': null })
+  assert.deepEqual(worn.find((w) => w.slot === 'torso'), { slot: 'torso', on: 'iron_chestplate', off: 'chainmail_chestplate' })
+  // Worse or equal is left in the bag.
+  bot.equips.length = 0
+  bot.give('leather_chestplate')
+  bot.give('iron_chestplate')
+  await sleep(60)
+  assert.deepEqual(bot.equips, [])
+  // Better again: diamond over iron, netherite over diamond (same points, tougher).
+  bot.give('diamond_chestplate')
+  await sleep(60)
+  bot.give('netherite_chestplate')
+  await sleep(60)
+  assert.equal(bot.wearing().torso, 'netherite_chestplate')
+  assert.ok(armorScore({ name: 'iron_helmet', enchants: [{ name: 'protection', lvl: 4 }] }) > armorScore({ name: 'diamond_helmet' }), 'Protection IV iron protects more than plain diamond')
+  assert.equal(armorInfo('elytra'), null)
+  assert.equal(armorScore({ name: 'iron_sword' }), 0)
+  keeper.detach()
+})
+
+test('what is worn on purpose is not replaced, and a cursed piece is never put on', async () => {
+  const bot = armorBot(['diamond_chestplate', 'iron_helmet', { name: 'netherite_boots', enchants: [{ name: 'binding_curse', lvl: 1 }] }, 'torch'], { torso: 'elytra', head: 'carved_pumpkin', 'off-hand': 'torch' })
+  const keeper = new ArmorKeeper(bot, { delayMs: 5 })
+  bot.give('shield')
+  bot.give('totem_of_undying')
+  assert.deepEqual(await keeper.wearBest(), [])
+  assert.deepEqual(bot.wearing(), { head: 'carved_pumpkin', torso: 'elytra', legs: null, feet: null, 'off-hand': 'torch' })
+  // An empty off hand takes the totem; a shield gives way to a totem.
+  const two = armorBot(['shield'])
+  const k2 = new ArmorKeeper(two)
+  await k2.wearBest()
+  assert.equal(two.wearing()['off-hand'], 'shield')
+  two.give('totem_of_undying')
+  await k2.wearBest()
+  assert.equal(two.wearing()['off-hand'], 'totem_of_undying')
+})
+
+test('the keeper waits for an open container, busy hands and a refused equip', async () => {
+  const bot = armorBot(['iron_helmet'])
+  const keeper = new ArmorKeeper(bot, { delayMs: 5, retryMs: 15 }).attach()
+  bot.currentWindow = { type: 'minecraft:chest' }
+  bot.inventory.emit('updateSlot', 9, null, bot.inventory.slots[9])
+  await sleep(40)
+  assert.equal(bot.wearing().head, null, 'no clicks into an open chest')
+  bot.currentWindow = null
+  bot.emit('windowClose')
+  await sleep(40)
+  assert.equal(bot.wearing().head, 'iron_helmet')
+  keeper.detach()
+
+  // Hands busy twice (hand_busy), then free: it comes back by itself.
+  const busy = armorBot(['iron_boots'])
+  let n = 0
+  const k2 = new ArmorKeeper(busy, { delayMs: 5, retryMs: 15, equip: async (item, dest) => (++n <= 2 ? { ok: false, why: 'hand_busy' } : (await busy.equip(item, dest), { ok: true })) })
+  await k2.wearBest()
+  assert.equal(busy.wearing().feet, null)
+  await sleep(120)
+  assert.equal(busy.wearing().feet, 'iron_boots')
+
+  // An equip that "succeeds" without moving anything (a paused body) is not reported as worn.
+  const paused = armorBot(['iron_boots'])
+  const logs = []
+  const k3 = new ArmorKeeper(paused, { delayMs: 5, retryMs: 5, equip: async () => ({ ok: true }), log: (level, msg) => logs.push(`${level}: ${msg}`) })
+  assert.deepEqual(await k3.wearBest(), [])
+  await sleep(80)
+  assert.ok(!logs.some((l) => /armor: put on/.test(l)), 'nothing is claimed that the inventory does not show')
+  assert.equal(k3.stats.worn, 0)
+  assert.equal(k3._retries, 4, 'and it stops retrying instead of spinning')
+  await sleep(40)
+  assert.equal(k3.stats.checks, 5, 'one look and four retries, then it waits for the next real change')
+  k3.detach()
+})
+
+test('a slot the model set is left alone until the model hands it back', async () => {
+  const bot = armorBot(['diamond_helmet', 'iron_chestplate'], { head: 'leather_helmet' })
+  const keeper = new ArmorKeeper(bot, { delayMs: 5 })
+  keeper.hold('head')
+  await keeper.wearBest()
+  assert.deepEqual([bot.wearing().head, bot.wearing().torso], ['leather_helmet', 'iron_chestplate'], 'held slot kept, the others still looked after')
+  assert.match(keeper.describe(), /auto, except head/)
+  assert.equal(keeper.brief(), 'armor: auto except head')
+
+  keeper.setAuto(false)
+  bot.give('diamond_leggings')
+  keeper.poke()
+  await sleep(40)
+  assert.equal(bot.wearing().legs, null, 'switched off: nothing is put on')
+  assert.equal(keeper.brief(), 'armor: manual')
+
+  assert.match(keeper.setAuto(true), /^auto — /)
+  await sleep(40)
+  assert.deepEqual(bot.wearing(), { head: 'diamond_helmet', torso: 'iron_chestplate', legs: 'diamond_leggings', feet: null, 'off-hand': null }, 'back on: held slots released and everything worn')
+  assert.equal(keeper.brief(), '', 'and the prompt line goes away again')
+})
+
+test('the model controls its armor through equip: wear, take off, switch the autopilot', async () => {
+  // A session over the simulated bot, with an inventory that has armor slots.
+  const sim = simulatedBot()
+  const a = armorBot(['iron_helmet', 'leather_helmet', 'diamond_sword'])
+  sim.inventory = a.inventory
+  sim.getEquipmentDestSlot = a.getEquipmentDestSlot
+  sim.equip = async (item, dest) => { if (!dest || dest === 'hand') { sim.heldItem = item; return } return a.equip(item, dest) }
+  sim.unequip = a.unequip
+  const wearing = a.wearing
+  const s = startTestSession({ bot: sim, actions: () => null, cfg: (cfg) => { cfg.behavior.useArmorManager = true } })
+  try {
+    s.spawn()
+    await s.until(() => wearing().head === 'iron_helmet', 3000) // the autopilot, on spawn
+    const run = async (action) => {
+      await s.internals().executeAction({ a: 'equip', ...action }, { threatIds: [], askedBy: null })
+      return s.internals().results.filter((r) => r.label === 'equip').at(-1)
+    }
+    const prompt = () => { const built = s.internals().buildActionPrompt(['test']); return typeof built === 'string' ? built : built.text }
+
+    // Take it off: it stays off, and the result says how to hand the slot back.
+    let r = await run({ item: 'none', where: 'head' })
+    assert.equal(r.ok, true, r.msg)
+    assert.match(r.msg, /took off iron_helmet \(head\)/)
+    assert.match(r.msg, /head stays as you set it/)
+    await sleep(700)
+    assert.equal(wearing().head, null, 'the autopilot does not put it straight back on')
+
+    // Wear the worse one on purpose, without naming a slot: it goes on the head.
+    r = await run({ item: 'leather_helmet' })
+    assert.match(r.msg, /equipped leather_helmet \(head\)/)
+    await sleep(500)
+    assert.equal(wearing().head, 'leather_helmet')
+
+    // Hand it back.
+    r = await run({ auto: true })
+    assert.match(r.msg, /armor is now auto — the best armor you carry is put on by itself/)
+    await s.until(() => wearing().head === 'iron_helmet', 3000)
+
+    // Wearing what the autopilot would pick anyway holds nothing.
+    r = await run({ item: 'iron_helmet', where: 'head' })
+    assert.doesNotMatch(r.msg, /stays as you set it/)
+
+    // Off entirely: said in the result, and on the prompt's state.
+    r = await run({ auto: false })
+    assert.match(r.msg, /armor is now manual/)
+    r = await run({ item: 'none', where: 'head' })
+    await sleep(500)
+    assert.equal(wearing().head, null)
+    assert.match(prompt(), /^armor: manual$/m)
+
+    // The hand still works as before; an empty slot and a missing slot are plain answers.
+    r = await run({ item: 'diamond_sword' })
+    assert.match(r.msg, /equipped diamond_sword \(hand\)/)
+    r = await run({ item: 'none', where: 'legs' })
+    assert.match(r.msg, /nothing on legs to take off/)
+    r = await run({ item: 'none' })
+    assert.equal(r.ok, false)
+    assert.match(r.msg, /say which slot to empty/)
+  } finally { s.stop() }
+})
+
+test('the armor plugin is gone, and equip tells the model what it can do', () => {
+  const src = fs.readFileSync(path.join(root, 'zincai', 'index.js'), 'utf8')
+  assert.doesNotMatch(src, /mineflayer-armor-manager|containedPlugin/, 'no third-party handler to contain: the handler is ours and cannot throw')
+  const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'))
+  assert.equal(pkg.dependencies['mineflayer-armor-manager'], undefined)
+  const { ACTION_TOOLS } = require('../zincai/api_wrapper')
+  const equip = ACTION_TOOLS.find((t) => t.name === 'equip')
+  assert.equal(equip.parameters.properties.auto.type, 'boolean')
+  assert.match(equip.parameters.properties.item.description, /"none" \+ where takes off/)
+  assert.ok(!equip.parameters.required, 'auto may be sent alone')
+  assert.match(fs.readFileSync(path.join(root, 'zincai', 'system_prompt.txt'), 'utf8'), /equip \{auto:false\}/)
 })
 
 // --------------------------------------------------------------- craft ---

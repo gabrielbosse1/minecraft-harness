@@ -143,6 +143,40 @@ can resume. Main-hand use is serialized so eating or equipping does not fight
 combat over the same slot. Death, reconnect, task replacement, and shutdown
 release controls.
 
+### Armor
+
+`armor.js` keeps the best armor the bot carries on its body. It replaces the
+`mineflayer-armor-manager` plugin, which read the picked-up item out of the
+item *entity* inside a packet handler and took the process down when that
+entity carried no data. The keeper never looks at an entity: a pickup, a slot
+change, a closed container and a spawn only make it look at the inventory
+again, so armor from a chest, a craft or a gift is worn too, not only armor
+picked up off the ground.
+
+- Pieces are ranked by the game's numbers: armor points, then toughness, then
+  Protection levels (iron above chainmail, netherite above diamond).
+- It never replaces something that is not armor (elytra, carved pumpkin, a
+  head), never puts on Curse of Binding, and only fills an *empty* off hand
+  (shield or totem; a totem replaces a shield).
+- It waits while a container is open or the hands are busy, goes through the
+  same hand lock as eating and fighting, and reports `armor: put on …` only
+  after the inventory shows the piece in its slot.
+
+The model is in charge through `equip`, the tool it already had:
+
+| Call | Effect |
+| --- | --- |
+| `equip {item:"iron_helmet"}` | wear it; armor goes to its own slot |
+| `equip {item:"none", where:"head"}` | take off what is there |
+| `equip {auto:false}` | autopilot off: nothing is put on for it |
+| `equip {auto:true}` | autopilot on, every slot handed back |
+
+A slot the model dresses or empties differently from what the autopilot would
+choose is left as the model set it until `equip {auto:true}`; the same goes
+for the shield combat would otherwise take into an empty off hand. While the
+autopilot is not simply on, the prompt carries an `armor:` line saying so.
+`behavior.useArmorManager` only sets whether it starts on.
+
 ### Objectives that survive interruptions
 
 `goals.js` is a small durable registry behind whatever the bot is doing. Every

@@ -398,7 +398,8 @@ class AdvancedCombat {
     hands = null,
     fleeOnDisengage = true,
     lineOfSight = null,
-    watch = null
+    watch = null,
+    mayTakeShield = null
   } = {}) {
     this.bot = bot
     this.maxHealth = maxHealth
@@ -431,6 +432,7 @@ class AdvancedCombat {
     }
     this.motion = new MotionTracker({ now: this.now })
     this.watch = typeof watch === 'function' ? watch : () => []
+    this.mayTakeShield = typeof mayTakeShield === 'function' ? mayTakeShield : () => true
     this._evadeDir = null
 
     this.state = 'idle' // idle | approach | melee | retreat | cooldown
@@ -747,6 +749,8 @@ class AdvancedCombat {
     try {
       if (this.profile.kind === 'ranged') return false
       if (this._offHandItem()) return this.hasShield()
+      // An off hand its owner emptied on purpose stays empty.
+      if (!this.mayTakeShield()) return false
       const shield = this.bot.inventory.items().find((i) => i.name === 'shield')
       if (!shield) return false
       await this.bot.equip(shield, 'off-hand')

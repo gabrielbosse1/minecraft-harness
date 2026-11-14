@@ -70,6 +70,7 @@
     "fovDegrees": 90,
     "perceptionRange": 10,
     "useArmorManager": true,
+    "_armorNote": "useArmorManager: whether the armor autopilot starts ON (zincai/armor.js — the bot's own; the mineflayer-armor-manager plugin is no longer used). On, the best armor carried is put on whenever the inventory changes. The model owns it at run time through the equip tool: equip {auto:false|true}, and a slot it dresses or empties itself is left alone.",
     "perception3D": false,
     "autoElytra": true
   },

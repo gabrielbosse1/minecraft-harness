@@ -284,7 +284,7 @@ function makeShared (cfg, { dataDir = DATA_DIR } = {}) {
  */
 function main () {
   if (process.argv.includes('--check')) {
-    for (const m of ['./api_wrapper', './memory', './perception', './filter', './builder', './continuity', './custom_mineflayer/pathfinder_wrapper', './custom_mineflayer/doors', './custom_mineflayer/escape', './system1', './tactics', './reflex_registry', './vanilla_guard', './control', './threats', './places', './skills', './observe', './brain', './events', './redstone_engine', './runtime_config', './boundary', './connection', './death_recovery', './host', './control_commands', './irc', './dig_policy', './updater', './supervisor', './watchdog', './block_search', './lanes', './goals']) require(m)
+    for (const m of ['./api_wrapper', './memory', './perception', './filter', './builder', './continuity', './custom_mineflayer/pathfinder_wrapper', './custom_mineflayer/doors', './custom_mineflayer/escape', './system1', './tactics', './reflex_registry', './vanilla_guard', './control', './threats', './places', './skills', './observe', './brain', './events', './redstone_engine', './runtime_config', './boundary', './connection', './death_recovery', './host', './control_commands', './irc', './dig_policy', './updater', './supervisor', './watchdog', './block_search', './armor', './lanes', './goals']) require(m)
     require('minecraft-data')('26.3') // postinstall patch must be in place
     logger.info(TAG, '--check OK — all modules load, 26.3 data present')
     return
@@ -425,30 +425,6 @@ function createHost (shared, cfg, { dataDir = null } = {}) {
   })
 }
 
-/**
- * A third-party plugin whose event handlers cannot take the process down.
- * A handler that throws while a packet is being dispatched is an uncaught
- * exception: the armor manager did exactly that on picking up an item whose
- * entity data had not arrived ("Cannot read properties of undefined"), and the
- * bot exited with code 1 in the middle of a gather. Its listeners are wrapped
- * as they are registered; a failure is logged and that one event is skipped.
- */
-function containedPlugin (plugin, name) {
-  const wrapped = (bot, options) => {
-    const realOn = bot.on
-    let warned = false
-    bot.on = function (event, fn) {
-      return realOn.call(this, event, function (...args) {
-        try { return fn.apply(this, args) } catch (err) {
-          if (!warned) { warned = true; logger.warn(TAG, `${name}: a "${String(event)}" handler failed (${err?.message || err}) — skipped, the bot carries on`) }
-        }
-      })
-    }
-    try { return plugin(bot, options) } finally { delete bot.on }
-  }
-  return wrapped
-}
-
 // ========================================================= one session ==
 /**
  * One connection to the server: the bot and everything attached to it.
@@ -505,7 +481,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   const mineflayer = require('mineflayer')
   const { pathfinder, goals, Movements } = require('mineflayer-pathfinder')
   const { Vec3 } = require('vec3')
-  const armorManager = require('mineflayer-armor-manager')
+  const { ArmorKeeper } = require('./armor')
 
   const { buildVisionBlock, VISION_LEGEND } = require('./perception')
   const filter = require('./filter')
@@ -569,7 +545,6 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   // Runtime vanilla invariant: no slash-command can ever leave this process.
   const guard = installVanillaGuard(bot, { logger })
   bot.loadPlugin(pathfinder)
-  if (cfg.behavior.useArmorManager) bot.loadPlugin(containedPlugin(armorManager, 'armor manager'))
   // Network-level physical barrier: every primitive that could move the body or
   // change the world is refused while the body is paused, disconnected, dead or
   // outside its permissions. Installed BEFORE any subsystem gets the bot.
@@ -583,6 +558,19 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   // a lane that would drive the body while it is paused or forbidden stays
   // silent instead of pressing keys into a wall.
   arbiter.setGate((cap) => boundary.check('__lane__', { caps: [cap] }))
+  // Wears the best armor carried (armor.js). It looks at the inventory when
+  // something changes — it never reads an item out of an entity, which is how
+  // the plugin it replaces crashed the process — and it leaves alone every
+  // slot the model dressed or emptied itself. The model's choice (auto on/off,
+  // held slots) lives on `shared`, so a reconnect does not forget it.
+  const armorPrefs = shared.armorPrefs || (shared.armorPrefs = { auto: cfg.behavior.useArmorManager !== false, held: new Set() })
+  const armor = new ArmorKeeper(bot, {
+    prefs: armorPrefs,
+    // Through the hand lock: one click sequence at a time, never across an eat or a swap.
+    equip: (item, dest) => arbiter.useHand('armor', item, async () => {}, { dest, restore: false, priority: PRIORITY.task }),
+    log: (level, msg) => logger[level]?.(TAG, msg),
+    onWorn: (list) => note({ type: 'armor', msg: list.map((w) => `put on ${w.on}${w.off ? ` (was ${w.off})` : ''}`).join(', ') })
+  })
   const sense = new ThreatSense(bot, {
     radius: cfg.threat.radius ?? 12,
     rangedRadius: cfg.threat.rangedRadius ?? 18,
@@ -2017,6 +2005,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       continuityBlock || null,
       visibleFacts.length ? `visible player memories (name-based, unverified): ${visibleFacts.join(' | ')}` : null,
       observe.selfLine(bot),
+      armor.brief() || null,
       observe.inventoryLine(bot),
       doingLine(),
       agendaLine(),
@@ -2916,8 +2905,25 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         return startSide('use_block', () => skills.useBlock({ what: action.what }), sideOpts('use_block', action, snap))
       case 'eat':
         return background('eat', adoptLease(skills.eat({ item: action.item }), 'eat finished'))
-      case 'equip':
-        return report('equip', await skills.equip({ item: action.item, where: action.where }), { wake: null })
+      case 'equip': {
+        // `auto` is the model's switch for the armor keeper; it may come alone
+        // or with an item.
+        let autoNote = ''
+        if (typeof action.auto === 'boolean') {
+          autoNote = `armor is now ${armor.setAuto(action.auto)}`
+          if (!String(action.item || '').trim()) return report('equip', { ok: true, msg: autoNote }, { wake: null })
+        }
+        const res = await skills.equip({ item: action.item, where: action.where })
+        // What the model put on or took off by hand stays as it left it —
+        // which only needs saying (and holding) when the autopilot would have
+        // chosen differently: wearing the best piece anyway changes nothing.
+        if (res.ok && res.slot && res.slot !== 'hand' && armorPrefs.auto && armor.plan().some((step) => step.slot === res.slot)) {
+          armor.hold(res.slot)
+          res.msg += ` — ${res.slot} stays as you set it (equip {auto:true} lets the best armor be put on by itself again)`
+        }
+        if (autoNote) res.msg += `; ${autoNote}`
+        return report('equip', res, { wake: null })
+      }
       case 'redstone_engineer': {
         const started = performance.now()
         // Its placements and lever flips are checked against the same
@@ -3320,6 +3326,8 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       hands: arbiter.lane('combat', PRIORITY.combat),
       // Running away is the survival layer's job here.
       fleeOnDisengage: false,
+      // The model's armor choices cover the fight's shield too.
+      mayTakeShield: () => armorPrefs.auto && !armorPrefs.held.has('off-hand'),
       // During a fight, also dodge any other player who hit the bot lately.
       watch: () => {
         const out = []
@@ -3454,7 +3462,9 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     every(60_000, () => { try { memory.save(); places.save(); continuity.save(); shared.saveConvo?.() } catch { /* best effort */ } })
     every(GOALS.tickMs ?? 15_000, () => { try { goalTick() } catch (err) { logger.debug(TAG, `goal tick: ${err.message || err}`) } })
 
-    try { bot.armorManager?.equipAll?.() } catch { /* cosmetic */ }
+    // The inventory window exists from here on (mineflayer adds it when its
+    // plugins are injected, after createBot returned): listen, and look once.
+    try { armor.attach(); armor.poke() } catch (err) { logger.debug(TAG, `armor keeper: ${err.message || err}`) }
     logger.info(TAG, 'ZincAI ready — reflexes flee, the model decides; chat lane + action lane on demand')
     if (first) {
       let restored = 0
@@ -3997,6 +4007,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     timers.clear()
     try { brain?.stop() } catch { /* noop */ }
     try { skills?.dispose() } catch { /* noop */ }
+    try { armor?.detach() } catch { /* noop */ }
     try { executor?.cancel() } catch { /* noop */ }
     try { system1?.stop() } catch { /* noop */ }
     try { combat?.stop() } catch { /* noop */ }

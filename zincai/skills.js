@@ -20,6 +20,9 @@ const { PRIORITY } = require('./control')
 const { PlaceIndex, CONTAINER_KINDS } = require('./places')
 const { whereIs } = require('./threats')
 const { findBlocksFast } = require('./block_search')
+const { armorInfo } = require('./armor')
+/** Where a wearable that is not armor goes when no slot is named. */
+const NATURAL_SLOT = { elytra: 'torso', carved_pumpkin: 'head', shield: 'off-hand', totem_of_undying: 'off-hand' }
 const { chooseFood, FOODS, HEALING } = require('./system1')
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -820,17 +823,44 @@ class Skills {
     }
   }
 
-  /** Equip an item by name. */
-  async equip ({ item, where = 'hand' } = {}) {
+  /**
+   * Equip an item by name — or, with item "none", take off what is in `where`.
+   * Armor named without a slot goes where armor goes (it used to land in the
+   * hand). The result carries `slot`, so the caller knows which one was set.
+   */
+  async equip ({ item, where = '' } = {}) {
+    const bot = this.bot
+    const asked = EQUIP_SLOTS[fold(where)] || null
+    const name = fold(item).replace(/\s+/g, '_')
+    if (!name) return fail('equip needs an item (or item:"none" with where, to take something off)')
+    // Both go through the hand lock: never across an eat, a swap or the armor keeper.
+    const locked = async (it, dest, fn) => {
+      for (let i = 0; i < 6; i++) {
+        const r = await this.arbiter.useHand('equip', it, fn, { dest, restore: false, priority: PRIORITY.task })
+        if (r.ok || r.why !== 'hand_busy') return r
+        await sleep(150)
+      }
+      return { ok: false, why: 'the hands are busy — try again in a moment' }
+    }
+    if (/^(none|nothing|empty|air|off|remove|unequip)$/.test(name)) {
+      if (!asked) return fail('say which slot to empty: where = head, torso, legs, feet or off-hand')
+      if (asked === 'hand') return fail('the hand is never empty-handed by request — equip another item instead')
+      const slotIndex = bot.getEquipmentDestSlot?.(asked) ?? { head: 5, torso: 6, legs: 7, feet: 8, 'off-hand': 45 }[asked]
+      const worn = bot.inventory?.slots?.[slotIndex]
+      if (!worn) return { ...ok(`nothing on ${asked} to take off`), slot: asked }
+      if (typeof bot.unequip !== 'function') return fail('taking items off is not available on this connection')
+      const r = await locked(null, asked, () => bot.unequip(asked))
+      const still = bot.inventory?.slots?.[slotIndex]
+      if (!r.ok || (still && still.name === worn.name)) return fail(`could not take off ${worn.name}: ${r.ok ? 'it did not come off (inventory full, or Curse of Binding)' : String(r.why).slice(0, 60)}`)
+      return { ...ok(`took off ${worn.name} (${asked}); it is in the inventory`), slot: asked }
+    }
     const mine = this._item(item)
     if (!mine) return fail(this._notCarrying(item))
-    const dest = EQUIP_SLOTS[fold(where)] || 'hand'
-    try {
-      await this.bot.equip(mine, dest)
-      return ok(`equipped ${mine.name} (${dest})`)
-    } catch (err) {
-      return fail(`could not equip ${mine.name}: ${String(err?.message || err).slice(0, 60)}`)
-    }
+    const natural = armorInfo(mine.name)?.slot || NATURAL_SLOT[mine.name] || 'hand'
+    const dest = asked || natural
+    const r = await locked(mine, dest, async () => {})
+    if (!r.ok) return fail(`could not equip ${mine.name}: ${String(r.why).slice(0, 60)}`)
+    return { ...ok(`equipped ${mine.name} (${dest})`), slot: dest }
   }
 
   /** Right-click a nearby block by name: door, gate, lever, button, bell… */

@@ -71,6 +71,10 @@ async function runUpdate ({
 
   // 1. inspect ------------------------------------------------------------
   const inside = await git(['rev-parse', '--is-inside-work-tree'])
+  if (inside.code !== 0 && /ENOENT/.test(inside.stderr)) {
+    // e.g. a slim Docker image: the source is a checkout, but nothing here can pull.
+    return failed('cannot update: git is not installed where the bot runs — install git there, or update by pressing Install in the panel')
+  }
   if (inside.code !== 0 || inside.stdout.trim() !== 'true') {
     return failed(`cannot update: ${cwd} is not a git checkout (install with git clone, or reinstall from the panel)`)
   }

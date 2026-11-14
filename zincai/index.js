@@ -360,6 +360,9 @@ function main () {
 
   process.on('SIGINT', () => shutdown(0, 'SIGINT'))
   process.on('SIGTERM', () => shutdown(0, 'SIGTERM'))
+  // The supervisor was killed outright (panel Kill, kill -9, OOM) and could not
+  // pass a signal on: leave the server and exit instead of running on unowned.
+  require('./supervisor').watchParent({ onGone: () => shutdown(0, 'the supervisor process is gone') })
   process.on('unhandledRejection', (err) => logger.error(TAG, `unhandled rejection: ${err?.message || err}`))
   process.on('exit', (code) => {
     try { shared.memory.save() } catch { /* best effort */ }

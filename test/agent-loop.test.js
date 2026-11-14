@@ -884,3 +884,63 @@ test('supervisor: restarts the child on exit 75 and passes any other exit code t
     assert.equal(code, 3, 'and the final exit code is the child\'s own')
   } finally { fs.rmSync(dir, { recursive: true, force: true }) }
 })
+
+test('supervisor: a parent that is killed outright takes the bot with it (no orphan left logged in)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zinc-orphan-'))
+  const { spawn } = require('node:child_process')
+  try {
+    const up = path.join(dir, 'up')
+    const gone = path.join(dir, 'gone')
+    const child = path.join(dir, 'child.js')
+    // Stands in for the bot: stays alive on a timer, like a connected session.
+    fs.writeFileSync(child, `
+      const fs = require('fs')
+      const { watchParent } = require(${JSON.stringify(require.resolve('../zincai/supervisor'))})
+      const watching = watchParent({ onGone: () => { fs.writeFileSync(${JSON.stringify(gone)}, 'saved'); process.exit(0) } })
+      fs.writeFileSync(${JSON.stringify(up)}, String(process.pid) + ' ' + watching)
+      setInterval(() => {}, 1000)
+    `)
+    const runner = path.join(dir, 'run.js')
+    fs.writeFileSync(runner, `
+      const { supervise } = require(${JSON.stringify(require.resolve('../zincai/supervisor'))})
+      supervise({ script: ${JSON.stringify(child)}, log: () => {} })
+    `)
+    const parent = spawn(process.execPath, [runner], { stdio: 'ignore' })
+    const waitFor = async (file, ms) => { const end = Date.now() + ms; while (Date.now() < end) { if (fs.existsSync(file)) return true; await sleep(25) } return false }
+    assert.ok(await waitFor(up, 10_000), 'the child came up')
+    const [pid, watching] = fs.readFileSync(up, 'utf8').split(' ')
+    assert.equal(watching, 'true', 'a supervised child watches its parent')
+    try {
+      parent.kill('SIGKILL') // no handler runs: nothing is forwarded
+      assert.ok(await waitFor(gone, 10_000), 'the child noticed and shut itself down')
+      await sleep(100)
+      assert.throws(() => process.kill(Number(pid), 0), /ESRCH/, 'and it is really gone')
+    } finally { try { process.kill(Number(pid), 'SIGKILL') } catch { /* already gone */ } }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('supervisor: watchParent is a no-op without a supervisor, and fires once', () => {
+  const { EventEmitter } = require('node:events')
+  let n = 0
+  // Not supervised: nothing is registered even if a channel happens to exist.
+  const plain = Object.assign(new EventEmitter(), { channel: { unref () {} } })
+  assert.equal(supervisor.watchParent({ proc: plain, env: {}, onGone: () => n++ }), false)
+  assert.equal(plain.listenerCount('disconnect'), 0)
+  // Supervised but started without a channel (ZINCAI_SUPERVISED set by hand).
+  assert.equal(supervisor.watchParent({ proc: new EventEmitter(), env: { [supervisor.CHILD_FLAG]: '1' }, onGone: () => n++ }), false)
+  let unrefd = 0
+  const kid = Object.assign(new EventEmitter(), { channel: { unref () { unrefd++ } } })
+  assert.equal(supervisor.watchParent({ proc: kid, env: { [supervisor.CHILD_FLAG]: '1' }, onGone: () => n++ }), true)
+  assert.equal(unrefd, 1, 'the channel does not keep the process alive by itself')
+  kid.emit('disconnect'); kid.emit('disconnect')
+  assert.equal(n, 1)
+})
+
+test('update: without git where the bot runs, the refusal says so instead of blaming the checkout', async () => {
+  const exec = async (cmd) => (cmd === 'git' ? { code: 1, stdout: '', stderr: 'spawn git ENOENT' } : { code: 0, stdout: '', stderr: '' })
+  const r = await runUpdate({ cwd: os.tmpdir(), exec })
+  assert.equal(r.ok, false)
+  assert.equal(r.changed, false)
+  assert.match(r.summary, /git is not installed where the bot runs/)
+  assert.match(r.summary, /Install in the panel/)
+})

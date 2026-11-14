@@ -363,7 +363,8 @@ Minecraft Server, Behaviour, Limits, Operator Control and Installation.
 | `elytra` | `MC_AUTO_ELYTRA` | `true` | Glide across long gaps. |
 | `rpm` | `INFERENCE_RPM` | `18` | Shared model-call budget per minute. |
 | `mininterval` | `INFERENCE_MIN_INTERVAL_MS` | `3000` | Spacing between action calls. |
-| `heartbeat` | `INFERENCE_HEARTBEAT_MS` | `90000` | Self-prompt when idle; `0` disables. |
+| `loop` | `INFERENCE_LOOP_MS` | `8000` | The agent loop: how soon the next turn starts by itself after one ends. `0` turns the loop off. |
+| `heartbeat` | `INFERENCE_HEARTBEAT_MS` | `90000` | Longest gap between turns: while the bot keeps choosing to do nothing the pause doubles from `loop` up to this. `0` turns the loop off. |
 | `reconnect` | `RECONNECT` | `true` | Retry a dropped link after a spawn. |
 | `maxattempts` | `RECONNECT_MAX_ATTEMPTS` | `40` | Retry cap before the process exits. |
 | `joinonstart` | `ZINC_JOIN_ON_START` | `true` | Off = the process starts without joining and waits for `join` on the console. |
@@ -418,11 +419,31 @@ Every start:
 Stop sends `SIGINT` (`stopCode: 2`), which is the bot's graceful shutdown: it
 saves memory and places, quits the bot and prints a session summary.
 
+`node zincai/index.js` is **two processes**: a tiny parent (`zincai/supervisor.js`)
+and the bot as its child, sharing the same console. The parent exists for one
+thing — starting the bot again when it exits with code 75, which is what the
+`update` and `restart` console commands do. Everything the panel relies on is
+unchanged:
+
+- **Stop** signals the parent, which passes the signal on and exits with the
+  bot's own exit code (0), so Stop is still not read as a crash.
+- **Kill** takes the parent out with no chance to pass anything on; the bot
+  notices the parent is gone, saves its state and leaves by itself, so no bot is
+  left logged in behind the panel's back.
+- A crash is still not retried: any exit code other than 75 ends both
+  processes with that code, and `autorecover` stays `false` for the reason
+  given [above](#why-autorecover-is-false).
+
+If something else already restarts the process (systemd `Restart=always`,
+`docker --restart`), set `ZINCAI_NO_SUPERVISOR=1`: the bot then runs as a single
+process and exits 75 after an update for that supervisor to bring back.
+
 ### Controlling the bot without restarting it
 
 The **Console** tab is the operator interface: type a command on its own and
-press enter. Nothing restarts the process, and none of it needs admin rights on
-the Minecraft server.
+press enter. Only `update` and `restart` start a new process (the panel's
+server stays "running" throughout), and none of it needs admin rights on the
+Minecraft server.
 
 ```
 status                      connection, life, activity, goals, jobs, limits
@@ -435,6 +456,9 @@ goals / jobs                what is running, what is waiting
 cancel g7                   cancel one goal and its jobs
 config show boundary        every boundary limit, with defaults
 config set boundary.radius 48
+update                      pull the newest source from GitHub, restart on it
+update check                only say whether there is something newer
+restart                     new process on the source already on disk
 pause                       # emergency handbrake: stop the body, delete nothing
 shutdown 0                  # emergency stop: save state and exit the process
 help
@@ -470,15 +494,35 @@ status
 
 ## Updating the bot
 
-Push to the branch the server was installed from, then press **Install** in the
-panel: the template runs `git fetch`/`checkout` on that branch and
-`npm ci --omit=dev` again. Runtime data in `datadir` (memory, places, goals,
-`runtime-config.json`) is left alone, and **Start** runs the `--dry-run`
+**From the console (the bot keeps its server slot in the panel):** push to the
+branch the server was installed from, then type
+
+```
+update
+```
+
+The bot fetches that branch, moves to the newest commit, runs
+`npm ci --omit=dev` only if the dependencies changed, checks that the new source
+loads (`--check`), then saves its state, leaves the Minecraft server and comes
+back on the new code a few seconds later. If the new source does not load, the
+checkout is rolled back and the running bot is not touched. `update check` only
+reports whether something newer exists; `update force` also discards local
+edits to tracked files. It needs `git` where the bot runs — true on a host node
+(Install already required it); a slim Docker image without git says so and you
+use Install instead.
+
+**From the panel:** press **Install**. The template runs `git fetch`/`checkout`
+on that branch and `npm ci --omit=dev` again, and **Start** runs the `--dry-run`
 preflight first, so a broken update is visible before the bot joins.
 
-Pressing **Install** is also how you pick up a changed *template* — but the
-panel caches the template repository for a few minutes, so a brand-new variable
-can take a moment to appear.
+Either way, runtime data in `datadir` (memory, places, goals,
+`runtime-config.json`, `dig-policy.json`) is left alone.
+
+Pressing **Install** is also the only way to pick up a changed *template* (a
+new variable such as `loop`): the console `update` replaces the bot's source,
+not the server definition the panel holds. The panel caches the template
+repository for a few minutes, so a brand-new variable can take a moment to
+appear; until then the bot simply uses its built-in default for it.
 
 ## Requirements
 

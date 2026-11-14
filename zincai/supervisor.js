@@ -15,6 +15,14 @@
  * source that is on disk NOW. Any other exit code ends both processes with
  * that code, so the panel sees exactly what it saw before.
  *
+ * The two are also tied the other way round: the child holds an IPC channel to
+ * the parent, and if the parent dies without a chance to pass a signal on
+ * (the panel's Kill button, `kill -9`, the OOM killer) the channel closes and
+ * the child shuts down in an orderly way (`watchParent`). Without that a
+ * killed parent would leave the bot running and logged in with nothing that
+ * can stop it, and the next Start would bring a second one under the same
+ * name.
+ *
  * Opt out with ZINCAI_NO_SUPERVISOR=1 (or --no-supervisor) when something else
  * already restarts the process (systemd Restart=always, docker --restart): the
  * bot then exits with RESTART_CODE (75) after an update and that supervisor
@@ -84,7 +92,9 @@ function supervise ({
     const start = () => {
       const startedAt = now()
       try {
-        child = spawn(execPath, [...execArgv, script, ...args], { stdio: 'inherit', env: { ...env, [CHILD_FLAG]: '1' } })
+        // The fourth entry is the IPC channel `watchParent` listens on; no
+        // message is ever sent over it — its closing is the whole signal.
+        child = spawn(execPath, [...execArgv, script, ...args], { stdio: ['inherit', 'inherit', 'inherit', 'ipc'], env: { ...env, [CHILD_FLAG]: '1' } })
       } catch (err) {
         log(`could not start the bot: ${err.message || err}`)
         return finish(1)
@@ -114,4 +124,25 @@ function supervise ({
   })
 }
 
-module.exports = { supervise, shouldSupervise, isSupervised, RESTART_CODE, CHILD_FLAG, OPT_OUT }
+/**
+ * Child side: call `onGone` once if the supervisor disappears. A no-op (returns
+ * false) when this process has no supervisor, so it is safe to call always.
+ *
+ * @param {{ proc?: NodeJS.Process, env?: object, onGone: () => void }} opts
+ * @returns {boolean} whether a parent is being watched
+ */
+function watchParent ({ proc = process, env = proc.env, onGone } = {}) {
+  if (!isSupervised(env) || typeof proc.on !== 'function' || !proc.channel) return false
+  let fired = false
+  proc.on('disconnect', () => {
+    if (fired) return
+    fired = true
+    try { onGone() } catch { /* the shutdown path reports its own failures */ }
+  })
+  // The listener must not be what keeps the bot alive: every other exit path
+  // (shutdown's own timer, a fatal join) behaves exactly as it did before.
+  try { proc.channel.unref?.() } catch { /* older Node: the channel stays referenced */ }
+  return true
+}
+
+module.exports = { supervise, shouldSupervise, isSupervised, watchParent, RESTART_CODE, CHILD_FLAG, OPT_OUT }

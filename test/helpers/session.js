@@ -262,9 +262,9 @@ function startTestSession ({ chat = [], actions = [], bot = simulatedBot(), cfg:
   // Test pace: no 3 s spacing, no self-started loop turns (heartbeatMs 0 — a
   // scripted model would be asked forever; test/agent-loop.test.js turns the
   // loop on explicitly), no reconnect.
-  // Tests keep the IRC batching window short: the production 5 s is a real
-  // behaviour, exercised explicitly in test/brain-chat-batch.test.js, but a
-  // suite that waited five seconds per chat chunk would take minutes.
+  // Tests keep the IRC batching window short: the production 6 s is a real
+  // behaviour, exercised explicitly in test/model-freedom.test.js, but a suite
+  // that waited six seconds per chat chunk would take minutes.
   cfg.inference = { ...cfg.inference, minIntervalMs: 40, chatMinIntervalMs: 20, chatBatchMs: 60, rpm: 1000, heartbeatMs: 0 }
   cfg.behavior = { ...cfg.behavior, chatCooldownMs: 10, useArmorManager: false }
   cfg.system1 = { ...cfg.system1, tickMs: 50 }

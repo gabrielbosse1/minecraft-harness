@@ -459,7 +459,10 @@ Exit code 75 is the restart request. `node zincai/index.js` starts a small
 supervisor (`supervisor.js`) that runs the bot as a child sharing its console;
 on 75 it starts a fresh child, on any other code it exits with that code. It
 forwards the panel's stop signal and gives up if the bot asks to restart three
-times within ten seconds of starting. `ZINCAI_NO_SUPERVISOR=1` or
+times within ten seconds of starting. If the supervisor itself is killed
+outright (the panel's Kill, `kill -9`, the OOM killer) the bot notices over the
+IPC channel it holds to it, saves its state and leaves, so it is never left
+running with nothing that can stop it. `ZINCAI_NO_SUPERVISOR=1` or
 `--no-supervisor` runs the bot as a single process for setups where systemd or
 Docker already restarts it. `--check` and `--dry-run` never start a supervisor.
 
@@ -618,7 +621,10 @@ no dotenv; nothing is read from a file the panel does not control.
 | `AMD_API_BASE_URL`, `AMD_MODEL` | Endpoint base URL and model alias. |
 | `AMD_MAX_TOKENS`, `AMD_TEMPERATURE`, `AMD_API_TIMEOUT_MS`, `AMD_CHAT_TIMEOUT_MS`, `AMD_MAX_CONCURRENT` | Model-call shape and lane concurrency. |
 | `BOT_MODE`, `BOT_ALIASES`, `BOT_LANGUAGE` | **Inert.** There are no modes, no name gating and no language check. A template that still sets them keeps booting. |
-| `INFERENCE_RPM`, `INFERENCE_MIN_INTERVAL_MS`, `INFERENCE_HEARTBEAT_MS` | Call budget, spacing and self-prompt. |
+| `INFERENCE_RPM`, `INFERENCE_MIN_INTERVAL_MS` | Call budget and spacing. |
+| `INFERENCE_LOOP_MS`, `INFERENCE_HEARTBEAT_MS` | The agent loop: pause after a turn (8000) and the longest it backs off to while idle (90000). `0` in either turns the loop off. |
+| `INFERENCE_CHAT_BATCH_MS` | How long chat lines are collected into one chunk (6000). |
+| `ZINCAI_NO_SUPERVISOR` | `1` = run as one process; `update`/`restart` then exit 75 for an outside supervisor. |
 | `RECONNECT`, `RECONNECT_MAX_ATTEMPTS` | Post-spawn reconnection behaviour. |
 | `ZINC_OPERATORS`, `ZINC_COMMAND_PREFIX` | **Inert.** Control is console-only; there is no chat command interface to configure. |
 | `ZINC_JOIN_ON_START` | Join the server when the process starts (`connection.joinOnStart`); `false` waits for `join`. |

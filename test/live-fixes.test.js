@@ -18,6 +18,7 @@ const { Vec3 } = require('vec3')
 const { simulatedBot, startTestSession, addPlayer, sleep } = require('./helpers/session')
 const { installPhysicalGuard } = require('../zincai/boundary')
 const { LoopWatchdog, watchdogEnabled } = require('../zincai/watchdog')
+const { installProtocolKeepAlive } = require('../zincai/protocol_keepalive')
 const { coerceReply } = require('../zincai/api_wrapper')
 const { resolveRecipe } = require('../src/recipes')
 
@@ -646,7 +647,10 @@ test('timeout diagnosis separates an active protocol link, server silence and a 
       now += 60_001
       wd._lastStall = { startedAt: now - 59_000, endedAt: now, durationMs: 59_000 }
     }
-    const cause = wd.connectionError(new Error('client timed out after 60000 milliseconds'))
+    const error = kind === 'silent'
+      ? Object.assign(new Error('server traffic timed out after 60000 milliseconds'), { code: 'ZINCAI_TRAFFIC_TIMEOUT' })
+      : new Error('client timed out after 60000 milliseconds')
+    const cause = wd.connectionError(error)
     return { cause, logs, wd }
   }
 
@@ -665,6 +669,23 @@ test('timeout diagnosis separates an active protocol link, server silence and a 
   assert.match(blocked.logs.at(-1).msg, /JavaScript thread was blocked/)
 })
 
+test('a late keep-alive stream warns but stays connected while ordinary packets continue', () => {
+  const logs = []
+  let now = 10_000
+  const wd = new LoopWatchdog({ log: (level, msg) => logs.push({ level, msg }), now: () => now, stack: false })
+  wd.linkUp({ timeoutMs: 60_000 })
+  wd.packet('keep_alive', { keepAliveId: 5n })
+  wd.outbound('keep_alive', { keepAliveId: 5n })
+  now += 59_999
+  wd.packet('entity_status', {})
+  now += 2
+  wd._checkKeepAlive(now)
+  assert.equal(wd.stats.lateKeepAliveStreams, 1)
+  assert.match(logs.at(-1).msg, /keeping the live link.*disconnects only when all server traffic stops/)
+  wd.packet('keep_alive', { keepAliveId: 6n })
+  assert.match(logs.at(-1).msg, /keep-alives resumed/)
+})
+
 test('a wrong keep-alive echo is identified as a client protocol failure', () => {
   const logs = []
   let now = 50_000
@@ -678,6 +699,98 @@ test('a wrong keep-alive echo is identified as a client protocol failure', () =>
   assert.match(logs.join('\n'), /client\/protocol reply path/)
 })
 
+test('protocol liveness echoes keep-alives but extends the deadline on any server packet', () => {
+  let now = 1_000
+  let nextId = 1
+  const timers = new Map()
+  const deferred = new Map()
+  const setTimer = (fn, ms) => {
+    const handle = { id: nextId++, at: now + ms, unref () {} }
+    timers.set(handle.id, { handle, fn })
+    return handle
+  }
+  const clearTimer = (handle) => timers.delete(handle?.id)
+  const defer = (fn) => {
+    const handle = { id: nextId++ }
+    deferred.set(handle.id, { handle, fn })
+    return handle
+  }
+  const clearDefer = (handle) => deferred.delete(handle?.id)
+  const runDue = () => {
+    for (;;) {
+      const due = [...timers.values()].filter((t) => t.handle.at <= now).sort((a, b) => a.handle.at - b.handle.at)[0]
+      if (!due) return
+      timers.delete(due.handle.id)
+      due.fn()
+    }
+  }
+  const runDeferred = () => {
+    for (const job of [...deferred.values()]) {
+      deferred.delete(job.handle.id)
+      job.fn()
+    }
+  }
+
+  const client = new EventEmitter()
+  client.writes = []
+  client.write = (name, packet) => client.writes.push({ name, packet })
+  client.end = (reason) => { client.endReason = reason }
+  const errors = []
+  client.on('error', (err) => errors.push(err))
+  const live = installProtocolKeepAlive(client, { timeoutMs: 60_000, now: () => now, setTimer, clearTimer, defer, clearDefer })
+  client.emit('connect')
+
+  const id = 0x123456789abcdefn
+  client.emit('keep_alive', { keepAliveId: id })
+  assert.equal(client.writes.length, 1)
+  assert.equal(client.writes[0].name, 'keep_alive')
+  assert.equal(client.writes[0].packet.keepAliveId, id, 'the 64-bit challenge is never coerced through Number')
+
+  const nextIdBeforeTraffic = nextId
+  for (let i = 0; i < 12; i++) {
+    now += 5_000
+    client.emit('packet', {}, { name: i % 2 ? 'entity_status' : 'time_update' })
+  }
+  assert.equal(nextId, nextIdBeforeTraffic, 'busy traffic updates one deadline timestamp instead of allocating timers')
+  runDue()
+  assert.equal(client.endReason, undefined, 'continuous ordinary traffic proves the link is alive at the old keep-alive deadline')
+
+  now += 60_000
+  runDue()
+  assert.equal(deferred.size, 1, 'an expired timer defers the final decision for socket I/O')
+  client.emit('packet', {}, { name: 'player_info' })
+  runDeferred()
+  assert.equal(client.endReason, undefined, 'already-ready packet I/O wins the timer race')
+
+  now += 60_000
+  runDue()
+  runDeferred()
+  assert.equal(client.endReason, 'trafficTimeout', 'only complete server silence closes the link')
+  assert.equal(errors.length, 1)
+  assert.equal(errors[0].code, 'ZINCAI_TRAFFIC_TIMEOUT')
+  assert.match(errors[0].message, /server traffic timed out after 60000 milliseconds/)
+  assert.deepEqual(live.stats, { packets: 13, challenges: 1, replies: 1, inactivityTimeouts: 1 })
+
+  live.stop()
+  assert.equal(client.listenerCount('packet'), 0)
+  assert.equal(client.listenerCount('keep_alive'), 0)
+  assert.equal(client.listenerCount('connect'), 0)
+  assert.equal(client.listenerCount('end'), 0)
+  assert.equal(timers.size, 0)
+  assert.equal(deferred.size, 0)
+
+  const disposedClient = new EventEmitter()
+  disposedClient.write = () => {}
+  disposedClient.end = () => {}
+  const disposed = installProtocolKeepAlive(disposedClient, { timeoutMs: 60_000, now: () => now, setTimer, clearTimer, defer, clearDefer })
+  disposedClient.emit('connect')
+  assert.equal(timers.size, 1)
+  disposed.stop()
+  assert.equal(timers.size, 0, 'session disposal cancels the outstanding checker')
+  assert.equal(disposedClient.listenerCount('packet'), 0, 'session disposal removes protocol listeners')
+  assert.equal(disposedClient.listenerCount('keep_alive'), 0)
+})
+
 test('the real 26.3 protocol echoes a non-zero 64-bit keep-alive id exactly on localhost', { timeout: 5000 }, async (t) => {
   const mc = require('minecraft-protocol')
   const server = mc.createServer({
@@ -688,7 +801,9 @@ test('the real 26.3 protocol echoes a non-zero 64-bit keep-alive id exactly on l
     keepAlive: false
   })
   let client = null
+  let liveness = null
   const close = async () => {
+    try { liveness?.stop() } catch { /* already stopped */ }
     // Destroy the test sockets directly. Client.end() deliberately keeps a
     // 30-second hard-close safety timer, which would make this fast test keep
     // the whole test process alive for another 30 seconds.
@@ -717,8 +832,9 @@ test('the real 26.3 protocol echoes a non-zero 64-bit keep-alive id exactly on l
     host: '127.0.0.1',
     port,
     version: '26.3',
-    checkTimeoutInterval: 2000
+    keepAlive: false
   })
+  liveness = installProtocolKeepAlive(client, { timeoutMs: 2000 })
   client.on('error', () => {})
   const [peer] = await within(login, 'protocol login')
   while (peer.state !== 'play') await within(once(peer, 'state'), 'play state')
@@ -729,7 +845,9 @@ test('the real 26.3 protocol echoes a non-zero 64-bit keep-alive id exactly on l
   peer.write('keep_alive', { keepAliveId: wanted })
   const [[challenge], [reply]] = await within(Promise.all([decoded, echoed]), 'keep-alive round trip')
   assert.equal(challenge.keepAliveId.valueOf(), wanted, 'client decoded all 64 bits')
-  assert.equal(reply.keepAliveId.valueOf(), wanted, 'minecraft-protocol echoed the exact challenge')
+  assert.equal(reply.keepAliveId.valueOf(), wanted, 'Zinc\'s handler echoed the exact challenge')
+  assert.equal(liveness.stats.challenges, 1)
+  assert.equal(liveness.stats.replies, 1)
   await close()
 })
 
@@ -740,7 +858,8 @@ test('the watchdog can be switched off, and the keep-alive tolerance is configur
   assert.equal(defaults.reconnect.keepAliveTimeoutMs, 60000)
   const src = fs.readFileSync(path.join(root, 'zincai', 'index.js'), 'utf8')
   assert.match(src, /const keepAliveTimeoutMs = Math\.max\(20_000, Number\(cfg\.reconnect\?\.keepAliveTimeoutMs\) \|\| 60_000\)/)
-  assert.match(src, /checkTimeoutInterval: keepAliveTimeoutMs/)
+  assert.match(src, /keepAlive: false/, 'the dependency\'s keep-alive-only timeout is disabled')
+  assert.match(src, /installProtocolKeepAlive\(client, \{ timeoutMs: keepAliveTimeoutMs/)
   assert.match(src, /wd\.outbound\(name, packet\)/, 'the exact keep-alive echo is observed')
-  assert.doesNotMatch(src, /checkTimeoutInterval: 30_000/)
+  assert.doesNotMatch(src, /checkTimeoutInterval:/)
 })

@@ -156,7 +156,7 @@
     "maxDelayMs": 120000,
     "maxAttempts": 40,
     "keepAliveTimeoutMs": 60000,
-    "_keepAliveNote": "How long without a keep-alive from the server before the link is given up (the server sends one every 15 s). 30000 dropped the bot after a single late one."
+    "_keepAliveNote": "How long without ANY decoded server packet before Zinc gives up the link. Keep-alive challenges are still echoed exactly, but a pause in only that packet stream never disconnects an otherwise active session."
   },
   "goals": {
     "_note": "Durable objectives (goals.js). Every long task becomes a record with an id, origin, priority, checkpoint and lifecycle; it survives deaths, restarts and context resets (goals.json in the data dir). stallMs: an ACTIVE goal whose checkpoint has not moved for this long wakes the model once (remindMs before a second nudge) \u2014 waiting on a furnace or the night is legitimate, so only the running goal is nudged and never failed automatically. maxFails: repeated failures plus no progress suspend it as blocked. starveMs/starveRemindMs: an open goal that waits this long while the body is idle is offered back to the model. maxResumes: a main task paused this many times is set aside (not deleted). verifyRadius: a restored build goal within this many blocks of its site is re-checked at startup (farther away it is left resumable+needsVerify; gather goals are always checked, they have no site). staleGuard: refuse quiet actions whose snapshot no longer matches the world (new threat or a different active goal).",

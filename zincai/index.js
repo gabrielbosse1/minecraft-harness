@@ -284,7 +284,7 @@ function makeShared (cfg, { dataDir = DATA_DIR } = {}) {
  */
 function main () {
   if (process.argv.includes('--check')) {
-    for (const m of ['./api_wrapper', './memory', './perception', './filter', './builder', './continuity', './custom_mineflayer/pathfinder_wrapper', './custom_mineflayer/doors', './custom_mineflayer/escape', './system1', './tactics', './reflex_registry', './vanilla_guard', './control', './threats', './places', './skills', './observe', './brain', './events', './redstone_engine', './runtime_config', './boundary', './connection', './death_recovery', './host', './control_commands', './irc', './dig_policy', './updater', './supervisor', './watchdog', './block_search', './armor', './lanes', './goals']) require(m)
+    for (const m of ['./api_wrapper', './memory', './perception', './filter', './builder', './continuity', './custom_mineflayer/pathfinder_wrapper', './custom_mineflayer/doors', './custom_mineflayer/escape', './system1', './tactics', './reflex_registry', './vanilla_guard', './control', './threats', './places', './skills', './observe', './brain', './events', './redstone_engine', './runtime_config', './boundary', './connection', './death_recovery', './host', './control_commands', './irc', './dig_policy', './updater', './supervisor', './watchdog', './protocol_keepalive', './block_search', './armor', './lanes', './goals']) require(m)
     require('minecraft-data')('26.3') // postinstall patch must be in place
     logger.info(TAG, '--check OK — all modules load, 26.3 data present')
     return
@@ -299,7 +299,7 @@ function main () {
     logger.info(TAG, `data dir: ${DATA_DIR} (memories, places, goals, metrics, runtime-config)`)
     logger.info(TAG, `behaviour: elytra=${cfg.behavior.autoElytra ? 'yes' : 'no'} limits=${cfg.inference.rpm}/min`)
     logger.info(TAG, `agent loop: ${cfg.inference.heartbeatMs > 0 && cfg.inference.loopMs > 0 ? `every ${cfg.inference.loopMs}ms, backing off to ${cfg.inference.heartbeatMs}ms while idle` : 'off (events only)'}; up to ${cfg.inference.maxStepsPerTurn ?? 6} model steps per turn; chat window ${cfg.inference.chatBatchMs}ms`)
-    logger.info(TAG, `limits: rpm=${cfg.inference.rpm} minInterval=${cfg.inference.minIntervalMs}ms heartbeat=${cfg.inference.heartbeatMs}ms reconnect=${cfg.reconnect.enabled ? `${cfg.reconnect.maxAttempts} attempts` : 'off'} keepAliveTimeout=${cfg.reconnect.keepAliveTimeoutMs}ms`)
+    logger.info(TAG, `limits: rpm=${cfg.inference.rpm} minInterval=${cfg.inference.minIntervalMs}ms heartbeat=${cfg.inference.heartbeatMs}ms reconnect=${cfg.reconnect.enabled ? `${cfg.reconnect.maxAttempts} attempts` : 'off'} serverTrafficTimeout=${cfg.reconnect.keepAliveTimeoutMs}ms`)
     logger.info(TAG, `prompts: action ${SYSTEM_PROMPT.split(/\s+/).length} words, chat ${CHAT_PROMPT.split(/\s+/).length} words (static), ${ZINC_TOOLS.length} tools`)
     logger.info(TAG, 'policy: flee from real threats until the model decides; no PvP unless the model names a player; no friend list')
     // The control plane is part of the preflight: an empty operator list and a
@@ -502,6 +502,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   const { AdvancedCombat } = require('../src/combat')
   const { craftItem } = require('../src/recipes')
   const { reasonToText } = require('../src/reasonToText')
+  const { installProtocolKeepAlive } = require('./protocol_keepalive')
 
   const wrapperLog = (level, msg) => logger[level === 'debug' ? 'debug' : level]?.(TAG, msg)
 
@@ -526,19 +527,23 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     username: cfg.server.username, // always ZincAI — enforced in loadConfig()
     version: cfg.server.version || false,
     auth: cfg.server.auth,
-    // How long without a keep-alive before the client gives the link up. The
-    // server sends one every 15 s; 30 s (the library default) drops the bot
-    // after ONE late keep-alive — a server on a small board that stalls on a
-    // world save, or a hitch on our side — and costs a reconnect and whatever
-    // the body was doing. 60 s rides through that and still ends a dead link.
-    checkTimeoutInterval: keepAliveTimeoutMs
+    // Zinc owns this instead of minecraft-protocol. That dependency times only
+    // the NEXT keep_alive packet and disconnected a link on which 46,029 other
+    // packets had arrived during the same minute. We still echo every challenge
+    // exactly, but declare the link dead only after NO server packet arrives.
+    keepAlive: false
   })
+  const client = bot._client
+  const protocolKeepAlive = client?.on && typeof client.write === 'function'
+    ? installProtocolKeepAlive(client, { timeoutMs: keepAliveTimeoutMs, log: wrapperLog })
+    : null
+  if (protocolKeepAlive) logger.info(TAG, `link liveness: exact keep-alive echo; disconnect only after ${Math.round(keepAliveTimeoutMs / 1000)}s with no server packets`)
+
   // Record packet names, keep-alive challenges and the exact IDs written back.
-  // At a timeout watchdog.js can then distinguish our event loop, whole-link
-  // silence and an active link whose keep-alive stream alone stopped.
+  // The protocol liveness handler above is independent of this report-only
+  // watchdog and remains active when ZINCAI_WATCHDOG=0.
   try {
     const wd = shared.watchdog
-    const client = bot._client
     if (wd && client?.on) {
       client.on('packet', (packet, meta) => wd.packet(meta?.name, packet))
       client.on('connect', () => wd.linkUp({ timeoutMs: keepAliveTimeoutMs }))
@@ -4127,6 +4132,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     try { continuity.save() } catch { /* best effort */ }
     for (const t of timers) { clearInterval(t); clearTimeout(t) }
     timers.clear()
+    try { protocolKeepAlive?.stop() } catch { /* noop */ }
     try { brain?.stop() } catch { /* noop */ }
     try { skills?.dispose() } catch { /* noop */ }
     try { armor?.detach() } catch { /* noop */ }

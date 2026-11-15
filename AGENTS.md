@@ -10,7 +10,7 @@ Run these after every non-trivial change:
 
 ```sh
 npm run check                        # syntax-check all JS files in zincai/, src/, scripts/, pufferpanel/
-npm test                             # run all 8 real-server simulation test suites (flying-squid 1.21.4)
+npm test                             # run the full real-server simulation suite (test/01..13, flying-squid 1.21.4)
 AMD_API_KEY=rc-test npm run dry-run  # validate config loading, env wiring, and 39-tool schema
 npm run pufferpanel:validate         # validate pufferpanel/zincai.json against PufferPanel v3 rules
 ```

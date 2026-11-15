@@ -26,17 +26,23 @@ describe('05 — real-server redstone inspection, logic & engineering', () => {
     const repPos = origin.offset(4, 0, 0)
     const lampPos = origin.offset(5, 0, 0)
 
-    await mc.setBlock(leverPos, 'lever', { face: 'floor', facing: 'east', powered: true })
-    await mc.setBlock(wirePos, 'redstone_wire', { power: 15, east: 'side', west: 'side' })
-    await mc.setBlock(repPos, 'repeater', { facing: 'west', delay: 2, powered: true })
-    await mc.setBlock(lampPos, 'redstone_lamp', { lit: true })
-
-    await waitFor(() =>
-      bot.blockAt(leverPos)?.name === 'lever' &&
-      bot.blockAt(wirePos)?.name === 'redstone_wire' &&
-      bot.blockAt(repPos)?.name === 'repeater' &&
-      bot.blockAt(lampPos)?.name === 'redstone_lamp',
-    { label: 'redstone bench visible to client' })
+    // flying-squid occasionally coalesces two block updates sent in the same
+    // tick, so the client keeps the previous material at one position even
+    // though the server world is correct. Re-sending the (idempotent) write is
+    // the honest fix: the test is about reading real chunks, not about a server
+    // packet-timing quirk.
+    const bench = [
+      [leverPos, 'lever', { face: 'floor', facing: 'east', powered: true }],
+      [wirePos, 'redstone_wire', { power: 15, east: 'side', west: 'side' }],
+      [repPos, 'repeater', { facing: 'west', delay: 2, powered: true }],
+      [lampPos, 'redstone_lamp', { lit: true }]
+    ]
+    for (const [pos, name, props] of bench) await mc.setBlock(pos, name, props)
+    await waitFor(async () => {
+      const off = bench.filter(([pos, name]) => bot.blockAt(pos)?.name !== name)
+      for (const [pos, name, props] of off) await mc.setBlock(pos, name, props)
+      return off.length === 0
+    }, { label: 'redstone bench visible to client' })
 
     // 1. Scan real redstone circuit + analyze with redstone_engineer + run logic_test + save project
     llm.enqueueAction({

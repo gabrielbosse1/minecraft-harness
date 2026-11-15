@@ -70,7 +70,7 @@ const ACTION_TOOLS = [
     text: STR('The line, max 200 chars. In the language of the conversation.'),
     to: STR('Recipient player (optional).')
   }, ['text']),
-  tool('go_to', 'Walk to a player, saved place, nearby id (chest2, bed1), or [x,y,z]. Routes around mobs and hazards; ordinary walks only clear soft terrain if no detour exists.', {
+  tool('go_to', 'Walk to a player, saved place, nearby id (chest2, bed1), or coordinates. Supply x and z alone to travel horizontally using the easiest reachable walking level (no demand to climb onto a roof or reach a guessed y); supply y only when the exact elevation matters. Routes around mobs and hazards; ordinary walks only clear soft terrain if no detour exists.', {
     player: STR('Player name.'),
     place: STR('Saved place or nearby id.'),
     x: INT('X.'),
@@ -165,6 +165,15 @@ const ACTION_TOOLS = [
     owner: STR('Owner player name if ownership="player".'),
     home: { type: 'boolean', description: 'True ONLY if this is your verified home (built by you or explicitly assigned to you).' }
   }, ['name']),
+  tool('memory', 'Your memory controls: recall relevant knowledge; remember a durable fact/lesson/commitment with category and evidence basis; archive a specific recalled record when obsolete; or organize memories during safe idle time. This does not erase historical records.', {
+    operation: { type: 'string', enum: ['recall', 'remember', 'archive', 'organize'] },
+    query: STR('Recall/search query, or rationale for organizing.'),
+    text: STR('Durable information to remember.'),
+    category: { type: 'string', enum: ['identity', 'relationship', 'preference', 'semantic', 'procedural', 'continuity', 'episodic'], description: 'Knowledge category.' },
+    basis: { type: 'string', enum: ['observed', 'reported', 'inferred'], description: 'Evidence: witnessed by Zinc, told by a player (unverified), or inferred.' },
+    entity: STR('Player/place/goal this concerns.'),
+    id: STR('Memory ID for reversible archive operation.')
+  }, ['operation']),
   tool('note', 'Record a durable discovery, lesson, or ownership observation in long-term memory, or add/drop a personal interest.', {
     text: STR('Short factual note or lesson learned.'),
     interest: STR('Emerging personal interest to add, or "-topic" to drop.')

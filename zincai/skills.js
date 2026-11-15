@@ -155,7 +155,7 @@ class Skills {
    *   executor — BuilderExecutor (for shelter scaffolding); a thunk is fine to
    *   break the construction-order cycle.
    */
-  constructor (bot, { arbiter, places, logger = () => {}, whisper = null, moveTimeoutMs = 60_000, executor = null, choreTimeoutMs = 240_000, pathfinder = null, boundary = null } = {}) {
+  constructor (bot, { arbiter, places, logger = () => {}, whisper = null, moveTimeoutMs = 90_000, executor = null, choreTimeoutMs = 240_000, pathfinder = null, boundary = null, onSlowWalk = null, slowWalkMs = 20_000 } = {}) {
     this.bot = bot
     /**
      * Optional shared physical boundary. A walk whose capability the operator
@@ -169,6 +169,8 @@ class Skills {
     this.log = logger
     this.whisper = whisper
     this.moveTimeoutMs = moveTimeoutMs
+    this.onSlowWalk = typeof onSlowWalk === 'function' ? onSlowWalk : null
+    this.slowWalkMs = Math.max(5_000, Number(slowWalkMs) || 20_000)
     // The pathfinder wrapper owns the (one-shot) permission to break blocks.
     this._pathfinder = typeof pathfinder === 'function' ? pathfinder : () => pathfinder
     this._executor = typeof executor === 'function' ? executor : () => executor
@@ -291,6 +293,7 @@ class Skills {
     token.walking = true
     if (!token.tetherPos) token.walkTarget = () => goal?.entity?.position || targetOfGoal(goal)
     let budget = timeoutMs
+    let warnedSlow = false
     let retried = false
     let interrupted = false
     let last = Date.now()
@@ -312,6 +315,14 @@ class Skills {
         if (!lane.isTop) { interrupted = true; last = now; idleSince = 0; continue } // a reflex is driving
         budget -= now - last
         last = now
+        const spent = timeoutMs - budget
+        if (!warnedSlow && spent >= this.slowWalkMs) {
+          warnedSlow = true
+          const target = targetOfGoal(goal)
+          const warning = `navigation is taking longer than ${Math.round(this.slowWalkMs / 1000)}s${target ? ` toward ${Math.floor(target.x)},${Math.floor(target.y)},${Math.floor(target.z)}` : ''}; pathfinding is still active and will continue/replan; reassess rather than assuming arrival`
+          this.log('warn', warning)
+          try { this.onSlowWalk?.(warning) } catch { /* notification must not stop movement */ }
+        }
         const here = bot.entity.position.floored()
         if (done ? done() : goal.isEnd(here)) return { ok: true, why: 'arrived', interrupted }
         if (this._noPathAt) {

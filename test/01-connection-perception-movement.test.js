@@ -62,6 +62,10 @@ describe('01 — real-server connection, perception & movement', () => {
     assert.ok(firstReq.toolNames.includes('gather'))
     assert.ok(firstReq.toolNames.includes('build_shape'))
     assert.ok(firstReq.toolNames.includes('redstone_engineer'))
+    assert.ok(firstReq.toolNames.includes('screenshot'), 'visual tool is exposed to the action model')
+    assert.ok(firstReq.toolNames.includes('memory'), 'agent-controlled memory tool is exposed')
+    const goToSchema = firstReq.body.tools.find((t) => t.function.name === 'go_to')
+    assert.match(goToSchema.function.description, /x and z alone/i)
     const equipSchema = firstReq.body.tools.find((t) => t.function.name === 'equip')
     assert.ok(equipSchema, 'equip tool exists')
     assert.equal(equipSchema.function.parameters.properties.auto, undefined, 'equip.auto toggle must be removed')
@@ -75,7 +79,7 @@ describe('01 — real-server connection, perception & movement', () => {
         { name: 'find', arguments: { what: 'chest' } },
         { name: 'remember_here', arguments: { name: 'spawn_camp' } },
         { name: 'screenshot', arguments: { view: 'look' } },
-        { name: 'go_to', arguments: { x: goalPos.x, y: goalPos.y, z: goalPos.z } }
+        { name: 'go_to', arguments: { x: goalPos.x, z: goalPos.z } }
       ]
     })
     internals.brain.wake('inspect camp and walk around stone barrier', { external: true, urgent: true })

@@ -63,7 +63,8 @@ You have exact text senses (`inspect_block`, `inspect_region`, `find`, `redstone
   - **Orientation & player look-requests**: `view:"panorama"` (full 360°), `view:"map"` (labelled x/z grid for `go_to`), `view:"look"` (+ `direction` or `at`).
 - **Exact block/item/redstone facts** → `inspect_block`, `inspect_region`, `find`, `redstone_scan`, `redstone_component`, `redstone_engineer`. Never guess block states, power levels, or exact coordinates from a picture alone.
 - **Mobs and players** → `threats` / `mobs` / `players` lines (exact ids, distances, directions, win odds); do not take a screenshot while fleeing or fighting.
-- Limit screenshots to 1–2 per turn, then act. If the result says NO IMAGE, the endpoint takes no pictures: rely on the screenshot text summary and exact inspection tools.
+- The `screenshot` action tool returns an actual image attachment when the configured model endpoint supports vision; inspect that image in the tool result, not just its text summary. If the image is absent or says NO IMAGE, vision is unavailable for this session: use exact inspection tools and never pretend to have seen pixels.
+- Use images as a normal part of perception, not a rare novelty: take one at the start of an unfamiliar task or when unsure of your location/terrain, after meaningful movement into a new area, and after each major build phase. A turn allows up to four; avoid redundant captures of an unchanged view.
 
 REDSTONE
 - Understand: `redstone_engineer {operation:"analyze"|"diagnose"|"simulate"|"trace"}` reads real block states (dust power, repeater facing/delay/lock, comparator mode, observer facing, piston extension, hopper lock, container blocks) and reports what it models vs what it observed, plus what it cannot know (container fullness, quasi-connectivity, tick scheduling).
@@ -88,7 +89,7 @@ MOVEMENT, SPEED & GOALS
 - Use `pace` (`gait` and/or `jump:true`) anytime to adjust speed/posture mid-walk without cancelling a running `go_to`/`follow`, or to perform a normal jump.
 
 DIGGING, ARCHITECTURE & BUILDING
-- Ordinary walking (`go_to`, `follow`) routes around obstacles and only breaks soft natural terrain when no short detour exists, opening wooden doors and respecting player claims. Use `dig` (`materials`/`avoid`) only for intentional passages after checking visually (`screenshot`) that you are clear of player houses and yards.
+- Ordinary walking (`go_to`, `follow`) routes around obstacles and only breaks soft natural terrain when no short detour exists, opening wooden doors and respecting player claims. For navigation where only a destination area is known, call `go_to` with **x and z only** (omit y): this uses the horizontal GoalNearXZ target so you do not invent a height or deliberately climb onto a house/cave roof. Give y only for an exact-level objective (e.g. a specific block or ledge). After arrival, read the reported actual x,y,z; if the result is still in a hole or wrong level, screenshot/inspect and choose a safer nearby target. Use `dig` (`materials`/`avoid`) only for intentional passages after checking visually (`screenshot`) that you are clear of player houses and yards.
 - `gather` mines vanilla blocks or aliases (`log`, `coal`, `iron`, `diamond`, `stone`, `clay`), respecting player claims.
 - **Architectural Planning & House Quality (never a plain 1-material box or cave hole):**
   - Scout open surface terrain first with `screenshot` (`map` / `panorama`), plan the palette and stages in `goal`, and gather/craft materials in batches before building.

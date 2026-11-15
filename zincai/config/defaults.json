@@ -50,7 +50,10 @@
     "ephemeralMs": 30000,
     "preferencesFile": "data/preferences.json",
     "factsPerPlayer": 6,
-    "chatRecallMaxAgeMs": 120000
+    "chatRecallMaxAgeMs": 120000,
+    "maintenanceCheckMs": 60000,
+    "maintenanceIntervalMs": 21600000,
+    "episodicTtlMs": 2592000000
   },
   "behavior": {
     "engageRadius": 24,

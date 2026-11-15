@@ -209,7 +209,10 @@ function makeShared (cfg, { dataDir = DATA_DIR } = {}) {
   const { GoalRegistry } = require('./goals')
   const at = (configured, fallback) => path.join(dataDir, String(configured || fallback).replace(/^(?:zincai-data|data)[/\\]/, ''))
   const memoryFile = at(cfg.memory.file, 'memories.json')
+  const LifecycleStore = require('./lifecycle').LifecycleStore
+  const lifecycle = new LifecycleStore({ file: at(cfg.lifecycle?.file, 'lifecycle.json') })
   const shared = {
+    lifecycle,
     cfg,
     dataDir,
     memoryFile,
@@ -374,6 +377,10 @@ function main () {
     shared.shuttingDown = true
     logger.info(TAG, `shutting down (${reason})`)
     try { host.shutdown({ reason, quit: true }) } catch { /* already gone */ }
+    try {
+      const open = shared.goals.openGoals().map(g => ({ id: g.id, description: g.description, status: g.status }))
+      shared.lifecycle.shutdown(reason, { stats: shared.events?.stats || {}, continuity: { openGoals: open } })
+    } catch { /* best effort */ }
     try { shared.memory.save() } catch { /* best effort */ }
     try { shared.places.save(true) } catch { /* best effort */ }
     try { shared.saveConvo() } catch { /* best effort */ }
@@ -3386,7 +3393,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       case 'inspect_region':
         return report('inspect_region', require('./region_inspect').inspectRegion(bot, action))
       case 'screenshot': {
-        const maxPerTurn = Math.max(1, Math.min(4, Math.trunc(Number(VISION.maxPerTurn ?? 2)) || 2))
+        const maxPerTurn = Math.max(1, Math.min(6, Math.trunc(Number(VISION.maxPerTurn ?? 4)) || 4))
         if (shotsThisTurn >= maxPerTurn) {
           return report('screenshot', { ok: false, msg: `already ${shotsThisTurn} screenshot(s) this turn — act on what you saw. For exact blocks and coordinates use inspect_block / inspect_region / find` })
         }
@@ -3474,6 +3481,33 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
           res.msg += homeMsg
         }
         return report('remember_here', res, { wake: null })
+      }
+      case 'memory': {
+        const operation = String(action.operation || '').toLowerCase()
+        if (operation === 'recall') {
+          const found = memory.longTerm.retrieve({ query: String(action.query || ''), entity: action.entity || null, k: cfg.memory.topK ?? 4 })
+          return report('memory', { ok: true, msg: found.entries.length ? found.entries.map(e => `#${e.id} ${memory.formatEntry(e)}`).join('\\n') : 'no relevant active memory found' })
+        }
+        if (operation === 'remember') {
+          const category = String(action.category || 'episodic')
+          const mapped = ['semantic', 'procedural', 'continuity'].includes(category) ? category : (category === 'preference' ? 'continuity' : 'episodic')
+          const basis = ['observed', 'reported', 'inferred'].includes(action.basis) ? action.basis : 'inferred'
+          const entry = memory.recordKnowledge({ text: action.text, category: mapped, basis, confidence: basis === 'observed' ? 0.92 : basis === 'reported' ? 0.4 : 0.65, importance: mapped === 'episodic' ? 2 : 3, tags: [category, 'agent_selected'], entities: action.entity ? [action.entity] : [], source: basis === 'reported' ? String(action.entity || 'player') : 'Zinc' })
+          return report('memory', { ok: Boolean(entry), msg: entry ? `stored ${category} memory #${entry.id} (${basis})` : 'memory text was empty' })
+        }
+        if (operation === 'archive') {
+          const entry = memory.longTerm.entries.find(e => e.id === String(action.id || ''))
+          if (!entry || entry.foundational) return report('memory', { ok: false, msg: 'memory ID not found or protected as foundational; nothing changed' })
+          entry.status = 'archived'; entry.archivedAt = Date.now(); memory.longTerm.save()
+          return report('memory', { ok: true, msg: `archived #${entry.id}; original record remains recoverable` })
+        }
+        if (operation === 'organize') {
+          const safe = !agenda.main && !skills?.current() && !task && !combat?.isEngaged && !system1?.fleeing && !brain?.pending?.length
+          if (!safe) return report('memory', { ok: false, msg: 'organization deferred: active task, danger, or queued decision input; try again when idle' })
+          const result = memory.longTerm.maintain({ episodicTtlMs: cfg.memory.episodicTtlMs ?? 30 * 24 * 60 * 60_000 })
+          return report('memory', { ok: true, msg: `organized memories; archived ${result.archived}, ${result.active} active records remain` })
+        }
+        return report('memory', { ok: false, msg: 'unknown memory operation' })
       }
       case 'note': {
         const text = String(action.text || '').trim().slice(0, 220)
@@ -3856,7 +3890,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
 
     const taskLane = arbiter.lane('task', PRIORITY.task)
     executor = new BuilderExecutor(bot, { scaffoldBlocks: cfg.build.scaffoldBlocks, logger: wrapperLog, hands: taskLane, boundary })
-    skills = new Skills(bot, { arbiter, places, logger: wrapperLog, whisper: guard.whisper, executor: () => executor, pathfinder: () => wrapper, boundary })
+    skills = new Skills(bot, { arbiter, places, logger: wrapperLog, whisper: guard.whisper, executor: () => executor, pathfinder: () => wrapper, boundary, moveTimeoutMs: cfg.navigation?.moveTimeoutMs ?? 180_000, slowWalkMs: cfg.navigation?.slowWalkMs ?? 20_000, onSlowWalk: (warning) => brain?.wake(warning, { external: true }) })
 
     brain = new Brain({
       act,
@@ -3930,6 +3964,12 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     })
     system1.start()
     brain.start()
+    // Process startup is distinct from Minecraft login/spawn. Queue this once
+    // the model lane exists so it is delivered as a real decision input.
+    brain.wake(shared.lifecycle.startupMessage({
+      openGoals: goalReg.openGoals().map(g => ({ id: g.id, description: g.description, status: g.status })),
+      previousContinuity: shared.lifecycle.previous?.continuity || {}
+    }), { external: true, important: true, fast: true })
 
     // A task interrupted by the flee reflex resumes by itself; tell the model.
     arbiter.on('preempt', ({ lane, by, reason }) => { if (lane === 'task') note({ type: 'interrupted', msg: `task paused: ${by} lane took over (${reason || 'reflex'})` }) })
@@ -3937,6 +3977,18 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
 
     let lastWorldWakeAt = 0
     const nearbyPlayerSeen = new Set()
+    let lastMemoryMaintenanceAt = Date.now()
+    every(Math.max(30_000, cfg.memory.maintenanceCheckMs ?? 60_000), () => {
+      const now = Date.now()
+      const cadence = Math.max(60_000, cfg.memory.maintenanceIntervalMs ?? 6 * 60 * 60_000)
+      const safe = alive && systemsReady && !agenda.main && !skills?.current() && !task && !combat?.isEngaged && !system1?.fleeing && !system1?.chasers?.length && !brain?.busy && !brain?.pending?.length
+      if (!safe || now - lastMemoryMaintenanceAt < cadence) return
+      lastMemoryMaintenanceAt = now
+      try {
+        const result = memory.longTerm.maintain({ episodicTtlMs: cfg.memory.episodicTtlMs ?? 30 * 24 * 60 * 60_000 })
+        logger.info(TAG, `memory maintenance: archived ${result.archived} expired episodic records; ${result.active} active / ${result.total} historical records`)
+      } catch (err) { logger.warn(TAG, `memory maintenance failed: ${err?.message || err}`) }
+    })
     every(3000, () => {
       try { places.scan(bot, { radius: cfg.places.scanRadius ?? 16 }) } catch { /* partial world */ }
       try {

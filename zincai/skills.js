@@ -266,7 +266,7 @@ class Skills {
    * (fleeing) does not count against the timeout.
    * @returns {Promise<{ok:boolean, why:string, interrupted:boolean}>}
    */
-  async _walk (token, goal, { dynamic = false, timeoutMs = this.moveTimeoutMs, done = null, retryNoPath = true } = {}) {
+  async _walk (token, goal, { dynamic = false, timeoutMs = this.moveTimeoutMs, done = null, retryNoPath = true, gait = token?.gait || null } = {}) {
     const bot = this.bot
     const lane = this.lane
     // A destination outside the permitted area is refused before a single key is
@@ -278,6 +278,10 @@ class Skills {
     }
     if (bot.pathfinder && Number.isFinite(bot.pathfinder.thinkTimeout)) {
       bot.pathfinder.thinkTimeout = Math.max(bot.pathfinder.thinkTimeout, 8000)
+    }
+    const wrapper = this._pathfinder()
+    if (gait && typeof wrapper?.setGait === 'function') {
+      wrapper.setGait(gait)
     }
     lane.acquire({ reason: token.label })
     this._noPathAt = 0
@@ -342,6 +346,7 @@ class Skills {
       // A dig corridor is for ONE walk: whoever granted it gets it closed here,
       // on success, on noPath and on cancellation alike.
       if (token.digWindow) { try { this._pathfinder()?.endDigging?.(token.cancelled || 'walk done') } catch { /* gone */ } }
+      if (gait) { try { this._pathfinder()?.setGait?.('auto') } catch { /* gone */ } }
       token.walking = false
       token.walkTarget = null
       // A replaced walk must not wipe the goal its replacement just set.
@@ -432,6 +437,7 @@ class Skills {
       const materials = Array.isArray(target.materials) && target.materials.length ? target.materials : null
       const avoid = Array.isArray(target.avoid) ? target.avoid : []
       token.label = `digging to ${label}`
+      token.gait = target.gait || null
       token.digWindow = true
       const opened = wrapper.beginDigging({ canDig: materials, avoid, maxMs: Math.max(5_000, Math.min(this.moveTimeoutMs, 120_000)) })
       if (!opened) return fail('could not open a way: this body cannot dig')
@@ -453,6 +459,7 @@ class Skills {
     const bot = this.bot
     const { GoalNear, GoalNearXZ, GoalFollow } = this._goals()
     return this._run('go_to', async (token) => {
+      token.gait = target.gait || null
       if (target.player) {
         const { name, entity } = this._playerEntity(target.player)
         if (!name) return fail(`no player named "${target.player}" is online`)
@@ -534,10 +541,11 @@ class Skills {
    * @param {{ player: string, maxMs?: number, lostMs?: number, stuckMs?: number }} opts
    *   maxMs 0 = no time limit
    */
-  follow ({ player, maxMs = 0, lostMs = 45_000, stuckMs = 60_000 } = {}) {
+  follow ({ player, maxMs = 0, lostMs = 45_000, stuckMs = 60_000, gait = null } = {}) {
     const bot = this.bot
     const { GoalFollow, GoalNear } = this._goals()
     return this._run('follow', async (token) => {
+      token.gait = gait || null
       const first = this._playerEntity(player)
       if (!first.name) return fail(`no player named "${player}" is online`)
       if (!first.entity) return fail(`${first.name} is too far away to see`)

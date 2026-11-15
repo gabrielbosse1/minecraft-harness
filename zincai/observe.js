@@ -30,7 +30,15 @@ function selfLine (bot) {
     if (item?.name) worn.push(item.name)
   }
   const off = bot.inventory?.slots?.[45]?.name
-  return `state: hp ${Math.round(Number(bot.health ?? 0))}/20 food ${Math.round(Number(bot.food ?? 0))}/20 | pos ${pos} ${dim} | ${tod}${bot.isRaining ? ', raining' : ''} | holding ${held}${off ? ` + ${off} (off-hand)` : ''}${worn.length ? ` | wearing ${worn.join(', ')}` : ' | no armor'}`
+  let motion = null
+  try { motion = typeof bot._zincaiMotion === 'function' ? bot._zincaiMotion() : null } catch { motion = null }
+  const vx = Number(bot.entity?.velocity?.x) || 0
+  const vz = Number(bot.entity?.velocity?.z) || 0
+  const speedMs = motion && Number.isFinite(motion.speedMs)
+    ? motion.speedMs
+    : Math.round(Math.hypot(vx, vz) * 200) / 10
+  const posture = motion?.posture || (bot.entity?.isSneaking ? 'crouching' : (bot.controlState?.sprint ? 'sprinting' : 'gait: auto'))
+  return `state: hp ${Math.round(Number(bot.health ?? 0))}/20 food ${Math.round(Number(bot.food ?? 0))}/20 | pos ${pos} ${dim} | ${tod}${bot.isRaining ? ', raining' : ''} | speed ${speedMs.toFixed(1)} m/s (${posture}) | holding ${held}${off ? ` + ${off} (off-hand)` : ''}${worn.length ? ` | wearing ${worn.join(', ')}` : ' | no armor'}`
 }
 
 /** "inventory (9/36 slots): iron_sword, bread x12, …" — every kind, counted. */

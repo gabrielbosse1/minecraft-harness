@@ -211,6 +211,27 @@ function tameState (e) {
 /** Tamed pet or mount? Unknown reads as false here; isProtected() is the cautious one. */
 const isTamed = (e) => tameState(e) === true
 
+/** Could this entity type ever have an owner (wolf, cat, parrot, horse, camel, allay, etc.)? */
+function canHaveOwner (e) {
+  if (!e) return false
+  const name = lower(e.name)
+  if (TAMABLE_FLAG_4.has(name) || TAMABLE_FLAG_2.has(name) || name === 'allay') return true
+  const ownerAt = metaIndex(name, 'owneruuid')
+  return ownerAt !== null && ownerAt >= 0
+}
+
+/**
+ * True ONLY for unnamed, unowned, non-tamable hostile mobs that can be
+ * automatically targeted/kited when the bot has good weapon & win odds.
+ */
+function isAutoFightCandidate (e, bot) {
+  if (!e || isPlayer(e) || isDecor(e)) return false
+  const name = lower(e.name)
+  if (!name || PROTECTED_NAMES.has(name)) return false
+  if (isNamed(e) || canHaveOwner(e) || tameState(e) !== false) return false
+  return isHostileMob(name, bot)
+}
+
 /** Must never be attacked on a type match: decor, pets, named mobs, villagers. */
 function isProtected (e) {
   if (!e) return true
@@ -784,6 +805,8 @@ module.exports = {
   isDecor,
   isNamed,
   isTamed,
+  canHaveOwner,
+  isAutoFightCandidate,
   tameState,
   useRegistry,
   meta,

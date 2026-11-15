@@ -44,9 +44,10 @@
 const { Vec3 } = require('vec3')
 
 const { ControlArbiter, PRIORITY } = require('./control')
-const { ThreatSense, isHostileMob } = require('./threats')
-const { mobSpeed, mobStats, statsOf, reachOf, cornerText } = require('./tactics')
-const { runnableHeading, surveyGround } = require('./custom_mineflayer/escape')
+const { ThreatSense, isHostileMob, isPlayer, isGliding, isUsingItem } = require('./threats')
+const { mobSpeed, mobStats, statsOf, reachOf, cornerText, situation } = require('./tactics')
+const { runnableHeading, clearToRun, surveyGround } = require('./custom_mineflayer/escape')
+const { MotionTracker, forecastImpact } = require('../src/combat')
 
 const byDistance = (a, b) => a.distance - b.distance
 
@@ -234,6 +235,12 @@ class System1 {
     this._mlg = null
     this._hazardEscape = null
     this._lastDodgeAt = 0
+    this._impactMotion = new MotionTracker({ now: () => this.now() })
+    this._impactEvade = null
+    this._lastImpactReportAt = 0
+    this._autoSuppressed = new Map()
+    this._autoSuppressedAllUntil = 0
+    this._lastAutoEngageAt = 0
     this._onPhysics = this._physicsTick.bind(this)
     this._onPathUpdate = (result) => {
       if (!this._flee || !this.hands.isTop) return
@@ -295,6 +302,9 @@ class System1 {
     this.lastEpisode = null
     this._mlg = null
     this._hazardEscape = null
+    this._impactEvade = null
+    this._autoSuppressed.clear()
+    this._autoSuppressedAllUntil = 0
     this.live = []
     this.chasers = []
     this._fall = { startY: null, fallen: 0 }
@@ -362,7 +372,7 @@ class System1 {
     this._decision = null
   }
 
-  get fleeing () { return Boolean(this._flee || this._hazardEscape) }
+  get fleeing () { return Boolean(this._flee || this._hazardEscape || this._impactEvade) }
 
   /** The model's standing decision about threats, if any: { label, at, until, count }. */
   get decision () { return this._decision }
@@ -452,6 +462,24 @@ class System1 {
     return t
   }
 
+  /** Suppress reflex auto-engagement (e.g. model called stop or hold). */
+  suppressAutoFight (ids = null, ttlMs = 30_000) {
+    const until = this.now() + ttlMs
+    if (!ids) {
+      this._autoSuppressedAllUntil = Math.max(this._autoSuppressedAllUntil, until)
+      return
+    }
+    for (const id of ids) this._autoSuppressed.set(id, until)
+  }
+
+  _isAutoSuppressed (threats, now) {
+    if (now < this._autoSuppressedAllUntil) return true
+    for (const [id, until] of this._autoSuppressed) {
+      if (now >= until) this._autoSuppressed.delete(id)
+    }
+    return threats.some((t) => (this._autoSuppressed.get(t.id) || 0) > now)
+  }
+
   // ------------------------------------------------------------- the tick
 
   /** One reflex scan — cheap; no LLM. */
@@ -463,12 +491,12 @@ class System1 {
 
     // 0. Immediate contact hazard (lava, fire, magma, cactus) → zero-LLM local escape.
     if (this._tickHazardEscape(now)) return
+    if (this._impactEvade && now < this._impactEvade.until) return
 
-    // 1. Real threats → flee (unless the model already decided about them).
-    //    A threat inside the trigger ring STARTS an escape; once running, it
-    //    lasts while anything still follows inside the wider release ring.
-    //    One ring for both made the bot flip between "fleeing" and "safe" at
-    //    the 12-block line and wake the model at every flip.
+    // 1. Real threats → smart fight-odds assessment vs flee (model retains final choice).
+    //    A threat inside the trigger ring STARTS an escape or auto-kite; once
+    //    running, an escape lasts while anything still follows inside the wider
+    //    release ring.
     this.sense.assess()
     const live = this._refreshLive()
     const tether = this._tetherNow()
@@ -479,6 +507,46 @@ class System1 {
       ? live.filter((t) => t.hard || t.lit || t.attacker || t.distance <= this.tetherTriggerRadius)
       : live
     const from = (this._flee || starters.length) ? this._chasers(now, tether) : []
+    if (from.length) {
+      const sit = situation(bot, from)
+      const hpNow = Number(bot.health ?? 20)
+      // If an auto-defense fight became unfavorable (low HP, lit creeper, huge horde), break off and flee.
+      if (this.combat?.isEngaged && this.combat.autoDefense) {
+        if (hpNow <= this.lowHealth || (sit && (sit.lit > 0 || sit.players > 0 || sit.fight.winChance < 55))) {
+          this.combat.disengage('outmatched', { cooldown: false })
+        }
+      }
+      // Unnamed, unowned, non-tamable hostiles with solid win odds & a real weapon:
+      // auto-target & kite instead of blindly fleeing, while waking the model so it keeps final say.
+      const canAutoEngage = Boolean(
+        !this._flee &&
+        this.combat &&
+        !this.combat.isEngaged &&
+        !tether &&
+        now >= (this.combat.cooldownUntil || 0) &&
+        sit?.fight?.autoEngage &&
+        !this._isAutoSuppressed(from, now)
+      )
+      if (canAutoEngage) {
+        const target = from[0]
+        const res = await this.combat.engage(target.entity?.name || 'any', { autoDefense: true }).catch(() => ({ ok: false }))
+        if (res?.ok) {
+          this.chasers = []
+          this.acknowledge(from.map((t) => t.id), { types: [...new Set(from.map((t) => t.name))], label: 'fight', ttlMs: 60_000 })
+          if (now - this._lastAutoEngageAt >= 4000) {
+            this._lastAutoEngageAt = now
+            this.onEvent({
+              type: 'combat',
+              text: `reflex: auto-kiting ${this._kinds(from)} (win ~${sit.fight.winChance}% with ${sit.me.weapon.name}) — attack, hold, or stop overrides`,
+              wake: true,
+              urgent: false
+            })
+          }
+          // Skip flee for this tick; continue to health/food/water checks below.
+          from.length = 0
+        }
+      }
+    }
     if (from.length) {
       this.chasers = from
       // Back from a look-back pause: the "not making ground" clock starts afresh.
@@ -866,8 +934,8 @@ class System1 {
     const ground = this._groundSense(threats)
     const opts = {
       radius: lit ? 22 : (tether ? 14 : 24),
-      maxNodes: tether ? 700 : 1400,
-      budgetMs: 0,
+      maxNodes: tether ? 450 : 750,
+      budgetMs: 45,
       crowd: ground.crowd,
       ...(ground.sectors ? { sectors: ground.sectors } : {}),
       ...(this._flee?.dir && !tether ? { heading: this._flee.dir } : {}),
@@ -1065,6 +1133,7 @@ class System1 {
     const e = bot.entity
     if (!e?.position) return
     this.sense.trackMotion()
+    this._evadeIncomingStrike()
     this._dodgeIncomingProjectile()
     const vy = Number(e.velocity?.y) || 0
     if (e.onGround || e.isInWater || e.elytraFlying) {
@@ -1383,6 +1452,108 @@ class System1 {
       return true
     }
     return false
+  }
+
+  /**
+   * 20 Hz spear/trident charge & mace smash avoidance even when idle or walking.
+   * Uses MotionTracker + forecastImpact across nearby players.
+   */
+  _evadeIncomingStrike () {
+    const bot = this.bot
+    const me = bot?.entity
+    if (!me?.position || !bot.entities) return false
+    if (this.combat?.isEngaged) {
+      if (this._impactEvade) this._impactEvade = null
+      return false
+    }
+    const now = this.now()
+    if (this._impactEvade) {
+      if (now < this._impactEvade.until) {
+        const dir = this._impactEvade.dir
+        if (dir) {
+          this.hands.acquire({ ttlMs: 900, reason: `evading ${this._impactEvade.who} ${this._impactEvade.kind}` })
+          this.hands.setGoal(null)
+          try { Promise.resolve(bot.look(Math.atan2(-dir.x, -dir.z), 0, true)).catch(() => {}) } catch { /* mock */ }
+          this.hands.setControlState('forward', true)
+          this.hands.setControlState('sprint', true)
+          this.hands.setControlState('jump', Boolean(me.onGround && this._impactEvade.kind === 'smash'))
+        }
+        return true
+      }
+      this._impactEvade = null
+      this.hands.clearControlStates()
+      this.hands.release('evade_done')
+    }
+
+    let best = null
+    for (const ent of Object.values(bot.entities)) {
+      if (!ent || ent === me || !ent.position || !isPlayer(ent)) continue
+      const dx = ent.position.x - me.position.x
+      const dy = ent.position.y - me.position.y
+      const dz = ent.position.z - me.position.z
+      if (dx * dx + dy * dy + dz * dz > 18 * 18) continue
+      const motion = this._impactMotion.update(ent)
+      const f = forecastImpact(ent, me, motion, { gliding: isGliding(ent), usingItem: isUsingItem(ent) })
+      if (f && (!best || f.inSec < best.inSec)) best = { ...f, entity: ent }
+    }
+    if (!best) return false
+
+    let dir = null
+    const pos = me.position
+    const ePos = best.entity.position
+    const awayDx = pos.x - ePos.x
+    const awayDz = pos.z - ePos.z
+    const awayLen = Math.hypot(awayDx, awayDz)
+    const away = awayLen > 0.05 ? { x: awayDx / awayLen, z: awayDz / awayLen } : { x: 1, z: 0 }
+
+    if (best.kind === 'smash') {
+      const dx = pos.x - best.at.x
+      const dz = pos.z - best.at.z
+      const len = Math.hypot(dx, dz)
+      const smashAway = len > 0.05 ? { x: dx / len, z: dz / len } : away
+      dir = runnableHeading(bot, smashAway, { blocks: 4, maxTurn: 1.8 }) || smashAway
+    } else {
+      const line = best.line || away
+      const side = { x: -line.z, z: line.x }
+      const rel = { x: pos.x - ePos.x, z: pos.z - ePos.z }
+      const sign = side.x * rel.x + side.z * rel.z >= 0 ? 1 : -1
+      for (const k of [sign, -sign]) {
+        const cand = { x: side.x * k, z: side.z * k }
+        if (clearToRun(bot, cand, { blocks: 3 })) { dir = cand; break }
+      }
+      if (!dir) {
+        for (const k of [sign, -sign]) {
+          const cand = { x: side.x * k, z: side.z * k }
+          const r = runnableHeading(bot, cand, { blocks: 3, maxTurn: 1.4 })
+          if (r) { dir = r; break }
+        }
+      }
+      if (!dir) dir = runnableHeading(bot, away, { blocks: 3, maxTurn: 1.6 }) || away
+    }
+    if (!dir) return false
+
+    const who = best.entity.username || best.entity.name || 'player'
+    this._impactEvade = {
+      until: now + Math.round((best.inSec + 0.4) * 1000),
+      dir,
+      kind: best.kind,
+      who
+    }
+    this.hands.acquire({ ttlMs: 1200, reason: `evading ${who} ${best.kind}` })
+    this.hands.setGoal(null)
+    try { Promise.resolve(bot.look(Math.atan2(-dir.x, -dir.z), 0, true)).catch(() => {}) } catch { /* mock */ }
+    this.hands.setControlState('forward', true)
+    this.hands.setControlState('sprint', true)
+    this.hands.setControlState('jump', Boolean(me.onGround && best.kind === 'smash'))
+    if (now - this._lastImpactReportAt >= 2000) {
+      this._lastImpactReportAt = now
+      this.onEvent({
+        type: 'evade',
+        text: `reflex: dodged ${who}'s ${best.kind === 'smash' ? 'mace smash' : 'spear/trident charge'}`,
+        wake: false
+      })
+    }
+    return true
   }
 
   // ----------------------------------------------- operator reflex helpers

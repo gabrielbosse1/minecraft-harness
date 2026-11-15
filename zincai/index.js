@@ -141,7 +141,11 @@ function loadConfig () {
       // room up to these, so a slow endpoint is waited out instead of retried
       // into the same wall.
       maxTimeoutMs: settings.int(['AMD_MAX_TIMEOUT_MS', 'amd.maxTimeoutMs'], raw.amd.maxTimeoutMs ?? 180_000, { min: 1_000, max: 900_000 }),
-      chatMaxTimeoutMs: settings.int(['AMD_CHAT_MAX_TIMEOUT_MS', 'amd.chatMaxTimeoutMs'], raw.amd.chatMaxTimeoutMs ?? 120_000, { min: 1_000, max: 900_000 })
+      chatMaxTimeoutMs: settings.int(['AMD_CHAT_MAX_TIMEOUT_MS', 'amd.chatMaxTimeoutMs'], raw.amd.chatMaxTimeoutMs ?? 120_000, { min: 1_000, max: 900_000 }),
+      stream: settings.bool(['AMD_STREAM', 'amd.stream'], raw.amd.stream ?? true),
+      streamIdleTimeoutMs: settings.int(['AMD_STREAM_IDLE_MS', 'amd.streamIdleTimeoutMs'], raw.amd.streamIdleTimeoutMs ?? 45_000, { min: 1_000, max: 300_000 }),
+      actionReasoningEffort: settings.str(['AMD_REASONING_EFFORT', 'amd.actionReasoningEffort'], raw.amd.actionReasoningEffort ?? 'low'),
+      chatReasoningEffort: settings.str(['AMD_CHAT_REASONING_EFFORT', 'amd.chatReasoningEffort'], raw.amd.chatReasoningEffort ?? 'low')
     },
     inference: raw.inference || {},
     memory: raw.memory || {},
@@ -167,7 +171,8 @@ function loadConfig () {
   cfg.inference.minIntervalMs = settings.int('INFERENCE_MIN_INTERVAL_MS', cfg.inference.minIntervalMs, { min: 0 })
   cfg.inference.heartbeatMs = settings.int('INFERENCE_HEARTBEAT_MS', cfg.inference.heartbeatMs, { min: 0 })
   cfg.inference.loopMs = settings.int('INFERENCE_LOOP_MS', cfg.inference.loopMs ?? 8000, { min: 0 })
-  cfg.inference.chatBatchMs = settings.int('INFERENCE_CHAT_BATCH_MS', cfg.inference.chatBatchMs ?? 6000, { min: 0 })
+  cfg.inference.loopBusyMs = settings.int(['INFERENCE_LOOP_BUSY_MS', 'inference.loopBusyMs'], cfg.inference.loopBusyMs ?? 90_000, { min: 0 })
+  cfg.inference.chatBatchMs = settings.int('INFERENCE_CHAT_BATCH_MS', cfg.inference.chatBatchMs ?? 2500, { min: 0 })
   cfg.inference.chatMaxTokens = settings.int(['INFERENCE_CHAT_MAX_TOKENS', 'inference.chatMaxTokens'], cfg.inference.chatMaxTokens ?? null, { min: 64, max: 131_072 })
   cfg.reconnect.maxAttempts = settings.int('RECONNECT_MAX_ATTEMPTS', cfg.reconnect.maxAttempts, { min: 1 })
   cfg.reconnect.keepAliveTimeoutMs = settings.int('KEEPALIVE_TIMEOUT_MS', cfg.reconnect.keepAliveTimeoutMs ?? 60_000, { min: 20_000 })
@@ -241,7 +246,18 @@ function makeShared (cfg, { dataDir = DATA_DIR } = {}) {
       chatTimeoutMs: cfg.amd.chatTimeoutMs ?? null,
       chatMaxRetries: cfg.amd.chatMaxRetries ?? 1,
       maxTimeoutMs: cfg.amd.maxTimeoutMs ?? 180_000,
-      chatMaxTimeoutMs: cfg.amd.chatMaxTimeoutMs ?? 120_000
+      chatMaxTimeoutMs: cfg.amd.chatMaxTimeoutMs ?? 120_000,
+      stream: cfg.amd.stream ?? true,
+      streamIdleTimeoutMs: cfg.amd.streamIdleTimeoutMs ?? 45_000,
+      rpm: cfg.inference?.rpm ?? 18,
+      chatReserve: cfg.inference?.chatReserve ?? 4,
+      actionReasoningEffort: cfg.amd.actionReasoningEffort ?? 'low',
+      chatReasoningEffort: cfg.amd.chatReasoningEffort ?? 'low',
+      onRequest: (lane, meta) => {
+        if (meta?.isRetry) {
+          try { shared.session?.internals?.()?.brain?.spent?.(lane) } catch { /* noop */ }
+        }
+      }
     }),
     parser: new BlueprintParser({ scaffoldBlocks: cfg.build.scaffoldBlocks, reach: cfg.build.reach }),
     events: new (require('./events').EventPipeline)({ file: at(cfg.events?.journalFile, 'events-journal.json') }),
@@ -1401,7 +1417,17 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   function staleActionReason (action, snap) {
     if (!snap || !QUIET_TASKS.has(action.a)) return null
     const known = new Set(snap.threatIds || [])
-    const fresh = [...(sense.last?.dangerIds || [])].filter((id) => !known.has(id))
+    const myPos = here()
+    const nearThreatIds = new Set(sense.last?.ids || [])
+    for (const w of sense.last?.watch || []) {
+      const wp = w.entity?.position
+      const flat = (myPos && wp) ? Math.hypot(wp.x - myPos.x, wp.z - myPos.z) : Number(w.distance ?? 99)
+      const dy = (myPos && wp) ? Math.abs(wp.y - myPos.y) : 0
+      if (flat <= 16 && dy <= 6 && Number(w.closing || 0) > 0.25) {
+        nearThreatIds.add(w.id)
+      }
+    }
+    const fresh = [...nearThreatIds].filter((id) => !known.has(id))
     if (fresh.length) {
       // WHO they are, with the ids `hold`/`attack` take. The refusal used to say
       // only "1 new threat": the model could not see its id (it was not in the
@@ -2533,7 +2559,12 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       // it "decided" may run. On the first step, ask again; on a later one the
       // request that preempted it is already queued.
       if (actions[0] && actions[0]._interrupted) {
-        if (step === 1) brain.wake(`reassess: your previous thinking was interrupted because a player's request came first. ${reasons.join('; ')}`, { external: true, fast: true })
+        const onlyLoop = reasons.every((r) => /^autonomous check-in\b/.test(r))
+        const preemptWhy = String(brain.lastPreemptReason || '')
+        const supersededByWorld = life !== lifeEpoch || epoch !== decisionEpoch || preemptWhy === 'external event preempted idle check-in'
+        if (step === 1 && !onlyLoop && !supersededByWorld) {
+          brain.wake(`reassess: your previous thinking was interrupted because a player's request came first. ${reasons.join('; ')}`, { external: true, fast: true })
+        }
         return { idle: false }
       }
       if (epoch !== decisionEpoch) {
@@ -2577,6 +2608,9 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         } finally {
           if (resultTap === tap) resultTap = null
           if (imageTap === stepImages) imageTap = null
+        }
+        if (action.a === 'goal' || action.a === 'stop') {
+          snap.goalId = agenda.main && !agenda.main.paused ? agenda.main.goalId : null
         }
         executed.push(action)
         const own = tap.filter((r) => r.label === action.a || (action.a === 'idle' && r.label === 'reply'))
@@ -3073,7 +3107,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     }
     return leaseContext.run({ lease: laneLease, claimed: false }, async () => {
     gateCtx = action
-    const IMMEDIATE_TRACKED = new Set(['say', 'stop', 'hold', 'equip', 'redstone_scan', 'redstone_component', 'redstone_engineer', 'recall', 'circuit_project', 'logic_test', 'inspect_region', 'inspect_block', 'screenshot', 'find', 'remember_here', 'note', 'social', 'goal'])
+    const IMMEDIATE_TRACKED = new Set(['say', 'stop', 'hold', 'pace', 'equip', 'redstone_scan', 'redstone_component', 'redstone_engineer', 'recall', 'circuit_project', 'logic_test', 'inspect_region', 'inspect_block', 'screenshot', 'find', 'remember_here', 'note', 'social', 'goal'])
     currentActId = IMMEDIATE_TRACKED.has(a)
       ? continuity.beginAction({ tool: a, summary: `${a} ${JSON.stringify(goalArgs(action)).slice(0, 80)}`, sig: `${a}:${JSON.stringify(goalArgs(action))}`, goalId: agenda.main?.goalId || null, args: goalArgs(action) })
       : null
@@ -3100,13 +3134,13 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       }
       case 'move': // legacy name
       case 'go_to': {
-        const target = { player: action.player, place: action.place, x: action.x, y: action.y, z: action.z }
+        const target = { player: action.player, place: action.place, x: action.x, y: action.y, z: action.z, gait: action.gait }
         const where = action.player || action.place || (Number.isFinite(Number(action.x)) ? `${Math.round(Number(action.x))},${Math.round(Number(action.z))}` : 'somewhere')
         const askedBy = resolveActionAttribution('go_to', action, snap)
         return startMain({ tool: 'go_to', label: `go to ${where}`, askedBy, detail: goalDetailFor('go_to', target), decision: decided(snap, { label: 'go_to' }), run: () => skills.goTo(target) })
       }
       case 'dig': {
-        const target = { player: action.player, place: action.place, x: action.x, y: action.y, z: action.z, materials: action.materials, avoid: action.avoid }
+        const target = { player: action.player, place: action.place, x: action.x, y: action.y, z: action.z, materials: action.materials, avoid: action.avoid, gait: action.gait }
         const askedBy = resolveActionAttribution('dig', action, snap)
         if (Number.isFinite(Number(action.x)) && Number.isFinite(Number(action.z))) {
           const g = continuity.propertyGuardAt({ x: Number(action.x), y: Number(action.y ?? here()?.y ?? 64), z: Number(action.z) }, dim(), { askedBy })
@@ -3118,7 +3152,17 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       }
       case 'follow': {
         const askedBy = resolveActionAttribution('follow', action, snap)
-        return startMain({ tool: 'follow', label: `follow ${action.player}`, askedBy, detail: goalDetailFor('follow', { player: action.player }), decision: decided(snap, { label: 'follow', ttlMs: 30 * 60_000 }), run: () => skills.follow({ player: action.player }) })
+        return startMain({ tool: 'follow', label: `follow ${action.player}`, askedBy, detail: goalDetailFor('follow', { player: action.player }), decision: decided(snap, { label: 'follow', ttlMs: 30 * 60_000 }), run: () => skills.follow({ player: action.player, gait: action.gait }) })
+      }
+      case 'pace': {
+        const applied = action.gait && typeof wrapper?.setGait === 'function' ? wrapper.setGait(action.gait) : wrapper?.getGait?.() || 'auto'
+        const jumped = action.jump ? (typeof wrapper?.jumpOnce === 'function' ? wrapper.jumpOnce() : false) : false
+        const motion = wrapper?.getMotionState?.()
+        const bits = []
+        if (action.gait) bits.push(`gait=${applied}`)
+        if (action.jump) bits.push(jumped ? 'jumped' : 'jump skipped')
+        if (motion) bits.push(`speed ${motion.speedMs.toFixed(1)} m/s (${motion.posture})`)
+        return report('pace', { ok: true, msg: bits.join(', ') || `gait=${applied}` }, { wake: false })
       }
       case 'stop': {
         const duel = fight?.player ? combat?.target : null
@@ -3128,6 +3172,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         try { goalReg.cancelAll({ reason: 'stop' }) } catch { /* best effort */ }
         replaceTask()
         system1.clearDecision()
+        system1.suppressAutoFight(null, 20_000)
         // A duel the model agreed to and then called off: the hits were part
         // of it, so the opponent is not somebody to run from afterwards.
         if (duel) sense.forgive(duel.id)
@@ -3150,7 +3195,16 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         const holdIds = wanted.filter((id) => listed.includes(id))
         decided(snap, { label: 'hold', ttlMs: 30 * 60_000 })
         // Without this the ids were parsed and then dropped on the floor.
-        if (holdIds.length) system1.acknowledge(holdIds, { label: 'hold', ttlMs: 30 * 60_000 })
+        if (holdIds.length) {
+          system1.acknowledge(holdIds, { label: 'hold', ttlMs: 30 * 60_000 })
+          system1.suppressAutoFight(holdIds, 120_000)
+          if (combat?.isEngaged && combat.autoDefense && combat.target && holdIds.includes(combat.target.id)) {
+            combat.disengage('hold', { cooldown: false })
+          }
+        } else if (!action.ids) {
+          system1.suppressAutoFight(null, 60_000)
+          if (combat?.isEngaged && combat.autoDefense) combat.disengage('hold', { cooldown: false })
+        }
         const n = holdIds.length
         // Ids that match nothing are a guess, and a guess must not read as "ok".
         if (!n && unknown.length) {
@@ -3809,20 +3863,20 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       talk,
       isBodyBusy: () => Boolean(skills?.current() || task || combat?.isEngaged || system1?.fleeing),
       logger: (level, msg) => logger[level]?.(TAG, msg),
-      minIntervalMs: cfg.inference.minIntervalMs ?? 3000,
-      chatMinIntervalMs: cfg.inference.chatMinIntervalMs ?? 1200,
+      minIntervalMs: cfg.inference.minIntervalMs ?? 1500,
+      chatMinIntervalMs: cfg.inference.chatMinIntervalMs ?? 800,
       // The IRC window: chat is handed over in chunks this long, not one wake
       // per line. 0 disables batching (each line is its own chunk).
-      chatBatchMs: cfg.inference.chatBatchMs ?? 6000,
+      chatBatchMs: cfg.inference.chatBatchMs ?? 2500,
       rpm: cfg.inference.rpm ?? 18,
       chatReserve: cfg.inference.chatReserve ?? 4,
-      urgentMinIntervalMs: cfg.inference.urgentMinIntervalMs ?? 1000,
+      urgentMinIntervalMs: cfg.inference.urgentMinIntervalMs ?? 300,
       // THE AGENT LOOP: the next turn starts `loopMs` after the last one ended,
       // backing off to `heartbeatMs` while the model keeps answering idle, and
       // looking in on a busy body every `loopBusyMs`. heartbeatMs 0 = off.
       heartbeatMs: cfg.inference.heartbeatMs ?? 90_000,
       loopMs: cfg.inference.loopMs ?? 8000,
-      loopBusyMs: cfg.inference.loopBusyMs ?? 30_000,
+      loopBusyMs: cfg.inference.loopBusyMs ?? 90_000,
       maxSelfChain: cfg.inference.maxSelfChain ?? 12
     })
 
@@ -3853,7 +3907,10 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       onEvent: (evt) => {
         note({ type: evt.type, msg: evt.text })
         try { telemetry.reflexEvent(evt) } catch { /* noop */ }
-        if (evt.wake && evt.urgent === true) decisionEpoch++
+        if (evt.wake && evt.urgent === true) {
+          decisionEpoch++
+          brain.preempt(`urgent reflex: ${evt.type}`)
+        }
         if (evt.wake) brain.wake(evt.text, { external: true, urgent: evt.urgent === true })
         // A new danger on screen changes the world: what failed a moment ago
         // (run away, fight back) may now be the right call.
@@ -4297,6 +4354,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     alive = false
     decisionEpoch++
     lifeEpoch++
+    brain?.preempt('bot died')
     const p = here()
     const where = p ? `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}` : 'unknown'
     hurts.flush() // name the killing blow before writing the obituary
@@ -4409,6 +4467,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
    */
   function resetContext ({ reason = 'context_reset', wake = true } = {}) {
     decisionEpoch++
+    brain?.preempt(`context reset: ${reason}`)
     // A reset drops stale queued decisions, but running work keeps its lease.
     try { lanes.dropWaiters('context reset') } catch { /* noop */ }
     results.length = 0

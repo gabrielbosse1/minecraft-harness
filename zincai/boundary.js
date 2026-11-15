@@ -14,6 +14,7 @@ const { asLogger } = require('./runtime_config')
 const ACTION_CAPABILITIES = Object.freeze({
   go_to: ['move'],
   follow: ['move'],
+  pace: ['move'],
   step_back: ['move'],
   stop_moving: [],
   dig: ['move', 'dig'],

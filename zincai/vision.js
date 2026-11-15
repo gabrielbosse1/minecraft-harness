@@ -1,7 +1,7 @@
 /**
  * zincai/vision.js — lightweight pure-JS Minecraft software voxel renderer.
  *
- * Renders genuine, recognizable Minecraft screenshots straight from Mineflayer's
+ * Renders approximate Minecraft-style screenshots straight from Mineflayer's
  * loaded chunks (`bot.world`) with ZERO GPU, browser, WebGL, or native binary
  * dependencies (only Node's built-in `node:zlib` for PNG compression).
  *
@@ -1457,6 +1457,7 @@ function entityList (bot, eye, maxDist, isHostile) {
     out.push({
       id: e.id,
       name,
+      type: e.name || e.type,
       isPlayer: e.type === 'player',
       hostile,
       style,
@@ -1566,6 +1567,8 @@ function drawMinecraftEntity (canvas, zbuf, e, sx, yTop, yBot, bw, bh) {
 
 // ── Perspective (`look`) & 360° (`panorama`) renderer ─────────────────────
 
+function formatPoint (p) { return p ? `${Math.round(p.x)},${Math.round(p.y)},${Math.round(p.z)}` : '?' }
+
 async function renderCamera (bot, opts) {
   const t0 = performance.now()
   const isPano = opts.view === 'panorama'
@@ -1637,6 +1640,40 @@ async function renderCamera (bot, opts) {
     }
   }
 
+  // Draw the actual pending route as a depth-tested 3D polyline. Sampling in
+  // world space naturally handles bends and the panorama's wraparound seam.
+  const nav = opts.navigation
+  const route = (nav?.path || []).slice(0, 256)
+  const projectMarker = (point, color, size = 2) => {
+    const vx = point.x - eye.x, vy = point.y - eye.y, vz = point.z - eye.z
+    const dist = Math.hypot(vx, vy, vz)
+    if (dist < 0.5 || dist > maxDist) return
+    let sx, sy
+    if (isPano) {
+      sx = (Math.atan2(vx, -vz) / (2 * Math.PI) + 0.5) * w
+      sy = (0.5 - Math.atan2(vy, Math.hypot(vx, vz)) / panoVert) * h
+    } else {
+      const tz = vx * fwd[0] + vy * fwd[1] + vz * fwd[2]
+      if (tz <= 0) return
+      sx = (1 + (vx * right[0] + vy * right[1] + vz * right[2]) / (tz * halfW)) * w / 2
+      sy = (1 - (vx * up[0] + vy * up[1] + vz * up[2]) / (tz * halfH)) * h / 2
+    }
+    if (sx < 0 || sx >= w || sy < 0 || sy >= h) return
+    drawDepthRect(canvas, zbuf, sx - size, sy - size, sx + size + 1, sy + size + 1, dist, color)
+  }
+  const asWorld = p => ({ x: p.x + 0.5, y: p.y + 0.15, z: p.z + 0.5 })
+  const linePoints = [{ x: bot.entity.position.x, y: bot.entity.position.y + 0.15, z: bot.entity.position.z }, ...route.map(asWorld)]
+  for (let i = 1; i < linePoints.length; i++) {
+    const a = linePoints[i - 1], b = linePoints[i]
+    const steps = Math.min(512, Math.max(1, Math.ceil(Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z) * 10)))
+    for (let j = 0; j <= steps; j++) {
+      const t = j / steps
+      projectMarker({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t, z: a.z + (b.z - a.z) * t }, [80, 220, 255], 1)
+    }
+  }
+  if (route[0]) projectMarker(asWorld(route[0]), [255, 220, 70], 2)
+  if (nav?.destination) projectMarker(asWorld(nav.destination), [255, 90, 80], 3)
+
   // Project grounded Minecraft-style entities with per-pixel depth occlusion
   const seenEnts = []
   for (const e of entityList(bot, eye, maxDist, opts.isHostile)) {
@@ -1675,7 +1712,7 @@ async function renderCamera (bot, opts) {
     const vis = drawMinecraftEntity(canvas, zbuf, e, sx, yTop, yBot, bw, bh)
     if (vis < 6) continue
 
-    const label = `${e.name.slice(0, 12)} ${Math.round(e.dist)}m`
+    const label = `${e.name.slice(0, 12)} ${e.hostile ? "HOSTILE " : ""}${Math.round(e.dist)}m`
     const lx = Math.max(2, Math.min(w - label.length * 6 - 3, Math.round(sx - label.length * 3)))
     const ly = Math.max(12, Math.round(yTop) - 10)
     canvas.text(lx, ly, label, e.style.tag, [12, 14, 18, 0.78])
@@ -1710,6 +1747,16 @@ async function renderCamera (bot, opts) {
     canvas.text(4, 3, `${dirLabel}  X ${p.x} Y ${p.y} Z ${p.z}`, [245, 248, 252], [10, 14, 20, 0.72])
   }
 
+  const biome = (() => { try { return bot.blockAt(bot.entity.position)?.biome?.name || 'unknown' } catch { return 'unknown' } })()
+  const dimension = bot.game?.dimension || 'unknown'
+  const hud = [
+    `BOT ${p.x} ${p.y} ${p.z} ${bearingName(yawToBearing(bot.entity.yaw || 0))} ${dimension} ${biome}`,
+    `HP ${bot.health ?? '?'} FOOD ${bot.food ?? '?'} GOAL ${opts.goal || 'none'}`,
+    `ACTION ${opts.action || 'none'} NAV ${nav?.status || 'unknown'} ${nav?.progress || ''}`,
+    `NEXT ${formatPoint(nav?.waypoint)} DEST ${formatPoint(nav?.destination)} ${nav?.resetReason || ''}`
+  ]
+  hud.forEach((line, i) => canvas.text(4, 14 + i * 9, line.slice(0, Math.max(1, Math.floor((w - 8) / 6))), [240, 245, 250], [10, 14, 20, 0.8]))
+
   const totalPx = w * h
   const topBlocks = [...counts.entries()]
     .sort((a, b) => b[1] - a[1])
@@ -1735,6 +1782,7 @@ async function renderCamera (bot, opts) {
   const chunkNote = sampler.chunksLoaded > 0
     ? `${chunksInView}/${sampler.chunksLoaded} loaded chunks in view, out to ${maxDist}m`
     : `out to ${maxDist}m`
+  lines.push(`bot: ${hud.join('; ')}`)
   lines.push(`rendered directly from loaded block data (${chunkNote}, procedural block textures & lighting)`)
 
   const png = encodePng(canvas.rgb, w, h)
@@ -1840,6 +1888,21 @@ async function renderMap (bot, opts) {
   }
   canvas.text(padL, 2, 'X (YELLOW) ACROSS   Z (BLUE) DOWN   NORTH IS UP', [224, 232, 240])
   canvas.text(padL, h - 10, `1 CELL = 1 BLOCK  GRID EVERY ${step}  SURFACE`, [186, 196, 208])
+
+  // Remaining path in world X/Z, clipped to the map. Do not draw segments
+  // outside the map: Canvas.line is not a clipping rasterizer.
+  const navPoints = [bot.entity.position, ...(opts.navigation?.path || [])]
+  const mapPoint = (p) => {
+    if (!p || Math.abs(p.x - pos.x) > radius || Math.abs(p.z - pos.z) > radius) return null
+    return [padL + Math.round((p.x - pos.x + radius + 0.5) * cell), padT + Math.round((p.z - pos.z + radius + 0.5) * cell)]
+  }
+  for (let i = 1; i < navPoints.length; i++) {
+    const a = mapPoint(navPoints[i - 1]), b = mapPoint(navPoints[i])
+    if (a && b) canvas.line(a[0], a[1], b[0], b[1], [80, 220, 255])
+    if (b) canvas.rect(b[0] - 1, b[1] - 1, 3, 3, i === 1 ? [255, 220, 70] : [80, 220, 255])
+  }
+  const dest = mapPoint(opts.navigation?.destination)
+  if (dest) canvas.rect(dest[0] - 3, dest[1] - 3, 7, 7, [255, 90, 80])
 
   // Entities on map
   const entsOnMap = []

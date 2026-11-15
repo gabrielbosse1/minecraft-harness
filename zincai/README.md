@@ -111,3 +111,33 @@ Only infrastructure and pacing parameters are exposed at runtime:
 - `connection.minRetryDelayMs` (`5000`), `connection.retryDelayMs` (`5000`), `connection.maxRetryDelayMs` (`120000`), `connection.maxRetries` (`40`)
 - `death.respawnDelayMs` (`1500`)
 - `control.allowConsole` (`true`), `control.auditLog` (`true`)
+
+### Visual feed and navigation
+
+Set `VISION_FEED_PORT=3000` to enable an optional live, first-person WebGL
+viewer at `http://127.0.0.1:3000/`. It streams loaded chunks, block updates,
+entities, position and the pathfinder's remaining steps, with an F3-style bot
+HUD. The cyan line bends through the actual planned steps (not the travelled
+trail); yellow marks the next step and red the destination. It is a polyline,
+not a smoothed prediction: smoothing could falsely imply a route through blocks.
+The line is redrawn as steps are consumed and cleared on reset or goal change.
+Progress is consumed/total steps in the latest path calculation, not an ETA.
+
+**Security:** the viewer has no authentication and exposes world and bot state.
+It binds to loopback by default. Set `VISION_FEED_HOST=0.0.0.0` only on a
+trusted network or behind an authenticated access-controlled proxy.
+
+The live viewer uses Prismarine Viewer's bundled Minecraft block models and
+textures and currently requires an exact supported version: 1.8.8, 1.9.4,
+1.10.2, 1.11.2, 1.12.2, 1.13.2, 1.14.4, 1.15.2, 1.16.1, 1.16.4, 1.17.1,
+1.18.1, 1.19, 1.20.1, 1.21.1 or 1.21.4. In particular, 26.3 is unsupported;
+the viewer logs a warning rather than interpreting state IDs using the wrong
+version. The viewer is first-person, not panoramic; its entity rendering,
+lighting and animations are not a full Minecraft client. Nearby labels are not
+visibility-tested. Player skins and SkinRestorer integration are not implemented.
+
+The agent's `screenshot` tool remains an **on-demand procedural renderer**, with
+a panorama, map, HUD, and depth-tested route overlay; it does not use the live
+viewer or vanilla assets. Neither renderer should be treated as authoritative
+for precise visibility or appearance. Mineflayer receives player profile skin
+properties from the server, but neither renderer consumes them yet.

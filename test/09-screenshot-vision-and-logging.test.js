@@ -219,3 +219,70 @@ test('09c: ZincAI runtime screenshot tool saves every PNG in session logs & reco
     await sim.stop()
   }
 })
+
+test('09d: pathfinder events drive navigation overlays and clear stale paths', { timeout: 60_000 }, async () => {
+  const mc = await startMcServer({ viewDistance: 3 })
+  try {
+    const bot = await mc.connectPlayer('NavigationVision')
+    const { pathfinder, goals, Movements } = require('mineflayer-pathfinder')
+    bot.loadPlugin(pathfinder)
+    const tracker = require('../zincai/vision_navigation').trackNavigation(bot)
+    bot.pathfinder.setMovements(new Movements(bot))
+    const pos = bot.entity.position.floored()
+    bot.pathfinder.setGoal(new goals.GoalNear(pos.x + 5, pos.y, pos.z, 1))
+    await waitFor(() => tracker.snapshot().path.length > 0 || tracker.snapshot().status === 'reached', { timeoutMs: 10000 })
+    const nav = tracker.snapshot()
+    assert.ok(['navigating', 'reached'].includes(nav.status))
+    assert.equal(nav.destination.x, pos.x + 5)
+    const shot = await vision.screenshot(bot, { view: 'panorama', maxDist: 32, navigation: nav, goal: 'test destination', action: 'walk' })
+    assertValidPng(shot.png, 720, 200)
+    assert.match(shot.summary, /GOAL test destination/i)
+    assert.match(shot.summary, /NAV (navigating|reached)/i)
+    bot.pathfinder.setGoal(null)
+    assert.equal(tracker.snapshot().status, 'idle')
+    assert.equal(tracker.snapshot().path.length, 0)
+    tracker.dispose()
+  } finally { await mc.close() }
+})
+
+test('09e: live viewer streams real chunks and the pathfinder pending steps', { timeout: 60_000 }, async () => {
+  const mc = await startMcServer({ viewDistance: 3 })
+  let feed, socket, tracker
+  try {
+    const bot = await mc.connectPlayer('LiveVision')
+    const { pathfinder, goals, Movements } = require('mineflayer-pathfinder')
+    bot.loadPlugin(pathfinder)
+    tracker = require('../zincai/vision_navigation').trackNavigation(bot)
+    bot.pathfinder.setMovements(new Movements(bot))
+    const errors = []
+    feed = require('../zincai/visual_feed').startVisualFeed(bot, {
+      port: 0, viewDistance: 2, onError: err => errors.push(err),
+      snapshot: () => ({ navigation: tracker.snapshot() })
+    })
+    if (!feed.server.listening) await new Promise(resolve => feed.server.once('listening', resolve))
+    const url = `http://127.0.0.1:${feed.server.address().port}`
+    assert.equal((await fetch(url)).status, 200)
+    assert.equal((await fetch(`${url}/state`)).status, 200)
+    const client = require('socket.io-client')
+    socket = client(url)
+    let chunks = 0, line = null
+    socket.on('loadChunk', () => { chunks++ })
+    socket.on('primitive', p => { if (p.id === 'route' && p.type === 'line') line = p })
+    await waitFor(() => chunks > 0, { timeoutMs: 10000 })
+    const pos = bot.entity.position.floored()
+    let emittedPath
+    bot.on('path_update', result => { if (result.path.length) emittedPath = result.path })
+    bot.pathfinder.setGoal(new goals.GoalNear(pos.x + 15, pos.y, pos.z, 1))
+    await waitFor(() => emittedPath && line, { timeoutMs: 10000 })
+    assert.deepEqual(tracker.snapshot().path, emittedPath.slice(0, 2048).map(({ x, y, z }) => ({ x, y, z })))
+    assert.ok(line.points.length > 1)
+    await waitFor(() => tracker.snapshot().progress && Number(tracker.snapshot().progress.split('/')[0]) > 0, { timeoutMs: 15000 })
+    assert.deepEqual(tracker.snapshot().path, emittedPath.slice(0, 2048).map(({ x, y, z }) => ({ x, y, z })))
+    assert.deepEqual(errors, [])
+  } finally {
+    socket?.disconnect()
+    feed?.close()
+    tracker?.dispose()
+    await mc.close()
+  }
+})

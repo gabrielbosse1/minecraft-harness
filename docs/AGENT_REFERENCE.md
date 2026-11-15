@@ -274,3 +274,15 @@ Config (env / `defaults.json` `amd.*`): `AMD_API_TIMEOUT_MS` (base, 120 s),
 
 Regression tests: `08e` (cancellation is not retried / not a timeout) and `08f`
 (a real timeout is remembered and stays inside its own lane).
+
+### Vision navigation snapshots and live viewer
+
+`vision_navigation.js` observes Mineflayer pathfinder events and retains the
+upstream mutable pending path array read-only (the pinned pathfinder consumes it
+in place). Snapshots copy the remaining nodes; resets, goal changes and stop
+clear stale routes. `vision.js` shows the route on its procedural screenshots.
+Optional `VISION_FEED_PORT` starts `visual_feed.js`, a loopback-by-default,
+unauthenticated Prismarine WebGL viewer using exact-version block assets. It
+streams the same predicted polyline, with a HUD. It is first-person rather than
+panoramic and does not provide SkinRestorer skins. 26.3 is unsupported by the
+viewer and must not be mapped to a different asset version.

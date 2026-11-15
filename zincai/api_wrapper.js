@@ -70,7 +70,7 @@ const ACTION_TOOLS = [
     text: STR('The line, max 200 chars. In the language of the conversation.'),
     to: STR('Recipient player (optional).')
   }, ['text']),
-  tool('go_to', 'Walk to a player, saved place, nearby id (chest2, bed1), or coordinates. Supply x and z alone to travel horizontally using the easiest reachable walking level (no demand to climb onto a roof or reach a guessed y); supply y only when the exact elevation matters. Routes around mobs and hazards; ordinary walks only clear soft terrain if no detour exists.', {
+  tool('go_to', 'Default movement tool: walk to a player, saved place, nearby id (chest2, bed1), or coordinates without breaking terrain. Supply x and z alone to travel horizontally using the easiest reachable walking level (no demand to climb onto a roof or reach a guessed y); supply y only when the exact elevation matters. Routes around mobs, obstacles, and hazards; only clears soft terrain if no detour exists.', {
     player: STR('Player name.'),
     place: STR('Saved place or nearby id.'),
     x: INT('X.'),
@@ -78,7 +78,7 @@ const ACTION_TOOLS = [
     z: INT('Z.'),
     gait: GAIT
   }),
-  tool('dig', 'ONE deliberate corridor: walks to [x,y,z] (or a player/place) breaking any breakable blocks in the path. Use when go_to reports no path or when tunneling intentionally.', {
+  tool('dig', 'Intentional tunneling/obstruction clearing ONLY: walks to [x,y,z] (or a player/place) breaking any breakable blocks in the path. Use ONLY when go_to reports no path around an actual obstruction or when deliberately mining a passage — never for normal travel or random digging in open areas.', {
     player: STR('Target player name.'),
     place: STR('Saved place or nearby id.'),
     x: INT('X of the destination.'),
@@ -109,9 +109,9 @@ const ACTION_TOOLS = [
     done: INT('update: number of the plan step you just finished (1 = first).'),
     next: STR('update: the very next concrete thing to do (survives death/restart).')
   }, ['operation']),
-  tool('attack', 'Fight. The ONLY way a fight ever starts. `target` = mob id or "any"; `player` = exact PvP target.', {
-    target: STR('Mob type or "any".'),
-    player: STR('Exact player name (PvP).'),
+  tool('attack', 'Engage in melee/ranged combat. The ONLY way a fight ever starts. Use `target` for mobs (e.g. "zombie", "any") when armed and healthy, or `player` for an exact PvP opponent (for PvP objectives, self-defense, or agreed sparring — never on allies or unprovoked neutral players).', {
+    target: STR('Mob type or "any" (for mobs, not players).'),
+    player: STR('Exact player name for PvP (objectives, self-defense, or agreed sparring).'),
     count: INT('Kill limit (default 1 animal; chain hostiles).')
   }),
   tool('hold', 'Accept current threats and continue the task unless hit/new threat/lit fuse. Pass the [id=…] values from the threats lines to hold specific ones (never guessed numbers); with none, all listed threats are held.', {
@@ -255,7 +255,7 @@ const ACTION_TOOLS = [
     stage: STAGE
   }, ['shape', 'block']),
   tool('run_script', 'Run saved script in zincai/scripts/.', { name: STR('Script name.') }, ['name']),
-  tool('idle', 'End your turn with nothing more to do: the body carries on with what it is doing (while fleeing: keep fleeing). Call it alone.')
+  tool('idle', 'End your turn when no new action is needed: the body carries on with what it is already doing (or keeps fleeing). Do not call idle to procrastinate when an active goal has a next step you can execute now.')
 ]
 
 /**

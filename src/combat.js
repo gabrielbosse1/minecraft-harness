@@ -162,13 +162,13 @@ function heldItemName (entity) {
   if (entity.itemInHand?.name) return String(entity.itemInHand.name)
   const eq = entity.equipment
   if (Array.isArray(eq)) {
+    const first = eq[0]
+    if (first?.name) return String(first.name)
     for (const item of eq) {
       if (!item) continue
       const name = typeof item === 'string' ? item : item.name
-      if (name && /sword|axe|mace|trident|spear|bow|crossbow|shield|elytra/.test(String(name))) return String(name)
+      if (name && /sword|axe|mace|trident|spear|bow|crossbow/.test(String(name))) return String(name)
     }
-    const first = eq[0]
-    if (first?.name) return String(first.name)
   }
   if (entity.inventory?.slots) {
     for (const item of entity.inventory.slots) {
@@ -341,30 +341,48 @@ function forecastImpact (attacker, me, motion, seen = {}) {
   if (!a || !b || !motion) return null
   const held = seen.held ?? heldItemName(attacker)
 
-  if (held === 'mace') {
-    if (!(motion.falling && motion.fallen >= 1.5 && motion.vy <= -0.42)) return null
-    let v = motion.vy
-    let dropped = 0
-    let ticks = 0
-    const height = a.y - b.y
-    while (dropped < height && ticks < 40) { v = (v - GRAVITY) * 0.98; dropped -= v; ticks++ }
-    const at = { x: a.x + motion.vx * ticks, z: a.z + motion.vz * ticks }
-    const miss = Math.hypot(at.x - b.x, at.z - b.z)
-    return miss <= 3.5 ? { kind: 'smash', inSec: ticks / 20, miss, line: null, at } : null
-  }
-
   const mine = me.velocity || {}
   const rel = { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z }
   const vel = { x: (motion.vx - (Number(mine.x) || 0)) * 20, y: motion.vy * 20, z: (motion.vz - (Number(mine.z) || 0)) * 20 }
+  const horiz = Math.hypot(rel.x, rel.z)
   const ca = closestApproach(rel, vel)
+  const flat = Math.hypot(vel.x, vel.z)
+  const line = flat > 0.5 ? { x: vel.x / flat, z: vel.z / flat } : null
+
+  if (held === 'mace') {
+    const fallingSmash = motion.falling && (motion.fallen >= 0.65 || motion.vy <= -0.22)
+    const risingLeap = motion.vy >= 0.22 && horiz <= 8.5
+    if (fallingSmash || risingLeap) {
+      let v = motion.vy
+      let y = a.y
+      let ticks = 0
+      while ((y > b.y || v > 0) && ticks < 45) {
+        v = (v - GRAVITY) * 0.98
+        y += v
+        ticks++
+      }
+      const at = { x: a.x + motion.vx * ticks, z: a.z + motion.vz * ticks }
+      const miss = Math.hypot(at.x - b.x, at.z - b.z)
+      if (miss <= 4.2) return { kind: 'smash', inSec: Math.max(0.1, ticks / 20), miss, line: null, at }
+    }
+    if (ca.speed >= 4.2 && ca.t > 0 && ca.t <= 1.1 && ca.miss <= 3.2 && horiz <= 8.5) {
+      return { kind: 'charge', inSec: ca.t, miss: ca.miss, line, at: null }
+    }
+    return null
+  }
+
   const thrust = /^(trident|spear)$|_spear$/.test(held)
   const fast = ca.speed >= 8 // faster than a sprint-jump
-  const lunge = thrust && (seen.usingItem || seen.gliding) && ca.speed >= 3
+  const lunge = thrust && (
+    ((seen.usingItem || seen.gliding) && ca.speed >= 2.2) ||
+    ca.speed >= 4.2 // sprinting / sprint-jumping straight at the bot with a spear or trident
+  )
   const glide = Boolean(seen.gliding) && ca.speed >= 6
   if (!(fast || lunge || glide)) return null
-  if (!(ca.t > 0 && ca.t <= 0.9) || ca.miss > 2.5) return null
-  const flat = Math.hypot(vel.x, vel.z)
-  return { kind: 'charge', inSec: ca.t, miss: ca.miss, line: flat > 0.5 ? { x: vel.x / flat, z: vel.z / flat } : null, at: null }
+  const maxWindow = lunge ? 1.25 : 0.9
+  const maxMiss = lunge ? 3.2 : 2.5
+  if (!(ca.t > 0 && ca.t <= maxWindow) || ca.miss > maxMiss) return null
+  return { kind: 'charge', inSec: ca.t, miss: ca.miss, line, at: null }
 }
 
 // ---------------------------------------------------------------------------
@@ -587,7 +605,7 @@ class AdvancedCombat {
   }
 
   /** Entry point for {"a":"attack","n":"zombie"}. Never throws. */
-  async engage (request, { explicitPlayersOnly = false } = {}) {
+  async engage (request, { explicitPlayersOnly = false, autoDefense = false } = {}) {
     if (this.bot.health !== undefined && this.bot.health <= 0) {
       return { ok: false, why: 'dead' }
     }
@@ -605,7 +623,11 @@ class AdvancedCombat {
 
     const label = isPlayer(target) ? String(target.username || 'player') : String(target.name).toLowerCase()
     // Asked again for the fight already in progress: carry on, do not restart it.
-    if (this.isEngaged && this.target === target) return { ok: true, target: label, already: true }
+    if (this.isEngaged && this.target === target) {
+      if (!autoDefense) this.autoDefense = false
+      return { ok: true, target: label, already: true }
+    }
+    this.autoDefense = Boolean(autoDefense)
     this.wantedName = label
     this.target = target
     this.state = 'approach'
@@ -657,6 +679,7 @@ class AdvancedCombat {
     this._releaseBow()
     this._shield(false)
     this.critArmed = false
+    this.autoDefense = false
     this.activeGoal = null
     try { this.hands.release('fight over') } catch { /* bot gone */ }
   }
@@ -946,6 +969,17 @@ class AdvancedCombat {
       return
     }
 
+    // Active mob kiting: while the swing cooldown recharges against melee mobs,
+    // backpedal + strafe out of mob reach rather than trading hits stationary.
+    if (!isPlayer(this.target) && !this.critArmed && !this.cooldown.ready(this.critThreshold)) {
+      if (horiz <= profile.reach + 1.45) {
+        this._applyStance({ forward: false, back: true, strafe: true })
+      } else {
+        this._applyStance({ forward: false, back: false, strafe: true })
+      }
+      return
+    }
+
     // Band-keeping: too close → backpedal, inside → orbit, too far was handled.
     // Never sprint here: a real client cannot sprint sideways or backwards,
     // and a sprinting attacker cannot land a critical hit.
@@ -1158,7 +1192,7 @@ class AdvancedCombat {
       const away = len > 0.05 ? { x: dx / len, z: dz / len } : this._awayFrom(f.entity.position)
       // 3.5 blocks at a sprint take about 0.6 s. With less time than it takes
       // to clear the circle, the shield is the better answer.
-      if (f.inSec >= 0.3 || !this.hasShield()) dir = runnableHeading(this.bot, away, { blocks: 3, maxTurn: 1.6 })
+      if (f.inSec >= 0.25 || !this.hasShield()) dir = runnableHeading(this.bot, away, { blocks: 3, maxTurn: 1.8 })
     } else {
       // Step off the line, to the side the bot is already on, if there is ground there.
       const line = f.line || this._awayFrom(f.entity.position)
@@ -1168,6 +1202,17 @@ class AdvancedCombat {
       for (const k of [sign, -sign]) {
         const cand = { x: side.x * k, z: side.z * k }
         if (clearToRun(this.bot, cand, { blocks: 3 })) { dir = cand; break }
+      }
+      if (!dir) {
+        for (const k of [sign, -sign]) {
+          const cand = { x: side.x * k, z: side.z * k }
+          const r = runnableHeading(this.bot, cand, { blocks: 3, maxTurn: 1.4 })
+          if (r) { dir = r; break }
+        }
+      }
+      if (!dir) {
+        const away = this._awayFrom(f.entity.position)
+        if (away) dir = runnableHeading(this.bot, away, { blocks: 3, maxTurn: 1.6 })
       }
     }
     this._panicAt = now

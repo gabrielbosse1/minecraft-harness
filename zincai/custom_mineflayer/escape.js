@@ -311,12 +311,9 @@ function planEscape (bot, movements, pursuers, opts = {}) {
   }
   const clock = typeof opts.now === 'function' ? opts.now : () => performance.now()
   const started = clock()
-  /** What the ground at a cell is worth, on top of the seconds in hand there (about -9..+9). */
-  const groundBonus = (node) => {
+  /** Cheap ground bonus without the expensive 75-block openness scan. */
+  const cheapGroundBonus = (node) => {
     let b = 0
-    const open = openness(standable, node.x, node.y, node.z)
-    node.open = open
-    if (open !== null) b += (open - 0.5) * 8
     if (crowd.length) { node.crowd = crowdAt(crowd, node.x + 0.5, node.y, node.z + 0.5); b -= Math.min(6, node.crowd * 3) }
     const dx = node.x + 0.5 - pos.x; const dz = node.z + 0.5 - pos.z
     const len = Math.hypot(dx, dz)
@@ -324,6 +321,12 @@ function planEscape (bot, movements, pursuers, opts = {}) {
     if (heading && len > 2) b += ((dx * heading.x + dz * heading.z) / len) * 1.2
     return b
   }
+  const openBonus = (node) => {
+    const open = node.open !== undefined ? node.open : (node.open = openness(standable, node.x, node.y, node.z))
+    return open !== null ? (open - 0.5) * 8 : 0
+  }
+  /** What the ground at a cell is worth, on top of the seconds in hand there (about -9..+9). */
+  const groundBonus = (node) => cheapGroundBonus(node) + openBonus(node)
 
   const sx = Math.floor(pos.x); const sy = Math.floor(pos.y); const sz = Math.floor(pos.z)
   const keyOf = (x, y, z) => x + ',' + y + ',' + z
@@ -386,22 +389,37 @@ function planEscape (bot, movements, pursuers, opts = {}) {
   let best = null
   let bestScore = -Infinity
   let safeCells = 0
-  const consider = (node, score) => { if (score > bestScore) { bestScore = score; best = node } }
+  const maxOpenGain = standable ? 4 : 0
+  const pickWithOpen = (cands, weight) => {
+    cands.sort((a, b) => b.base - a.base)
+    const cap = maxOpenGain * weight
+    for (const c of cands) {
+      if (c.base + cap <= bestScore) break
+      const score = c.base + openBonus(c.node) * weight
+      if (score > bestScore) { bestScore = score; best = c.node }
+    }
+  }
   // A. Safe ground far enough to be worth running to, preferably ground that leads out.
+  const candsA = []
   for (const node of nodes.values()) {
     if (!node.safe) continue
     safeCells++
     if (node.g < minRun) continue
     // Time in hand on arrival, capped so "far enough" does not always mean "as far as possible".
-    consider(node, Math.min(node.margin, 12) + (node.leadsOut ? 6 : 0) + Math.min(node.g, 16) * 0.05 + towardBonus(node) + groundBonus(node))
+    candsA.push({ node, base: Math.min(node.margin, 12) + (node.leadsOut ? 6 : 0) + Math.min(node.g, 16) * 0.05 + towardBonus(node) + cheapGroundBonus(node) })
   }
+  pickWithOpen(candsA, 1)
   let why = best ? (best.leadsOut ? 'open' : 'pocket') : ''
   let chased = false
   if (!best && safeCells) {
     // B. Only a few safe cells, right here: a pocket. Take the one that buys the
     //    most time (that may be where the bot already stands) and say so — the
     //    model gets those seconds to decide.
-    for (const node of nodes.values()) if (node.safe) consider(node, node.margin + (node.leadsOut ? 6 : 0) + groundBonus(node) * 0.5)
+    const candsB = []
+    for (const node of nodes.values()) {
+      if (node.safe) candsB.push({ node, base: node.margin + (node.leadsOut ? 6 : 0) + cheapGroundBonus(node) * 0.5 })
+    }
+    pickWithOpen(candsB, 0.5)
     why = best.leadsOut ? 'open' : 'pocket'
   }
   if (best && why === 'pocket') {
@@ -424,7 +442,7 @@ function planEscape (bot, movements, pursuers, opts = {}) {
     //    Judged from the pursuers and the map, never from how far a budget got.
     let reachedEdge = cutShort && open.size > 0
     if (!reachedEdge) for (const node of nodes.values()) if (node.frontier) { reachedEdge = true; break }
-    best = breakOut(movements, pursuers, { sx, sy, sz, radius, maxNodes, budgetMs, avoid, clock, maxDrop, groundBonus })
+    best = breakOut(movements, pursuers, { sx, sy, sz, radius, maxNodes, budgetMs, avoid, clock, maxDrop, cheapGroundBonus, openBonus: standable ? openBonus : null })
     if (best) {
       if (encircled(pursuers, pos)) why = 'surrounded'
       else if (reachedEdge) { why = 'chased'; chased = true } else why = 'trapped'
@@ -477,7 +495,7 @@ function contact (pursuers, x, y, z) {
  * distance plus contact.
  * @returns {object|null} the destination node ({ x, y, z, g, parent })
  */
-function breakOut (movements, pursuers, { sx, sy, sz, radius, maxNodes, budgetMs, avoid, clock, maxDrop = 3, groundBonus = null }) {
+function breakOut (movements, pursuers, { sx, sy, sz, radius, maxNodes, budgetMs, avoid, clock, maxDrop = 3, cheapGroundBonus = null, openBonus = null, groundBonus = null }) {
   const timeLimited = Number.isFinite(budgetMs) && budgetMs > 0
   const keyOf = (x, y, z) => x + ',' + y + ',' + z
   const seen = new Map()
@@ -487,8 +505,7 @@ function breakOut (movements, pursuers, { sx, sy, sz, radius, maxNodes, budgetMs
   heap.push({ key: 0, node: root })
   const started = clock()
   let count = 0
-  let top = null
-  let topScore = -Infinity
+  const cands = []
   while (heap.size) {
     if (count >= maxNodes || (timeLimited && count % 16 === 0 && clock() - started > budgetMs)) break
     const { node } = heap.pop()
@@ -499,8 +516,9 @@ function breakOut (movements, pursuers, { sx, sy, sz, radius, maxNodes, budgetMs
     // Seconds until a mob could be there, a bonus for ground that goes on, minus
     // the distance. Contact on the way only breaks ties: it is already what
     // chose the route, and standing still among them is contact without end.
-    const score = Math.min(mobClock(pursuers, node.x + 0.5, node.y, node.z + 0.5), 10) * 2 + (edge ? 6 : 0) - node.g * 0.1 - Math.min(node.cost - node.g, 60) * 0.05 + (groundBonus && node.g >= 3 ? groundBonus(node) * 0.6 : 0)
-    if (score > topScore) { topScore = score; top = node }
+    const cheapFn = cheapGroundBonus || groundBonus
+    const base = Math.min(mobClock(pursuers, node.x + 0.5, node.y, node.z + 0.5), 10) * 2 + (edge ? 6 : 0) - node.g * 0.1 - Math.min(node.cost - node.g, 60) * 0.05 + (cheapFn && node.g >= 3 ? cheapFn(node) * 0.6 : 0)
+    cands.push({ node, base, needsOpen: Boolean(openBonus && node.g >= 3) })
     if (Math.hypot(node.x - sx, node.z - sz) >= radius - 1) continue
     let neighbors = []
     try { neighbors = movements.getNeighbors({ x: node.x, y: node.y, z: node.z, remainingBlocks: 0 }) } catch { neighbors = [] }
@@ -516,6 +534,16 @@ function breakOut (movements, pursuers, { sx, sy, sz, radius, maxNodes, budgetMs
       seen.set(key, next)
       heap.push({ key: cost, node: next })
     }
+  }
+  if (!cands.length) return null
+  cands.sort((a, b) => b.base - a.base)
+  let top = null
+  let topScore = -Infinity
+  const maxOpenGain = openBonus ? 2.4 : 0
+  for (const c of cands) {
+    if (c.base + (c.needsOpen ? maxOpenGain : 0) <= topScore) break
+    const score = c.base + (c.needsOpen ? openBonus(c.node) * 0.6 : 0)
+    if (score > topScore) { topScore = score; top = c.node }
   }
   return top
 }

@@ -15,7 +15,7 @@
  */
 'use strict'
 
-const { bearing, meta } = require('./threats')
+const { bearing, meta, isAutoFightCandidate } = require('./threats')
 
 /**
  * Per mob: health, damage per hit to an unarmoured player, ground speed in
@@ -171,7 +171,7 @@ function bestWeapon (bot) {
   try { items = bot.inventory.items() } catch { items = [] }
   for (const it of items) {
     const w = weaponStats(it.name)
-    if (w.kind === 'sword' || w.kind === 'axe') {
+    if (w.kind === 'sword' || w.kind === 'axe' || w.kind === 'trident' || w.kind === 'spear' || w.kind === 'mace') {
       if (w.dmg * Math.min(w.speed, 1.6) > best.dmg * Math.min(best.speed, 1.6)) best = w
     }
   }
@@ -246,7 +246,7 @@ function situation (bot, hostiles, { canRun = null } = {}) {
   const armor = armorPoints(bot)
   const through = (dmg, points) => dmg * (1 - Math.min(0.8, points * 0.04))
   const weapon = bestWeapon(bot)
-  const crit = weapon.kind === 'sword' || weapon.kind === 'axe' ? 1.5 : 1
+  const crit = weapon.kind === 'sword' || weapon.kind === 'axe' || weapon.kind === 'mace' || weapon.kind === 'trident' || weapon.kind === 'spear' ? 1.5 : 1
   const swing = 1 / Math.min(weapon.speed, 1.6) + 0.1
   let seconds = 0
   let meleeHit = 0; let meleeCount = 0
@@ -260,12 +260,33 @@ function situation (bot, hostiles, { canRun = null } = {}) {
   }
   // Half a second of immunity after each hit: at most two hits a second land, however many mobs.
   const perSecond = meleeCount ? (meleeHit / meleeCount) * Math.min(meleeCount, 2) : 0
-  // One opponent at a time gets knocked back and lands about every third second.
-  const pressure = (meleeCount <= 1 ? perSecond * 0.35 : (meleeCount === 2 ? perSecond * 0.6 : perSecond)) + duel
+  // Kiting + knockback reduces contact rate on melee mobs (single targets take ~0.3x, small packs ~0.48x, big hordes ~0.78x).
+  const kiteFactor = weapon.kind !== 'none'
+    ? (meleeCount <= 1 ? 0.3 : (meleeCount <= 3 ? 0.48 : 0.78))
+    : (meleeCount <= 1 ? 0.45 : (meleeCount === 2 ? 0.7 : 1.0))
+  const pressure = perSecond * kiteFactor + duel
   const cost = pressure * seconds
-  let verdict = 'good'
-  if (cost >= hp * 0.9 || explosive >= 3) verdict = 'bad'
-  else if (cost >= hp * 0.4 || explosive > 0 || hp <= 8 || players > 0) verdict = 'risky'
+  const ratio = cost / Math.max(1, hp)
+  let winChance = Math.round(100 / (1 + Math.pow(ratio / 0.72, 2.1)))
+  winChance -= lit * 35 + Math.max(0, explosive - lit) * 8 + players * 10
+  if (hp <= 10) winChance -= 15
+  if (weapon.kind === 'none') winChance -= 20
+  winChance = Math.max(5, Math.min(99, winChance))
+
+  const allAutoCandidates = list.every((t) => isAutoFightCandidate(t.entity, bot))
+  const hasBoss = groups.has('warden') || groups.has('wither') || groups.has('elder_guardian')
+  const autoEngage = Boolean(
+    allAutoCandidates &&
+    !hasBoss &&
+    weapon.dmg >= 4 &&
+    hp > 10 &&
+    lit === 0 &&
+    winChance >= 65
+  )
+
+  let verdict = 'risky'
+  if (winChance < 40 || cost >= hp * 1.05 || explosive >= 3 || lit > 0) verdict = 'bad'
+  else if (winChance >= 68 && cost < hp * 0.65 && explosive <= 1 && players === 0 && hp > 8) verdict = 'good'
 
   return {
     total: list.length,
@@ -283,7 +304,7 @@ function situation (bot, hostiles, { canRun = null } = {}) {
     open,
     blocked,
     me: { hp, armor, weapon },
-    fight: { seconds, cost, perSecond: pressure, verdict }
+    fight: { seconds, cost, perSecond: pressure, winChance, autoEngage, verdict }
   }
 }
 
@@ -347,7 +368,8 @@ function describeSituation (s, { route = null } = {}) {
     if (route && route.why === 'chased' && !(s.closing !== null && s.closing < -0.3)) ways += ' — but they are as fast as you or already on you: running alone will not shake them off'
   }
   const time = s.fight.seconds > 90 ? '90+' : String(Math.max(1, Math.round(s.fight.seconds)))
-  const odds = `${s.me.weapon.name} ${s.me.weapon.dmg} dmg, armor ${s.me.armor}/20, hp ${Math.round(s.me.hp)}: ≈ ${time}s to kill ${s.total > 1 ? 'them all' : (s.players ? 'them' : 'it')}, you would take ≈ ${Math.round(s.fight.cost)} dmg → ${s.fight.verdict.toUpperCase()}${s.players ? ' (a player may be better or worse than this)' : ''}`
+  const tag = s.fight.autoEngage ? ' (unnamed hostiles — auto-kite eligible; your call: attack, hold, or retreat)' : ''
+  const odds = `${s.me.weapon.name} ${s.me.weapon.dmg} dmg, armor ${s.me.armor}/20, hp ${Math.round(s.me.hp)}: ≈ ${time}s to kill ${s.total > 1 ? 'them all' : (s.players ? 'them' : 'it')}, you would take ≈ ${Math.round(s.fight.cost)} dmg, win ~${s.fight.winChance}% → ${s.fight.verdict.toUpperCase()}${s.players ? ' (a player may be better or worse than this)' : tag}`
   return [head, `pressure: ${press.join('; ')} | ways out: ${ways}`, `if you fight: ${odds}`]
 }
 

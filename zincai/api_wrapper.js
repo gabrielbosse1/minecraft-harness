@@ -62,6 +62,7 @@ const STR = (description) => ({ type: 'string', description })
 const INT = (description) => ({ type: 'integer', description })
 const STAGE = STR('Phase: foundation | walls_with_windows | roof | interior_details.')
 const AT = { type: 'array', description: 'Corner [x,y,z] — the minimum x/y/z the thing occupies. Every shape starts here and grows toward +x/+y/+z. Default: feet.', items: { type: 'integer' }, minItems: 3, maxItems: 3 }
+const GAIT = { type: 'string', enum: ['auto', 'crouch', 'walk', 'sprint', 'sprint_jump'], description: 'Movement gait/speed: sprint_jump (fastest for goals), sprint, walk, crouch, or auto.' }
 const tool = (name, description, properties = {}, required = []) => ({ name, description, parameters: { type: 'object', properties, ...(required.length ? { required } : {}) } })
 
 const ACTION_TOOLS = [
@@ -74,7 +75,8 @@ const ACTION_TOOLS = [
     place: STR('Saved place or nearby id.'),
     x: INT('X.'),
     y: INT('Y (optional).'),
-    z: INT('Z.')
+    z: INT('Z.'),
+    gait: GAIT
   }),
   tool('dig', 'ONE deliberate corridor: walks to [x,y,z] (or a player/place) breaking any breakable blocks in the path. Use when go_to reports no path or when tunneling intentionally.', {
     player: STR('Target player name.'),
@@ -83,9 +85,14 @@ const ACTION_TOOLS = [
     y: INT('Y of the destination (optional).'),
     z: INT('Z of the destination.'),
     materials: { type: 'array', description: 'Only these block ids may be broken (e.g. [oak_log, dirt]); default: any breakable block in the way.', items: STR('Block id.'), minItems: 1, maxItems: 16 },
-    avoid: { type: 'array', description: 'Never break these block ids.', items: STR('Block id.'), minItems: 1, maxItems: 16 }
+    avoid: { type: 'array', description: 'Never break these block ids.', items: STR('Block id.'), minItems: 1, maxItems: 16 },
+    gait: GAIT
   }),
-  tool('follow', 'Follow a player until you call stop. Keeps going by itself: it dodges mobs and comes back, waits for a path, and walks to where the player was last seen. Call it ONCE — it does not need repeating.', { player: STR('Player name.') }, ['player']),
+  tool('follow', 'Follow a player until you call stop. Keeps going by itself: it dodges mobs and comes back, waits for a path, and walks to where the player was last seen. Call it ONCE — it does not need repeating.', { player: STR('Player name.'), gait: GAIT }, ['player']),
+  tool('pace', 'Adjust speed/gait (even mid-walk without cancelling go_to/follow) or do a normal jump. Prefer setting `gait` directly on go_to/follow for goals.', {
+    gait: GAIT,
+    jump: { type: 'boolean', description: 'True = perform one normal jump.' }
+  }),
   tool('stop', 'Cancel current task, follow, fight and paused tasks.'),
   tool('goal', 'Manage persistent objectives (survive death/restart/context reset): list|show|add|resume|suspend|cancel|complete|update|combine|verify.', {
     operation: { type: 'string', enum: ['list', 'show', 'add', 'resume', 'suspend', 'cancel', 'complete', 'update', 'combine', 'verify'] },
@@ -142,7 +149,7 @@ const ACTION_TOOLS = [
   tool('inspect_region', 'Read-only paginated 3D block snapshot around [x,y,z]; no circuit trace.', { x: INT('X.'), y: INT('Y.'), z: INT('Z.'), radius: INT('0–2, default 1.'), page: INT('Page, default 1.') }, ['x', 'y', 'z']),
   tool('redstone_scan', 'Read-only local redstone snapshot (start with x,y,z; page with snapshot id).', { x: INT('X.'), y: INT('Y.'), z: INT('Z.'), radius: INT('0–2, default 1.'), snapshot: STR('Existing snapshot id.'), page: INT('Page, default 1.') }),
   tool('redstone_component', 'Inspect captured redstone component state and neighbors.', { snapshot: STR('Snapshot id.'), x: INT('X.'), y: INT('Y.'), z: INT('Z.'), page: INT('Page, default 1.') }, ['snapshot', 'x', 'y', 'z']),
-  tool('screenshot', 'SEE: a rendered picture of the world around you, returned as an image. For orientation only — when you do not know what kind of place you are in, which way is open, or what a build looks like as a whole. For exact facts (which block, its state, counts, coordinates, redstone) use inspect_block / inspect_region / find / redstone tools instead: they are exact and cheaper.', {
+  tool('screenshot', 'SEE: rendered image of the world around you. Use BEFORE digging/breaking/clearing (to make sure you are not digging in front of a house or inside a cave), BEFORE picking a build site (panorama/map for open surface terrain), and DURING/AFTER building stages to inspect proportions, depth, and flaws. Use inspect_block / inspect_region / find / redstone tools for exact coordinates and block IDs.', {
     view: { type: 'string', enum: ['look', 'panorama', 'map'], description: 'look = first person (default); panorama = full 360° strip, north in the middle; map = top-down with a labelled x/z grid.' },
     direction: { type: 'string', enum: ['north', 'northeast', 'east', 'southeast', 'south', 'southwest', 'west', 'northwest', 'up', 'down'], description: 'look only: where to face (default: where you face now).' },
     at: { type: 'array', description: 'look only: face this block [x,y,z] instead.', items: { type: 'integer' }, minItems: 3, maxItems: 3 }
@@ -533,12 +540,15 @@ function toolTurnMessages (calls, { format = 'tool', content = '', images = [] }
  * `tools` / `tool_choice` are omitted when no tools are provided (used by
  * plain-text graceful degradation).
  */
-function buildToolsPayload ({ model, messages, temperature, maxTokens = null, tools = null, toolChoice = 'required', parallelToolCalls = true, extraParams = null }) {
+function buildToolsPayload ({ model, messages, temperature, maxTokens = null, tools = null, toolChoice = 'required', parallelToolCalls = true, stream = false, streamOptions = null, extraParams = null }) {
   const payload = {
     model,
     messages,
     temperature,
-    stream: false
+    stream: Boolean(stream)
+  }
+  if (payload.stream && streamOptions && typeof streamOptions === 'object') {
+    payload.stream_options = streamOptions
   }
   const explicitMax = positiveInt(maxTokens, 16, 500_000)
   if (explicitMax !== null) payload.max_tokens = explicitMax
@@ -553,6 +563,24 @@ function buildToolsPayload ({ model, messages, temperature, maxTokens = null, to
     }
   }
   return payload
+}
+
+function parseRetryAfterMs (headerValue) {
+  if (!headerValue) return null
+  const raw = String(headerValue).trim()
+  if (!raw) return null
+  const secs = Number(raw)
+  if (Number.isFinite(secs) && secs >= 0) return Math.min(60_000, Math.max(1000, Math.round(secs * 1000)))
+  const at = Date.parse(raw)
+  if (Number.isFinite(at)) return Math.min(60_000, Math.max(1000, at - Date.now()))
+  return null
+}
+
+function normalizeReasoningEffort (val) {
+  if (val === null || val === undefined) return null
+  const s = String(val).trim().toLowerCase()
+  if (!s || s === 'none' || s === 'off' || s === 'default' || s === 'null') return null
+  return s
 }
 
 /** Extract model reasoning trace from OpenAI-compatible fields or <think> tags. */
@@ -635,7 +663,14 @@ class AmdToolsClient {
     // take minutes; the point is that a deadline is never *shorter* than the
     // endpoint has shown it needs.
     maxTimeoutMs = 180_000,
-    chatMaxTimeoutMs = 120_000
+    chatMaxTimeoutMs = 120_000,
+    stream = true,
+    streamIdleTimeoutMs = 45_000,
+    rpm = 18,
+    chatReserve = 4,
+    actionReasoningEffort = 'low',
+    chatReasoningEffort = 'low',
+    onRequest = null
   }) {
     if (!apiKey) {
       throw new Error('AMD API key missing: set AMD_API_KEY (or API_KEY / RADEON_API_KEY)')
@@ -674,7 +709,9 @@ class AmdToolsClient {
       degradedRecoveries: 0,
       contextOverflows: 0,
       aborted: 0,
-      timeouts: 0
+      timeouts: 0,
+      rateWaits: 0,
+      streamedResponses: 0
     }
     this.toolChoice = toolChoice
     this.parallelToolCalls = true
@@ -684,6 +721,20 @@ class AmdToolsClient {
     this.chatTimeoutMs = Number.isFinite(chatTimeoutMs) && chatTimeoutMs > 0 ? chatTimeoutMs : Math.min(timeoutMs, 90_000)
     this.chatMaxTimeoutMs = Math.max(this.chatTimeoutMs, Number(chatMaxTimeoutMs) || 120_000)
     this.chatMaxRetries = Math.max(0, Math.min(maxRetries, Math.trunc(Number(chatMaxRetries)) || 0))
+    this.streamEnabled = stream !== false
+    this.streamSupported = this.streamEnabled ? null : false
+    this.streamOptionsSupported = this.streamEnabled ? null : false
+    this.streamIdleTimeoutMs = Number.isFinite(Number(streamIdleTimeoutMs)) && Number(streamIdleTimeoutMs) > 0
+      ? Number(streamIdleTimeoutMs)
+      : 45_000
+    this.rpm = Number.isFinite(Number(rpm)) && Number(rpm) > 0 ? Math.max(1, Math.trunc(Number(rpm))) : 18
+    this.chatReserve = Number.isFinite(Number(chatReserve)) && Number(chatReserve) >= 0 ? Math.trunc(Number(chatReserve)) : 4
+    this.actionReasoningEffort = normalizeReasoningEffort(actionReasoningEffort)
+    this.chatReasoningEffort = normalizeReasoningEffort(chatReasoningEffort)
+    this.onRequest = typeof onRequest === 'function' ? onRequest : null
+    this._rateCalls = []
+    this._cooldownUntil = 0
+    this._rateLock = Promise.resolve()
     this._queue = []
     this._running = new Set()
     // Latency samples per lane: a chat reply and a 39-tool action call have
@@ -798,6 +849,57 @@ class AmdToolsClient {
     return Math.min(maxCapMs, Math.round(baseMs * this._timeoutGrowth[lane]))
   }
 
+  _defaultReasoningParams (lane = 'action') {
+    if (this.reasoningEffortSupported === false) return null
+    const effort = lane === 'chat' ? this.chatReasoningEffort : this.actionReasoningEffort
+    return effort ? { reasoning_effort: effort } : null
+  }
+
+  async _waitForRateSlot (lane = 'action', signal = null, isRetry = false) {
+    for (;;) {
+      if (signal?.aborted) {
+        const cancelled = new Error('request cancelled by the caller')
+        cancelled.name = 'AbortError'
+        cancelled.code = 'ZINCAI_ABORTED'
+        throw cancelled
+      }
+      let waitMs = 0
+      const step = this._rateLock.then(() => {
+        const now = Date.now()
+        while (this._rateCalls.length && now - this._rateCalls[0].at >= 60_000) {
+          this._rateCalls.shift()
+        }
+        if (this._cooldownUntil > now) {
+          waitMs = this._cooldownUntil - now
+          return
+        }
+        if (this.rpm > 0) {
+          if (this._rateCalls.length >= this.rpm) {
+            waitMs = Math.max(25, this._rateCalls[0].at + 60_000 - now + 25)
+            return
+          }
+          if (lane !== 'chat' && this.chatReserve > 0) {
+            const actionCap = Math.max(1, this.rpm - this.chatReserve)
+            const actionCalls = this._rateCalls.filter((c) => c.lane !== 'chat')
+            if (actionCalls.length >= actionCap) {
+              waitMs = Math.max(25, actionCalls[0].at + 60_000 - now + 25)
+              return
+            }
+          }
+        }
+        this._rateCalls.push({ at: now, lane })
+        if (this.onRequest) {
+          try { this.onRequest(lane, { isRetry }) } catch { /* noop */ }
+        }
+      })
+      this._rateLock = step.catch(() => {})
+      await step
+      if (waitMs <= 0) return
+      this.stats.rateWaits = (this.stats.rateWaits || 0) + 1
+      await sleep(Math.min(waitMs, 5_000), signal)
+    }
+  }
+
   /**
    * Fetch with a timeout, and optionally with an OUTSIDE signal.
    *
@@ -832,6 +934,156 @@ class AmdToolsClient {
     } finally {
       clearTimeout(timer)
       if (externalSignal) externalSignal.removeEventListener('abort', onExternalAbort)
+    }
+  }
+
+  async _readSseCompletion (res, { stallTimeoutMs, maxTotalMs, signal = null }) {
+    if (!res.body || typeof res.body.getReader !== 'function') {
+      return res.json()
+    }
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder('utf-8')
+    const controller = new AbortController()
+    let timedOut = false
+    let callerAborted = false
+    const onExternalAbort = () => {
+      callerAborted = true
+      controller.abort()
+      try { reader.cancel() } catch { /* noop */ }
+    }
+    if (signal) {
+      if (signal.aborted) onExternalAbort()
+      else signal.addEventListener('abort', onExternalAbort, { once: true })
+    }
+    let stallTimer = null
+    const resetStall = () => {
+      if (stallTimer) clearTimeout(stallTimer)
+      stallTimer = setTimeout(() => {
+        timedOut = true
+        controller.abort()
+        try { reader.cancel() } catch { /* noop */ }
+      }, stallTimeoutMs)
+    }
+    const totalTimer = setTimeout(() => {
+      timedOut = true
+      controller.abort()
+      try { reader.cancel() } catch { /* noop */ }
+    }, maxTotalMs)
+    resetStall()
+
+    let buffer = ''
+    let content = ''
+    let hasContent = false
+    let reasoning = ''
+    let finishReason = null
+    let usage = null
+    const toolCallsByIdx = new Map()
+    let sawEvent = false
+
+    const applyChunk = (evt) => {
+      if (!evt || typeof evt !== 'object') return
+      sawEvent = true
+      if (evt.usage) usage = evt.usage
+      const choice = evt.choices?.[0]
+      if (!choice) return
+      if (choice.finish_reason !== undefined && choice.finish_reason !== null) {
+        finishReason = choice.finish_reason
+      }
+      const delta = choice.delta || choice.message
+      if (!delta || typeof delta !== 'object') return
+      if (typeof delta.content === 'string') {
+        content += delta.content
+        hasContent = true
+      }
+      if (typeof delta.reasoning_content === 'string') reasoning += delta.reasoning_content
+      else if (typeof delta.reasoning === 'string') reasoning += delta.reasoning
+      if (Array.isArray(delta.tool_calls)) {
+        for (const tc of delta.tool_calls) {
+          const idx = Number.isFinite(tc?.index) ? tc.index : 0
+          let acc = toolCallsByIdx.get(idx)
+          if (!acc) {
+            acc = { id: tc?.id || `call_${idx + 1}`, type: tc?.type || 'function', function: { name: '', arguments: '' } }
+            toolCallsByIdx.set(idx, acc)
+          }
+          if (tc?.id) acc.id = tc.id
+          if (tc?.type) acc.type = tc.type
+          if (tc?.function?.name) acc.function.name += tc.function.name
+          if (typeof tc?.function?.arguments === 'string') acc.function.arguments += tc.function.arguments
+        }
+      }
+    }
+
+    try {
+      for (;;) {
+        if (controller.signal.aborted) break
+        const { value, done } = await reader.read()
+        if (done) break
+        resetStall()
+        buffer += decoder.decode(value, { stream: true })
+        let nl
+        while ((nl = buffer.indexOf('\n')) >= 0) {
+          const line = buffer.slice(0, nl).trim()
+          buffer = buffer.slice(nl + 1)
+          if (!line || line.startsWith(':')) continue
+          if (!line.startsWith('data:')) continue
+          const dataStr = line.slice(5).trim()
+          if (!dataStr || dataStr === '[DONE]') continue
+          try {
+            applyChunk(JSON.parse(dataStr))
+          } catch {
+            /* ignore malformed keepalive/partial event line */
+          }
+        }
+      }
+      buffer += decoder.decode()
+      for (const rawLine of buffer.split('\n')) {
+        const line = rawLine.trim()
+        if (!line.startsWith('data:')) continue
+        const dataStr = line.slice(5).trim()
+        if (!dataStr || dataStr === '[DONE]') continue
+        try { applyChunk(JSON.parse(dataStr)) } catch { /* noop */ }
+      }
+      if (callerAborted || signal?.aborted) {
+        const err = new Error('request cancelled by the caller')
+        err.name = 'AbortError'
+        err.zincaiCallerAbort = true
+        throw err
+      }
+      if (timedOut) {
+        const err = new Error('stream stalled or exceeded deadline')
+        err.name = 'AbortError'
+        err.zincaiTimedOut = true
+        throw err
+      }
+      if (!sawEvent) {
+        const err = new TypeError('SSE stream ended before any completion chunks arrived')
+        throw err
+      }
+      const toolCalls = [...toolCallsByIdx.entries()]
+        .sort((a, b) => a[0] - b[0])
+        .map(([, tc]) => tc)
+      const message = {
+        role: 'assistant',
+        content: hasContent ? content : null,
+        ...(reasoning ? { reasoning_content: reasoning } : {}),
+        ...(toolCalls.length ? { tool_calls: toolCalls } : {})
+      }
+      this.stats.streamedResponses = (this.stats.streamedResponses || 0) + 1
+      return {
+        choices: [{ message, finish_reason: finishReason }],
+        ...(usage ? { usage } : {})
+      }
+    } catch (err) {
+      if (err && typeof err === 'object') {
+        if (callerAborted || signal?.aborted) err.zincaiCallerAbort = true
+        else if (timedOut) err.zincaiTimedOut = true
+      }
+      throw err
+    } finally {
+      if (stallTimer) clearTimeout(stallTimer)
+      clearTimeout(totalTimer)
+      if (signal) signal.removeEventListener('abort', onExternalAbort)
+      try { reader.releaseLock() } catch { /* noop */ }
     }
   }
 
@@ -903,7 +1155,10 @@ class AmdToolsClient {
     let attempt = 0
     let lastError = null
     let effectiveMaxTokens = positiveInt(maxTokens, 16, 500_000)
-    let effectiveExtra = extraParams && typeof extraParams === 'object' ? { ...extraParams } : null
+    const defaultExtra = this._defaultReasoningParams(lane)
+    let effectiveExtra = (defaultExtra || (extraParams && typeof extraParams === 'object'))
+      ? { ...(defaultExtra || {}), ...(extraParams && typeof extraParams === 'object' ? extraParams : {}) }
+      : null
     let clampedOutputOnce = false
     const externalAbort = () => Boolean(signal?.aborted)
     // How far a retry of THIS call may grow its deadline: three times the
@@ -926,10 +1181,12 @@ class AmdToolsClient {
         cancelled.code = 'ZINCAI_ABORTED'
         throw cancelled
       }
+      await this._waitForRateSlot(lane, signal, attempt > 0)
       attempt += 1
       this.stats.requests += 1
       const withImages = hasImages(messages)
       const activeToolChoice = toolChoice || this.toolChoice
+      const useStream = this.streamEnabled && this.streamSupported !== false
       const payload = buildToolsPayload({
         model: this.model,
         messages,
@@ -938,6 +1195,8 @@ class AmdToolsClient {
         tools,
         toolChoice: activeToolChoice,
         parallelToolCalls: this.parallelToolCalls === null ? null : (parallel && this.parallelToolCalls !== false),
+        stream: useStream,
+        streamOptions: useStream && this.streamOptionsSupported !== false ? { include_usage: true } : null,
         extraParams: effectiveExtra
       })
       const promptChars = measureMessages(messages).chars + measureTools(tools)
@@ -947,14 +1206,30 @@ class AmdToolsClient {
         const res = await this._fetchWithTimeout(url, { method: 'POST', headers, body: JSON.stringify(payload) }, timeoutMs, signal)
 
         if (res.status === 429 || res.status >= 500) {
+          const retryAfterMs = res.status === 429 ? parseRetryAfterMs(res.headers?.get?.('retry-after')) : null
+          if (retryAfterMs) {
+            this._cooldownUntil = Math.max(this._cooldownUntil, Date.now() + retryAfterMs)
+          }
           const snippet = redactSecrets((await res.text().catch(() => '')).slice(0, 200), this._apiKey)
           lastError = new Error(`HTTP ${res.status}: ${snippet}`)
-          logger.warn(TAG, `retryable HTTP ${res.status} (attempt ${attempt}/${maxRetries + 1})`)
+          logger.warn(TAG, `retryable HTTP ${res.status}${retryAfterMs ? ` (Retry-After ${Math.round(retryAfterMs / 1000)}s)` : ''} (attempt ${attempt}/${maxRetries + 1})`)
           continue
         }
 
         if (!res.ok) {
           const snippet = redactSecrets((await res.text().catch(() => '')).slice(0, 350), this._apiKey)
+          if (res.status === 400 && payload.stream_options && /stream_options|include_usage/i.test(snippet)) {
+            if (this.streamOptionsSupported !== false) logger.warn(TAG, 'endpoint rejected stream_options — omitting stream_options for this session')
+            this.streamOptionsSupported = false
+            attempt -= 1
+            continue
+          }
+          if (res.status === 400 && payload.stream && /stream/i.test(snippet)) {
+            if (this.streamSupported !== false) logger.warn(TAG, 'endpoint rejected stream=true — falling back to non-streaming for this session')
+            this.streamSupported = false
+            attempt -= 1
+            continue
+          }
           if (res.status === 400 && payload.tool_choice === 'required' && /tool_choice|required/i.test(snippet)) {
             if (this.toolChoice === 'required') logger.warn(TAG, 'endpoint rejected tool_choice "required" — falling back to "auto" for this session')
             this.toolChoice = 'auto'
@@ -992,7 +1267,13 @@ class AmdToolsClient {
           throw failure
         }
 
-        const data = await res.json()
+        const ctype = String(res.headers?.get?.('content-type') || '').toLowerCase()
+        const isSse = ctype.includes('text/event-stream')
+        const stallMs = timeoutMs >= 10_000 ? Math.min(timeoutMs, this.streamIdleTimeoutMs) : timeoutMs
+        const maxTotalMs = Math.max(timeoutMs * 2, this._capFor(lane) * 2)
+        const data = isSse
+          ? await this._readSseCompletion(res, { stallTimeoutMs: stallMs, maxTotalMs, signal })
+          : await res.json()
         const message = data?.choices?.[0]?.message
         // A reasoning model cut off mid-thought answers with `content: null`
         // and only `reasoning_content`: that is a truncated answer, not a

@@ -63,16 +63,16 @@ class Brain {
     talk,
     isBodyBusy = () => false,
     logger = () => {},
-    minIntervalMs = 3000,
-    fastMinIntervalMs = 800,
-    chatMinIntervalMs = 1200,
+    minIntervalMs = 1500,
+    fastMinIntervalMs = 500,
+    chatMinIntervalMs = 800,
     rpm = 18,
     chatReserve = 4,
-    urgentMinIntervalMs = 1000,
+    urgentMinIntervalMs = 300,
     heartbeatMs = 90_000,
     maxSelfChain = 12,
     selfChainPauseMs = 30_000,
-    chatBatchMs = 6000,
+    chatBatchMs = 2500,
     loopMs = null,
     loopBusyMs = null,
     now = () => Date.now()
@@ -110,6 +110,8 @@ class Brain {
     /** Pending CHAT-lane lines: { sender, text, whisper, at, mono } in arrival order. */
     this.chatQueue = []
     this.busyAction = false
+    this._actionIsLoop = false
+    this.lastPreemptReason = null
     this.busyChat = false
     this.paused = false
     this.lastActionAt = -Infinity
@@ -201,6 +203,7 @@ class Brain {
     if (external) { this.selfChain = 0; this.selfChainUntil = 0; this.idleStreak = 0 }
     this.stats.queuedPeak = Math.max(this.stats.queuedPeak, this.pending.length)
     if (preempt) this.preempt(reason)
+    else if (external && this.busyAction && this._actionIsLoop) this.preempt('external event preempted idle check-in')
     this._kick()
   }
 
@@ -221,6 +224,7 @@ class Brain {
   /** Cancel the action thought in flight (if any). @returns true when one was cancelled */
   preempt (why = 'preempted') {
     this.preempted = true // a multi-step turn checks this between steps
+    this.lastPreemptReason = String(why || 'preempted')
     if (!this.busyAction || typeof this.inflightAbort !== 'function') return false
     let done = false
     try { done = Boolean(this.inflightAbort(why)) } catch { done = false }
@@ -414,7 +418,9 @@ class Brain {
     const reactionClass = urgent ? 'immediate' : (fast ? 'fast' : 'deliberate')
     this.pending = []
     this.busyAction = true
+    this._actionIsLoop = loopTurn
     this.preempted = false
+    this.lastPreemptReason = null
     this.lastActionAt = now
     this.calls.push({ at: now, lane: 'action' })
     this.stats.actionTurns++
@@ -424,7 +430,8 @@ class Brain {
       .then(() => this.act(reasons, {
         queuedMono: Number.isFinite(earliestMono) ? earliestMono : invokeMono,
         invokeMono,
-        reactionClass
+        reactionClass,
+        loopTurn
       }))
       .then(({ idle }) => {
         this.failStreak = 0
@@ -451,6 +458,7 @@ class Brain {
       })
       .finally(() => {
         this.busyAction = false
+        this._actionIsLoop = false
         this.lastActionEndAt = this.now()
         if (this.pending.length) this._kick()
       })

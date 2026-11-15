@@ -922,6 +922,11 @@ class PathfinderWrapper {
     this._jitterTimer = null
     this._sprintTimer = null
     this._sprintWalkPhase = 'sprint'
+    this._gait = 'auto'
+    this._speedMs = 0
+    this._speedSamples = []
+    this._jumpPulseUntil = 0
+    this._lastSprintJumpAt = 0
     this._lastHeading = null
     this._pauseUntil = 0
     this._applied = []
@@ -929,6 +934,7 @@ class PathfinderWrapper {
 
     this.fleeRadius = Number.isFinite(opts.fleeRadius) ? opts.fleeRadius : 8
     this._jumpSprintTimer = null
+    try { if (this.bot) this.bot._zincaiMotion = () => this.getMotionState() } catch { /* frozen */ }
 
     this.threat = opts.threat instanceof PredictiveThreatMap
       ? opts.threat
@@ -1577,6 +1583,108 @@ class PathfinderWrapper {
     return this.bot.pathfinder?.movements || null
   }
 
+  /** Normalize & set active movement gait: 'auto' | 'crouch' | 'walk' | 'sprint' | 'sprint_jump'. */
+  setGait (gait = 'auto') {
+    const raw = String(gait || 'auto').trim().toLowerCase()
+    const map = {
+      auto: 'auto',
+      default: 'auto',
+      crouch: 'crouch',
+      sneak: 'crouch',
+      crouching: 'crouch',
+      walk: 'walk',
+      walking: 'walk',
+      sprint: 'sprint',
+      sprinting: 'sprint',
+      run: 'sprint',
+      sprint_jump: 'sprint_jump',
+      'sprint-jump': 'sprint_jump',
+      jump_sprint: 'sprint_jump',
+      jump_walk: 'sprint_jump',
+      fast: 'sprint_jump'
+    }
+    const next = map[raw] || 'auto'
+    this._gait = next
+    const movements = this._movements()
+    const bot = this.bot
+    try {
+      if (next === 'crouch') {
+        if (movements) movements.allowSprinting = false
+        bot.setControlState?.('sprint', false)
+        bot.setControlState?.('sneak', true)
+      } else if (next === 'walk') {
+        if (movements) movements.allowSprinting = false
+        bot.setControlState?.('sprint', false)
+        bot.setControlState?.('sneak', false)
+      } else if (next === 'sprint' || next === 'sprint_jump') {
+        if (movements) movements.allowSprinting = true
+        bot.setControlState?.('sneak', false)
+      } else {
+        bot.setControlState?.('sneak', false)
+      }
+    } catch { /* partial mock */ }
+    return next
+  }
+
+  getGait () { return this._gait }
+
+  /** Current horizontal speed in blocks/sec (m/s). */
+  getSpeed () {
+    if (this._speedMs > 0) return this._speedMs
+    const v = this.bot?.entity?.velocity
+    if (!v) return 0
+    return Math.round(Math.hypot(Number(v.x) || 0, Number(v.z) || 0) * 200) / 10
+  }
+
+  /** Live speed, configured gait, and active posture label for prompt/observation. */
+  getMotionState () {
+    const bot = this.bot
+    const speedMs = this.getSpeed()
+    const moving = Boolean(bot?.pathfinder?.isMoving?.()) || speedMs > 0.4
+    let posture = 'idle'
+    if (this._gait === 'crouch' || bot?.entity?.isSneaking) posture = 'crouching'
+    else if (!moving) posture = `gait: ${this._gait}`
+    else if (this._gait === 'sprint_jump' || (this._gait === 'auto' && this._goalDistance() >= 24 && speedMs > 4.8)) posture = 'sprint_jumping'
+    else if (bot?.controlState?.sprint || speedMs > 4.7) posture = 'sprinting'
+    else if (bot?.entity && bot.entity.onGround === false) posture = 'airborne'
+    else posture = 'walking'
+    return { speedMs, gait: this._gait, posture }
+  }
+
+  /** Perform a single clean normal jump. */
+  jumpOnce () {
+    const bot = this.bot
+    if (!bot?.entity) return false
+    try {
+      bot.setControlState('jump', true)
+      this._jumpPulseUntil = Date.now() + 120
+      setTimeout(() => {
+        try { if (!this.isUrgent()) bot.setControlState('jump', false) } catch { /* gone */ }
+      }, 120)
+      return true
+    } catch { return false }
+  }
+
+  _goalDistance () {
+    const bot = this.bot
+    const goal = bot?.pathfinder?.goal
+    const pos = bot?.entity?.position
+    if (!goal || !pos) return 0
+    const gx = Number(goal.x ?? goal.entity?.position?.x)
+    const gz = Number(goal.z ?? goal.entity?.position?.z)
+    if (!Number.isFinite(gx) || !Number.isFinite(gz)) return 0
+    return Math.hypot(gx - pos.x, gz - pos.z)
+  }
+
+  _lowCeiling () {
+    const bot = this.bot
+    try {
+      const headAbove = bot.entity.position.floored().offset(0, 2, 0)
+      const b = bot.blockAt(headAbove)
+      return Boolean(b && b.boundingBox === 'block')
+    } catch { return false }
+  }
+
   // ------------------------------------------------- human movement mimic--
   _startHumanizer () {
     const bot = this.bot
@@ -1594,7 +1702,7 @@ class PathfinderWrapper {
     }
     jitter()
 
-    // Variable sprint/walk cycles — sprint is a gait, not a default.
+    // Variable sprint/walk cycles — sprint is a gait, not a default (unless an explicit gait is set).
     // Danger override: never sprint airborne, in liquid, or next to a drop-off.
     const cycle = () => {
       this._sprintTimer = setTimeout(cycle, this._sprintWalkPhase === 'sprint' ? 900 + Math.random() * 1600 : 400 + Math.random() * 800)
@@ -1608,16 +1716,88 @@ class PathfinderWrapper {
       const hazard = this._nearHazard()
       // Running for its life (or fighting) the bot sprints — careful posture included.
       if (this.isUrgent()) { movements.allowSprinting = true; return }
-      if (this._careful) { movements.allowSprinting = false; return }
+      if (this._careful || this._gait === 'crouch' || this._gait === 'walk') { movements.allowSprinting = false; return }
+      if (this._gait === 'sprint' || this._gait === 'sprint_jump') { movements.allowSprinting = !hazard || this._gait === 'sprint_jump'; return }
       movements.allowSprinting = this._sprintWalkPhase === 'sprint' && !hazard
     }
     cycle()
+
+    // 20 Hz speed measurement + gait/sprint-jump/crouch enforcement.
+    const motionTick = () => {
+      if (!bot.entity?.position) return
+      const now = Date.now()
+      const p = bot.entity.position
+      this._speedSamples.push({ x: p.x, z: p.z, t: now })
+      while (this._speedSamples.length > 2 && now - this._speedSamples[0].t > 300) this._speedSamples.shift()
+      if (this._speedSamples.length >= 2) {
+        const first = this._speedSamples[0]
+        const last = this._speedSamples[this._speedSamples.length - 1]
+        const dt = (last.t - first.t) / 1000
+        if (dt >= 0.04) {
+          this._speedMs = Math.round((Math.hypot(last.x - first.x, last.z - first.z) / dt) * 10) / 10
+        }
+      }
+
+      if (this._jumpPulseUntil && now >= this._jumpPulseUntil) {
+        this._jumpPulseUntil = 0
+        if (!this.isUrgent() && !bot.entity.isInWater) {
+          try { bot.setControlState('jump', false) } catch { /* mock */ }
+        }
+      }
+
+      const movements = this._movements()
+      if (this.isUrgent()) {
+        if (movements) movements.allowSprinting = true
+        try { if (bot.controlState?.sneak) bot.setControlState('sneak', false) } catch { /* mock */ }
+        return
+      }
+
+      if (this._gait === 'crouch') {
+        if (movements) movements.allowSprinting = false
+        try { bot.setControlState('sneak', true); bot.setControlState('sprint', false) } catch { /* mock */ }
+        return
+      }
+      if (this._gait === 'walk') {
+        if (movements) movements.allowSprinting = false
+        try { bot.setControlState('sneak', false); bot.setControlState('sprint', false) } catch { /* mock */ }
+        return
+      }
+      if (this._gait === 'sprint') {
+        if (movements) movements.allowSprinting = true
+        try { bot.setControlState('sneak', false) } catch { /* mock */ }
+        return
+      }
+
+      const wantJumpWalk = this._gait === 'sprint_jump' || (this._gait === 'auto' && this._goalDistance() >= 24)
+      if (wantJumpWalk && bot.pathfinder?.isMoving?.()) {
+        if (movements) movements.allowSprinting = true
+        try { bot.setControlState('sneak', false) } catch { /* mock */ }
+        if (
+          bot.entity.onGround &&
+          !bot.entity.isInWater &&
+          !bot.entity.isInLava &&
+          !this._nearHazard() &&
+          !this._lowCeiling() &&
+          this._speedMs >= 2.0 &&
+          now - this._lastSprintJumpAt >= 480 &&
+          now >= this._pauseUntil
+        ) {
+          this._lastSprintJumpAt = now
+          this._jumpPulseUntil = now + 90
+          try {
+            bot.setControlState('sprint', true)
+            bot.setControlState('jump', true)
+          } catch { /* mock */ }
+        }
+      }
+    }
+    this._onTick(motionTick)
 
     // Idle pause on abrupt heading change while navigating (200–800ms).
     const headingPause = () => {
       if (!bot.entity || !bot.pathfinder) return
       if (!bot.pathfinder.isMoving?.()) { this._lastHeading = null; return }
-      if (this.isUrgent()) { this._lastHeading = bot.entity.yaw; return } // never pause mid-escape
+      if (this.isUrgent() || this._gait === 'sprint_jump' || this._gait === 'sprint') { this._lastHeading = bot.entity.yaw; return } // never pause mid-escape or explicit fast gait
       const yaw = bot.entity.yaw
       if (this._lastHeading !== null) {
         let d = Math.abs(yaw - this._lastHeading) % (2 * Math.PI)

@@ -31,6 +31,7 @@
 'use strict'
 
 const zlib = require('node:zlib')
+const { getBlockTexture, HAS_TEXTURES } = require('./textures')
 
 // ── Minimal PNG encoder (RGB, colour type 2, bit depth 8) ─────────────────
 
@@ -835,12 +836,25 @@ function sampleBlockTexture (mat, axis, dx, dy, dz, fx, fy, fz, bx, by, bz, out 
   const tu = Math.min(15, Math.max(0, (u * 16) | 0))
   const tv = Math.min(15, Math.max(0, (v * 16) | 0))
 
+  const topFace = axis === 1 && dy <= 0
+  const botFace = axis === 1 && dy > 0
+
+  const face = topFace ? 'top' : (botFace ? 'bottom' : 'side')
+  const realTex = mat.name ? getBlockTexture(mat.name, face) : null
+  if (realTex) {
+    const idx = ((tv & 15) * 16 + (tu & 15)) * 4
+    if (realTex[idx + 3] >= 16) {
+      out[0] = realTex[idx]
+      out[1] = realTex[idx + 1]
+      out[2] = realTex[idx + 2]
+      return out
+    }
+  }
+
   let r = mat.rgb[0]
   let g = mat.rgb[1]
   let b = mat.rgb[2]
   const pat = mat.pattern
-  const topFace = axis === 1 && dy <= 0
-  const botFace = axis === 1 && dy > 0
 
   if (pat === 'grass') {
     const dirt = mat.accent || [134, 96, 67]
@@ -1865,6 +1879,23 @@ async function renderMap (bot, opts) {
         const slope = (hy - northY) * 0.085 + (hy - westY) * 0.05
         const rel = Math.max(-0.22, Math.min(0.24, (hy - pos.y) * 0.02))
         const shade = Math.max(0.50, Math.min(1.30, 1 + rel + Math.max(-0.22, Math.min(0.22, slope))))
+        const topTex = m.name ? getBlockTexture(m.name, 'top') : null
+        if (topTex) {
+          const x0 = padL + gx * cell
+          const y0 = padT + gz * cell
+          for (let py = 0; py < cell; py++) {
+            const tv = Math.min(15, Math.floor((py * 16) / cell))
+            for (let px = 0; px < cell; px++) {
+              const tu = Math.min(15, Math.floor((px * 16) / cell))
+              const ti = (tv * 16 + tu) * 4
+              const tr = topTex[ti + 3] >= 16 ? topTex[ti] : m.rgb[0]
+              const tg = topTex[ti + 3] >= 16 ? topTex[ti + 1] : m.rgb[1]
+              const tb = topTex[ti + 3] >= 16 ? topTex[ti + 2] : m.rgb[2]
+              canvas.set(x0 + px, y0 + py, clampByte(tr * shade), clampByte(tg * shade), clampByte(tb * shade))
+            }
+          }
+          continue
+        }
         r = clampByte(m.rgb[0] * shade)
         g = clampByte(m.rgb[1] * shade)
         b = clampByte(m.rgb[2] * shade)

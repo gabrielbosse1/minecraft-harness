@@ -112,6 +112,12 @@ class AmdClient {
     const timer = setTimeout(() => controller.abort(), timeoutMs)
     try {
       return await fetch(url, { ...options, signal: controller.signal })
+    } catch (err) {
+      // Tag the cause so the retry loop can say "timeout" only when OUR
+      // deadline rang: a network abort is not a slow endpoint, and logging it
+      // as one sends operators looking in the wrong place.
+      if (err && typeof err === 'object' && controller.signal.aborted) err.zincaiTimedOut = true
+      throw err
     } finally {
       clearTimeout(timer)
     }
@@ -187,7 +193,12 @@ class AmdClient {
         const isNetwork = err instanceof TypeError // fetch network failures
         if (isAbort || isNetwork) {
           lastError = new Error(redactSecrets(err.message || String(err), this._apiKey))
-          logger.warn(TAG, `retryable ${isAbort ? 'timeout' : 'network'} error (attempt ${attempt}/${this.maxRetries + 1})`)
+          if (err?.zincaiTimedOut) {
+            // Say which deadline rang and for how long, so a retry burst reads as one event.
+            logger.warn(TAG, `retryable timeout: no response within ${Math.round(this.timeoutMs / 1000)}s (attempt ${attempt}/${this.maxRetries + 1})`)
+          } else {
+            logger.warn(TAG, `retryable ${isAbort ? 'timeout' : 'network'} error (attempt ${attempt}/${this.maxRetries + 1})`)
+          }
           continue
         }
         throw err

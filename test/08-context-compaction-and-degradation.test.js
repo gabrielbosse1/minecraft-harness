@@ -341,3 +341,105 @@ test('08d: Real-server Chat-lane mid-sentence cutoff & plain-text graceful degra
     await sim.stop()
   }
 })
+
+test('08e: A cancelled call is not retried and not logged as a timeout', { timeout: 30_000 }, async () => {
+  const http = require('http')
+  const { AmdToolsClient, createChatTools } = require('../zincai/api_wrapper')
+
+  let served = 0
+  // The endpoint never answers: it is holding the request, exactly like a slow
+  // reasoning model. Every request that reaches it is counted.
+  const server = http.createServer((req, res) => {
+    req.on('data', () => {})
+    req.on('end', () => { served += 1 })
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const baseUrl = `http://127.0.0.1:${server.address().port}/v1`
+  const messages = [{ role: 'system', content: 'chat' }, { role: 'user', content: 'oi' }]
+
+  try {
+    const client = new AmdToolsClient({
+      apiKey: 'rc-test', baseUrl, model: 'sim-model', timeoutMs: 12_000, maxRetries: 2, discoverModels: false
+    })
+
+    // The caller cancels the thought (chat preempting the body). Before the fix
+    // this was indistinguishable from a timeout, so it was retried 3 times and
+    // logged as "retryable timeout" three times.
+    const controller = new AbortController()
+    setTimeout(() => controller.abort(), 80)
+    const t0 = Date.now()
+    let threw = null
+    try {
+      await client._complete({
+        messages, tools: createChatTools(), lane: 'action',
+        timeoutMs: 12_000, maxRetries: 2, signal: controller.signal
+      })
+    } catch (err) { threw = err }
+
+    assert.ok(threw, 'a cancelled call must reject')
+    assert.equal(threw.name, 'AbortError', `cancellation must surface as AbortError, got ${threw.name}: ${threw.message}`)
+    assert.ok(Date.now() - t0 < 1_000, `cancellation must be immediate, took ${Date.now() - t0}ms`)
+    assert.equal(served, 1, `a cancelled call must NOT be retried (the endpoint received ${served} requests)`)
+    assert.equal(client.stats.timeouts, 0, 'a cancelled call must not be counted as a timeout')
+    assert.equal(client.stats.retries, 0, 'a cancelled call must not consume retries')
+  } finally {
+    await new Promise((resolve) => server.close(resolve))
+  }
+})
+
+test('08f: A real timeout is remembered, so the lane deadline grows and stays out of the other lane', { timeout: 40_000 }, async () => {
+  const http = require('http')
+  const { AmdToolsClient, createChatTools } = require('../zincai/api_wrapper')
+
+  // The endpoint holds the request forever: a reasoner that ran past the
+  // deadline is exactly this case from the client's point of view.
+  let served = 0
+  const server = http.createServer((req, res) => {
+    req.on('data', () => {})
+    req.on('end', () => { served += 1 })
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const baseUrl = `http://127.0.0.1:${server.address().port}/v1`
+
+  try {
+    const client = new AmdToolsClient({
+      apiKey: 'rc-test', baseUrl, model: 'sim-model',
+      timeoutMs: 10_000, maxRetries: 0, chatTimeoutMs: 10_000, discoverModels: false
+    })
+    const before = client._effectiveTimeoutMs(client.timeoutMs, client.maxTimeoutMs, 'action')
+    assert.equal(before, 10_000, 'no samples yet: the configured base is used')
+
+    let threw = null
+    try {
+      await client._complete({
+        messages: [{ role: 'user', content: 'hi' }], tools: createChatTools(),
+        lane: 'action', maxRetries: 0
+      })
+    } catch (err) { threw = err }
+
+    assert.ok(threw, 'a call that never answers must fail')
+    assert.equal(client.stats.timeouts, 1, 'the expired deadline must be counted exactly once')
+    assert.equal(served, 1)
+
+    // The deadline that expired is remembered: the next call of this lane gets
+    // a budget that already fits the endpoint's observed slowness. Before this
+    // fix the next call used the same 10 s and timed out again.
+    const after = client._effectiveTimeoutMs(client.timeoutMs, client.maxTimeoutMs, 'action')
+    assert.ok(after > before, `action deadline must grow after a timeout (${before} -> ${after})`)
+    assert.ok(after <= client.maxTimeoutMs, 'the deadline must respect its ceiling')
+
+    // …and the other lane, which never timed out, keeps its own budget.
+    assert.equal(
+      client._effectiveTimeoutMs(client.chatTimeoutMs, client.chatMaxTimeoutMs, 'chat'),
+      client.chatTimeoutMs,
+      'a slow action call must not stretch the chat lane deadline'
+    )
+
+    // The published stats expose both, so an operator can read a burst at a glance.
+    const stats = client.getStats()
+    assert.equal(stats.timeouts, 1)
+    assert.ok(stats.effectiveTimeouts.action >= before)
+  } finally {
+    await new Promise((resolve) => server.close(resolve))
+  }
+})

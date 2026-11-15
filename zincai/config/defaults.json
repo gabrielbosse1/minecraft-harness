@@ -17,7 +17,9 @@
     "maxRetries": 2,
     "maxConcurrent": 2,
     "chatTimeoutMs": 90000,
-    "chatMaxRetries": 1
+    "chatMaxRetries": 1,
+    "maxTimeoutMs": 180000,
+    "chatMaxTimeoutMs": 120000
   },
   "inference": {
     "minIntervalMs": 3000,

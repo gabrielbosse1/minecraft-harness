@@ -136,7 +136,12 @@ function loadConfig () {
       maxRetries: settings.int(['AMD_API_MAX_RETRIES', 'amd.maxRetries'], raw.amd.maxRetries ?? 2, { min: 0, max: 5 }),
       maxConcurrent: settings.int(['AMD_MAX_CONCURRENT', 'amd.maxConcurrent'], raw.amd.maxConcurrent ?? 2, { min: 1, max: 8 }),
       chatTimeoutMs: settings.int(['AMD_CHAT_TIMEOUT_MS', 'amd.chatTimeoutMs'], raw.amd.chatTimeoutMs ?? null, { min: 1_000, max: 600_000 }),
-      chatMaxRetries: settings.int(['AMD_CHAT_MAX_RETRIES', 'amd.chatMaxRetries'], raw.amd.chatMaxRetries ?? 1, { min: 0, max: 5 })
+      chatMaxRetries: settings.int(['AMD_CHAT_MAX_RETRIES', 'amd.chatMaxRetries'], raw.amd.chatMaxRetries ?? 1, { min: 0, max: 5 }),
+      // Ceilings for the adaptive deadline: a call that timed out earns more
+      // room up to these, so a slow endpoint is waited out instead of retried
+      // into the same wall.
+      maxTimeoutMs: settings.int(['AMD_MAX_TIMEOUT_MS', 'amd.maxTimeoutMs'], raw.amd.maxTimeoutMs ?? 180_000, { min: 1_000, max: 900_000 }),
+      chatMaxTimeoutMs: settings.int(['AMD_CHAT_MAX_TIMEOUT_MS', 'amd.chatMaxTimeoutMs'], raw.amd.chatMaxTimeoutMs ?? 120_000, { min: 1_000, max: 900_000 })
     },
     inference: raw.inference || {},
     memory: raw.memory || {},
@@ -231,7 +236,9 @@ function makeShared (cfg, { dataDir = DATA_DIR } = {}) {
       reserveOutputRatio: cfg.compaction?.reserveOutputRatio ?? 0.25,
       maxConcurrent: cfg.amd.maxConcurrent ?? 2,
       chatTimeoutMs: cfg.amd.chatTimeoutMs ?? null,
-      chatMaxRetries: cfg.amd.chatMaxRetries ?? 1
+      chatMaxRetries: cfg.amd.chatMaxRetries ?? 1,
+      maxTimeoutMs: cfg.amd.maxTimeoutMs ?? 180_000,
+      chatMaxTimeoutMs: cfg.amd.chatMaxTimeoutMs ?? 120_000
     }),
     parser: new BlueprintParser({ scaffoldBlocks: cfg.build.scaffoldBlocks, reach: cfg.build.reach }),
     events: new (require('./events').EventPipeline)({ file: at(cfg.events?.journalFile, 'events-journal.json') }),
@@ -305,6 +312,9 @@ function main () {
     logger.info(TAG, `data dir: ${DATA_DIR} (sessions telemetry, memories, places, goals, journal, runtime-config)`)
     logger.info(TAG, `agent loop: ${cfg.inference.heartbeatMs > 0 && cfg.inference.loopMs > 0 ? `every ${cfg.inference.loopMs}ms, backing off to ${cfg.inference.heartbeatMs}ms while idle` : 'off (events only)'}; up to ${cfg.inference.maxStepsPerTurn ?? 6} model steps per turn; chat window ${cfg.inference.chatBatchMs}ms`)
     logger.info(TAG, `limits: rpm=${cfg.inference.rpm} minInterval=${cfg.inference.minIntervalMs}ms heartbeat=${cfg.inference.heartbeatMs}ms reconnect=${cfg.reconnect.maxAttempts} attempts serverTrafficTimeout=${cfg.reconnect.keepAliveTimeoutMs}ms`)
+    // The deadline is adaptive; say where it starts and how far it may grow, so
+    // a "retryable timeout" line can be read against the policy that produced it.
+    logger.info(TAG, `model deadlines: action ${Math.round(cfg.amd.timeoutMs / 1000)}s→${Math.round(cfg.amd.maxTimeoutMs / 1000)}s (${cfg.amd.maxRetries} retries), chat ${Math.round((cfg.amd.chatTimeoutMs ?? cfg.amd.timeoutMs) / 1000)}s→${Math.round(cfg.amd.chatMaxTimeoutMs / 1000)}s (${cfg.amd.chatMaxRetries} retries); a cancelled call is never retried`)
     logger.info(TAG, `prompts: action ${SYSTEM_PROMPT.split(/\s+/).length} words, chat ${CHAT_PROMPT.split(/\s+/).length} words (static), ${ZINC_TOOLS.length} tools`)
     try {
       const rc = new (require('./runtime_config').RuntimeConfig)({ file: path.join(DATA_DIR, 'runtime-config.json') })

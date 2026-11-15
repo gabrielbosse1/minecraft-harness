@@ -36,7 +36,22 @@ const { ContextBudget, measureMessages, measureTools, compactMessagesFallback, t
 const logger = require('../src/logger')
 
 const TAG = 'amd'
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+/** Sleep, but let a cancelled call stop waiting the moment the caller gives up. */
+const sleep = (ms, signal = null) => new Promise((resolve, reject) => {
+  if (signal?.aborted) { const err = new Error('request cancelled by the caller'); err.name = 'AbortError'; err.code = 'ZINCAI_ABORTED'; return reject(err) }
+  const timer = setTimeout(() => {
+    if (signal) signal.removeEventListener('abort', onAbort)
+    resolve()
+  }, ms)
+  const onAbort = () => {
+    clearTimeout(timer)
+    const err = new Error('request cancelled by the caller')
+    err.name = 'AbortError'
+    err.code = 'ZINCAI_ABORTED'
+    reject(err)
+  }
+  if (signal) signal.addEventListener('abort', onAbort, { once: true })
+})
 const backoffMs = (attempt) => Math.min(8_000, 500 * 2 ** attempt) + Math.floor(Math.random() * 250)
 
 // ---------------------------------------------------------------------------
@@ -614,7 +629,13 @@ class AmdToolsClient {
     toolChoice = 'required',
     maxConcurrent = 2,
     chatTimeoutMs = null,
-    chatMaxRetries = 1
+    chatMaxRetries = 1,
+    // The ceiling an adaptive deadline may grow to. Both are far above the
+    // configured base because a reasoning model on a busy endpoint really can
+    // take minutes; the point is that a deadline is never *shorter* than the
+    // endpoint has shown it needs.
+    maxTimeoutMs = 180_000,
+    chatMaxTimeoutMs = 120_000
   }) {
     if (!apiKey) {
       throw new Error('AMD API key missing: set AMD_API_KEY (or API_KEY / RADEON_API_KEY)')
@@ -651,17 +672,26 @@ class AmdToolsClient {
       proactiveCompactions: 0,
       reactiveCompactions: 0,
       degradedRecoveries: 0,
-      contextOverflows: 0
+      contextOverflows: 0,
+      aborted: 0,
+      timeouts: 0
     }
     this.toolChoice = toolChoice
     this.parallelToolCalls = true
     this.maxToolCalls = 6
     this.maxConcurrent = Math.max(1, Math.trunc(Number(maxConcurrent)) || 1)
+    this.maxTimeoutMs = Math.max(this.timeoutMs, Number(maxTimeoutMs) || 180_000)
     this.chatTimeoutMs = Number.isFinite(chatTimeoutMs) && chatTimeoutMs > 0 ? chatTimeoutMs : Math.min(timeoutMs, 90_000)
+    this.chatMaxTimeoutMs = Math.max(this.chatTimeoutMs, Number(chatMaxTimeoutMs) || 120_000)
     this.chatMaxRetries = Math.max(0, Math.min(maxRetries, Math.trunc(Number(chatMaxRetries)) || 0))
     this._queue = []
     this._running = new Set()
+    // Latency samples per lane: a chat reply and a 39-tool action call have
+    // nothing in common in size, and mixing them made the chat lane inherit the
+    // action lane's slow p90 (and vice versa).
     this._latencies = []
+    this._latenciesByLane = { action: [], chat: [] }
+    this._timeoutGrowth = { action: 1, chat: 1 }
     this.visionSupported = null
     this.reasoningEffortSupported = null
     this._discoverModels = discoverModels !== false
@@ -699,18 +729,73 @@ class AmdToolsClient {
     return this._modelsDiscoveryPromise
   }
 
-  _recordLatency (ms) {
+  _recordLatency (ms, lane = 'action') {
     if (!Number.isFinite(ms) || ms <= 0) return
     this._latencies.push(ms)
     if (this._latencies.length > 16) this._latencies.shift()
+    const list = this._latenciesByLane[lane] || (this._latenciesByLane[lane] = [])
+    list.push(ms)
+    // Eight samples is enough to see a climbing p90 without remembering a whole session.
+    if (list.length > 8) list.shift()
   }
 
-  _effectiveTimeoutMs (baseMs, maxCapMs = 180_000) {
+  /**
+   * A deadline that turned out to be too short: remember the next one.
+   *
+   * Kept apart from the latency samples on purpose — an expired deadline only
+   * tells us the answer takes LONGER than `expiredMs`, so `expiredMs / 2` is
+   * the honest floor: it is the fastest answer consistent with that deadline
+   * having expired, and a real (slower) timing sample supersedes it next call.
+   */
+  _noteTimeout (expiredMs, lane = 'action') {
+    const floor = Math.max(1, Math.round(expiredMs / 2))
+    const list = this._latenciesByLane[lane] || (this._latenciesByLane[lane] = [])
+    list.push(floor)
+    if (list.length > 8) list.shift()
+    const base = Math.max(1, this._baseTimeoutFor(lane))
+    const capFactor = this._capFor(lane) / base
+    const needed = (expiredMs * 1.5) / base
+    this._timeoutGrowth[lane] = Math.min(capFactor, Math.max(this._timeoutGrowth[lane] || 1, needed))
+  }
+
+  _baseTimeoutFor (lane) { return lane === 'chat' ? this.chatTimeoutMs : this.timeoutMs }
+  _capFor (lane) { return lane === 'chat' ? this.chatMaxTimeoutMs : this.maxTimeoutMs }
+
+  /**
+   * The per-attempt timeout for one call.
+   *
+   * Three things used to go wrong here, and all of them produce the "retryable
+   * timeout" lines operators see in bursts:
+   *
+   *   1. The p90 was taken over EVERY call of the process, so a slow action
+   *      turn stretched the chat lane's budget and a burst of chat stretched
+   *      the action lane's. Samples are now per lane.
+   *
+   *   2. A deadline that expired taught the client NOTHING: the next call used
+   *      the same too-short number, timed out again, and the burst repeated
+   *      forever. A timeout is now remembered (see _noteTimeout), which raised
+   *      the cap from 180 s to the configurable `maxTimeoutMs`.
+   *
+   *   3. The factor only ever grew. When the endpoint recovered, every call
+   *      sat on a deadline far longer than the answer needed, so one dead
+   *      request held a lane for minutes before the retry it was always going
+   *      to need. The factor now also DECAYS, one 10 % step per successful
+   *      call, back to the configured base.
+   */
+  _effectiveTimeoutMs (baseMs, maxCapMs = 180_000, lane = 'action') {
     // Preserve explicit short timeouts used in unit tests and low-timeout configs.
-    if (!Number.isFinite(baseMs) || baseMs < 10_000 || this._latencies.length < 2) return baseMs
-    const sorted = [...this._latencies].sort((a, b) => a - b)
+    if (!Number.isFinite(baseMs) || baseMs < 10_000) return baseMs
+    const samples = this._latenciesByLane[lane] || []
+    const growth = this._timeoutGrowth[lane] || 1
+    if (samples.length < 2) return Math.min(maxCapMs, Math.round(baseMs * growth))
+    const sorted = [...samples].sort((a, b) => a - b)
     const p90 = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.9))]
-    return Math.min(maxCapMs, Math.max(baseMs, Math.round(p90 * 1.5)))
+    const target = Math.max(1, Math.min(maxCapMs / baseMs, (p90 * 1.5) / baseMs))
+    // Rise at once (a slow endpoint must not be cut off), fall slowly (one fast
+    // answer is not proof that the endpoint recovered).
+    const next = target > growth ? target : growth - 0.1
+    this._timeoutGrowth[lane] = Math.max(1, Math.min(next, maxCapMs / baseMs))
+    return Math.min(maxCapMs, Math.round(baseMs * this._timeoutGrowth[lane]))
   }
 
   /**
@@ -731,6 +816,19 @@ class AmdToolsClient {
     }
     try {
       return await fetch(url, { ...options, signal: controller.signal })
+    } catch (err) {
+      // Which clock rang? The caller's cancellation is NOT a timeout: retrying
+      // it re-sends a request nobody is waiting for any more, three times, and
+      // that is exactly how a preempted turn turns into a burst of
+      // "retryable timeout" lines.
+      if (err && typeof err === 'object') {
+        if (externalSignal?.aborted) {
+          err.zincaiCallerAbort = true
+        } else if (controller.signal.aborted) {
+          err.zincaiTimedOut = true
+        }
+      }
+      throw err
     } finally {
       clearTimeout(timer)
       if (externalSignal) externalSignal.removeEventListener('abort', onExternalAbort)
@@ -761,7 +859,7 @@ class AmdToolsClient {
         lane,
         resolve,
         reject,
-        run: () => this._completeNow({ messages, tools, maxTokens, temperature, timeoutMs, maxRetries, signal, parallel, toolChoice, extraParams })
+        run: () => this._completeNow({ messages, tools, maxTokens, temperature, lane, timeoutMs, maxRetries, signal, parallel, toolChoice, extraParams })
       })
       this._pump()
     })
@@ -787,6 +885,7 @@ class AmdToolsClient {
     tools,
     maxTokens,
     temperature,
+    lane = 'action',
     timeoutMs = this.timeoutMs,
     maxRetries = this.maxRetries,
     signal = null,
@@ -806,11 +905,26 @@ class AmdToolsClient {
     let effectiveMaxTokens = positiveInt(maxTokens, 16, 500_000)
     let effectiveExtra = extraParams && typeof extraParams === 'object' ? { ...extraParams } : null
     let clampedOutputOnce = false
+    const externalAbort = () => Boolean(signal?.aborted)
+    // How far a retry of THIS call may grow its deadline: three times the
+    // budget it started with, never past the lane's configured ceiling. A test
+    // or a test harness that pins a short timeout stays short.
+    const maxTimeoutMs = Math.min(this._capFor(lane), Math.max(timeoutMs, Math.round(timeoutMs * 3)))
 
     while (attempt <= maxRetries) {
       if (attempt > 0) {
         this.stats.retries += 1
-        await sleep(backoffMs(attempt - 1))
+        // The backoff is cancellable too: a preempted turn must die AT ONCE,
+        // not after this request's remaining retries have been slept through.
+        await sleep(backoffMs(attempt - 1), signal)
+      }
+      // Checked per attempt: a retry is a fresh request even if the first was
+      // allowed to start.
+      if (externalAbort()) {
+        const cancelled = new Error('request cancelled by the caller')
+        cancelled.name = 'AbortError'
+        cancelled.code = 'ZINCAI_ABORTED'
+        throw cancelled
       }
       attempt += 1
       this.stats.requests += 1
@@ -891,7 +1005,6 @@ class AmdToolsClient {
           this.stats.failures += 1
           throw new Error('Malformed response: choices[0].message has neither content nor tool_calls')
         }
-        this._recordLatency(Date.now() - startedAt)
         const usage = parseUsage(data?.usage)
         if (usage.promptTokens !== null) {
           this.stats.promptTokens += usage.promptTokens
@@ -904,8 +1017,36 @@ class AmdToolsClient {
         }
         const finishReason = data?.choices?.[0]?.finish_reason ?? null
         if (withImages) this.visionSupported = true
+        this._recordLatency(Date.now() - startedAt, lane)
         return { message, usage, raw: data, finishReason }
       } catch (err) {
+        // The caller cancelled (a chat line preempting this thought, a session
+        // ending): nothing is waiting for the answer any more, so a retry is a
+        // wasted request that also logs a fake "timeout".
+        if (externalAbort() || err?.zincaiCallerAbort) {
+          this.stats.aborted = (this.stats.aborted || 0) + 1
+          const cancelled = new Error('request cancelled by the caller')
+          cancelled.name = 'AbortError'
+          cancelled.code = 'ZINCAI_ABORTED'
+          throw cancelled
+        }
+        // A deadline WE set: one attempt, but say which one and why, with the
+        // timeout that produced it, so a burst is readable at a glance.
+        if (err?.zincaiTimedOut) {
+          this.stats.timeouts = (this.stats.timeouts || 0) + 1
+          const waited = timeoutMs
+          // The deadline that expired is evidence about this endpoint: the NEXT
+          // call of this lane starts with a budget that already fits, instead of
+          // timing out once more on the same too-short number.
+          this._noteTimeout(waited, lane)
+          // A deadline that expired says the endpoint is slower than we
+          // allowed. Give the retry a longer one (up to the lane cap) instead
+          // of spending all three attempts on the same too-short number.
+          timeoutMs = Math.min(maxTimeoutMs, Math.round(waited * 1.5))
+          lastError = new Error(`no response within ${Math.round(waited / 1000)}s (attempt ${attempt}/${maxRetries + 1})`)
+          logger.warn(TAG, `retryable timeout: no response from the endpoint within ${Math.round(waited / 1000)}s (attempt ${attempt}/${maxRetries + 1})${attempt <= maxRetries ? ` — retrying with ${Math.round(timeoutMs / 1000)}s` : ''}`)
+          continue
+        }
         const isAbort = err && (err.name === 'AbortError' || /abort/i.test(String(err.message)))
         const isNetwork = err instanceof TypeError
         if (isAbort || isNetwork) {
@@ -1048,7 +1189,7 @@ class AmdToolsClient {
       messages: msgs,
       tools: activeSet,
       lane: 'action',
-      timeoutMs: this._effectiveTimeoutMs(this.timeoutMs, 180_000),
+      timeoutMs: this._effectiveTimeoutMs(this.timeoutMs, this.maxTimeoutMs, 'action'),
       ...extra
     })
 
@@ -1354,7 +1495,7 @@ class AmdToolsClient {
       maxTokens: budget,
       temperature: Math.max(this.temperature, 0.5),
       lane: 'chat',
-      timeoutMs: this._effectiveTimeoutMs(this.chatTimeoutMs, 120_000),
+      timeoutMs: this._effectiveTimeoutMs(this.chatTimeoutMs, this.chatMaxTimeoutMs, 'chat'),
       maxRetries: this.chatMaxRetries,
       ...(extraParams ? { extraParams } : {})
     })
@@ -1543,6 +1684,15 @@ class AmdToolsClient {
       avgPromptTokensPerCall: s.requests ? Math.round(s.promptTokens / s.requests) : 0,
       avgCompletionTokensPerCall: s.requests ? Math.round(s.completionTokens / s.requests) : 0,
       kvCacheHitRate: hitRate,
+      // The two numbers that explain a "timeout" burst: how many deadlines we
+      // actually hit, and how many calls the caller cancelled (those are not
+      // failures — a cancelled turn was deliberately replaced).
+      timeouts: s.timeouts || 0,
+      aborted: s.aborted || 0,
+      effectiveTimeouts: {
+        action: this._effectiveTimeoutMs(this.timeoutMs, this.maxTimeoutMs, 'action'),
+        chat: this._effectiveTimeoutMs(this.chatTimeoutMs, this.chatMaxTimeoutMs, 'chat')
+      },
       budget: this.budget.snapshot(),
       uptimeMinutes: Math.round((Date.now() - this._startedAt) / 60_000) || 0
     }

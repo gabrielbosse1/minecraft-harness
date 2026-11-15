@@ -107,6 +107,7 @@ CLI: node zincai/index.js [--dry-run | --check]
 
 ### `src/`, `scripts/`, `pufferpanel/`
 - `src/amdClient.js` — OpenAI-compatible HTTP client with retries, concurrency cap, reasoning extraction (`reasoning_content`/`reasoning`/`<think>`).
+- `zincai/api_wrapper.js` — `AmdToolsClient`: per-lane call queues, native tool calling, and the **retry/timeout policy** (see §9). A call cancelled by the caller is never retried; only a real expired deadline is a retryable timeout.
 - `src/combat.js` — `AdvancedCombat` (weapon selection, crit timing, sprint-reset, reach, chain kills, `explicitPlayersOnly`).
 - `src/recipes.js` — Crafting tree solver over `prismarine-recipe`.
 - `src/logger.js`, `src/reasonToText.js`, `src/reconnect.js`, `src/settings.js` — Shared utilities.
@@ -249,3 +250,27 @@ npm run pufferpanel:validate
 - Spawn mobs via `serv.initEntity('mob', mcData.entitiesByName[name].id, serv.overworld, pos)` + `mob.updateAndSpawn()` (not `serv.spawnMob`), and never call `flying-squid`'s `player.teleport()` directly (move test players via Mineflayer `setControlState`).
 - In `sim-harness.js`, `startSimulation()` waits for the initial spawn wake (`llm.actionRequests().length >= 1 && !brain.busyAction`) before returning so scripted actions enqueued by tests are never consumed by the boot turn.
 - When testing `attack` deterministically against a hostile mob without racing `System1`'s flee reflex, spawn the mob beyond `ThreatSense.radius` (`12m`, e.g. `14m`) and inside `combat.engage` range (`24m`). When checking inventory items that `ArmorKeeper` may auto-equip immediately, inspect `bot.inventory.slots` (slots `5..8` included), not just `bot.inventory.items()`.
+
+---
+
+## 9. Inference Timeouts & Retries (`zincai/api_wrapper.js`)
+
+The endpoint is the slowest moving part of the process, and "retryable timeout"
+lines in the log are the symptom operators ask about most. The policy:
+
+| Rule | Why |
+| --- | --- |
+| A **caller cancellation** (a chat line preempting an action thought, session ending) is an `AbortError` with `code: ZINCAI_ABORTED` — never retried, never logged as a timeout. | The old code could not tell the two abort sources apart, so a preempted turn re-sent the same request 3× and printed 3 "retryable timeout" lines for nothing. |
+| Backoff between retries is cancellable. | A cancelled turn must die immediately, not after its remaining retries have been slept through. |
+| A **real expired deadline** is counted (`stats.timeouts`), logged with the deadline and the next attempt's room, and *remembered* (`_noteTimeout`). | The next call of that lane then starts with a budget that already fits, instead of timing out on the same too-short number again. |
+| Deadlines are **per lane** (action / chat) and **adaptive both ways**: they rise at once to `p90 × 1.5` of that lane's samples and decay 10 % per successful call back to the configured base. | Mixing the two lanes made chat inherit the action lane's slow p90; a factor that only grew left a recovered endpoint stuck on a 3-minute deadline. |
+| The retry of a timed-out attempt gets `× 1.5` more room, up to the lane ceiling. | Waiting out a genuinely slow reasoning call beats burning all attempts on the same wall. |
+
+Config (env / `defaults.json` `amd.*`): `AMD_API_TIMEOUT_MS` (base, 120 s),
+`AMD_MAX_TIMEOUT_MS` (action ceiling, 180 s), `AMD_CHAT_TIMEOUT_MS` (base, 90 s),
+`AMD_CHAT_MAX_TIMEOUT_MS` (chat ceiling, 120 s), `AMD_API_MAX_RETRIES` (2),
+`AMD_CHAT_MAX_RETRIES` (1). `getStats()` publishes `timeouts`, `aborted`, and
+`effectiveTimeouts: { action, chat }` so a burst is readable at a glance.
+
+Regression tests: `08e` (cancellation is not retried / not a timeout) and `08f`
+(a real timeout is remembered and stays inside its own lane).

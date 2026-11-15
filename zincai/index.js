@@ -160,6 +160,9 @@ function loadConfig () {
     telemetry: raw.telemetry || {}
   }
 
+  cfg.vision.feedPort = settings.int('VISION_FEED_PORT', 0, { min: 0, max: 65535 })
+  cfg.vision.feedHost = settings.str('VISION_FEED_HOST', '127.0.0.1')
+
   cfg.inference.rpm = settings.int('INFERENCE_RPM', cfg.inference.rpm, { min: 1, max: 600 })
   cfg.inference.minIntervalMs = settings.int('INFERENCE_MIN_INTERVAL_MS', cfg.inference.minIntervalMs, { min: 0 })
   cfg.inference.heartbeatMs = settings.int('INFERENCE_HEARTBEAT_MS', cfg.inference.heartbeatMs, { min: 0 })
@@ -575,6 +578,8 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   // Runtime vanilla invariant: no slash-command can ever leave this process.
   const guard = installVanillaGuard(bot, { logger })
   bot.loadPlugin(pathfinder)
+  const visionNavigation = require('./vision_navigation').trackNavigation(bot)
+  bot.once('end', () => visionNavigation.dispose())
   // Network-level physical barrier: every primitive that could move the body or
   // change the world is refused while the body is paused, disconnected, dead or
   // outside its permissions. Installed BEFORE any subsystem gets the bot.
@@ -3342,7 +3347,10 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
             height: isPano ? VISION.panoramaHeight : VISION.height,
             maxDist: VISION.maxDistance,
             radius: VISION.mapRadius,
-            isHostile: (name) => isHostileMob(name, bot)
+            isHostile: (name) => isHostileMob(name, bot),
+            navigation: visionNavigation.snapshot(),
+            goal: goalReg.get(agenda.main?.goalId)?.description || null,
+            action: agenda.main?.tool || null
           })
         } catch (err) { return report('screenshot', { ok: false, msg: `could not render: ${String(err?.message || err).slice(0, 120)}` }) }
         shotsThisTurn++
@@ -3694,7 +3702,32 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   // ------------------------------------------------------ event wiring ---
   onBot('login', () => logger.info(TAG, `logged in as ${bot.username}`))
 
+  let visualFeed = null
+  bot.once('end', () => { if (visualFeed) visualFeed.close() })
   onBot('spawn', () => {
+    if (!visualFeed && VISION.feedPort) {
+      try {
+        visualFeed = require('./visual_feed').startVisualFeed(bot, {
+          host: VISION.feedHost, port: VISION.feedPort,
+          snapshot: () => {
+            const pos = bot.entity.position
+            const bearing = ((Math.atan2(-Math.sin(bot.entity.yaw || 0), Math.cos(bot.entity.yaw || 0)) * 180 / Math.PI) + 360) % 360
+            const facing = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'][Math.round(bearing / 45) % 8]
+            let biome = 'unknown'
+            try { biome = bot.blockAt(pos)?.biome?.name || biome } catch { /* unloaded */ }
+            const entities = Object.values(bot.entities || {}).filter(e => e && e !== bot.entity && e.position)
+              .map(e => ({ e, d: pos.distanceTo(e.position) })).filter(({ d }) => d <= 48)
+              .sort((a, b) => a.d - b.d).slice(0, 8)
+              .map(({ e, d }) => `${e.username || e.name || e.type || 'entity'} ${Math.round(d)}m${isHostileMob(e.name, bot) ? ' hostile' : ''}`)
+            return { position: { x: pos.x, y: pos.y, z: pos.z }, facing, dimension: dim(), biome,
+              health: bot.health, food: bot.food, goal: goalReg.get(agenda.main?.goalId)?.description || null,
+              action: agenda.main?.tool || null, navigation: visionNavigation.snapshot(), entities }
+          },
+          onError: err => logger.warn(TAG, `visual feed: ${err.message || err}`)
+        })
+        logger.info(TAG, `visual feed listening on ${VISION.feedHost}:${VISION.feedPort} (no authentication)`)
+      } catch (err) { logger.warn(TAG, `visual feed unavailable: ${err.message || err}`) }
+    }
     alive = true
     owner?.markDead?.(false)
     const first = !spawned

@@ -158,8 +158,11 @@ function inferBasis (provenance) {
 function scoreImportance (evt) {
   const text = String(evt && (evt.msg || evt.text || evt.summary) || '').toLowerCase()
   const type = String(evt && evt.type || '').toLowerCase()
-  if (type === 'build_complete' || type === 'gift' || /gave me|thanked|diamond|netherite/.test(text)) return 3
-  if (type === 'death' || type === 'combat_win' || type === 'leveled' || type === 'crafted') return 2
+  // Ordinary transient telemetry is not permanent knowledge. Promote only
+  // durable discoveries, commitments, relationship evidence, recurring lessons,
+  // and significant milestones; damage/movement/chat remain episodic windows.
+  if (/complaint|bug|limitation|promise|boundary|repeatedly|recurring/.test(text) || type === 'build_complete' || type === 'gift') return 2
+  if (type === 'death' || type === 'combat_win' || type === 'leveled' || type === 'crafted') return 1
   if (type === 'chat' || type === 'spawn' || type === 'move') return 1
   return 0
 }
@@ -422,23 +425,49 @@ class LongTermMemory {
         dup.occurrences = (dup.occurrences || 1) + (e.occurrences || 1)
         dup.updatedAt = Math.max(dup.updatedAt || dup.ts, e.updatedAt || e.ts)
         dup.importance = Math.max(dup.importance || 1, e.importance || 1)
+        // Preserve the source record and its ID as an auditable archive entry.
+        e.status = 'archived'
+        e.supersededBy = dup.id
+        e.archivedAt = this.now()
+        kept.push(e)
         continue
       }
       kept.push(e)
     }
     this.entries = kept
 
-    // 2. If still above maxEntries, evict non-foundational, contradicted/outdated or lowest-utility entries first.
-    if (this.entries.length > this.maxEntries) {
-      const evictRank = (e) => {
-        if (e.foundational) return 1e9 + (e.importance || 3) * 1000
-        const statusWeight = e.status === 'active' ? 100 : 0
-        return statusWeight + (e.importance || 0) * 50 + (e.confidence || 0.5) * 20 + ((e.updatedAt || e.ts) / 1e11)
+    // Never evict historical records: maxEntries controls active memory, while
+    // excess low-value records are archived with original IDs and provenance.
+    const active = this.entries.filter(e => e.status === 'active')
+    if (active.length > this.maxEntries) {
+      active.sort((a, b) => (a.importance || 0) - (b.importance || 0) || (a.confidence || 0) - (b.confidence || 0) || (a.updatedAt || a.ts) - (b.updatedAt || b.ts))
+      for (const e of active.slice(0, active.length - this.maxEntries)) {
+        if (e.foundational) continue
+        e.status = 'archived'
+        e.archivedAt = this.now()
       }
-      this.entries.sort((a, b) => evictRank(a) - evictRank(b))
-      this.entries = this.entries.slice(this.entries.length - this.maxEntries)
     }
     this._invalidateCache()
+    this.save()
+  }
+
+  /**
+   * Safe, deterministic maintenance pass. Keeps source records and IDs intact;
+   * archived episodic entries remain searchable via explicit history tooling.
+   */
+  maintain ({ now = this.now(), episodicTtlMs = 30 * 24 * 60 * 60_000 } = {}) {
+    let archived = 0
+    for (const entry of this.entries) {
+      const age = now - (entry.updatedAt || entry.ts || now)
+      if (entry.status === 'active' && entry.category === 'episodic' && !entry.foundational && (entry.importance || 0) <= 1 && age > episodicTtlMs) {
+        entry.status = 'archived'
+        entry.archivedAt = now
+        archived++
+      }
+    }
+    this.consolidate()
+    this.save()
+    return { archived, total: this.entries.length, active: this.entries.filter(e => e.status === 'active').length }
   }
 
   /**
@@ -500,7 +529,7 @@ class LongTermMemory {
     if (!q || !this.entries.length) return []
     const terms = tokenize(q)
     if (!terms.length) return []
-    const activeEntries = this.entries.filter((e) => e.status !== 'outdated')
+    const activeEntries = this.entries.filter((e) => e.status !== 'outdated' && e.status !== 'archived')
     const literal = activeEntries.filter((e) => fold(e.text).includes(q))
     const scored = []
     if (literal.length) {
@@ -528,7 +557,7 @@ class LongTermMemory {
     const q = embed(text)
     const scored = []
     for (const e of this.entries) {
-      if (e.status === 'outdated') continue
+      if (e.status === 'outdated' || e.status === 'archived') continue
       const v = e._vec || (e._vec = embed(e.text))
       const sim = cosine(q, v)
       if (sim <= 0.05) continue
@@ -570,7 +599,7 @@ class LongTermMemory {
 
     const scored = []
     for (const e of this.entries) {
-      if (e.status === 'outdated') continue
+      if (e.status === 'outdated' || e.status === 'archived') continue
       if (e.status === 'contradicted' && !includeContradicted) continue
       if (category && e.category !== category) continue
       if (sinceMs !== null && (e.updatedAt || e.ts) < sinceMs) continue
@@ -661,7 +690,8 @@ class MemorySystem {
         evt.msg || evt.text || JSON.stringify(evt),
         evt.tags || [evt.type || 'misc'],
         Math.max(1, importance),
-        { kind: 'event', source: String(evt.type || 'unknown') },
+        evt.provenance || { kind: evt.basis === 'reported' ? 'player claim' : evt.basis === 'inferred' ? 'inferred event' : 'direct observation', source: String(evt.sender || evt.type || 'unknown') },
+
         {
           category: evt.category || 'episodic',
           basis: evt.basis || 'observed',

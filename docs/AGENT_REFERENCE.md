@@ -19,6 +19,65 @@ Dense, factual specification of `minecraft-harness` for AI coding agents and con
 
 ---
 
+## 1b. Memory Architecture (three stores, one facade)
+
+`MemorySystem` (`zincai/memory.js`) is the only memory object the runtime talks
+to. It owns three physically separate stores plus volatile working context.
+
+| Store | Path | Contents | Automatic prompt use |
+| --- | --- | --- | --- |
+| Raw history | `data/history/<category>/<YYYY-MM-DD>.jsonl` (+ `<day>.idx.json` keyword sidecars) | every observation, chat line, tool outcome, decision, relationship event and error; append-only | **never** — only explicit `memory {operation:"history"}` searches (newest files first, ≤`maxScanFiles` files, ≤`maxFileBytes` each) |
+| Entity dossiers | `data/entities/<kind>-<id>.json`, `data/entities/index.json` | long-form Markdown-backed documents: player (UUID-keyed), self, place, group, event; sections `identity, description, interactions, preferences, behavior, facts, uncertainties, timeline, notes`; `evidence[]`, `memoryIds[]` | `recognitionBlock()` for visible/speaking/referenced players, budgeted |
+| Curated memories | `data/memories.json` | short records: category, `basis` (`observed`/`reported`/`inferred`), confidence, importance, stable id, `evidence[]` (history refs), `profileId`, `status` (`active`/`outdated`/`contradicted`/`archived`/`deleted`) | `contextBlock()` (goal + position + entity + players), budgeted per compaction level |
+| Working context | in-process | `working` (last 5), `shortTerm` (10 min), `ephemeral` (30 s), preferences | prompt sections, never persisted as knowledge |
+
+Hard rules enforced by the implementation:
+
+- Telemetry types (`hurt`, `heal`, `entity_hurt`, `player_arrived`, `player_left`,
+  `dimension`, `inventory`, `weather`, `move`, …) are history-only; curated
+  promotion requires importance ≥ 3 **and** a non-telemetry type, or an explicit
+  `promote: true`.
+- Player identity is the UUID. A name-only dossier is upgraded in place on first
+  UUID sighting; a different UUID reusing a username gets its own dossier.
+- `archive`/`delete` only change the curated row (`deleted`/`archived`, restorable);
+  raw history files are never touched. `maintain()` merges true duplicates
+  (cosine ≥ 0.94, same category/basis/location), supersedes old `subjectKey`
+  versions as `outdated`, archives expired low-value episodes, and never evicts
+  `foundational` records.
+- Corrupt dossiers are quarantined as `<file>.corrupt-<ts>` and rebuilt; corrupt
+  curated JSON starts empty; partial NDJSON lines are skipped on read.
+- `HistoryLog.append` coalesces an identical line inside a 45 s window into
+  `repeats` instead of appending a second record.
+- Only durable chat is curated: a player line becomes a `reported` claim when it
+  carries a coordinate, a structure/container, ownership or a stated preference
+  (or an agreement). Small talk stays in raw history and in the dossier's
+  evidence. A reported claim recorded without explicit evidence is anchored to
+  the most recent chat/relationship history record.
+- `maintain()` also archives rows written by older builds that promoted ordinary
+  telemetry ("X took damage 16m away") and clears their `foundational` flag, and
+  seeds name-only player dossiers from recurring legacy memories (upgraded in
+  place when the UUID is later observed).
+
+### Automatic retrieval (one budgeted block per turn)
+
+`MemorySystem.contextBlock()` composes, in this order, inside
+`memory.recallBudgetChars` (820 at L0 → 220 at L4, shrinking with compaction):
+
+1. `recognitionBlock()` — up to 2 players in front of Zinc, resolved by UUID →
+   one dossier line each (identity basis, relationship stance/trust, last fact).
+2. Curated recall — sparse-embedding + keyword + entity + proximity + goal +
+   recency ranking, `recallTopK` 3 (2 at L4), 45% of the budget.
+3. `past attempts (raw log):` — at L0/L1 only, a ≤4-file keyword search of
+   `errors`/`decisions`/`actions` for the current goal/query, 2 lines. Never a
+   dump; skipped when less than 140 characters of budget remain.
+
+The block is cached for 3 s keyed by query/goal/position/players/level, so a
+prompt rebuild does not re-rank. `memory {operation:"history"}` is the way to ask
+for more; measured cost with 400 curated records and 60 history files is
+~0.6 ms per uncached build (test 13n).
+
+---
+
 ## 2. Boot Chain & Exports (`zincai/index.js`)
 
 ```text
@@ -91,7 +150,10 @@ CLI: node zincai/index.js [--dry-run | --check]
 | `places.js` | `PlaceIndex` (`places.named`, containers, workstations; `data/places.json`) |
 | `block_search.js`, `block_inspect.js`, `region_inspect.js` | Fast block lookup and honest paginated inspection |
 | `goals.js` | `GoalRegistry` (`STATUS`: `active`, `queued`, `waiting`, `resumable`, `blocked`, `completed`, `failed`, `cancelled`; `list()`, `openGoals()`, `suspendAll()`) |
-| `memory.js` | `MemoryStore` (working, short-term, episodic/procedural; `data/memories.json`) |
+| `memory.js` | `MemorySystem` facade + `LongTermMemory` curated store (`data/memories.json`): stable ids, `get`/`update`/`archive`/`restore`/`remove`/`merge`/`duplicates`/`search`, evidence links, non-destructive `maintain`; automatic `contextBlock`/`recognitionBlock` |
+| `memory_text.js` | Shared tokenizer, accent folding, synonym table, sparse bag-of-words embed/cosine, whole-word match, clipping — used by all three memory stores |
+| `history.js` | `HistoryLog`: append-only NDJSON raw history under `data/history/<category>/<day>.jsonl`, per-file keyword sidecar index, bounded `search`/`read`, coalesced repeats, opt-in age pruning of world/chat/actions only |
+| `entities.js` | `ProfileStore`: one JSON+Markdown dossier per subject under `data/entities/` (players keyed by UUID, name-only upgrade, rename handling), sections, evidence/memory links, merge, quarantine on corruption |
 | `continuity.js` | `ContinuityStore` (`getRelationship`, social stances, evidence; `data/continuity.json`) |
 | `journal.js` | `Journal` (goal plans & session digest; `data/journal.json`) |
 | `telemetry.js` | `TelemetryRecorder`, `makeSessionId`, `setContinuationProvider`, `lifecycle`, `worldEvent`, `reflexEvent`, `chatIn`, `chatOut`, `modelRequest`, `modelResponse`, `toolExec`, `screenshot` (archives session PNGs under `sessions/<id>/screenshots/`), `goalEvent`, `combatEvent`, `operatorCommand`, `error`, `flush`, `close` |
@@ -156,8 +218,9 @@ CLI: node zincai/index.js [--dry-run | --check]
 | | `circuit_project` | `{ operation: 'list'\|'show'\|'save'\|'delete', name?, ... }` |
 | **Social & Meta** | `say` | `{ text, to? }` |
 | | `goal` | `{ operation: 'add'\|'update'\|'complete'\|'fail'\|'cancel'\|'list', ... }` |
+| | `memory` | `{ operation: recall\|search\|read\|remember\|update\|archive\|delete\|restore\|merge\|duplicates\|link\|profile\|profiles\|history\|organize, ... }` |
 | | `note` | `{ text, interest?, tags? }` |
-| | `recall` | `{ query, limit? }` |
+| | `recall` | `{ query, category?, entity?, goal?, x/y/z? }` |
 | | `social` | `{ operation: 'show'\|'update', player, stance?, trust?, confidence?, willingness?, opinion?, evidence? }` |
 | | `idle` | `{ reason? }` |
 
@@ -178,6 +241,15 @@ CLI: node zincai/index.js [--dry-run | --check]
 | `death.respawnDelayMs` | integer | `1500` | `0..60000` |
 | `control.allowConsole` | boolean | `true` | — |
 | `control.auditLog` | boolean | `true` | — |
+
+`zincai/config/defaults.json` → `memory` (not operator-settable at runtime):
+`file`, `preferencesFile`, `workingMax` (5), `shortTermMinutes` (10),
+`ephemeralMs` (30000), `topK` (3), `factsPerPlayer` (6), `chatRecallMaxAgeMs`
+(120000), `recallBudgetChars` (820), `maxEntries` (500), `episodicTtlMs`
+(30 days), `maintenanceCheckMs` (60000), `maintenanceIntervalMs` (6 h),
+`maintenance.activeThreshold` (400), `maintenance.duplicateThreshold` (0.94),
+`history.dir` (`data/history`), `history.retainDays` (`0` = keep everything),
+`entities.dir` (`data/entities`).
 
 ### Console Commands (`zincai/control_commands.js`)
 `status`, `pause`, `stop`, `resume`, `leave`, `join`, `restart-connection`, `goals`, `jobs`, `cancel <goal-id>`, `config [show [group|name] | set <name> <value> | reset <name>]`, `update [check|force]`, `restart`, `shutdown [exit-code]`, `help`.
@@ -223,6 +295,50 @@ Note: `openGoals` includes all non-terminal goals (`!['completed', 'failed', 'ca
 ### `data/latest.json`
 Points to `{ sessionId, status, startedAt, updatedAt, eventsFile, continuationFile, stats }`.
 
+### `data/memories.json` (curated)
+JSON array. One record:
+```json
+{
+  "id": "m...", "ts": 1794693600000, "createdAt": "ISO", "updatedAt": 1794693600000,
+  "lastVerifiedAt": 1794693600000,
+  "text": "Chest 1 holds 12 iron ingots and 4 gold",
+  "category": "semantic", "basis": "observed", "confidence": 0.95, "importance": 3,
+  "foundational": true, "tags": ["container", "chest1"], "entities": ["Faylan25"],
+  "location": { "x": 10, "y": 64, "z": 20, "dim": "overworld" },
+  "goalIds": [], "subjectKey": "container:chest1", "status": "active",
+  "occurrences": 3, "revision": 1,
+  "evidence": ["world/2026-11-15.jsonl#42"],
+  "profileId": "player:069a79f4-44e9-4726-a6b4-7a5b2f5d3a11",
+  "provenance": { "kind": "direct_observation", "source": "world" }
+}
+```
+`previousText` preserves an edited value; `archiveReason`/`deletedAt`/`lastEditReason`
+record lifecycle changes; `mergedFrom[]`/`supersededBy` link merges. Archived and
+deleted records remain on disk (restorable); only `hard:true` deletes the row.
+
+### `data/entities/<kind>-<id>.json` (dossiers)
+One file per subject. Player ids are `player:<uuid>` (`player:name:<slug>` until a
+UUID is seen, upgraded in place). Fields: `schema, id, kind, uuid, identityBasis,
+names[], aliasesStale[], displayName, firstSeenAt, lastSeenAt, interactions,
+relationship{stance,trust,confidence,willingness,assessment,evidence[]},
+sections{identity,description,interactions,preferences,behavior,facts,uncertainties,timeline,notes},
+doc, evidence[{ref,at,note}], memoryIds[], tags[], status, mergedFrom[], revision,
+createdAt, updatedAt`. `index.json` maps uuid/name → id and is rebuilt by scanning
+the directory when missing or corrupt.
+
+### `data/history/<category>/<day>.jsonl` (raw)
+One JSON record per line:
+```json
+{ "id": "h-...", "ref": "world/2026-11-15.jsonl#42", "at": 1794693600000,
+  "iso": "ISO", "cat": "world", "kind": "entity_hurt", "text": "...",
+  "entities": ["Steve"], "uuid": null, "where": {"x":10,"y":64,"z":20,"dim":"overworld"},
+  "session": "...", "importance": 1, "repeats": null, "data": {} }
+```
+`<day>.idx.json` holds `{day, records, tokens{}, entities[], uuids[], kinds{},
+firstAt, lastAt}` and is what makes an old record findable without scanning every
+file. `history.search()` returns hits ranked by keyword/entity/kind + recency with
+`ref`, `scannedFiles`, `candidateFiles`, `truncated`.
+
 ---
 
 ## 7. Real-Server Simulation Testing (`test/`)
@@ -232,7 +348,7 @@ All tests run against **real local Minecraft 1.21.4 servers (`flying-squid@^1.12
 ### Commands
 ```sh
 npm run check                # syntax check every JS module
-npm test                     # node --test test/*.test.js (all 9 suites, 18 end-to-end tests)
+npm test                     # node --test test/*.test.js (13 suites, 49 tests)
 AMD_API_KEY=rc-test npm run dry-run
 npm run pufferpanel:validate
 ```

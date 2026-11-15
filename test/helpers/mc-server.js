@@ -85,7 +85,11 @@ function getFreePort () {
   })
 }
 
-async function waitFor (fn, { timeoutMs = 15_000, intervalMs = 50, label = 'condition' } = {}) {
+// Generous default: `node --test` runs several real flying-squid servers in
+// parallel, and chunk streaming on a loaded machine can take many seconds. The
+// helper still resolves as soon as the condition is true, so a higher ceiling
+// only affects genuinely stuck cases.
+async function waitFor (fn, { timeoutMs = 30_000, intervalMs = 50, label = 'condition' } = {}) {
   const deadline = Date.now() + timeoutMs
   let lastErr = null
   while (Date.now() < deadline) {

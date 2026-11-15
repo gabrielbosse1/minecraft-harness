@@ -39,11 +39,33 @@ The LLM layer (`brain.js`, `api_wrapper.js`, `lanes.js`, `src/amdClient.js`) spl
 - Runs concurrently with ongoing walking, gathering, or building so conversation never stalls waiting for a physical task.
 
 ### Action Lane
-- Uses `system_prompt.txt` plus the live world snapshot (`perception.js`), IRC timeline, threat summary (`tactics.js`), open goals (`goals.js`), active plan digest (`journal.js`), and social/memory recalls.
+- Uses `system_prompt.txt` plus the live world snapshot (`perception.js`), IRC timeline, threat summary (`tactics.js`), open goals (`goals.js`), active plan digest (`journal.js`), and one budgeted memory block (dossiers of the players present, curated recall for the goal/position/request, and a short `past attempts (raw log)` warning).
 - Exposes all **39 function tools** identically on every call (`ACTION_TOOLS` in `api_wrapper.js`) so prompt prefix caching stays warm.
 - Executes multi-step tool loops (`think → tool calls → tool outputs → think`) up to `inference.maxStepsPerTurn` (default 6).
 - Extracts and records `reasoning` (`reasoning_content` / `reasoning` / `<think>`) alongside tool calls and token usage in session telemetry.
 - Uses a `situationVersion` counter so stale decisions formed before a sudden reflex interrupt (damage, flee start, death) are discarded instead of executing outdated actions.
+
+---
+
+## 2b. Memory Architecture
+
+Memory is three separate stores behind one facade (`zincai/memory.js`), because
+they answer different questions and have different costs:
+
+| Layer | Question it answers | Store | Fed to the prompt |
+| --- | --- | --- | --- |
+| Working memory | "what is happening right now?" | in-process rings (`working`, `shortTerm`, `ephemeral`) | yes, small and volatile |
+| Curated memories | "what do I know that matters?" | `data/memories.json` (id, category, basis, confidence, importance, evidence refs, status) | yes, ranked and budgeted |
+| Entity dossiers | "who/what is this, in depth?" | `data/entities/*.json` (Markdown section bodies, UUID identity, relationship, evidence, linked memories) | one summary line per visible player; the full document only on request |
+| Raw history | "what exactly happened?" | `data/history/<category>/<day>.jsonl` + keyword sidecars | never automatically; bounded search only |
+
+Invariants: curated records are never the only copy of a fact (raw history is
+append-only and independent); archive/soft-delete never touches history; player
+identity is the Minecraft UUID; telemetry and ordinary chat are history-only;
+maintenance (idle, or ≥400 active records / every 6 h) merges true duplicates,
+supersedes outdated versions, archives noise and reports gaps — it never deletes
+foundational records or evidence. Retrieval is budgeted per compaction level and
+cached for 3 seconds; measured cost is well under a millisecond for a full store.
 
 ---
 

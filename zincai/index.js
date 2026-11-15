@@ -219,6 +219,11 @@ function makeShared (cfg, { dataDir = DATA_DIR } = {}) {
     memory: new MemorySystem({
       file: memoryFile,
       preferencesFile: at(cfg.memory.preferencesFile, 'preferences.json'),
+      dataDir,
+      historyDir: at(cfg.memory.history?.dir, 'history'),
+      entitiesDir: at(cfg.memory.entities?.dir, 'entities'),
+      maxEntries: cfg.memory.maxEntries ?? 500,
+      retainDays: cfg.memory.history?.retainDays ?? 0,
       workingMax: cfg.memory.workingMax,
       shortTermMinutes: cfg.memory.shortTermMinutes,
       ephemeralMs: cfg.memory.ephemeralMs ?? 30_000
@@ -492,6 +497,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     maxBuffer: cfg.telemetry?.maxBuffer ?? 50,
     logger: (level, msg) => logger[level]?.(TAG, msg)
   }))
+  try { memory.setSessionId(telemetry.sessionId) } catch { /* history works without a session id */ }
   const owner = host || shared.host || null
   // The shared enforcement boundary. It is consulted by the lane scheduler,
   // by every lane's key/goal write, by each physical tool and by the bot-level
@@ -717,8 +723,27 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   // throws; a perception failure must never take the session down.
   const pipeline = shared.events
   const latency = pipeline.latency
+  // Telemetry event types that belong in raw history (and dossiers), never in
+  // curated memory. Kept as a named constant so the rule is auditable.
+  const { TELEMETRY_ONLY_TYPES: TELEMETRY_ONLY_MEMORY_TYPES } = require('./memory')
   const recentEntityPos = new Map() // entity id -> {x,y,z,at}
   const lastSeenPlayers = new Set()
+  /** Minecraft UUID of a known player, if the server has told us one. */
+  const uuidOf = (name) => {
+    const entry = bot.players?.[name]
+    return entry?.uuid || entry?.entity?.uuid || null
+  }
+  /**
+   * Every failure worth investigating lands in the raw error log. The model is
+   * never shown this automatically; `memory {operation:"history"}` can search it.
+   */
+  const recordError = (kind, err) => {
+    try {
+      const errText = `${kind}: ${err?.message || err}`
+      const stack = err?.stack ? String(err.stack).split('\n').slice(1, 4).join(' | ') : null
+      memory.history.append('errors', stack ? `${errText} (at ${stack})` : errText, { kind, importance: 2 })
+    } catch { /* diagnostics must never throw */ }
+  }
   const perceive = (spec = {}) => {
     let rec = null
     try {
@@ -752,6 +777,25 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         importance: spec.importance ?? 0
       })
     } catch { /* telemetry best effort */ }
+    // RAW HISTORY: the complete record of what happened, separate from curated
+    // memory. This is what a curated memory's `evidence` reference points at,
+    // and it is never fed to the model automatically.
+    let historyRef = null
+    try {
+      const saved = memory.history.recordPerceived({
+        eventType: spec.memoryType || spec.eventType || spec.type || 'event',
+        source: spec.source || 'world',
+        summary: spec.summary || spec.text || spec.msg,
+        entities: spec.entities || [],
+        uuid: spec.uuid || (spec.sender ? uuidOf(spec.sender) : null),
+        where: spec.where === undefined ? here() : (spec.where || null),
+        importance: spec.importance ?? 0,
+        observedAt: spec.observedAt || Date.now(),
+        dedupeKey: spec.dedupeKey
+      })
+      historyRef = saved?.ref || null
+      if (rec && historyRef) rec.historyRef = historyRef
+    } catch { /* history is evidence, never a reason to fail the event */ }
     if (spec.remember !== false) {
       note({
         type: spec.memoryType || spec.eventType || 'event',
@@ -760,11 +804,21 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         sender: spec.sender
       })
     }
-    // Important perceived events become episodic long-term memories with their
-    // real provenance, so a restart can recall them (with occurrence honesty).
-    if ((spec.importance ?? 0) >= 2 && spec.persist !== false && spec.eventType !== 'chat') {
+    // Only MEANINGFUL events become curated memories; ordinary telemetry stays
+    // in raw history. `player_arrived`, `entity_hurt`, `hurt`, `heal` and friends
+    // used to fill the store with hundreds of "X took damage 16m away" rows that
+    // drowned every real memory in recall. They now live in history, and player
+    // events additionally land in that player's dossier.
+    const memoryType = String(spec.memoryType || spec.eventType || spec.type || '').toLowerCase()
+    const curatedWorthy = spec.persist === true || (
+      (spec.importance ?? 0) >= 3 &&
+      !TELEMETRY_ONLY_MEMORY_TYPES.has(memoryType) &&
+      memoryType !== 'chat' &&
+      spec.persist !== false
+    )
+    if (curatedWorthy) {
       try {
-        memory.longTerm.add(spec.summary || spec.text, ['event', spec.eventType], spec.importance, {
+        memory.longTerm.add(spec.summary || spec.text, ['event', memoryType], spec.importance, {
           kind: spec.observationBasis === 'reported' ? 'reported' : 'world_observation',
           source: spec.source || 'world'
         }, {
@@ -772,7 +826,8 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
           basis: spec.observationBasis === 'reported' ? 'reported' : (spec.occurrenceTimeKnown === false ? 'inferred' : 'observed'),
           confidence: spec.occurrenceTimeKnown === false ? 0.7 : 0.9,
           location: spec.where ? { x: Math.floor(spec.where.x ?? spec.where[0] ?? 0), y: Math.floor(spec.where.y ?? 0), z: Math.floor(spec.where.z ?? 0), dim: dim() } : null,
-          entities: spec.entities || []
+          entities: spec.entities || [],
+          evidence: historyRef ? [historyRef] : []
         })
       } catch { /* memory best-effort */ }
     }
@@ -866,7 +921,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   }
 
   // ------------------------------------------------------ action results --
-  const INFORMATIONAL = new Set(['find', 'look_in', 'inspect_block', 'inspect_region', 'screenshot', 'logic_test', 'redstone_scan', 'redstone_component', 'redstone_engineer', 'recall', 'circuit_project', 'goal', 'note', 'social', 'remember_here'])
+  const INFORMATIONAL = new Set(['find', 'look_in', 'inspect_block', 'inspect_region', 'screenshot', 'logic_test', 'redstone_scan', 'redstone_component', 'redstone_engineer', 'recall', 'circuit_project', 'goal', 'note', 'social', 'remember_here', 'memory'])
   // stop the model re-issuing a call the body keeps refusing.
   const failGate = new FailGate({
     windowMs: cfg.inference?.failWindowMs ?? 120_000,
@@ -929,6 +984,28 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     }
     const resultTs = Date.now()
     results.push({ label, ok: Boolean(r.ok), msg, ts: resultTs, at: new Date(resultTs).toISOString(), actId: finalActId })
+    // RAW HISTORY: every tool outcome, with who asked for it and whether it
+    // worked. This is the evidence trail a curated "lesson" points back to.
+    try {
+      const args = (gateCtx && String(gateCtx.a) === label) ? gateCtx : null
+      memory.history.append('actions', `${label}${r.ok ? '' : ' FAILED'}: ${msg}`, {
+        kind: r.ok ? 'action_ok' : 'action_failed',
+        at: resultTs,
+        entities: [args?.player, args?.place, agenda.main?.askedBy].filter(Boolean),
+        importance: r.ok ? 1 : 2,
+        maxText: 600,
+        data: {
+          tool: label,
+          ok: Boolean(r.ok),
+          actId: finalActId,
+          // Only small scalar arguments are kept: a build grid does not belong
+          // in an evidence line.
+          args: args
+            ? Object.fromEntries(Object.entries(args).filter(([, v]) => ['string', 'number', 'boolean'].includes(typeof v)).slice(0, 8).map(([k, v]) => [k, typeof v === 'string' ? v.slice(0, 120) : v]))
+            : null
+        }
+      })
+    } catch { /* history best effort */ }
     if (results.length > 5) results.splice(0, results.length - 5)
     // Confirm-time instrumentation + a timestamped event carrying which of
     // Zinc's own actions this result belongs to (`[by your actN]` in prompts).
@@ -2088,9 +2165,23 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       ...(continuity.identity.interests || []).slice(0, 2),
       rawNamed.slice(0, 80)
     ].filter(Boolean).join(' ')
-    // Memories are high-priority preserved context across EVERY compaction tier.
+    // Automatic recall: relevant curated memories PLUS the dossiers of the
+    // players in front of Zinc, inside one bounded context budget. It is
+    // preserved across every compaction tier (smaller, never absent).
     const recallTopK = level >= 4 ? Math.min(2, cfg.memory.topK ?? 3) : (cfg.memory.topK ?? 3)
-    const recalled = memory.recallBlock(autoQuery, recallTopK)
+    const recallBudget = level >= 4 ? 220 : level === 3 ? 320 : level === 2 ? 460 : level === 1 ? 620 : (cfg.memory.recallBudgetChars ?? 820)
+    const recalled = memory.contextBlock({
+      query: autoQuery,
+      goal: agenda.main ? { id: agenda.main.goalId || null, description: agenda.main.label } : null,
+      near: pos ? { x: pos.x, y: pos.y, z: pos.z, dim: dim() } : null,
+      players: Object.entries(bot.players || {})
+        .filter(([name, p]) => name !== bot.username && p?.entity?.position)
+        .slice(0, level >= 4 ? 1 : 2)
+        .map(([name]) => name),
+      budgetChars: recallBudget,
+      topK: recallTopK,
+      level
+    })
     const prefs = level < 4 ? memory.preferencesLine() : ''
     const chatMax = level >= 4 ? 2 : level === 3 ? 3 : level === 2 ? 6 : level === 1 ? 10 : 16
     const chat = chatLines(chatMax, { maxAgeMs: cfg.inference?.logMaxAgeMs ?? 15 * 60_000 })
@@ -2119,12 +2210,6 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         .map((e) => String(e.text || e.msg))
       : []
     const justNow = ephItems.length ? `just now: ${ephItems.join('; ').slice(0, 220)}` : null
-    const visiblePlayersLimit = level >= 4 ? 2 : 3
-    const factsPerVisible = level >= 4 ? 1 : 2
-    const visibleFacts = Object.entries(bot.players || {})
-      .filter(([name, p]) => name !== bot.username && p?.entity?.position)
-      .slice(0, visiblePlayersLimit)
-      .flatMap(([name]) => memory.factsAbout(name, factsPerVisible).map((f) => `${name}: ${f}`))
     const liveResultIds = new Set(results.slice(-resKeep).map((r) => r.actId).filter(Boolean))
     const relevantPlayers = [
       ...Object.keys(bot.players || {}).filter((n) => n !== bot.username),
@@ -2151,7 +2236,6 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     const lines = [
       coreIdentity(),
       continuityBlock || null,
-      visibleFacts.length ? `visible player memories (name-based, unverified): ${visibleFacts.join(' | ')}` : null,
       observe.selfLine(bot),
       level < 3 ? (armor.brief() || null) : null,
       invLine,
@@ -2245,6 +2329,11 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     const knownMax = level >= 4 ? 2 : level === 3 ? 3 : level === 2 ? Math.min(4, cfg.memory.factsPerPlayer ?? 6) : (cfg.memory.factsPerPlayer ?? 6)
     const known = memory.factsAbout(sender, knownMax)
     const relLine = level < 4 ? continuity.formatRelationship(sender) : null
+    // Recognition before answering: the dossier of the person speaking, kept
+    // short; the full document is one `memory` call away.
+    const dossierLine = level < 4
+      ? memory.recognitionBlock([sender], { uuidOf, maxChars: level >= 3 ? 220 : 380 })
+      : ''
 
     // THE LOG. One IRC-style window: what was already there (chat and events,
     // each with its clock time), a marker, then everything that arrived since
@@ -2282,6 +2371,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       level < 3 ? agendaLine() : null,
       level < 4 ? goalBriefLine() : null,
       relLine ? `relationship with ${relLine}` : null,
+      dossierLine || null,
       ...(level < 4 ? threatBrief() : []),
       level < 3 ? observe.playersLine(bot) : null,
       roomLine(),
@@ -2519,6 +2609,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         }
       } catch (err) {
         try { telemetry.error(`action_step_${step}`, err) } catch { /* noop */ }
+        recordError(`action_step_${step}`, err)
         if (step === 1) throw err
         logger.warn(TAG, `turn step ${step} failed (${err?.message || err}); the turn ends here`)
         break
@@ -3369,9 +3460,10 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
           k: cfg.memory.topK ?? 4
         })
         const lines = res.entries.length
-          ? res.entries.map((h) => `- [${h.category}${h.basis !== 'observed' ? `, ${h.basis}` : ''}${h.status !== 'active' ? `, ${h.status}` : ''} | score ${h.score}] ${memory.formatEntry(h)}`).join('\n')
+          ? res.entries.map((h) => `- (#${h.id}) [${h.category}${h.basis !== 'observed' ? `, ${h.basis}` : ''}${h.status !== 'active' ? `, ${h.status}` : ''} | score ${h.score}] ${memory.formatEntry(h)}${(h.evidence || []).length ? ` (evidence: ${h.evidence.slice(-1)[0]})` : ''}`).join('\n')
           : `nothing relevant found — ${res.unknownReason}`
-        const header = `recall "${String(action.query || '').slice(0, 60)}" (${res.entries.length}/${res.totalStoreSize} stored memories considered)`
+        const dossier = action.entity ? memory.recognitionBlock([String(action.entity)], { uuidOf, maxChars: 300 }) : ''
+        const header = `recall "${String(action.query || '').slice(0, 60)}" (${res.entries.length}/${res.totalStoreSize} stored memories considered)${dossier ? `\n${dossier}` : ''}`
         return report('recall', { ok: true, msg: `${header}\n${lines}` })
       }
       case 'redstone_scan':
@@ -3477,37 +3569,221 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
             }
             const loc = `${p.x},${p.y},${p.z} (${dim()})`
             memory.longTerm?.upsertByTag(`place:${String(action.name).toLowerCase()}`, `saved place "${action.name}" at ${loc}${ownership ? ` [${ownership}${action.owner ? ':' + action.owner : ''}]` : ''}${action.note ? `: ${action.note}` : ''}`, ['place', String(action.name).toLowerCase()], 2)
+            // Places are subjects too: keep a dossier with coordinates,
+            // ownership basis and provenance for the named place.
+            try {
+              const profile = memory.profiles.ensure({ kind: 'place', name: String(action.name), at: Date.now() })
+              if (profile) {
+                memory.profiles.appendNote(profile.id, 'facts', `location ${loc}${ownership ? `, ownership: ${ownership}${action.owner ? ` (${action.owner})` : ''}` : ''}`, { source: 'remember_here' })
+                if (action.note) memory.profiles.appendNote(profile.id, 'description', String(action.note), { source: 'remember_here' })
+              }
+            } catch { /* dossier best effort */ }
           } catch { /* noop */ }
           res.msg += homeMsg
         }
         return report('remember_here', res, { wake: null })
       }
       case 'memory': {
-        const operation = String(action.operation || '').toLowerCase()
-        if (operation === 'recall') {
-          const found = memory.longTerm.retrieve({ query: String(action.query || ''), entity: action.entity || null, k: cfg.memory.topK ?? 4 })
-          return report('memory', { ok: true, msg: found.entries.length ? found.entries.map(e => `#${e.id} ${memory.formatEntry(e)}`).join('\\n') : 'no relevant active memory found' })
+        const operation = String(action.operation || 'recall').toLowerCase()
+        const entity = action.entity ? String(action.entity).trim() : null
+        const entryOf = (id) => memory.longTerm.get(String(id || '').trim())
+        const fmtHit = (e) => `#${e.id} [${e.category}${e.basis !== 'observed' ? `, ${e.basis}` : ''}${e.status !== 'active' ? `, ${e.status}` : ''}] ${memory.formatEntry(e)}${(e.evidence || []).length ? ` (evidence: ${e.evidence.slice(-2).join(', ')})` : ''}`
+        const safeToOrganize = () => !agenda.main && !skills?.current() && !task && !combat?.isEngaged && !system1?.fleeing && !brain?.pending?.length
+        const remember = (res) => {
+          try {
+            const kind = `memory_${operation}`
+            memory.history.append('decisions', `memory ${operation}: ${res.msg}`, {
+              kind,
+              at: Date.now(),
+              entities: [entity, action.id].filter(Boolean),
+              importance: res.ok ? 1 : 2
+            })
+          } catch { /* history best effort */ }
+          return report('memory', res)
         }
+
+        if (operation === 'recall' || operation === 'search') {
+          const near = [action.x, action.y, action.z].every(Number.isInteger)
+            ? { x: action.x, y: action.y, z: action.z, dim: dim() }
+            : null
+          const found = memory.longTerm.search({
+            query: String(action.query || ''),
+            category: ['episodic', 'semantic', 'procedural', 'continuity'].includes(String(action.category)) ? String(action.category) : null,
+            entity,
+            near,
+            goalId: action.goal ? String(action.goal) : null,
+            status: String(action.status || 'active'),
+            k: Number.isInteger(action.limit) ? Math.max(1, Math.min(20, action.limit)) : (cfg.memory.topK ?? 4)
+          })
+          const lines = found.entries.length ? found.entries.map(fmtHit).join('\n') : `nothing relevant found — ${found.unknownReason}`
+          return report('memory', { ok: true, msg: `recall "${String(action.query || entity || '').slice(0, 60)}" (${found.entries.length}/${found.totalStoreSize} stored memories considered)\n${lines}` })
+        }
+
+        if (operation === 'read') {
+          const entry = entryOf(action.id)
+          if (!entry) return report('memory', { ok: false, msg: `memory #${action.id || '?'} not found` })
+          const bits = [
+            `#${entry.id} [${entry.category} | ${entry.basis} | ${entry.status}] importance ${entry.importance}, confidence ${Math.round((entry.confidence ?? 0) * 100)}%, created ${String(entry.createdAt).slice(0, 10)}, updated ${new Date(entry.updatedAt || entry.ts).toISOString().slice(0, 10)}`,
+            entry.text,
+            entry.previousText ? `previous version: ${entry.previousText}` : null,
+            (entry.tags || []).length ? `tags: ${entry.tags.join(', ')}` : null,
+            (entry.entities || []).length ? `entities: ${entry.entities.join(', ')}` : null,
+            entry.location ? `location: ${entry.location.x},${entry.location.y},${entry.location.z} ${entry.location.dim || ''}` : null,
+            entry.profileId ? `profile: ${entry.profileId}` : null,
+            entry.uncertainty ? `uncertainty: ${entry.uncertainty}` : null,
+            (entry.mergedFrom || []).length ? `merged from: ${entry.mergedFrom.join(', ')}` : null,
+            (entry.evidence || []).length ? `evidence: ${entry.evidence.join(', ')}` : 'evidence: none linked',
+            entry.contradictionNote ? `contradicted: ${entry.contradictionNote}` : null
+          ].filter(Boolean)
+          return report('memory', { ok: true, msg: bits.join('\n') })
+        }
+
         if (operation === 'remember') {
-          const category = String(action.category || 'episodic')
-          const mapped = ['semantic', 'procedural', 'continuity'].includes(category) ? category : (category === 'preference' ? 'continuity' : 'episodic')
+          const category = String(action.category || 'semantic')
+          const mapped = ['semantic', 'procedural', 'continuity'].includes(category) ? category : (category === 'episodic' ? 'episodic' : 'semantic')
           const basis = ['observed', 'reported', 'inferred'].includes(action.basis) ? action.basis : 'inferred'
-          const entry = memory.recordKnowledge({ text: action.text, category: mapped, basis, confidence: basis === 'observed' ? 0.92 : basis === 'reported' ? 0.4 : 0.65, importance: mapped === 'episodic' ? 2 : 3, tags: [category, 'agent_selected'], entities: action.entity ? [action.entity] : [], source: basis === 'reported' ? String(action.entity || 'player') : 'Zinc' })
-          return report('memory', { ok: Boolean(entry), msg: entry ? `stored ${category} memory #${entry.id} (${basis})` : 'memory text was empty' })
+          const text = String(action.text || '').trim()
+          // Long-form notes about a subject go into that subject's dossier,
+          // with a short curated memory pointing at it.
+          if (entity && (action.section || action.doc)) {
+            const uuid = uuidOf(entity)
+            const profile = memory.ensureSubject(entity, { uuid })
+            if (!profile) return report('memory', { ok: false, msg: `no dossier for "${entity}"` })
+            if (action.doc) memory.profiles.update(profile.id, { doc: action.doc }, { reason: 'agent wrote dossier body' })
+            if (action.section) memory.profiles.appendNote(profile.id, String(action.section), text || action.doc || '', { source: basis })
+            return remember({ ok: true, msg: `updated ${profile.kind} dossier ${profile.id}${action.section ? ` section "${action.section}"` : ''}${action.doc ? ' (document body replaced)' : ''}` })
+          }
+          if (!text) return report('memory', { ok: false, msg: 'memory remember needs `text` (and optionally `entity`, `section` or `doc`)' })
+          const entry = memory.recordKnowledge({
+            text,
+            category: mapped,
+            basis,
+            confidence: basis === 'observed' ? 0.92 : basis === 'reported' ? 0.4 : 0.65,
+            importance: Number.isInteger(action.importance) ? action.importance : (mapped === 'episodic' ? 2 : 3),
+            tags: [category, 'agent_selected'],
+            entities: entity ? [entity] : [],
+            source: basis === 'reported' ? String(entity || 'player') : 'Zinc',
+            evidence: action.evidence ? [String(action.evidence)] : []
+          })
+          if (!entry) return report('memory', { ok: false, msg: 'memory text was empty' })
+          if (basis === 'reported' && entity) {
+            const profile = memory.observePlayer(entity, { uuid: uuidOf(entity), at: Date.now() })
+            if (profile) memory.profiles.appendNote(profile.id, 'facts', `[reported by ${entity}, unverified] ${text.slice(0, 300)}`, { source: 'player statement', evidence: action.evidence || null })
+          }
+          return remember({ ok: true, msg: `stored ${mapped} memory #${entry.id} (${basis}, importance ${entry.importance})${entity ? ` about ${entity}` : ''}` })
         }
-        if (operation === 'archive') {
-          const entry = memory.longTerm.entries.find(e => e.id === String(action.id || ''))
-          if (!entry || entry.foundational) return report('memory', { ok: false, msg: 'memory ID not found or protected as foundational; nothing changed' })
-          entry.status = 'archived'; entry.archivedAt = Date.now(); memory.longTerm.save()
-          return report('memory', { ok: true, msg: `archived #${entry.id}; original record remains recoverable` })
+
+        if (operation === 'update') {
+          const res = memory.longTerm.update(String(action.id || ''), {
+            text: action.text,
+            category: ['episodic', 'semantic', 'procedural', 'continuity'].includes(String(action.category)) ? String(action.category) : undefined,
+            basis: ['observed', 'reported', 'inferred'].includes(action.basis) ? action.basis : undefined,
+            confidence: Number.isFinite(action.confidence) ? action.confidence / 100 : undefined,
+            importance: Number.isInteger(action.importance) ? action.importance : undefined,
+            entities: entity ? [entity] : undefined,
+            evidence: action.evidence ? [String(action.evidence)] : undefined
+          }, { reason: String(action.reason || 'agent correction') })
+          return remember(res.ok ? { ok: true, msg: `updated memory #${res.entry.id}; previous text kept as history${res.entry.profileId ? `; dossier ${res.entry.profileId} unaffected` : ''}` } : res)
         }
+
+        if (operation === 'archive' || operation === 'delete' || operation === 'restore') {
+          const id = String(action.id || '').trim()
+          if (!id) return report('memory', { ok: false, msg: `memory ${operation} needs the memory \`id\`` })
+          if (operation === 'restore') {
+            const res = memory.longTerm.restore(id)
+            return remember(res.ok ? { ok: true, msg: `restored #${id} to active memory` } : res)
+          }
+          if (operation === 'archive') {
+            const res = memory.longTerm.archive(id, { reason: String(action.reason || 'agent archive') })
+            return remember(res.ok ? { ok: true, msg: `archived #${id}; the record, its provenance and its raw-history evidence all remain` } : res)
+          }
+          const res = memory.longTerm.remove(id, { hard: action.hard === true, reason: String(action.reason || 'agent delete') })
+          return remember(res.ok
+            ? { ok: true, msg: action.hard === true ? `permanently removed curated record #${id}; raw history untouched` : `removed #${id} from active memory (soft delete; restore with operation "restore"); raw history untouched` }
+            : res)
+        }
+
+        if (operation === 'merge') {
+          const ids = Array.isArray(action.ids) ? action.ids : String(action.ids || action.id || '').split(/[\s,]+/).filter(Boolean)
+          const res = memory.longTerm.merge({ ids, into: action.into || null, text: action.text || null, reason: String(action.reason || 'agent merge') })
+          if (!res.ok) return report('memory', res)
+          return remember({ ok: true, msg: `merged ${res.archived.length + 1} memories into #${res.entry.id}; sources archived with supersededBy (nothing erased)` })
+        }
+
+        if (operation === 'duplicates') {
+          const groups = memory.longTerm.duplicates({ threshold: Number.isFinite(action.threshold) ? Math.max(0.5, Math.min(0.99, action.threshold)) : 0.9 })
+          if (!groups.length) return report('memory', { ok: true, msg: 'no duplicate clusters found' })
+          const msg = groups.map((g) => `similar (${g.category}): ${g.ids.join(', ')} — ${g.entries.map((e) => `#${e.id} "${e.text}"`).join(' | ')}`).join('\n')
+          return report('memory', { ok: true, msg: `${groups.length} duplicate cluster(s):\n${msg}\nMerge with operation "merge" and the ids you want to keep.` })
+        }
+
+        if (operation === 'link') {
+          const id = String(action.id || '').trim()
+          const ref = String(action.evidence || action.ref || '').trim()
+          if (!id || !ref) return report('memory', { ok: false, msg: 'memory link needs `id` and `evidence` (a history reference or note)' })
+          const res = memory.longTerm.linkEvidence(id, [ref])
+          if (entity) {
+            const profile = memory.profiles.get(entity)
+            if (profile) memory.profiles.linkEvidence(profile.id, [ref])
+          }
+          return remember(res.ok ? { ok: true, msg: `linked evidence ${ref} to #${id}` } : res)
+        }
+
+        if (operation === 'profile') {
+          const who = String(action.entity || action.profile || action.query || '').trim()
+          if (!who) return report('memory', { ok: false, msg: 'memory profile needs `entity` (player name or UUID)' })
+          let profile = memory.profiles.get(who)
+          if (!profile) profile = memory.ensureSubject(who, { uuid: uuidOf(who) })
+          if (!profile) return report('memory', { ok: false, msg: `no dossier for "${who}"` })
+          return report('memory', { ok: true, msg: memory.playerProfile(profile.id, { max: 6000 }) || 'empty dossier' })
+        }
+
+        if (operation === 'profiles') {
+          const all = memory.profiles.list({ includeArchived: action.status === 'archived' })
+          if (!all.length) return report('memory', { ok: true, msg: 'no dossiers yet — they are created when a player is met, spoken to, or remembered' })
+          return report('memory', { ok: true, msg: `dossiers (${all.length}):\n${all.slice(0, 12).map((p) => `- ${memory.profiles.summary(p, { maxChars: 220 })}`).join('\n')}` })
+        }
+
+        if (operation === 'history') {
+          const ref = String(action.ref || '').trim()
+          if (ref) {
+            const read = memory.readHistory(ref, { context: 1 })
+            if (!read.ok) return report('memory', { ok: false, msg: read.msg })
+            return report('memory', {
+              ok: true,
+              msg: `history ${ref}:\n${read.records.map((r) => `${r.current ? '>>' : '  '} [${String(r.iso || '').slice(0, 19)}] ${r.kind}: ${r.text}`).join('\n')}`
+            })
+          }
+          const since = Number.isFinite(action.sinceMs) ? action.sinceMs : (Number.isFinite(action.sinceDays) ? Date.now() - action.sinceDays * 24 * 3600_000 : null)
+          const res = memory.searchHistory({
+            query: String(action.query || ''),
+            category: ['world', 'chat', 'actions', 'decisions', 'relationships', 'errors', 'maintenance'].includes(String(action.category)) ? String(action.category) : null,
+            entity,
+            since,
+            limit: Number.isInteger(action.limit) ? Math.max(1, Math.min(20, action.limit)) : 8
+          })
+          if (!res.hits.length) return report('memory', { ok: true, msg: `no raw history matched (${res.scannedFiles} files scanned)${res.truncated ? '; older files were not scanned' : ''}` })
+          return report('memory', {
+            ok: true,
+            msg: `history matches (${res.hits.length}; scanned ${res.scannedFiles} files${res.truncated ? ', older not scanned' : ''}):\n${res.hits.map((h) => `- [${String(h.iso || '').slice(0, 10)}] ${h.cat}/${h.kind}: ${h.text} (${h.ref})`).join('\n')}`
+          })
+        }
+
         if (operation === 'organize') {
-          const safe = !agenda.main && !skills?.current() && !task && !combat?.isEngaged && !system1?.fleeing && !brain?.pending?.length
-          if (!safe) return report('memory', { ok: false, msg: 'organization deferred: active task, danger, or queued decision input; try again when idle' })
-          const result = memory.longTerm.maintain({ episodicTtlMs: cfg.memory.episodicTtlMs ?? 30 * 24 * 60 * 60_000 })
-          return report('memory', { ok: true, msg: `organized memories; archived ${result.archived}, ${result.active} active records remain` })
+          if (!safeToOrganize()) return report('memory', { ok: false, msg: 'organization deferred: active task, danger, or queued decision input; try again when idle' })
+          const result = memory.maintainAll({
+            episodicTtlMs: cfg.memory.episodicTtlMs ?? 30 * 24 * 60 * 60_000,
+            duplicateThreshold: cfg.memory.maintenance?.duplicateThreshold ?? 0.94
+          })
+          const c = result.curated
+          const pReport = result.profiles || {}
+          return remember({
+            ok: true,
+            msg: `organized: ${c.merged.length} merged, ${c.archived} archived (never deleted), ${c.outdated} superseded, ${c.duplicatesRemaining.length} duplicate cluster(s) left for review; dossiers ${pReport.checked ?? 0} checked, ${pReport.needsAssessment?.length ?? 0} need a relationship assessment; ${result.unincorporated.length} memory link(s) filed into dossiers; ${c.active} active / ${c.total} historical records`
+          })
         }
-        return report('memory', { ok: false, msg: 'unknown memory operation' })
+
+        return report('memory', { ok: false, msg: `unknown memory operation "${operation}"` })
       }
       case 'note': {
         const text = String(action.text || '').trim().slice(0, 220)
@@ -3557,6 +3833,15 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
             const memSummary = `opinion on ${updated.name}: stance=${updated.stance || 'unassessed'}${updated.trust !== null ? `, trust=${updated.trust}` : ''}${updated.summary ? ` — ${updated.summary}` : ''}${action.evidence ? ` (evidence: ${action.evidence})` : ''}`.slice(0, 220)
             try { memory.longTerm?.upsertByTag?.(`rel:${updated.name.toLowerCase()}`, memSummary, ['relationship', updated.name], 2) } catch { /* noop */ }
           }
+          // The dossier and the social store are two views of the same
+          // relationship: keep the long-form profile in step with the model's
+          // considered stance, and record the decision itself.
+          try {
+            memory.syncProfileFromRelationship(updated.name, updated)
+            memory.history.append('decisions', `social ${op} for ${updated.name}: stance=${updated.stance || 'unassessed'}${action.decision ? `, decision=${action.decision}` : ''}${action.evidence ? ` — ${action.evidence}` : ''}`, {
+              kind: 'relationship_update', entities: [updated.name], importance: 2
+            })
+          } catch { /* memory best-effort */ }
           return report('social', { ok: true, msg: `updated ${continuity.formatRelationship(who)}` })
         }
         return report('social', { ok: false, msg: `unknown social operation "${op}" (list|show|update|decide)` })
@@ -3982,12 +4267,33 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       const now = Date.now()
       const cadence = Math.max(60_000, cfg.memory.maintenanceIntervalMs ?? 6 * 60 * 60_000)
       const safe = alive && systemsReady && !agenda.main && !skills?.current() && !task && !combat?.isEngaged && !system1?.fleeing && !system1?.chasers?.length && !brain?.busy && !brain?.pending?.length
-      if (!safe || now - lastMemoryMaintenanceAt < cadence) return
+      if (!safe) return
+      // Threshold trigger: a store that keeps growing past the ceiling gets
+      // organised sooner than the cadence, but only while genuinely idle.
+      const activeCount = memory.longTerm.entries.filter((e) => e.status === 'active').length
+      const threshold = cfg.memory.maintenance?.activeThreshold ?? 400
+      const overThreshold = activeCount >= threshold
+      if (!overThreshold && now - lastMemoryMaintenanceAt < cadence) return
       lastMemoryMaintenanceAt = now
       try {
-        const result = memory.longTerm.maintain({ episodicTtlMs: cfg.memory.episodicTtlMs ?? 30 * 24 * 60 * 60_000 })
-        logger.info(TAG, `memory maintenance: archived ${result.archived} expired episodic records; ${result.active} active / ${result.total} historical records`)
-      } catch (err) { logger.warn(TAG, `memory maintenance failed: ${err?.message || err}`) }
+        const result = memory.maintainAll({
+          episodicTtlMs: cfg.memory.episodicTtlMs ?? 30 * 24 * 60 * 60_000,
+          duplicateThreshold: cfg.memory.maintenance?.duplicateThreshold ?? 0.94,
+          maxActive: Math.max(threshold, cfg.memory.maxEntries ?? 500)
+        })
+        const c = result.curated
+        logger.info(TAG, `memory maintenance: ${c.merged.length} merged, ${c.archived} archived, ${c.outdated} superseded; ${c.active} active / ${c.total} historical records; ${result.profiles?.checked ?? 0} dossiers checked`)
+        // Age-based pruning is opt-in (`memory.history.retainDays`); evidence
+        // categories are never pruned, and curated memories never depend on it.
+        const retainDays = cfg.memory.history?.retainDays ?? 0
+        if (retainDays > 0) {
+          const pruned = memory.history.prune({ retainDays })
+          if (pruned.removed.length) logger.info(TAG, `history pruned: ${pruned.removed.length} files older than ${retainDays}d`)
+        }
+      } catch (err) {
+        recordError('memory_maintenance', err)
+        logger.warn(TAG, `memory maintenance failed: ${err?.message || err}`)
+      }
     })
     every(3000, () => {
       try { places.scan(bot, { radius: cfg.places.scanRadius ?? 16 }) } catch { /* partial world */ }
@@ -4097,6 +4403,12 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       memoryType: isPlayer ? 'player_arrived' : 'spawn',
       wake: null
     })
+    // A player appearing is identity evidence, not a curated memory: adjust the
+    // dossier's last-seen time and, when new, create it keyed by UUID.
+    if (isPlayer) {
+      const pname = entity.username || name
+      try { memory.observePlayer(pname, { uuid: entity.uuid || uuidOf(pname), at: Date.now() }) } catch { /* best effort */ }
+    }
   })
   onBot('entityGone', (entity) => {
     if (!systemsReady || !entity || entity === bot.entity) return
@@ -4495,7 +4807,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     timeline.chat(sender, text, { whisper })
     note({ type: 'chat', sender, text: `${sender}: ${text}` })
     try { telemetry.chatIn({ sender, text, whisper }) } catch { /* noop */ }
-    perceive({
+    const chatRec = perceive({
       source: 'mineflayer', eventType: 'chat', reactionClass: 'fast',
       summary: `${sender}: ${text}`,
       entities: [sender],
@@ -4505,7 +4817,13 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       occurrenceTimeKnown: true, observationBasis: 'direct', importance: 2,
       memoryType: 'chat', remember: false
     })
-    memory.rememberChat(sender, text, { addressed: null })
+    try {
+      const profile = memory.observePlayer(sender, { uuid: uuidOf(sender), interaction: true, evidenceRef: chatRec?.historyRef || null })
+      // A conversation is evidence for the dossier; the raw line itself lives in
+      // history, and only durable claims become curated memories.
+      if (profile && chatRec?.historyRef) memory.profiles.linkEvidence(profile.id, [chatRec.historyRef])
+    } catch { /* memory best-effort */ }
+    memory.rememberChat(sender, text, { addressed: null, evidence: chatRec?.historyRef || null })
     logger.debug(TAG, `chat from ${sender}: ${text}`)
     pushConvo(sender, 'them', text)
     brain.hear(sender, text, { whisper })
@@ -4624,6 +4942,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     // Before spawn a socket error IS the end of this attempt; afterwards the
     // 'end' event follows and carries the session down.
     try { shared.watchdog?.connectionError(err) } catch { /* report only */ }
+    recordError('socket', err)
     if (!spawned) over('error', err)
     else logger.error(TAG, `socket error: ${err.message || err}`)
   })

@@ -80,7 +80,10 @@
 | Module | Responsibility |
 | --- | --- |
 | `goals.js` | Persistent goal registry with lifecycle transitions & reconciliation (`data/goals.json`) |
-| `memory.js` | Working, short-term, and long-term episodic/procedural memory (`data/memories.json`) |
+| `memory.js` | `MemorySystem` facade: working/short-term/ephemeral context, curated long-term store with provenance, confidence, evidence refs, stable ids and archive/restore/merge (`data/memories.json`), automatic `contextBlock`/`recognitionBlock` retrieval, and coordinated maintenance |
+| `memory_text.js` | Shared tokenizer, accent folding, synonym table, sparse embedding and cosine used by every memory layer |
+| `history.js` | Append-only raw history under `data/history/<category>/<day>.jsonl` with per-file keyword sidecars, bounded search, coalesced repeats and opt-in pruning |
+| `entities.js` | Long-form subject dossiers under `data/entities/` — players keyed by Minecraft UUID (rename-safe), places, groups, self — with sections, evidence links, merge and corruption quarantine |
 | `continuity.js` | Player relationship models, evidence history, and self-notes (`data/continuity.json`) |
 | `journal.js` | Multi-step plans and continuation digests (`data/journal.json`) |
 | `telemetry.js` | `TelemetryRecorder` writing `data/sessions/<id>/events.jsonl`, `continuation.json`, and `data/latest.json` |
@@ -97,7 +100,7 @@ All 39 tools are always registered on every action turn:
 - **Combat & Survival Decisions:** `attack`, `hold`
 - **Perception & Inspection:** `inspect_block`, `inspect_region`, `find`, `remember_here`, `screenshot`
 - **Redstone & Logic:** `redstone_scan`, `redstone_component`, `redstone_engineer`, `logic_test`, `circuit_project`
-- **Social, Memory & Goals:** `say`, `goal`, `note`, `recall`, `social`, `idle`
+- **Social, Memory & Goals:** `say`, `goal`, `note`, `memory`, `recall`, `social`, `idle`
 
 ---
 

@@ -864,7 +864,7 @@ class ContinuityStore {
    * ownership signs, structural modifications, damaged self-builds, and
    * unexplored frontier directions without dumping raw block lists.
    */
-  observeEnvironment (bot, places = null) {
+  observeEnvironment (bot, places = null, { suppressOpportunistic = false } = {}) {
     if (!bot?.entity?.position) return { summary: '', changes: [], unexplored: [] }
     const pos = bot.entity.position
     const dim = String(bot.game?.dimension || 'overworld').replace(/^minecraft:/, '')
@@ -983,13 +983,13 @@ class ContinuityStore {
     if (chestCount > 0 && chestPos) features.push(`containers(${chestCount})@(${chestPos.x},${chestPos.y},${chestPos.z})`)
     if (redstoneCount > 0 && redstonePos) features.push(`redstone(${redstoneCount})@(${redstonePos.x},${redstonePos.y},${redstonePos.z})`)
     if (waterCount >= 4 && waterPos) features.push(`water(${waterCount})@(${waterPos.x},${waterPos.y},${waterPos.z})`)
-    if (oreCount > 0 && orePos) features.push(`${oreName}@(${orePos.x},${orePos.y},${orePos.z})`)
+    if (!suppressOpportunistic && oreCount > 0 && orePos) features.push(`${oreName}@(${orePos.x},${orePos.y},${orePos.z})`)
     if (cropCount >= 3) features.push(`crops(${cropCount})`)
     if (treeCount >= 2 && features.length < 5) features.push(`logs(${treeCount})`)
     if (clustered.text && features.length < 4) features.push(`blocks[${clustered.text}]`)
     if (p.y < 52) features.push(`y=${p.y}`)
 
-    const unexplored = this._computeUnexplored(bot, p, dim, cx, cz)
+    const unexplored = suppressOpportunistic ? [] : this._computeUnexplored(bot, p, dim, cx, cz)
     this._lastSceneSummary = features.slice(0, 5).join(', ')
     this._lastUnexplored = unexplored
     return { summary: this._lastSceneSummary, changes: newlyNoticed, unexplored }
@@ -1010,7 +1010,8 @@ class ContinuityStore {
       const tz = p.z + d.dz * 18
       const ty = this._probeSafeGroundY(bot, tx, p.y, tz)
       if (ty !== null) out.push(`${d.label} (${tx},${ty},${tz})`)
-      else out.push(`${d.label} (~${tx},${p.y},${tz})`)
+      // Unknown/blocked cells are not coordinates: never turn an unverified
+      // rock column into navigation advice. Keep only probed walkable targets.
     }
     return out
   }

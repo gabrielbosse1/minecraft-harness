@@ -6,7 +6,7 @@ Dense, factual specification of `minecraft-harness` for AI coding agents and con
 
 ## 1. Non-Negotiable Architectural Invariants
 
-1. **Zero behavioral modes or permission switches.** Never add persona modes (`explorer`/`builder`/`hunter`), `set_mode`, `actions.allowDig`/`allowPlace`/`allowCombat`, `dig_policy`, `equip.auto`, chat relevance filters, language guards, or trusted-player UUID lists. Model agency is unconstrained; all **39 tools** are sent with a byte-identical schema every turn.
+1. **Zero behavioral modes or permission switches.** Never add persona modes (`explorer`/`builder`/`hunter`), `set_mode`, `actions.allowDig`/`allowPlace`/`allowCombat`, `dig_policy`, `equip.auto`, chat relevance filters, language guards, or trusted-player UUID lists. Model agency is unconstrained; all **41 tools** are sent with a byte-identical schema every turn.
 2. **Vanilla client-only boundary.** No RCON, no server plugins, no op commands. `installVanillaGuard` (`zincai/vanilla_guard.js`) blocks any `/...` chat line except guarded `/msg <onlinePlayer> <text>` whispers and emits `vanilla_command_blocked`.
 3. **Physical boundary is lifecycle + anti-flood only.** `PhysicalBoundary` (`zincai/boundary.js`) gates 19 Mineflayer primitives strictly on `connected`, `alive`, `!paused`, and sliding-window `limits.maxPhysicalActionsPerMinute` (default `600`, `0` = unlimited).
 4. **Defer Mineflayer method wrapping to `inject_allowed`.** Immediately after `mineflayer.createBot(...)` returns, plugins have not attached `bot.chat`, `bot.dig`, `bot.placeBlock`, etc. Both `installVanillaGuard` and `installPhysicalGuard` MUST hook `bot.once('inject_allowed', ...)` (with a `login` fallback) when methods are absent at call time.
@@ -125,15 +125,17 @@ CLI: node zincai/index.js [--dry-run | --check]
 ### `zincai/`
 | File | Key Exports / Role |
 | --- | --- |
-| `index.js` | Entrypoint, `loadConfig`, `makeShared`, `createHost`, `startSession`, 39-tool switch, `buildLiveContinuation` |
-| `api_wrapper.js` | `AmdToolsClient`, `ACTION_TOOLS` (39), `createRecoveryTools`, `extractReasoning`, `coerceActions`, `buildToolsPayload` |
+| `index.js` | Entrypoint, `loadConfig`, `makeShared`, `createHost`, `startSession`, 41-tool switch, `buildLiveContinuation` |
+| `api_wrapper.js` | `AmdToolsClient`, `ACTION_TOOLS` (41), `createRecoveryTools`, `extractReasoning`, `coerceActions`, `buildToolsPayload` |
 | `context_budget.js` | `ContextBudget`, `resolveModelLimits`, `/models` discovery, HTTP 400 limit learning, proactive/reactive compaction, `trimIncompleteSentence` |
 | `brain.js` | `Brain` — multi-step action loop (`maxStepsPerTurn: 6`), `wake(reason, opts)`, `situationVersion` staleness guard |
 | `lanes.js` | `LaneScheduler` — concurrent `chat` + `action` lanes sharing `rpm` (18) with `chatReserve` (4) |
 | `irc.js` | `IrcTimeline` — unified chronological log of chat, whispers, and world events |
 | `system1.js` | `System1` — 200ms survival reflex tick (threat flee, contact hazard lookahead/exit, eat, water clutch, elytra, swim) |
 | `threats.js` | `ThreatSense` (trigger 12m / ranged 18m / close 8m / watch 32m), `HurtTracker`, `isProtected`, `isHostileMob` |
-| `tactics.js` | Vanilla melee/armor fight estimator injected into prompts during threats |
+| `tactics.js` | Vanilla melee/armor fight estimator injected into prompts during threats; emitted threat entries include usable entity ids |
+| `environment.js` | Block-derived sky/roof/ground/light/hazard/facing/biome observations and bounded surface-exit candidates |
+| `build_site.js` | Preflight validation for large habitation sites (cave roof, liquid, unloaded cells, unsupported foundation) |
 | `control.js` | `ControlArbiter`, `PRIORITY` (`survival > combat > task > idle`) |
 | `boundary.js` | `PhysicalBoundary`, `installPhysicalGuard`, `ACTION_CAPABILITIES`, `BOT_METHOD_CAPS` (19 gated bot methods) |
 | `vanilla_guard.js` | `installVanillaGuard`, `isCommandLine`, `assertVanillaAction`, `FORBIDDEN_ACTION_FIELDS` |
@@ -179,7 +181,7 @@ CLI: node zincai/index.js [--dry-run | --check]
 
 ---
 
-## 4. Action Tool Catalog (39 Tools, `zincai/api_wrapper.js`)
+## 4. Action Tool Catalog (41 Tools, `zincai/api_wrapper.js`)
 
 | Category | Tool | Key Arguments |
 | --- | --- | --- |

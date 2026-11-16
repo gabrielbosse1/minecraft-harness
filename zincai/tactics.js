@@ -278,6 +278,7 @@ function situation (bot, hostiles, { canRun = null } = {}) {
   const autoEngage = Boolean(
     allAutoCandidates &&
     !hasBoss &&
+    explosive === 0 &&
     weapon.dmg >= 4 &&
     hp > 10 &&
     lit === 0 &&
@@ -334,7 +335,7 @@ function describeGroup (g) {
     if (stats.explosive && !g.lit) kind.push('explodes')
     if (kind.length) tags.push(kind.join(', '))
   }
-  return `${g.name}${g.count > 1 ? ` x${g.count}` : ''} (${g.count > 1 ? 'nearest ' : ''}${g.nearest.where}${tags.length ? '; ' + tags.join('; ') : ''})`
+  return `${g.name} [id=${g.nearest.id}]${g.count > 1 ? ` x${g.count}` : ''} (${g.count > 1 ? 'nearest ' : ''}${g.nearest.where}${tags.length ? '; ' + tags.join('; ') : ''})`
 }
 
 /**

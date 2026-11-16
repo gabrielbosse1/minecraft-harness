@@ -70,7 +70,7 @@ const ACTION_TOOLS = [
     text: STR('The line, max 200 chars. In the language of the conversation.'),
     to: STR('Recipient player (optional).')
   }, ['text']),
-  tool('go_to', 'Default movement tool: walk to a player, saved place, nearby id (chest2, bed1), or coordinates without breaking terrain. Supply x and z alone to travel horizontally using the easiest reachable walking level (no demand to climb onto a roof or reach a guessed y); supply y only when the exact elevation matters. Routes around mobs, obstacles, and hazards; only clears soft terrain if no detour exists.', {
+  tool('go_to', 'Default navigation: walk to a player, saved place, nearby block id (such as chest2), or absolute world coordinates in blocks. Supply x and z alone for horizontal travel on the easiest reachable walking level; supply y only when exact elevation matters. Uses the pathfinder, routes around obstacles/hazards where possible, and may break only its configured soft-terrain blocks when no short detour exists; this is not a tunneling tool. Results report arrival/failure and actual position where available.', {
     player: STR('Player name.'),
     place: STR('Saved place or nearby id.'),
     x: INT('X.'),
@@ -78,7 +78,7 @@ const ACTION_TOOLS = [
     z: INT('Z.'),
     gait: GAIT
   }),
-  tool('dig', 'Intentional tunneling/obstruction clearing ONLY: walks to [x,y,z] (or a player/place) breaking any breakable blocks in the path. Use ONLY when go_to reports no path around an actual obstruction or when deliberately mining a passage — never for normal travel or random digging in open areas.', {
+  tool('dig', 'Intentional obstruction clearing/tunneling: pathfind to a player, saved place/block id, or absolute world x/y/z, temporarily allowing pathfinder block breaking only along that route. Optional materials restrict which block ids may be broken; avoid forbids ids. It does not dig straight up to find the surface. Use only for a verified obstruction or deliberate passage, not ordinary travel; results report observed blocks broken and final position.', {
     player: STR('Target player name.'),
     place: STR('Saved place or nearby id.'),
     x: INT('X of the destination.'),
@@ -93,7 +93,7 @@ const ACTION_TOOLS = [
     gait: GAIT,
     jump: { type: 'boolean', description: 'True = perform one normal jump.' }
   }),
-  tool('stop', 'Cancel current task, follow, fight and paused tasks.'),
+  tool('stop', 'Stop the currently running body task/follow/fight. The durable goal is retained (suspended) rather than cancelled; use goal cancel with its id only when you intentionally abandon that objective. A stopped task may finish its current cancellation cleanup before the body is idle.'),
   tool('goal', 'Manage persistent objectives (survive death/restart/context reset): list|show|add|resume|suspend|cancel|complete|update|combine|verify.', {
     operation: { type: 'string', enum: ['list', 'show', 'add', 'resume', 'suspend', 'cancel', 'complete', 'update', 'combine', 'verify'] },
     id: STR('Goal id (g3), or comma-separated ids for combine ("g1,g2").'),
@@ -105,14 +105,14 @@ const ACTION_TOOLS = [
     player: STR('Player name(s) when player_requested or shared_project.'),
     note: STR('Progress or status note.'),
     percent: INT('For update: 0–100.'),
-    steps: { type: 'array', description: 'add/update: the ordered plan, 2–8 short steps. Shown back to you every turn with done marks, so you continue instead of re-planning.', items: { type: 'string' }, maxItems: 10 },
+    steps: { type: 'array', description: 'add/update: an ordered plan of up to 10 short steps. Shown with done marks across turns, so continue rather than re-planning.', items: { type: 'string' }, maxItems: 10 },
     done: INT('update: number of the plan step you just finished (1 = first).'),
     next: STR('update: the very next concrete thing to do (survives death/restart).')
   }, ['operation']),
-  tool('attack', 'Engage in melee/ranged combat. The ONLY way a fight ever starts. Use `target` for mobs (e.g. "zombie", "any") when armed and healthy, or `player` for an exact PvP opponent (for PvP objectives, self-defense, or agreed sparring — never on allies or unprovoked neutral players).', {
+  tool('attack', 'Start an explicit melee/ranged attack. Survival reflexes may independently evade or auto-kite a threat while you decide; this tool starts the deliberate attack task. Use `target` for mobs (e.g. "zombie", "any") when fighting is safer/useful than retreating, or `player` for an exact PvP opponent only when explicitly authorized by the configured policy (never auto-initiate PvP).', {
     target: STR('Mob type or "any" (for mobs, not players).'),
-    player: STR('Exact player name for PvP (objectives, self-defense, or agreed sparring).'),
-    count: INT('Kill limit (default 1 animal; chain hostiles).')
+    player: STR('Exact player name; only use when allowed by the configured PvP policy. The harness never auto-initiates attacks on players.'),
+    count: INT('Optional kill limit (1–24); players always stop at one. If omitted, animals default to 1 and hostiles use the configured chain limit.')
   }),
   tool('hold', 'Accept current threats and continue the task unless hit/new threat/lit fuse. Pass the [id=…] values from the threats lines to hold specific ones (never guessed numbers); with none, all listed threats are held.', {
     ids: { type: 'array', description: 'Threat ids to hold (the numbers in [id=7]). Omit = every listed threat.', items: INT('Threat id.'), minItems: 1, maxItems: 12 }
@@ -259,7 +259,7 @@ const ACTION_TOOLS = [
     page: INT('For graph: page, default 1.'),
     note: STR('For bind: note (max 240 chars).')
   }, ['operation']),
-  tool('build', 'Place blocks. A named blueprint, an inline grid+palette, OR one single block: grid [["C"]] + palette {C:"cobblestone"} + at [x,y,z] places exactly that one block there. `at` is the minimum corner; the grid grows toward +x (row), +y (layer), +z (column).', {
+  tool('build', 'Place a saved blueprint or an inline 3D grid from carried materials; this mutates the world, checks ownership/materials, and reports placed counts/failures. A one-block inline build is grid [["C"]] + palette {C:"cobblestone"}. `at` is the minimum [x,y,z] world-block corner (default: your feet); rows grow +x, layers +y, columns +z. Large named houses/shelters/towers are refused on unloaded, liquid, unsupported, or natural-cave-roof sites.', {
     blueprint: STR('Blueprint name in zincai/blueprints/.'),
     grid: { type: 'array', description: 'Layers bottom-up; each layer is an array of ROW STRINGS, one char per block ("."/" " = air). A 3x3 floor is ONE layer: [["sss","sss","sss"]]. A 2-high 3-long wall is two layers: [["sss"],["sss"]].', items: { type: 'array', items: { type: 'string' } } },
     palette: { type: 'object', description: 'Char -> block id map.', additionalProperties: { type: 'string' } },
@@ -370,28 +370,35 @@ function parseToolCall (call, known) {
     logger.warn(TAG, `unknown tool call "${name}" — ignoring`)
     return { error: 'unknown', name }
   }
+  const bad = (detail) => ({ error: 'args', name, detail: String(detail || 'invalid arguments').slice(0, 180) })
   try {
     const rawArgs = call?.function?.arguments
     let args = typeof rawArgs === 'string' ? JSON.parse(rawArgs || '{}') : (rawArgs || {})
-    if (!args || typeof args !== 'object' || Array.isArray(args)) return { error: 'args', name }
+    if (!args || typeof args !== 'object' || Array.isArray(args)) return bad('arguments must be a JSON object')
     const schema = known.find((t) => t.name === name).parameters
     // Reject undeclared fields: in particular, an injected `a` must never
     // override the chosen tool name in the executor.
-    if (Object.keys(args).some((key) => !Object.hasOwn(schema.properties, key))) return { error: 'args', name }
-    if ((schema.required || []).some((key) => !Object.hasOwn(args, key))) return { error: 'args', name }
+    const extra = Object.keys(args).find((key) => !Object.hasOwn(schema.properties, key))
+    if (extra) return bad(`unknown parameter '${extra}' for ${name}`)
+    const missing = (schema.required || []).find((key) => !Object.hasOwn(args, key))
+    if (missing) return bad(`missing required parameter '${missing}'`)
     for (const [key, value] of Object.entries(args)) {
       const spec = schema.properties[key]
-      if (spec.type === 'string' && typeof value !== 'string') return { error: 'args', name }
-      if (spec.type === 'integer' && !Number.isInteger(value)) return { error: 'args', name }
-      if (spec.type === 'boolean' && typeof value !== 'boolean') return { error: 'args', name }
-      if (spec.type === 'array' && (!Array.isArray(value) || (spec.minItems != null && value.length < spec.minItems) || (spec.maxItems != null && value.length > spec.maxItems))) return { error: 'args', name }
-      if (spec.type === 'array' && spec.items?.type === 'string' && value.some((v) => typeof v !== 'string')) return { error: 'args', name }
-      if (spec.type === 'object' && (!value || typeof value !== 'object' || Array.isArray(value))) return { error: 'args', name }
+      if (spec.type === 'string' && typeof value !== 'string') return bad(`'${key}' must be a string`)
+      if (spec.type === 'integer' && !Number.isInteger(value)) return bad(`'${key}' must be an integer`)
+      if (spec.type === 'boolean' && typeof value !== 'boolean') return bad(`'${key}' must be true or false`)
+      if (spec.type === 'array' && !Array.isArray(value)) return bad(`'${key}' must be an array`)
+      if (spec.type === 'array' && spec.minItems != null && value.length < spec.minItems) return bad(`'${key}' needs at least ${spec.minItems} items`)
+      if (spec.type === 'array' && spec.maxItems != null && value.length > spec.maxItems) return bad(`'${key}' allows at most ${spec.maxItems} items`)
+      if (spec.type === 'array' && spec.items?.type === 'string' && value.some((v) => typeof v !== 'string')) return bad(`every item in '${key}' must be a string`)
+      if (spec.type === 'array' && spec.items?.type === 'integer' && value.some((v) => !Number.isInteger(v))) return bad(`every item in '${key}' must be an integer`)
+      if (spec.type === 'number' && (typeof value !== 'number' || !Number.isFinite(value))) return bad(`'${key}' must be a finite number`)
+      if (spec.type === 'object' && (!value || typeof value !== 'object' || Array.isArray(value))) return bad(`'${key}' must be an object`)
       if (spec.enum) {
         // `strict: true` marks a closed verb list (the chat lane's `do`): an
         // out-of-enum value there must fail the call, never be approximated.
         if (spec.strict) {
-          if (!spec.enum.includes(value)) return { error: 'args', name }
+          if (!spec.enum.includes(value)) return bad(`'${key}' must be one of: ${spec.enum.join(', ')}`)
           continue
         }
         const fixed = coerceEnum(value, spec.enum)
@@ -407,7 +414,7 @@ function parseToolCall (call, known) {
     return { name, args }
   } catch (err) {
     logger.warn(TAG, `malformed tool arguments for ${name}: ${err.message}`)
-    return { error: 'args', name }
+    return bad(`could not parse arguments: ${err.message}`)
   }
 }
 
@@ -423,7 +430,7 @@ function coerceAction (message, strict = true) {
   if (toolCalls.length > 0) {
     const parsed = parseToolCall(toolCalls[0], ACTION_TOOLS)
     if (parsed.error === 'unknown') return strict ? { a: 'idle', _unknownTool: parsed.name } : null
-    if (parsed.error === 'args') return strict ? { a: 'idle', _badArgs: parsed.name } : null
+    if (parsed.error === 'args') return strict ? { a: 'idle', _badArgs: parsed.name, _badArgsDetail: parsed.detail } : null
     const { name, args } = parsed
     const mapped = ARG_LEGACY[name] ? ARG_LEGACY[name](args) : { ...args }
     return { ...mapped, a: name, _via: 'tool' }
@@ -441,7 +448,7 @@ function coerceAction (message, strict = true) {
       if (tc && typeof tc === 'object' && typeof tc.name === 'string') {
         const parsed = parseToolCall({ function: { name: tc.name, arguments: tc.arguments ?? {} } }, ACTION_TOOLS)
         if (parsed.error === 'unknown') return strict ? { a: 'idle', _unknownTool: parsed.name } : null
-        if (parsed.error === 'args') return strict ? { a: 'idle', _badArgs: parsed.name } : null
+        if (parsed.error === 'args') return strict ? { a: 'idle', _badArgs: parsed.name, _badArgsDetail: parsed.detail } : null
         const mapped = ARG_LEGACY[parsed.name] ? ARG_LEGACY[parsed.name](parsed.args) : { ...parsed.args }
         return { ...mapped, a: parsed.name, _via: 'tool' }
       }
@@ -464,7 +471,7 @@ function coerceAction (message, strict = true) {
       if (name === 'craft' && args.item === undefined && args.i !== undefined) { args.item = args.i; delete args.i }
       if (name === 'attack' && args.target === undefined && args.n !== undefined) { args.target = args.n; delete args.n }
       const parsed = parseToolCall({ function: { name, arguments: args } }, ACTION_TOOLS)
-      if (parsed.error) return { a: 'idle', _badArgs: name }
+      if (parsed.error) return { a: 'idle', _badArgs: name, _badArgsDetail: parsed.detail }
       const mapped = ARG_LEGACY[name] ? ARG_LEGACY[name](parsed.args) : parsed.args
       return { ...mapped, a: name, _via: 'json-fallback' }
     }
@@ -765,7 +772,7 @@ class AmdToolsClient {
     this._rateLock = Promise.resolve()
     this._queue = []
     this._running = new Set()
-    // Latency samples per lane: a chat reply and a 39-tool action call have
+    // Latency samples per lane: a chat reply and a 41-tool action call have
     // nothing in common in size, and mixing them made the chat lane inherit the
     // action lane's slow p90 (and vice versa).
     this._latencies = []
@@ -1433,7 +1440,7 @@ class AmdToolsClient {
         if (est.totalTokens <= plan.hardPromptBudget) break
       }
       // If even survival-level user compaction cannot leave minimum output headroom
-      // because the endpoint's context window is too small for all 39 tool schemas,
+      // because the endpoint's context window is too small for all 41 tool schemas,
       // proactively degrade to the compact core toolset before hitting HTTP 400.
       const minFitLimit = plan.contextWindow - Math.max(1_024, Math.min(plan.outputReserve, 2_048))
       if (lane === 'action' && est.totalTokens > minFitLimit && Array.isArray(activeTools) && activeTools.length > 15) {

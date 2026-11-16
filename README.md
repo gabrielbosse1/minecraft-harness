@@ -10,7 +10,7 @@ The harness connects to any vanilla Minecraft Java server (including 1.21.4 and 
 
 | Principle | How it works |
 | --- | --- |
-| **Model freedom** | No personas (`explorer`/`builder`/`hunter`), no hidden tool gating, no hardcoded gather whitelists, and no language or chat-relevance filters. All **39 tools** are exposed on every action turn with an identical JSON schema for prefix-cache efficiency. |
+| **Model freedom** | No personas (`explorer`/`builder`/`hunter`), no hidden tool gating, no hardcoded gather whitelists, and no language or chat-relevance filters. All **41 tools** are exposed on every action turn with an identical JSON schema for prefix-cache efficiency. |
 | **Reflexes flee; the model decides** | Local `System1` survival reflexes handle immediate self-preservation (eating, fleeing real threats via BFS escape planning, hazard exit, water clutch, armor upgrades) without waiting on the API. The model decides whether to keep fleeing, fight (`attack`), move elsewhere (`go_to`/`follow`), or stand ground (`hold`). |
 | **Two concurrent LLM lanes** | **Chat lane** reads batched IRC-style chat windows and replies naturally in the speaker's language — without blocking ongoing movement or building — and can trigger immediate simple actions (`reply.do`) or hand tasks to the action lane (`reply.task`). **Action lane** runs a multi-step tool loop (`think → tool → observe → think`) up to `maxStepsPerTurn`. |
 | **Strict vanilla client boundary** | `installVanillaGuard` blocks command-shaped chat (`/...`) from ever leaving the client (except guarded `/msg` whispers), and `installPhysicalGuard` gates all 19 Mineflayer movement/world primitives behind lifecycle state (`connected`, `alive`, `paused`) and an anti-flood rate ceiling (`limits.maxPhysicalActionsPerMinute`). |
@@ -128,7 +128,7 @@ npm run pufferpanel:validate # validate pufferpanel/zincai.json against PufferPa
 
 | Test suite | Coverage |
 | --- | --- |
-| `test/01-connection-perception-movement.test.js` | Real server join, physical boundary, world/inventory perception, 39-tool schema, `inspect_block`, `inspect_region`, `find`, `remember_here`, `screenshot`, obstacle pathfinding |
+| `test/01-connection-perception-movement.test.js` | Real server join, physical boundary, world/inventory perception, 41-tool schema, `inspect_block`, `inspect_region`, `find`, `remember_here`, `screenshot`, obstacle pathfinding |
 | `test/02-gathering-digging-building.test.js` | Real `gather` (`oak_log` + arbitrary vanilla blocks like `amethyst_block`), `build`, `build_shape`, `dig` |
 | `test/03-chat-social-lanes.test.js` | Real second player (`Alice`), TCP chat lane reply, immediate `reply.do: "come"`, `social`, `note`, `say`, runtime `vanilla_guard` blocking `/op` |
 | `test/04-reflexes-combat-survival.test.js` | `ArmorKeeper` auto-equip & manual slot hold, `System1` flee reflex against real zombie, `attack` killing a real zombie on server |
@@ -142,7 +142,7 @@ npm run pufferpanel:validate # validate pufferpanel/zincai.json against PufferPa
 ## Documentation Map
 
 - [`docs/architecture.md`](docs/architecture.md) — System architecture, control arbitration, reflex loop, tool execution, telemetry, and persistence.
-- [`zincai/README.md`](zincai/README.md) — Module-by-module guide to `zincai/` and the 39-tool surface.
+- [`zincai/README.md`](zincai/README.md) — Module-by-module guide to `zincai/` and the 41-tool surface.
 - [`docs/pufferpanel-guide.md`](docs/pufferpanel-guide.md) — Step-by-step PufferPanel v3 setup guide.
 - [`pufferpanel/README.md`](pufferpanel/README.md) — Template specification, variables, and diagnostics.
 - [`AGENTS.md`](AGENTS.md) & [`docs/AGENT_REFERENCE.md`](docs/AGENT_REFERENCE.md) — Dense technical reference and invariants for AI coding agents and contributors.

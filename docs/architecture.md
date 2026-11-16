@@ -39,8 +39,8 @@ The LLM layer (`brain.js`, `api_wrapper.js`, `lanes.js`, `src/amdClient.js`) spl
 - Runs concurrently with ongoing walking, gathering, or building so conversation never stalls waiting for a physical task.
 
 ### Action Lane
-- Uses `system_prompt.txt` plus the live world snapshot (`perception.js`), IRC timeline, threat summary (`tactics.js`), open goals (`goals.js`), active plan digest (`journal.js`), and one budgeted memory block (dossiers of the players present, curated recall for the goal/position/request, and a short `past attempts (raw log)` warning).
-- Exposes all **39 function tools** identically on every call (`ACTION_TOOLS` in `api_wrapper.js`) so prompt prefix caching stays warm.
+- Uses `system_prompt.txt` plus the live world snapshot (`perception.js`, `observe.js`, block-derived `environment.js`), IRC timeline, threat summary (`tactics.js`), open goals (`goals.js`), active plan digest (`journal.js`), and one budgeted memory block (dossiers of the players present, curated recall for the goal/position/request, and a short `past attempts (raw log)` warning). House/site preflight lives in `build_site.js`; failed repeated calls are tracked by `failgate.js`.
+- Exposes all **41 function tools** identically on every call (`ACTION_TOOLS` in `api_wrapper.js`) so prompt prefix caching stays warm.
 - Executes multi-step tool loops (`think → tool calls → tool outputs → think`) up to `inference.maxStepsPerTurn` (default 6).
 - Extracts and records `reasoning` (`reasoning_content` / `reasoning` / `<think>`) alongside tool calls and token usage in session telemetry.
 - Uses a `situationVersion` counter so stale decisions formed before a sudden reflex interrupt (damage, flee start, death) are discarded instead of executing outdated actions.

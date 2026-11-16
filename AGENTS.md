@@ -1,6 +1,6 @@
 # AGENTS.md — Working Guide for AI Coding Agents
 
-Read [`docs/AGENT_REFERENCE.md`](docs/AGENT_REFERENCE.md) first for the complete module map, 39-tool catalog, `data/` telemetry schemas, runtime config keys, and real-server test harness details.
+Read [`docs/AGENT_REFERENCE.md`](docs/AGENT_REFERENCE.md) first for the complete module map, 41-tool catalog, `data/` telemetry schemas, runtime config keys, and real-server test harness details.
 
 ---
 
@@ -11,7 +11,7 @@ Run these after every non-trivial change:
 ```sh
 npm run check                        # syntax-check all JS files in zincai/, src/, scripts/, pufferpanel/
 npm test                             # run the full real-server simulation suite (test/01..13, flying-squid 1.21.4)
-AMD_API_KEY=rc-test npm run dry-run  # validate config loading, env wiring, and 39-tool schema
+AMD_API_KEY=rc-test npm run dry-run  # validate config loading, env wiring, and 41-tool schema
 npm run pufferpanel:validate         # validate pufferpanel/zincai.json against PufferPanel v3 rules
 ```
 
@@ -19,7 +19,7 @@ npm run pufferpanel:validate         # validate pufferpanel/zincai.json against 
 
 ## Core Invariants (Do Not Break)
 
-1. **No behavioral modes or permission switches.** Do not add persona modes (`explorer`/`builder`/`hunter`), `set_mode`, `dig_policy`, `equip.auto`, action allowlists, chat relevance filters, language guards, or trusted-player UUID lists. All **39 tools** remain exposed identically on every action turn.
+1. **No behavioral modes or permission switches.** Do not add persona modes (`explorer`/`builder`/`hunter`), `set_mode`, `dig_policy`, `equip.auto`, action allowlists, chat relevance filters, language guards, or trusted-player UUID lists. All **41 tools** remain exposed identically on every action turn.
 2. **Vanilla client-only boundary.** No RCON, no server plugins, no slash commands. `installVanillaGuard` blocks `/...` chat (except guarded `/msg`), and `PhysicalBoundary` gates 19 Mineflayer primitives strictly on lifecycle state (`connected`, `alive`, `!paused`) and anti-flood rate limits (`limits.maxPhysicalActionsPerMinute`).
 3. **Console-only operator control.** Operator commands enter via `stdin` / `Host.command(line, from)` only — never in-game chat.
 4. **Unified `data/` runtime directory.** Persist all JSON stores and session telemetry (`sessions/<id>/events.jsonl`, `sessions/<id>/continuation.json`, `latest.json`) under `ZINC_DATA_DIR` (default `./data/`). Never write runtime artifacts into `zincai/data/`.

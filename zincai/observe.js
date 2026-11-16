@@ -13,6 +13,7 @@
 
 const { whereIs, isPlayer, isDecor, isNamed, isTamed, isHostileMob, HOSTILE_NAMES } = require('./threats')
 const { heldItemName } = require('../src/combat')
+const { environmentSnapshot } = require('./environment')
 
 const ARMOR_SLOTS = [5, 6, 7, 8]
 
@@ -38,7 +39,9 @@ function selfLine (bot) {
     ? motion.speedMs
     : Math.round(Math.hypot(vx, vz) * 200) / 10
   const posture = motion?.posture || (bot.entity?.isSneaking ? 'crouching' : (bot.controlState?.sprint ? 'sprinting' : 'gait: auto'))
-  return `state: hp ${Math.round(Number(bot.health ?? 0))}/20 food ${Math.round(Number(bot.food ?? 0))}/20 | pos ${pos} ${dim} | ${tod}${bot.isRaining ? ', raining' : ''} | speed ${speedMs.toFixed(1)} m/s (${posture}) | holding ${held}${off ? ` + ${off} (off-hand)` : ''}${worn.length ? ` | wearing ${worn.join(', ')}` : ' | no armor'}`
+  let environment = ''
+  try { environment = environmentSnapshot(bot)?.line || '' } catch { /* partial world data */ }
+  return `state: hp ${Math.round(Number(bot.health ?? 0))}/20 food ${Math.round(Number(bot.food ?? 0))}/20 | pos ${pos} ${dim} | ${tod}${bot.isRaining ? ', raining' : ''} | speed ${speedMs.toFixed(1)} m/s (${posture}) | holding ${held}${off ? ` + ${off} (off-hand)` : ''}${worn.length ? ` | wearing ${worn.join(', ')}` : ' | no armor'}${environment ? `\n${environment}` : ''}`
 }
 
 /** "inventory (9/36 slots): iron_sword, bread x12, …" — every kind, counted. */

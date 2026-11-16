@@ -19,6 +19,7 @@
 const { PRIORITY } = require('./control')
 const { PlaceIndex, CONTAINER_KINDS } = require('./places')
 const { whereIs } = require('./threats')
+const { environmentSnapshot } = require('./environment')
 const { findBlocksFast } = require('./block_search')
 const { armorInfo } = require('./armor')
 /** Where a wearable that is not armor goes when no slot is named. */
@@ -453,16 +454,29 @@ class Skills {
       const opened = wrapper.beginDigging({ canDig: materials, avoid, maxMs: Math.max(5_000, Math.min(this.moveTimeoutMs, 120_000)) })
       if (!opened) return fail('could not open a way: this body cannot dig')
 
-      const r = await this._walk(token, goal, { timeoutMs: Math.max(this.moveTimeoutMs, 90_000) })
-      const p = bot.entity?.position
-      // Honest report: permission was granted for this route, not a claim about
-      // how many blocks fell (the walk only breaks what actually blocks it).
-      const allowedToBreak = materials ? `only ${materials.join('/')}` : (avoid.length ? `anything but ${avoid.join('/')}` : 'only what was in the way')
-      const coords = p ? `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}` : '?'
-      if (!r.ok) {
-        return fail(`could not get through to ${label}: ${r.why}${r.interrupted ? ' (interrupted by fleeing)' : ''} (may break ${allowedToBreak})`)
+      const broken = new Map()
+      const onBlockUpdate = (oldBlock, newBlock) => {
+        if (!oldBlock?.position || !newBlock || !/^(air|cave_air|void_air)$/.test(String(newBlock.name || ''))) return
+        const pos = oldBlock.position
+        const me = bot.entity?.position
+        if (me && Math.hypot(pos.x - me.x, pos.y - me.y, pos.z - me.z) > 8) return
+        broken.set(`${pos.x},${pos.y},${pos.z}`, oldBlock.name)
       }
-      return ok(`reached ${label} (${coords}); this route could break ${allowedToBreak}`)
+      bot.on?.('blockUpdate', onBlockUpdate)
+      let r
+      try { r = await this._walk(token, goal, { timeoutMs: Math.max(this.moveTimeoutMs, 90_000) }) } finally {
+        try { bot.removeListener?.('blockUpdate', onBlockUpdate) } catch { /* best effort */ }
+      }
+      const p = bot.entity?.position
+      const allowedToBreak = materials ? `only ${materials.join('/')}` : (avoid.length ? `anything but ${avoid.join('/')}` : 'only blocks in the path')
+      const brokenSummary = broken.size ? `broke ${broken.size} block${broken.size === 1 ? '' : 's'} (${[...broken.values()].slice(0, 5).join(', ')}${broken.size > 5 ? ', …' : ''})` : 'broke 0 observed blocks'
+      const coords = p ? `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}` : '?'
+      let envLine = ''
+      try { envLine = environmentSnapshot(bot)?.line || '' } catch { /* partial world */ }
+      if (!r.ok) {
+        return fail(`could not get through to ${label}: ${r.why}${r.interrupted ? ' (interrupted by fleeing)' : ''}; ${brokenSummary}; break filter: ${allowedToBreak}; now at ${coords}${envLine ? `; ${envLine}` : ''}`)
+      }
+      return ok(`reached ${label} (${coords}); ${brokenSummary}; break filter: ${allowedToBreak}${envLine ? `; ${envLine}` : ''}`)
     })
   }
 
@@ -1140,9 +1154,10 @@ class Skills {
       const askedRadius = Math.trunc(Number(radius)) || GATHER_DEFAULT_RADIUS
       radius = Math.max(1, Math.min(GATHER_MAX_RADIUS, askedRadius))
       const cut = askedRadius > GATHER_MAX_RADIUS ? ` (${GATHER_MAX_RADIUS} is the most one gather covers — a larger radius changes nothing)` : ''
-      const countExact = () => bot.inventory.items().filter((i) => i.name === want).reduce((n, i) => n + (Number(i.count) || 0), 0)
-      const before = countExact()
-      const progress = () => `dig calls completed: ${dug}/${wanted}; exact inventory ${want} net change: ${countExact() - before} (not attributable; other drops or later pickup not counted)`
+      const matchingNames = new Set(targets.names)
+      const countInventoryTargets = () => bot.inventory.items().filter((i) => matchingNames.has(i.name)).reduce((n, i) => n + (Number(i.count) || 0), 0)
+      const before = countInventoryTargets()
+      const progress = () => `blocks gathered: ${dug}/${wanted} ${targets.names.join('/')}; carried target items changed by ${countInventoryTargets() - before} (inventory delta; may include other pickups)`
       let dug = 0
       let misses = 0
       let skippedProtected = 0

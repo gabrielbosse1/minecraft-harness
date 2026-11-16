@@ -63,9 +63,14 @@ const TOOL_LANES = Object.freeze({
   run_script: LANES.BODY,
   stop: LANES.BODY,
   hold: LANES.BODY,
+  memory: LANES.COMPUTATION,
+  redstone_design: LANES.COMPUTATION,
+  redstone_review: LANES.COMPUTATION,
   // --- COMPUTATION: no world mutation at all ---
   logic_test: LANES.COMPUTATION,
   circuit_project: LANES.COMPUTATION,
+  build_redstone: LANES.COMPUTATION,
+  place_redstone: LANES.COMPUTATION,
   // --- WORLD INFO: read-only ---
   inspect_block: LANES.WORLD_INFO,
   inspect_region: LANES.WORLD_INFO,
@@ -187,6 +192,19 @@ const isShared = (resource) => {
 }
 
 const laneOf = (tool) => TOOL_LANES[tool] || LANES.BODY
+const laneFromResources = (resources) => {
+  const resource = (resources || []).find((r) => typeof r === 'string' && r.startsWith('lane:'))
+  return resource ? resource.slice(5) : LANES.BODY
+}
+
+// The redstone engineer is a mixed read/write API: placement and verification
+// toggle real world blocks, while analysis/design/trace are read-only or pure.
+function laneOfAction (action) {
+  const tool = typeof action === 'string' ? action : action?.a
+  const op = typeof action === 'object' ? String(action.operation || '').toLowerCase() : ''
+  if (tool === 'redstone_engineer' && ['place', 'verify'].includes(op)) return LANES.BODY
+  return laneOf(tool)
+}
 
 /**
  * Every resource a call needs, including its lane's own slot.
@@ -196,9 +214,11 @@ const laneOf = (tool) => TOOL_LANES[tool] || LANES.BODY
  * for roamer tools (`gather`, `light_up`) is the coarse world key.
  */
 function resourcesFor (tool, opts = {}) {
-  const lane = laneOf(tool)
+  const action = opts.action || opts
+  const lane = laneOfAction(typeof action === 'object' ? { ...action, a: tool } : tool)
   const res = new Set([`lane:${lane}`])
-  const declared = TOOL_RESOURCES[tool] || []
+  const redstoneWrite = tool === 'redstone_engineer' && ['place', 'verify'].includes(String(action?.operation || '').toLowerCase())
+  const declared = redstoneWrite ? ['world'] : (TOOL_RESOURCES[tool] || [])
   for (const r of declared) res.add(r)
   // A footprint only replaces the coarse key; other resources stay.
   const footprintKeys = opts.footprint ? regionsFor(opts.footprint) : []
@@ -309,7 +329,7 @@ class LaneScheduler {
     // waiting work that all fires the instant the pause ends.
     const gateRefusal = this.gate ? this.gate(resources, meta) : null
     if (gateRefusal) {
-      this.events.push({ at: t, kind: 'refused', tool, holder, reason: String(gateRefusal).slice(0, 120), lane: laneOf(tool), goalId: meta.goalId || null })
+      this.events.push({ at: t, kind: 'refused', tool, holder, reason: String(gateRefusal).slice(0, 120), lane: laneFromResources(resources), goalId: meta.goalId || null })
       return Promise.resolve(null)
     }
     if (this.canGrant(resources)) {
@@ -318,7 +338,7 @@ class LaneScheduler {
     }
     return new Promise((resolve) => {
       this.waiters.push({ tool, holder, meta, resources, resolve, enqueuedAt: t })
-      this.events.push({ at: t, kind: 'queued', tool, holder, resources: resources.slice(), lane: laneOf(tool), goalId: meta.goalId || null })
+      this.events.push({ at: t, kind: 'queued', tool, holder, resources: resources.slice(), lane: laneFromResources(resources), goalId: meta.goalId || null })
     })
   }
 
@@ -353,7 +373,7 @@ class LaneScheduler {
     const lease = {
       id: holder,
       tool,
-      lane: laneOf(tool),
+      lane: laneFromResources(resources),
       resources,
       grantedAt,
       waitedMs,
@@ -385,7 +405,7 @@ class LaneScheduler {
       const info = this.held.get(r)
       if (info && info.holder === holder) { tool = info.tool; this.held.delete(r) }
     }
-    this.events.push({ at: t, kind: 'release', tool, holder, reason, lane: tool ? laneOf(tool) : null })
+    this.events.push({ at: t, kind: 'release', tool, holder, reason, lane: tool ? laneFromResources(resources) : null })
     this._drain()
   }
 
@@ -667,6 +687,7 @@ module.exports = {
   regionKey,
   regionsFor,
   laneOf,
+  laneOfAction,
   resourcesFor,
   conflicts,
   isShared,

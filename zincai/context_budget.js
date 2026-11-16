@@ -80,6 +80,12 @@ function resolveModelLimits (model) {
       }
     }
   }
+  // Recognize this configured vision model without claiming unverified vendor
+  // limits; keep the same conservative generic budget until live metadata or
+  // an endpoint limit error supplies authoritative numbers.
+  if (/minicpm[-_.]?v[-_.]?4[._-]?7/i.test(raw) || /minicpm[-_.]?v[-_.]?4[._-]?7/i.test(base)) {
+    return { ...DEFAULT_MODEL_LIMITS, family: 'minicpm-v-4.7', source: 'default' }
+  }
   return { ...DEFAULT_MODEL_LIMITS }
 }
 

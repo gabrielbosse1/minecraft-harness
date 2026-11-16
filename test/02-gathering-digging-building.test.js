@@ -144,6 +144,35 @@ describe('02 — real-server gathering, digging, placing & building', () => {
     }
   })
 
+  it('refuses a large house build under natural cave rock before placing any blocks', async () => {
+    sim = await startSimulation()
+    const { mc, llm, bot, internals, waitFor } = sim
+    const origin = bot.entity.position.floored()
+    const buildAt = [origin.x + 8, origin.y, origin.z + 8]
+    const roof = new (require('vec3'))(buildAt[0] + 2, buildAt[1] + 5, buildAt[2] + 1)
+    await mc.setBlock(roof, 'stone')
+    await waitFor(() => bot.blockAt(roof)?.name === 'stone', { label: 'natural stone ceiling loaded' })
+    llm.enqueueAction({ toolCalls: [{ name: 'build', arguments: { blueprint: 'small_house', at: buildAt } }] })
+    internals.brain.wake('test house site', { external: true, urgent: true })
+    await waitFor(() => internals.results.some((r) => r.label === 'build' && !r.ok && /cave\/underground/.test(r.msg)), {
+      timeoutMs: 10_000, label: 'house site refused as cave'
+    })
+    assert.equal((await mc.getBlock(new (require('vec3'))(...buildAt))).name, 'air', 'refusal must happen before placement')
+  })
+
+  it('refuses a blind vertical shaft dig and recommends a walkable route', async () => {
+    sim = await startSimulation()
+    const { llm, bot, internals, waitFor } = sim
+    const pos = bot.entity.position.floored()
+    llm.enqueueAction({ toolCalls: [{ name: 'dig', arguments: { x: pos.x, y: pos.y + 6, z: pos.z } }] })
+    internals.brain.wake('test avoid blind shaft', { external: true, urgent: true })
+    await waitFor(() => internals.results.some((r) => r.label === 'dig' && !r.ok && /vertical shaft request/.test(r.msg)), {
+      timeoutMs: 10_000, label: 'blind upward dig refused'
+    })
+    assert.equal(bot.entity.position.floored().x, pos.x)
+    assert.equal(bot.entity.position.floored().z, pos.z)
+  })
+
   it('digs through a dirt barrier to reach coordinates on the other side', async () => {
     sim = await startSimulation()
     const { mc, llm, bot, internals, waitFor } = sim

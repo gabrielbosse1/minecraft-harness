@@ -30,6 +30,8 @@
  */
 'use strict'
 
+const { environmentSnapshot } = require('./environment')
+
 const zlib = require('node:zlib')
 const { getBlockTexture, HAS_TEXTURES } = require('./textures')
 
@@ -1797,6 +1799,7 @@ async function renderCamera (bot, opts) {
     ? `${chunksInView}/${sampler.chunksLoaded} loaded chunks in view, out to ${maxDist}m`
     : `out to ${maxDist}m`
   lines.push(`bot: ${hud.join('; ')}`)
+  try { const env = environmentSnapshot(bot); if (env?.line) lines.push(env.line) } catch { /* visual render still succeeds with partial environment data */ }
   lines.push(`rendered directly from loaded block data (${chunkNote}, procedural block textures & lighting)`)
 
   const png = encodePng(canvas.rgb, w, h)
@@ -1969,6 +1972,7 @@ async function renderMap (bot, opts) {
   const lines = [
     `map centred on you at ${pos.x},${pos.y},${pos.z}: ${side}x${side} blocks (x ${pos.x - radius}..${pos.x + radius}, z ${pos.z - radius}..${pos.z + radius}), north up, grid line every ${step} blocks labelled with world x (top, yellow) and z (left, blue)`
   ]
+  try { const env = environmentSnapshot(bot); if (env?.line) lines.push(env.line) } catch { /* partial world data */ }
   if (Number.isFinite(minY)) lines.push(`surface heights y ${minY}..${maxY} (lighter = higher than you, darker = lower)`)
   lines.push(`ground: ${topGround.join(', ') || 'unloaded'}`)
   if (entsOnMap.length) {

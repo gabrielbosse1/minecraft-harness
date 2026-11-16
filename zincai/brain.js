@@ -398,7 +398,7 @@ class Brain {
       this.pending.push({
         text: busy
           ? 'autonomous check-in (your body is still busy — see `doing`; idle lets it carry on, or adjust/stop it if it is going wrong)'
-          : 'autonomous check-in (pursue an open/new goal, explore, or idle if content)',
+          : 'autonomous check-in (continue the highest-priority open goal; if none, choose a useful objective or idle)',
         external: true, urgent: false, fast: false, important: false, at: now, mono: performance.now()
       })
       this.stats.heartbeats++

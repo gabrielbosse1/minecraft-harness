@@ -14,9 +14,9 @@
  * prompt's results). The failure is also advertised in the prompt so a
  * weaker model gets an explicit "stop trying this" instruction.
  *
- * Only SYNCHRONOUS failures are gated (the churn source). Long tasks that
- * fail later in the background report through a different path and never
- * loop at this cadence.
+ * Synchronous refusals and completed background-task failures share this
+ * gate: the latter are recorded when their real result arrives, so repeating
+ * the same failed navigation/build/gather request is blocked too.
  *
  * Resets (the world plausibly changed, so a retry is fair):
  *   - any SUCCESS of the same tool clears that tool's entries;
@@ -33,7 +33,8 @@
 
 const GATEABLE = new Set([
   'attack', 'craft', 'take', 'put', 'smelt', 'give', 'sleep',
-  'use_block', 'look_in', 'equip', 'eat', 'go_to', 'follow', 'build', 'build_shape'
+  'use_block', 'look_in', 'equip', 'eat', 'go_to', 'follow', 'build', 'build_shape',
+  'dig', 'gather', 'corpse_run', 'light_up', 'shelter', 'place'
 ])
 
 /** Fields that change what a call means. Anything else (formatting junk) is ignored. */

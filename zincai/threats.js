@@ -21,6 +21,7 @@
  */
 'use strict'
 
+const { Vec3 } = require('vec3')
 const { attachDoors, describe: describeDoor, blocksWalk } = require('./custom_mineflayer/doors')
 
 const HOSTILE_NAMES = new Set([
@@ -288,7 +289,7 @@ function clearLine (bot, from, to, { step = 0.4, maxDist = 32 } = {}) {
   const dist = Math.hypot(dx, dy, dz)
   if (dist > maxDist) return false
   const n = Math.max(1, Math.ceil(dist / step))
-  const p = { x: 0, y: 0, z: 0 }
+  const p = new Vec3(0, 0, 0)
   let lastKey = ''
   for (let i = 1; i < n; i++) {
     const t = i / n

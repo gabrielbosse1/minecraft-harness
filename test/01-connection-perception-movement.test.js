@@ -4,7 +4,7 @@
  * Connects ZincAI to a real offline flying-squid 1.21.4 server and drives
  * real end-to-end tool calls via a local OpenAI-compatible HTTP endpoint:
  *  - Spawn & world state observation in action prompts
- *  - Clean 39-tool surface (no removed dig_policy or equip.auto toggles)
+ *  - Clean 41-tool surface (no removed dig_policy or equip.auto toggles)
  *  - Pathfinding around a real stone barrier via LLM-issued `go_to`
  *  - Ground-truth `find`, `inspect_block`, `inspect_region`, `remember_here`, `screenshot`
  */

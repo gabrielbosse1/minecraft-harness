@@ -76,7 +76,7 @@ const { resolveModelLimits } = require('./context_budget')
 const { stamp: ircStamp, ago: ircAgo, formatLine: ircLine, LEGEND: IRC_LEGEND } = require('./irc')
 const { FailGate } = require('./failgate')
 const { ContinuityStore } = require('./continuity')
-const { LaneScheduler, JobRegistry, laneOf, LANES } = require('./lanes')
+const { LaneScheduler, JobRegistry, laneOf, laneOfAction, LANES } = require('./lanes')
 const { TelemetryRecorder } = require('./telemetry')
 const ZINC_TOOLS = createZincTools()
 
@@ -1278,7 +1278,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     if (prev) shelfMain(prev, `set aside: ${spec.label} was started`)
     agenda.shelved = agenda.shelved.filter((x) => !spec.goalId || x.goalId !== spec.goalId)
     replaceTask()
-    const main = { ...spec, startedAt: Date.now(), paused: null, resumes: 0, seq: 0 }
+    const main = { ...spec, failAction: gateCtx?.a === spec.tool ? { ...gateCtx } : null, startedAt: Date.now(), paused: null, resumes: 0, seq: 0 }
     let goal = main.goalId ? goalReg.get(main.goalId) : null
     if (goal) {
       goalReg.update(goal.id, { detail: { ...(goal.detail || {}), ...(spec.detail || {}) } })
@@ -1452,7 +1452,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   function focusGoal () {
     const open = goalReg.openGoals()
     const byId = (id) => (id ? open.find((g) => g.id === id) : null)
-    return byId(agenda.main && !agenda.main.paused ? agenda.main.goalId : null) || byId(journal.focus) || open.find((g) => g.status === 'active') || null
+    return byId(agenda.main && !agenda.main.paused ? agenda.main.goalId : null) || byId(journal.focus) || open.find((g) => g.status === 'active') || open.slice().sort((a, b) => b.priority - a.priority || a.createdAt - b.createdAt)[0] || null
   }
 
   /** Compaction with goal continuation (journal.js): plan, next step, what was done and what keeps failing. */
@@ -1460,7 +1460,13 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     if (cfg.compaction?.enabled === false) return null
     try {
       journal.prune(goalReg.openGoals().map((g) => g.id))
-      return journal.continuation({ goal: focusGoal(), exclude })
+      const focused = focusGoal()
+      const primary = journal.continuation({ goal: focused, exclude })
+      const parent = focused?.parentId ? goalReg.get(focused.parentId) : null
+      const parentBlock = parent && ['pending', 'active', 'suspended', 'resumable'].includes(parent.status)
+        ? journal.continuation({ goal: parent, exclude })
+        : null
+      return parentBlock ? `${parentBlock}\n  current subgoal: ${focused.id} — ${focused.description}\n${primary || ''}` : primary
     } catch { return null }
   }
 
@@ -1804,10 +1810,13 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         // not completed just because the model says so.
         const detail = goalReg.get(action.id)?.detail || {}
         if (detail.redstoneVerified === null && detail.redstoneVerificationFailed) {
-          return report('goal', { ok: false, msg: `goal ${action.id} NOT completed: its redstone failed functional verification — diagnose, fix and verify again first` }, { wake: true })
+          return { ok: false, msg: `goal ${goal.id} NOT completed: its redstone failed functional verification — diagnose, fix and verify again first` }
         }
         const r = goalReg.complete(goal.id, { note: action.note ? String(action.note).slice(0, 100) : 'marked complete by the model' })
-        return r.ok ? { ok: true, msg: `${goal.id} completed: ${goal.description}` } : { ok: false, msg: r.why }
+        if (!r.ok) return { ok: false, msg: r.why }
+        const nextGoal = goalReg.openGoals().slice().sort((a, b) => b.priority - a.priority || a.createdAt - b.createdAt)[0] || null
+        journal.setFocus(nextGoal?.id || null)
+        return { ok: true, msg: `${goal.id} completed: ${goal.description}${nextGoal ? `; next open objective: ${nextGoal.id} ${nextGoal.description}` : '; no other open objective'}` }
       }
       case 'resume': {
         if (!goal) return { ok: false, msg: `no goal matches "${wanted || '?'}"` }
@@ -1937,6 +1946,11 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       .then((r) => r, (err) => ({ ok: false, msg: String(err?.message || err) }))
       .then((r) => {
         if (task?.id === id) task = null
+        const gateAction = main?.failAction || null
+        if (gateAction && String(label) === String(gateAction.a)) {
+          if (r?.ok) failGate.recordSuccess(gateAction)
+          else if (!/cancelled|replaced|paused/i.test(String(r?.msg || ''))) failGate.recordFailure(gateAction, r?.msg || 'task failed', here())
+        }
         if (main) {
           // An earlier run of this task, or a task the agenda no longer holds: not news.
           if (agenda.main !== main || main.seq !== seq) return
@@ -2065,7 +2079,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         ? `  decide: idle = let the body dodge and go back to "${errand}" by itself | attack = fight | hold = stop dodging, they are harmless or accepted | stop = give up "${errand}"`
         : '  decide: idle = keep fleeing | attack = fight | go_to / follow = go there instead | hold = stop running, they are harmless or accepted')
     }
-    else if (combat?.isEngaged) lines.push('  you chose to fight.')
+    else if (combat?.isEngaged) lines.push(combat.autoDefense ? '  reflex auto-kiting is active; you did not explicitly order an attack.' : '  your explicit attack task is active.')
     else {
       const d = system1?.decisionLine()
       lines.push(d ? `  ${d}.` : '  not close enough to make the body run yet.')
@@ -2140,7 +2154,20 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     const pos = here()
     sense.assess()
     try { places.scan(bot, { radius: cfg.places.scanRadius ?? 16 }) } catch { /* partial world */ }
-    try { continuity.observeEnvironment(bot, places) } catch { /* partial world */ }
+    try {
+      const traveling = Boolean(agenda.main && ['go_to', 'follow', 'dig', 'corpse_run'].includes(agenda.main.tool))
+      continuity.observeEnvironment(bot, places, { suppressOpportunistic: traveling })
+    } catch { /* partial world */ }
+    // Keep the named-place index and verified identity home as one source of truth.
+    try {
+      const h = continuity.identity?.home
+      if (h && Number.isFinite(h.x) && Number.isFinite(h.y) && Number.isFinite(h.z)) {
+        const savedHome = places.getPlace('home')
+        if (!savedHome || savedHome.x !== h.x || savedHome.y !== h.y || savedHome.z !== h.z || savedHome.dim !== (h.dim || dim())) {
+          places.remember('home', h, { dim: h.dim || dim(), ownership: 'own', owner: bot.username, note: `verified ${h.basis || 'home'}` })
+        }
+      }
+    } catch { /* partial place store */ }
     // Everything shown as coming at the bot is what a decision this turn is
     // about — and everything the body is running from right now, including
     // the ones that slipped behind a corner a moment ago (they are not in the
@@ -2399,7 +2426,8 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   function isPreDecisionInspect (action) {
     if (!action) return false
     const a = String(action.a || '')
-    if (['look_in', 'inspect_block', 'inspect_region', 'screenshot', 'redstone_scan', 'redstone_component', 'redstone_engineer', 'recall', 'find', 'equip', 'eat'].includes(a)) return true
+    if (['look_in', 'inspect_block', 'inspect_region', 'screenshot', 'redstone_scan', 'redstone_component', 'recall', 'find', 'equip', 'eat'].includes(a)) return true
+    if (a === 'redstone_engineer') return !['place', 'verify'].includes(String(action.operation || '').toLowerCase())
     if (a === 'social' && ['list', 'show'].includes(String(action.operation || 'list'))) return true
     if (a === 'goal' && ['list', 'show', 'verify'].includes(String(action.operation || 'list'))) return true
     return false
@@ -2692,7 +2720,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         if (plainIdle) wantsEnd = true
         // The body does one thing at a time. A second physical call in the same
         // answer would cancel the first before it took a step.
-        if (bodyStarted && laneOf(action.a) === LANES.BODY) {
+        if (bodyStarted && laneOfAction(action) === LANES.BODY) {
           const text = `NOT RUN: ${bodyStarted} was started by this same answer and the body does one thing at a time. Wait for its result (you will be woken), then call ${action.a}.`
           calls.push({ id: action._callId, name: callName, args: publicArgs(action), result: text })
           logger.info(TAG, `${action.a} skipped: ${bodyStarted} already started in this answer`)
@@ -2712,7 +2740,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         }
         executed.push(action)
         const own = tap.filter((r) => r.label === action.a || (action.a === 'idle' && r.label === 'reply'))
-        const startedBody = !plainIdle && !own.length && laneOf(action.a) === LANES.BODY && bodyWorking()
+        const startedBody = !plainIdle && !own.length && laneOfAction(action) === LANES.BODY && bodyWorking()
         let text
         if (startedBody) {
           bodyStarted = action.a
@@ -2917,7 +2945,13 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     try { telemetry.combatEvent(evt) } catch { /* noop */ }
     if (!evt.result) return
     const f = fight
-    if (!f) return
+    if (!f) {
+      // Reflex auto-defense is not an explicit model-ordered fight, but its
+      // completion/disengage still releases decision suppression and body state.
+      system1?.clearDecision()
+      if (evt.result !== 'disengaged' && !combat?.isEngaged) resumeMain('reflex combat')
+      return
+    }
     if (evt.result === 'won') {
       f.kills++
       // "attack zombie" means the zombies, not one zombie: take the next one of
@@ -3018,6 +3052,9 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       origin = bot.entity.position.floored()
     }
     const plan = parser.plan({ name: label, blocks }, origin, bot.entity.position)
+    // Large habitation/tower structures require a loaded, solid, dry outdoor site.
+    const siteError = require('./build_site').buildSiteError(bot, { label, origin, steps: plan.steps || [] })
+    if (siteError) return { ok: false, msg: siteError }
     // Property respect check: never build over another player's claimed structure without authorization.
     //
     // This used to probe exactly three cells — first, middle, last step. Steps
@@ -3180,7 +3217,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     // finally block of the executor wrapper below.
     let laneLease = null
     try {
-      const lane = laneOf(a)
+      const lane = laneOfAction(action)
       // A newer physical decision interrupts the current task before waiting
       // for its lease; the old task retains its lock until it really exits.
       if (lane === LANES.BODY && agenda.main && lanes.bodyHolder()) {
@@ -3188,7 +3225,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         replaceTask()
       }
       const footprint = footprintOf(action)
-      const meta = { goalId: agenda.main?.goalId || null, footprint }
+      const meta = { goalId: agenda.main?.goalId || null, footprint, operation: action.operation, action }
       if (lane === LANES.WORLD_INFO || lane === LANES.COMPUTATION) {
         laneLease = lanes.tryAcquire(a, meta)
       } else {
@@ -3217,7 +3254,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         // Prose, invalid tool calls, or empty tool-less responses used to vanish silently; tell the model once.
         if (action._prose) report('reply', { ok: false, msg: 'you answered in prose without calling a tool, so nothing happened — call a tool (say to talk)' })
         else if (action._unknownTool) report('reply', { ok: false, msg: `there is no tool "${action._unknownTool}"` })
-        else if (action._badArgs) report('reply', { ok: false, msg: `arguments for ${action._badArgs} failed schema validation` })
+        else if (action._badArgs) report('reply', { ok: false, msg: `arguments for ${action._badArgs} failed validation${action._badArgsDetail ? `: ${action._badArgsDetail}` : ''}` })
         else if (action._truncated) report('reply', { ok: false, msg: 'your answer hit the output-token limit while you were still reasoning, so no tool was called and nothing happened. Decide in one line and put the tool call FIRST; the continue block already holds the plan — do not re-derive it' })
         else if (action._fallback) report('reply', { ok: false, msg: 'you returned no tool call, so nothing happened — call a listed tool (say to talk, idle to wait)' })
         return
@@ -3240,6 +3277,16 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       case 'dig': {
         const target = { player: action.player, place: action.place, x: action.x, y: action.y, z: action.z, materials: action.materials, avoid: action.avoid, gait: action.gait }
         const askedBy = resolveActionAttribution('dig', action, snap)
+        const currentPos = here()
+        if (!action.player && !action.place && currentPos && Number.isFinite(Number(action.x)) && Number.isFinite(Number(action.z))) {
+          const sameColumn = Math.hypot(Number(action.x) - currentPos.x, Number(action.z) - currentPos.z) <= 1
+          if (sameColumn && Number.isFinite(Number(action.y)) && Number(action.y) > currentPos.y + 2) {
+            return report('dig', { ok: false, msg: 'refused: this is a vertical shaft request above your current column, not a useful walking route. Do not dig upward blindly; inspect the ceiling, then use go_to toward a known walkable surface exit or choose a verified horizontal passage.' })
+          }
+          if (sameColumn && !Number.isFinite(Number(action.y))) {
+            return report('dig', { ok: false, msg: 'refused: dig without y at your current x/z has no meaningful destination and will not find the surface. Use go_to for a walkable route, or provide a deliberate, verified tunneling destination.' })
+          }
+        }
         if (Number.isFinite(Number(action.x)) && Number.isFinite(Number(action.z))) {
           const g = continuity.propertyGuardAt({ x: Number(action.x), y: Number(action.y ?? here()?.y ?? 64), z: Number(action.z) }, dim(), { askedBy })
           if (!g.ok) return report('dig', { ok: false, msg: `refused to dig: destination is inside ${g.reason} — use go_to or get permission` })
@@ -3264,11 +3311,19 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       }
       case 'stop': {
         const duel = fight?.player ? combat?.target : null
+        const stoppedGoalId = agenda.main?.goalId || null
         agenda.main = null
         agenda.asked = []
-        // Cancelled is terminal: a late tool result cannot bring it back.
-        try { goalReg.cancelAll({ reason: 'stop' }) } catch { /* best effort */ }
         replaceTask()
+        // Stop execution, not the durable objective: preserve it as suspended
+        // so it can be resumed explicitly after the interruption is understood.
+        if (stoppedGoalId) {
+          try {
+            const g = goalReg.get(stoppedGoalId)
+            if (g && ['pending', 'active'].includes(g.status)) goalReg.suspend(stoppedGoalId, { reason: 'execution stopped; objective retained', by: 'model' })
+            if (journal.focus === stoppedGoalId) journal.setFocus(stoppedGoalId)
+          } catch { /* best effort */ }
+        }
         system1.clearDecision()
         system1.suppressAutoFight(null, 20_000)
         // A duel the model agreed to and then called off: the hits were part
@@ -3561,8 +3616,9 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         const res = skills.rememberHere({ name: action.name, note: action.note })
         if (res.ok && p) {
           try {
-            if (ownership || action.owner) {
+            if (ownership || action.owner || action.home === true) {
               places.remember(action.name, p, { dim: dim(), note: action.note, ownership: ownership || (action.home ? 'own' : ''), owner: action.owner || '' })
+              if (action.home === true) places.remember('home', p, { dim: dim(), note: 'verified home', ownership: 'own', owner: bot.username })
             }
             if (ownership && ownership !== 'unknown') {
               continuity.recordClaim({ name: action.name, pos: p, radius: 9, dim: dim(), kind: ownership, owner: action.owner || (ownership === 'own' ? bot.username : null), note: action.note || '', source: 'model_note' })
@@ -3975,8 +4031,8 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         origin: g.origin,
         progress: g.progress || null
       })),
-      plan: active ? (() => { try { return journal.planOf?.(active.id) || null } catch { return null } })() : null,
-      journalDigest: (() => { try { return journal.continuation?.({ focusGoal: active }) || null } catch { return null } })(),
+      plan: active ? (() => { try { return journal.planLine(active.id) || null } catch { return null } })() : null,
+      journalDigest: (() => { try { return journal.continuation?.({ goal: active }) || null } catch { return null } })(),
       pendingProposals: (agenda.asked || []).slice(-6)
     }
   }

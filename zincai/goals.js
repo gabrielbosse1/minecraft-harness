@@ -96,13 +96,14 @@ class GoalRegistry {
    *           max?: number, terminalKeep?: number, now?: () => number,
    *           saveThrottleMs?: number }} [opts]
    */
-  constructor ({ file = null, logger = () => {}, max = 40, terminalKeep = 12, now = () => Date.now(), saveThrottleMs = 1500 } = {}) {
+  constructor ({ file = null, logger = () => {}, max = 40, terminalKeep = 12, now = () => Date.now(), saveThrottleMs = 1500, onLifecycle = null } = {}) {
     this.file = file || null
     this.log = logger
     this.max = Math.max(4, clampInt(max, 4, 500, 40))
     this.terminalKeep = Math.max(0, clampInt(terminalKeep, 0, 200, 12))
     this.now = now
     this.saveThrottleMs = Math.max(0, Number(saveThrottleMs) || 0)
+    this.onLifecycle = typeof onLifecycle === 'function' ? onLifecycle : null
     this.goals = []
     this.seq = 0
     this.savedAt = 0
@@ -288,6 +289,44 @@ class GoalRegistry {
   /** The currently running objective, if any. */
   active () { return this.goals.find((g) => g.status === STATUS.active) || nodesFirst(this.goals) }
 
+  /** Primary (top-level, non-subtask) open objective, preferring active > resumable > suspended > pending. */
+  primaryGoal () {
+    const rank = { [STATUS.active]: 4, [STATUS.resumable]: 3, [STATUS.suspended]: 2, [STATUS.pending]: 1 }
+    const tops = this.goals.filter((g) => isOpen(g) && !g.parentId)
+    if (!tops.length) return this.openGoals()[0] || null
+    tops.sort((a, b) => (rank[b.status] - rank[a.status]) || (b.priority - a.priority) || (a.createdAt - b.createdAt))
+    return tops[0]
+  }
+
+  /** Subtasks attached to a given parent goal id. */
+  subtasksOf (parentId, { openOnly = false } = {}) {
+    const key = clean(parentId, 24).toLowerCase()
+    if (!key) return []
+    return this.goals.filter((g) => (g.parentId || '').toLowerCase() === key && (!openOnly || isOpen(g)))
+  }
+
+  /** Record a temporary survival/threat interruption on an active goal so it can resume cleanly later. */
+  recordInterruption (id, reason = 'interrupted by survival threat', { by = 'survival' } = {}) {
+    const goal = this.get(id)
+    if (!goal || goal.status !== STATUS.active) return { ok: false, goal, why: 'not active' }
+    const res = this.transition(id, STATUS.resumable, { reason, by })
+    if (res.ok && res.goal) {
+      res.goal.suspendedBy = clean(by, 40)
+      this.save({ force: true })
+    }
+    return res
+  }
+
+  /** Resume the highest-priority resumable/suspended top-level goal when none is currently active. */
+  resumePrimary (reason = 'resumed after interruption') {
+    if (this.active()) return { ok: false, goal: this.active(), why: 'another goal is already active' }
+    const cand = this.goals
+      .filter((g) => (g.status === STATUS.resumable || g.status === STATUS.suspended) && !g.parentId)
+      .sort((a, b) => (b.priority - a.priority) || ((b.suspendedAt || b.updatedAt) - (a.suspendedAt || a.updatedAt)))[0]
+    if (!cand) return { ok: false, goal: null, why: 'no resumable primary goal' }
+    return this.resume(cand.id, { reason })
+  }
+
   // ------------------------------------------------------------ creation --
 
   /**
@@ -295,12 +334,34 @@ class GoalRegistry {
    *           parentId?:string|null, relatedIds?:string[], resources?:Array,
    *           preconditions?:string[], dependencies?:string[],
    *           completion?:string, failure?:string, interruption?:string, resume?:string,
-   *           detail?:object, status?:string }} spec
+   *           detail?:object, status?:string, allowDuplicate?:boolean }} spec
    */
   add (spec = {}) {
     const now = this.now()
     const description = clean(spec.description, 160)
     if (!description) return null
+    const normDesc = description.toLowerCase()
+    const parentId = spec.parentId ? clean(spec.parentId, 24) : null
+    const kind = clean(spec.kind || 'declared', 24)
+    if (!spec.allowDuplicate) {
+      const existing = this.goals.find((g) =>
+        isOpen(g) &&
+        g.description.toLowerCase() === normDesc &&
+        (g.parentId || null) === parentId &&
+        g.kind === kind
+      )
+      if (existing) {
+        if (spec.priority !== undefined && Number(spec.priority) > existing.priority) {
+          existing.priority = clampInt(spec.priority, 0, 100, existing.priority)
+        }
+        if (spec.detail && typeof spec.detail === 'object') {
+          existing.detail = { ...existing.detail, ...spec.detail }
+        }
+        existing.updatedAt = now
+        this.save()
+        return existing
+      }
+    }
     this.seq += 1
     const goal = this._normalize({
       id: `g${this.seq}`,
@@ -495,6 +556,21 @@ class GoalRegistry {
     if (note) goal.progress.note = clean(note, 120)
     this._history(goal, from, to, reason || note || '')
     this.save({ force: true })
+    if (this.onLifecycle) {
+      let eventType = null
+      if (to === STATUS.active) {
+        eventType = (from === STATUS.suspended || from === STATUS.resumable || from === STATUS.failed) ? 'objective_resumed' : 'objective_started'
+      } else if (to === STATUS.suspended || to === STATUS.resumable) {
+        eventType = 'objective_paused'
+      } else if (to === STATUS.completed) {
+        eventType = 'objective_completed'
+      } else if (to === STATUS.failed) {
+        eventType = 'objective_failed'
+      }
+      if (eventType) {
+        try { this.onLifecycle({ eventType, goal, from, to, reason: clean(reason || note || error || '', 120) }) } catch { /* never break transition */ }
+      }
+    }
     return { ok: true, goal }
   }
 

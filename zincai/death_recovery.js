@@ -112,6 +112,29 @@ function normalizeObs (s = {}) {
   }
 }
 
+/**
+ * Infer a truthful cause of death from recent damage/attacker/environment state.
+ * Never invents details: falls back to 'unknown' when no signal is available.
+ */
+function inferDeathCause (bot, { lastAttacker = null, lastHazard = null, recentDeathMessage = '' } = {}) {
+  if (recentDeathMessage && String(recentDeathMessage).trim()) {
+    return String(recentDeathMessage).trim().slice(0, 120)
+  }
+  if (lastAttacker && lastAttacker.name) {
+    const label = lastAttacker.kind === 'player' ? `player ${lastAttacker.name}` : lastAttacker.name
+    return `killed by ${label}`
+  }
+  if (lastHazard) return `killed by ${lastHazard}`
+  try {
+    const e = bot?.entity
+    if (e?.isInLava) return 'burned in lava'
+    if (e?.isInWater && Number(bot?.oxygenLevel ?? 20) <= 0) return 'drowned'
+    if (e?.position && e.position.y < -64) return 'fell into the void'
+    if (Number(bot?.food ?? 20) <= 0) return 'starved'
+  } catch { /* partial mock */ }
+  return 'unknown cause'
+}
+
 function respawnSummary (lastDeath, observation = {}) {
   const obs = normalizeObs(observation)
   const parts = []
@@ -120,6 +143,7 @@ function respawnSummary (lastDeath, observation = {}) {
   if (obs.health !== null) parts.push(`hp ${Math.round(obs.health)}/20`)
   const count = obs.inventory.reduce((n, i) => n + (Number(i?.count) || 0), 0)
   parts.push(count > 0 ? `${count} items carried` : 'inventory empty')
+  if (lastDeath?.cause) parts.push(`cause: ${lastDeath.cause}`)
   if (lastDeath?.position) {
     parts.push(`died at ${lastDeath.position.x},${lastDeath.position.y},${lastDeath.position.z}`)
   }
@@ -130,4 +154,4 @@ function normDim (d) {
   return String(d || 'overworld').replace(/^minecraft:/, '').toLowerCase()
 }
 
-module.exports = { DeathRecovery, respawnSummary, normDim }
+module.exports = { DeathRecovery, respawnSummary, inferDeathCause, normDim }

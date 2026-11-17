@@ -78,6 +78,8 @@ const { FailGate } = require('./failgate')
 const { ContinuityStore } = require('./continuity')
 const { LaneScheduler, JobRegistry, laneOf, laneOfAction, LANES } = require('./lanes')
 const { TelemetryRecorder } = require('./telemetry')
+const { SurvivalPlanner, inspectTools } = require('./survival_planner')
+const { inferDeathCause } = require('./death_recovery')
 const ZINC_TOOLS = createZincTools()
 
 // logger.js is plain text with ISO timestamps — Pufferpanel-safe by design.
@@ -322,7 +324,7 @@ function makeShared (cfg, { dataDir = DATA_DIR } = {}) {
  */
 function main () {
   if (process.argv.includes('--check')) {
-    for (const m of ['./api_wrapper', './context_budget', './memory', './perception', './filter', './builder', './continuity', './custom_mineflayer/pathfinder_wrapper', './custom_mineflayer/doors', './custom_mineflayer/escape', './system1', './tactics', './reflex_registry', './vanilla_guard', './control', './threats', './places', './skills', './observe', './brain', './events', './redstone_engine', './runtime_config', './boundary', './connection', './death_recovery', './host', './control_commands', './irc', './telemetry', './updater', './supervisor', './watchdog', './protocol_keepalive', './block_search', './armor', './lanes', './goals']) require(m)
+    for (const m of ['./api_wrapper', './context_budget', './memory', './perception', './filter', './builder', './continuity', './custom_mineflayer/pathfinder_wrapper', './custom_mineflayer/doors', './custom_mineflayer/escape', './system1', './threat_response', './tactics', './reflex_registry', './vanilla_guard', './control', './threats', './places', './skills', './procedures', './survival_planner', './observe', './brain', './events', './redstone_engine', './runtime_config', './boundary', './connection', './death_recovery', './host', './control_commands', './irc', './telemetry', './updater', './supervisor', './watchdog', './protocol_keepalive', './block_search', './armor', './lanes', './goals']) require(m)
     require('minecraft-data')('26.3') // postinstall patch must be in place
     logger.info(TAG, '--check OK — all modules load, 26.3 data present')
     return
@@ -697,6 +699,20 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     getInventory: () => bot.inventory?.items?.() || [],
     checkRoute: (from, to) => checkRouteHome(from, to)
   })
+  const survivalPlanner = new SurvivalPlanner({
+    enabled: cfg.survival?.enabled !== false,
+    minCookedPoints: cfg.survival?.minCookedPoints ?? 20,
+    urgentFoodThreshold: cfg.survival?.urgentFoodThreshold ?? 8,
+    urgentHealthThreshold: cfg.survival?.urgentHealthThreshold ?? 12,
+    idleGraceMs: cfg.survival?.idleGraceMs ?? 25_000,
+    needCooldownMs: cfg.survival?.needCooldownMs ?? 90_000,
+    urgentCooldownMs: cfg.survival?.urgentCooldownMs ?? 25_000,
+    scanRadius: cfg.survival?.scanRadius ?? 24
+  })
+  const actionFailStreaks = new Map() // tool -> { count, lastMsg, at }
+  let lastAttackerInfo = null // { name, kind, at }
+  let lastHazardInfo = null // { name, at }
+  let lastIdleSince = Date.now()
   const sayQueue = []
   const timers = new Set()
   const every = (ms, fn) => { const t = setInterval(fn, ms); timers.add(t); return t }
@@ -1025,6 +1041,26 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
           importance: r.ok ? 0 : 1,
           remember: false
         })
+        if (r.ok) {
+          actionFailStreaks.delete(label)
+        } else {
+          const prev = actionFailStreaks.get(label)
+          const count = (prev && resultTs - prev.at < 120_000) ? prev.count + 1 : 1
+          actionFailStreaks.set(label, { count, lastMsg: msg, at: resultTs })
+          if (count >= 2) {
+            perceive({
+              source: 'self',
+              eventType: 'repeated_action_failure',
+              reactionClass: 'fast',
+              summary: `${label} failed ${count} times in a row — change approach instead of repeating (${msg.slice(0, 120)})`,
+              causalActId: finalActId || null,
+              occurredAt: resultTs,
+              observationBasis: 'direct',
+              importance: 2,
+              remember: false
+            })
+          }
+        }
       }
     } catch { /* never let instrumentation break reporting */ }
     logger.info(TAG, `${label}: ${r.ok ? 'ok' : 'FAILED'} — ${msg}`)
@@ -1113,8 +1149,21 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   // it was that a death, a restart or a compaction erased what the bot was
   // doing, with no checkpoint to resume from.
   const goalReg = shared.goals
+  goalReg.onLifecycle = ({ eventType, goal, reason }) => {
+    if (!systemsReady || ended || !goal) return
+    perceive({
+      source: 'goals',
+      eventType,
+      reactionClass: eventType === 'objective_paused' || eventType === 'objective_failed' ? 'fast' : 'deliberate',
+      summary: `${goal.id} (${goal.description})${reason ? ` — ${reason}` : ''}`,
+      occurredAt: Date.now(),
+      observationBasis: 'direct',
+      importance: (eventType === 'objective_completed' || eventType === 'objective_failed' || eventType === 'objective_paused') ? 2 : 1,
+      remember: false
+    })
+  }
   const GOALS = cfg.goals || {}
-  const GOAL_PRIORITY = { shelter: 80, corpse_run: 75, gather: 60, build: 55, build_shape: 55, craft: 50, go_to: 45, dig: 45, give: 45, follow: 40, take: 40, put: 40, light_up: 35, smelt: 35, sleep: 30, look_in: 25 }
+  const GOAL_PRIORITY = { shelter: 80, corpse_run: 75, prepare_food: 65, hunt_and_loot: 62, mine_resource: 60, gather: 60, build: 55, build_shape: 55, craft: 50, go_to: 45, dig: 45, give: 45, follow: 40, take: 40, put: 40, light_up: 35, smelt: 35, sleep: 30, look_in: 25 }
   const goalPriority = (tool) => Math.max(0, Math.min(100, Math.trunc(Number(GOAL_PRIORITY[String(tool)] ?? 45))))
   const SIDE_KINDS = new Set(['take', 'put', 'smelt', 'craft', 'sleep', 'look_in', 'use_block', 'give'])
   let goalToolSeq = 0
@@ -1671,6 +1720,22 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         const done = Math.max(0, Math.trunc(Number(goal.progress?.done) || 0))
         const remaining = Math.max(1, total - done)
         return { ok: true, tool: 'gather', label: goal.description, run: () => skills.gather({ item: want, count: remaining, radius: args.radius }) }
+      }
+      if (kind === 'mine_resource') {
+        const want = String(args.item || '')
+        const total = Math.max(1, Math.trunc(Number(args.count) || 4))
+        const done = Math.max(0, Math.trunc(Number(goal.progress?.done) || 0))
+        const remaining = Math.max(1, total - done)
+        return { ok: true, tool: 'mine_resource', label: goal.description, run: () => skills.mineResource({ item: want, count: remaining, radius: args.radius, ensureTool: args.ensure_tool !== false }) }
+      }
+      if (kind === 'hunt_and_loot') {
+        const total = Math.max(1, Math.trunc(Number(args.count) || 1))
+        const done = Math.max(0, Math.trunc(Number(goal.progress?.done) || 0))
+        const remaining = Math.max(1, total - done)
+        return { ok: true, tool: 'hunt_and_loot', label: goal.description, run: () => skills.huntAndLoot({ target: args.target || 'food', count: remaining, radius: args.radius }, combat) }
+      }
+      if (kind === 'prepare_food') {
+        return { ok: true, tool: 'prepare_food', label: goal.description, run: () => skills.prepareFood({ item: args.item || '', count: args.count, eatAfter: Boolean(args.eat_after) }) }
       }
       if (kind === 'go_to') {
         const target = args.player ? { player: args.player } : args.place ? { place: args.place } : { x: args.x, y: args.y, z: args.z }
@@ -2266,6 +2331,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       observe.selfLine(bot),
       level < 3 ? (armor.brief() || null) : null,
       invLine,
+      level < 3 ? (survivalPlanner.promptLine(bot) || null) : null,
       doingLine(),
       agendaLine(),
       level >= 4 ? goalBriefLine() : goalLines(),
@@ -3908,6 +3974,49 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         const askedBy = resolveActionAttribution('gather', action, snap)
         return startMain({ tool: 'gather', label: `gather ${action.item}${n > 1 ? ` x${n}` : ''}`, askedBy, detail: goalDetailFor('gather', { item: action.item, count: n, radius: action.radius }), decision: decided(snap, { label: 'gather' }), run: () => skills.gather({ item: action.item, count: n, radius: action.radius, guard: (p) => continuity.propertyGuardAt(p, dim(), { askedBy }) }) })
       }
+      case 'mine_resource': {
+        decided(snap, { label: 'mine_resource' })
+        const n = Math.max(1, Math.min(64, Math.trunc(Number(action.count)) || 4))
+        const askedBy = resolveActionAttribution('mine_resource', action, snap)
+        const ensureTool = action.ensure_tool !== false
+        return startMain({
+          tool: 'mine_resource',
+          label: `mine ${action.item}${n > 1 ? ` x${n}` : ''}`,
+          askedBy,
+          detail: goalDetailFor('mine_resource', { item: action.item, count: n, radius: action.radius, ensure_tool: ensureTool }),
+          decision: decided(snap, { label: 'mine_resource' }),
+          run: () => skills.mineResource({ item: action.item, count: n, radius: action.radius, ensureTool, guard: (p) => continuity.propertyGuardAt(p, dim(), { askedBy }) })
+        })
+      }
+      case 'hunt_and_loot': {
+        decided(snap, { label: 'hunt_and_loot' })
+        const n = Math.max(1, Math.min(8, Math.trunc(Number(action.count)) || 1))
+        const target = String(action.target || 'food')
+        const askedBy = resolveActionAttribution('hunt_and_loot', action, snap)
+        return startMain({
+          tool: 'hunt_and_loot',
+          label: `hunt ${target}${n > 1 ? ` x${n}` : ''}`,
+          askedBy,
+          detail: goalDetailFor('hunt_and_loot', { target, count: n, radius: action.radius }),
+          decision: decided(snap, { label: 'hunt_and_loot' }),
+          run: () => skills.huntAndLoot({ target, count: n, radius: action.radius }, combat)
+        })
+      }
+      case 'prepare_food': {
+        decided(snap, { label: 'prepare_food' })
+        const n = Math.max(1, Math.min(32, Math.trunc(Number(action.count)) || 4))
+        const item = String(action.item || '')
+        const eatAfter = Boolean(action.eat_after)
+        const askedBy = resolveActionAttribution('prepare_food', action, snap)
+        return startMain({
+          tool: 'prepare_food',
+          label: `prepare food${item ? ` (${item})` : ''}`,
+          askedBy,
+          detail: goalDetailFor('prepare_food', { item, count: n, eat_after: eatAfter }),
+          decision: decided(snap, { label: 'prepare_food' }),
+          run: () => skills.prepareFood({ item, count: n, eatAfter })
+        })
+      }
       case 'light_up': {
         decided(snap, { label: 'light_up' })
         return startMain({ tool: 'light_up', label: 'lighting the area', askedBy: resolveActionAttribution('light_up', action, snap), decision: decided(snap, { label: 'light_up' }), run: () => skills.lightUp({ radius: action.radius }) })
@@ -4107,6 +4216,17 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     const open = goalReg.openGoals()
     const pending = (open.length ? `; unfinished: ${open.slice(0, 4).map((g) => goalReg.describe(g)).join(' | ')}` : '') + continued
     const summary = require('./death_recovery').respawnSummary(deathRecovery.lastDeath, observation)
+    perceive({
+      source: 'mineflayer',
+      eventType: 'respawn',
+      reactionClass: 'immediate',
+      summary: `respawned — ${summary}`,
+      where: p,
+      occurredAt: Date.now(),
+      observationBasis: 'direct',
+      importance: 3,
+      remember: false
+    })
     const tail = recovery.verdict === 'go_home'
       ? `; ${recovery.why}`
       : recovery.verdict === 'report'
@@ -4149,7 +4269,8 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
               .sort((a, b) => a.d - b.d).slice(0, 8)
               .map(({ e, d }) => `${e.username || e.name || e.type || 'entity'} ${Math.round(d)}m${isHostileMob(e.name, bot) ? ' hostile' : ''}`)
             return { position: { x: pos.x, y: pos.y, z: pos.z }, facing, dimension: dim(), biome,
-              health: bot.health, food: bot.food, goal: goalReg.get(agenda.main?.goalId)?.description || null,
+              health: bot.health, food: bot.food, threatMode: system1?.threatMode || 'NONE',
+              goal: goalReg.get(agenda.main?.goalId)?.description || null,
               action: agenda.main?.tool || null, navigation: visionNavigation.snapshot(), entities }
           },
           onError: err => logger.warn(TAG, `visual feed: ${err.message || err}`)
@@ -4282,6 +4403,32 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       onEvent: (evt) => {
         note({ type: evt.type, msg: evt.text })
         try { telemetry.reflexEvent(evt) } catch { /* noop */ }
+        if (evt.type === 'hazard' && evt.text) {
+          lastHazardInfo = { name: String(evt.text).slice(0, 60), at: Date.now() }
+        }
+        if (evt.type === 'flee_start' || evt.type === 'flee_end' || evt.type === 'threat_mode_change') {
+          perceive({
+            source: 'system1',
+            eventType: evt.type,
+            reactionClass: evt.type === 'flee_start' ? 'immediate' : 'fast',
+            summary: evt.text || evt.type,
+            occurredAt: Date.now(),
+            observationBasis: 'direct',
+            importance: evt.type === 'flee_start' ? 3 : 2,
+            remember: false
+          })
+        } else if (evt.type === 'threat' && evt.urgent) {
+          perceive({
+            source: 'system1',
+            eventType: 'immediate_threat',
+            reactionClass: 'immediate',
+            summary: evt.text || 'immediate threat detected',
+            occurredAt: Date.now(),
+            observationBasis: 'direct',
+            importance: 3,
+            remember: false
+          })
+        }
         if (evt.wake && evt.urgent === true) {
           decisionEpoch++
           brain.preempt(`urgent reflex: ${evt.type}`)
@@ -4368,6 +4515,21 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
               currentlyNear.add(pname)
               if (!nearbyPlayerSeen.has(pname)) {
                 const rel = continuity.touchPlayer(pname)
+                // Informational player_approaching event: NEVER preempts tasks or triggers flee!
+                perceive({
+                  source: 'mineflayer',
+                  eventType: 'player_approaching',
+                  reactionClass: 'deliberate',
+                  summary: `player ${pname} approached within ${Math.round(d)}m (peaceful)`,
+                  entities: [pname],
+                  where: pobj.entity.position,
+                  occurredAt: now,
+                  observationBasis: 'direct',
+                  importance: 1,
+                  dedupeKey: `player_approach:${pname}`,
+                  dedupeWindowMs: 15_000,
+                  remember: false
+                })
                 if (bodyIdle && now - lastWorldWakeAt >= 25_000) {
                   lastWorldWakeAt = now
                   const viewTag = rel?.entry?.stance ? ` — your view: ${rel.entry.stance}` : ''
@@ -4384,6 +4546,190 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
           brain.wake(`world change noticed: ${env.changes.slice(0, 2).join('; ')}`, { external: true })
         }
       } catch { /* partial world */ }
+    })
+
+    // 2s survival, threshold, approaching-hostile, inventory-capacity & tool-durability monitor.
+    let lastHealthBand = 2 // 2=healthy (>10), 1=low (<=10), 0=critical (<=6)
+    let lastFoodBand = 2 // 2=fed (>12), 1=hungry (<=12), 0=starving (<=6)
+    let lastInvCapBand = 0 // 0=ok (<32), 1=near_full (32..35), 2=full (>=36)
+    const prevTools = new Map() // kind:slot -> { name, remaining, maxDur, warned }
+    const seenApproachingHostiles = new Map() // entityId -> lastAt
+    every(2000, () => {
+      if (!systemsReady || !alive || ended) return
+      const now = Date.now()
+      try {
+        // Track idle duration for routine survival planning
+        const bodyBusy = Boolean(agenda.main || skills?.current() || task || combat?.isEngaged || system1?.fleeing || brain?.busyAction)
+        if (bodyBusy) lastIdleSince = now
+
+        // 1. Health & hunger threshold crossing events
+        const hp = Number(bot.health)
+        if (Number.isFinite(hp)) {
+          const hpBand = hp <= (cfg.system1.fleeBelowHealth ?? 6) ? 0 : (hp <= (cfg.system1.lowHealth ?? 10) ? 1 : 2)
+          if (hpBand < lastHealthBand) {
+            perceive({
+              source: 'internal',
+              eventType: 'health_threshold',
+              reactionClass: 'immediate',
+              summary: hpBand === 0 ? `CRITICAL health (${Math.round(hp)}/20 HP)` : `low health (${Math.round(hp)}/20 HP)`,
+              occurredAt: now,
+              observationBasis: 'direct',
+              importance: 3,
+              dedupeKey: `hp_band:${hpBand}`,
+              dedupeWindowMs: 8000,
+              remember: false
+            })
+          }
+          lastHealthBand = hpBand
+        }
+        const food = Number(bot.food)
+        if (Number.isFinite(food)) {
+          const foodBand = food <= 6 ? 0 : (food <= 12 ? 1 : 2)
+          if (foodBand < lastFoodBand) {
+            perceive({
+              source: 'internal',
+              eventType: 'hunger_threshold',
+              reactionClass: foodBand === 0 ? 'immediate' : 'fast',
+              summary: foodBand === 0 ? `STARVING (${Math.round(food)}/20 food — cannot sprint)` : `hungry (${Math.round(food)}/20 food)`,
+              occurredAt: now,
+              observationBasis: 'direct',
+              importance: foodBand === 0 ? 3 : 2,
+              dedupeKey: `food_band:${foodBand}`,
+              dedupeWindowMs: 10_000,
+              remember: false
+            })
+          }
+          lastFoodBand = foodBand
+        }
+
+        // 2. Approaching hostiles (closing within 14m)
+        const closingThreats = [...(sense.last?.threats || []), ...(sense.last?.watch || [])]
+          .filter((t) => t && t.kind !== 'player' && t.distance <= 14 && (t.closing > 0.25 || t.lit || t.distance <= 8))
+        for (const t of closingThreats.slice(0, 3)) {
+          const lastAt = seenApproachingHostiles.get(t.id) || 0
+          if (now - lastAt >= 8000) {
+            seenApproachingHostiles.set(t.id, now)
+            perceive({
+              source: 'sense',
+              eventType: t.lit || t.distance <= 5.5 ? 'immediate_threat' : 'hostile_approaching',
+              reactionClass: t.lit || t.distance <= 5.5 ? 'immediate' : 'fast',
+              summary: `${t.name}${t.lit ? ' (FUSE LIT)' : ''} approaching (${Math.round(t.distance)}m ${t.where || ''})`,
+              entities: [t.name],
+              where: t.entity?.position || null,
+              occurredAt: now,
+              observationBasis: 'direct',
+              importance: t.lit || t.distance <= 5.5 ? 3 : 2,
+              groupKey: `approach:${t.name}`,
+              remember: false
+            })
+          }
+        }
+        if (seenApproachingHostiles.size > 48) {
+          for (const [id, at] of seenApproachingHostiles) if (now - at > 30_000) seenApproachingHostiles.delete(id)
+        }
+
+        // 3. Inventory capacity threshold events
+        const invItems = bot.inventory?.items?.() || []
+        const capBand = invItems.length >= 36 ? 2 : (invItems.length >= 32 ? 1 : 0)
+        if (capBand > lastInvCapBand) {
+          perceive({
+            source: 'internal',
+            eventType: 'inventory_capacity',
+            reactionClass: 'fast',
+            summary: capBand === 2 ? 'inventory FULL (36/36 slots) — store or drop items before gathering more' : `inventory nearly full (${invItems.length}/36 slots)`,
+            occurredAt: now,
+            observationBasis: 'direct',
+            importance: 2,
+            dedupeKey: `inv_cap:${capBand}`,
+            dedupeWindowMs: 20_000,
+            remember: false
+          })
+        }
+        lastInvCapBand = capBand
+
+        // 4. Tool low durability & breakage detection
+        const toolSnap = inspectTools(bot)
+        const liveToolKeys = new Set()
+        for (const kind of Object.keys(toolSnap.byKind)) {
+          for (const ti of toolSnap.byKind[kind]) {
+            const key = `${ti.kind}:${ti.slot}:${ti.name}`
+            liveToolKeys.add(key)
+            const prev = prevTools.get(key)
+            const isLow = ti.remaining <= 14 || ti.ratio <= 0.15
+            if (isLow && (!prev || !prev.warned)) {
+              perceive({
+                source: 'internal',
+                eventType: 'tool_low_durability',
+                reactionClass: 'fast',
+                summary: `${ti.name} low durability (${ti.remaining}/${ti.maxDur} remaining)`,
+                occurredAt: now,
+                observationBasis: 'direct',
+                importance: 2,
+                dedupeKey: `tool_low:${ti.name}:${ti.slot}`,
+                dedupeWindowMs: 30_000,
+                remember: false
+              })
+            }
+            prevTools.set(key, { name: ti.name, remaining: ti.remaining, maxDur: ti.maxDur, warned: isLow || Boolean(prev?.warned) })
+          }
+        }
+        for (const [key, prev] of prevTools.entries()) {
+          if (!liveToolKeys.has(key)) {
+            if (prev.remaining <= 5) {
+              perceive({
+                source: 'internal',
+                eventType: 'tool_broken',
+                reactionClass: 'fast',
+                summary: `${prev.name} broke (was at ${prev.remaining}/${prev.maxDur} durability)`,
+                occurredAt: now,
+                observationBasis: 'direct',
+                importance: 2,
+                dedupeKey: `tool_broken:${prev.name}`,
+                dedupeWindowMs: 10_000,
+                remember: false
+              })
+            }
+            prevTools.delete(key)
+          }
+        }
+
+        // 5. Autonomous survival planner evaluation (urgent needs + idle routine upkeep)
+        const plan = survivalPlanner.decide(bot, {
+          busy: bodyBusy,
+          fleeing: Boolean(system1?.fleeing),
+          inCombat: Boolean(combat?.isEngaged),
+          hasActiveGoal: Boolean(goalReg.active()),
+          idleMs: now - lastIdleSince
+        })
+        if (plan?.need) {
+          survivalPlanner.markAttempted(plan.need.key, { urgent: plan.need.tier === 'urgent' })
+          if (plan.need.tier === 'urgent' && cfg.survival?.autoExecuteUrgent !== false) {
+            // Pause any lower-priority active objective cleanly and execute urgent survival need
+            const activeGoal = goalReg.active()
+            if (activeGoal && activeGoal.priority < plan.need.priority) {
+              goalReg.recordInterruption(activeGoal.id, `urgent survival need: ${plan.need.title}`, { by: 'survival' })
+            }
+            perceive({
+              source: 'survival',
+              eventType: 'hunger_threshold',
+              reactionClass: 'immediate',
+              summary: `autonomous survival (${plan.need.title}): ${plan.need.reason}`,
+              occurredAt: now,
+              observationBasis: 'direct',
+              importance: 3,
+              remember: false
+            })
+            if (plan.need.tool === 'prepare_food') {
+              startMain({ tool: 'prepare_food', label: plan.need.title, priority: plan.need.priority, detail: { args: plan.need.args }, run: () => skills.prepareFood({ item: plan.need.args.item || '', count: plan.need.args.count || 4, eatAfter: true }) })
+            } else if (plan.need.tool === 'hunt_and_loot') {
+              startMain({ tool: 'hunt_and_loot', label: plan.need.title, priority: plan.need.priority, detail: { args: plan.need.args }, run: () => skills.huntAndLoot(plan.need.args, combat) })
+            }
+          } else if (plan.need.tier === 'routine' && !bodyBusy && now - lastWorldWakeAt >= 30_000) {
+            lastWorldWakeAt = now
+            brain?.wake(`survival routine suggestion: ${plan.need.title} (${plan.need.reason}) — consider ${plan.need.tool}`, { external: false })
+          }
+        }
+      } catch { /* best-effort monitor */ }
     })
     every(10_000, () => { syncContinuation('periodic') })
     every(60_000, () => { try { memory.save(); places.save(); continuity.save(); shared.saveConvo?.(); telemetry.flush() } catch { /* best effort */ } })
@@ -4420,14 +4766,31 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   const hurts = new HurtTracker(bot, sense, {
     isReady: () => systemsReady && !ended,
     onHurt: (cause, { hp }) => {
+      const now = Date.now()
       note({ type: 'hurt', msg: cause.text })
       const hitMatch = /hit by player ([A-Za-z0-9_]{1,20})/i.exec(String(cause.text || ''))
+      const mobMatch = /(?:hit|shot|blown up|killed) by (?:a |an )?([a-z0-9_ ]{2,28})/i.exec(String(cause.text || ''))
       if (hitMatch) {
+        lastAttackerInfo = { name: hitMatch[1], kind: 'player', at: now }
         try { continuity.recordPlayerObservation(hitMatch[1], `${cause.text} (hp ${hp})`) } catch { /* noop */ }
+      } else if (mobMatch) {
+        lastAttackerInfo = { name: mobMatch[1].trim(), kind: 'mob', at: now }
       }
+      perceive({
+        source: 'mineflayer',
+        eventType: 'attacked',
+        reactionClass: 'immediate',
+        summary: `${cause.text} (hp ${Math.round(hp)}/20)`,
+        entities: hitMatch ? [hitMatch[1]] : (mobMatch ? [mobMatch[1].trim()] : []),
+        occurredAt: now,
+        observationBasis: 'direct',
+        importance: 3,
+        dedupeKey: `attacked:${cause.text}`,
+        dedupeWindowMs: 800,
+        remember: false
+      })
       // Do not clear the fail gate on damage — repeated damage during a failed
       // combat retry would otherwise re-arm a failure churn loop. Death and new threats still clear it.
-      const now = Date.now()
       if (hp > 0 && (cause.text !== lastHurt.text || now - lastHurt.at > 4000)) brain.wake(`hurt: ${cause.text} (hp ${hp})`, { external: true })
       lastHurt = { at: now, text: cause.text }
     }
@@ -4445,6 +4808,22 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     if (!ENTITY_INTEREST_RE.test(name)) return
     const isPlayer = entity.type === 'player' || entity.username
     const d = here() && entity.position ? Math.round(entity.position.distanceTo(here())) : null
+    if (name === 'item' && d !== null && d <= 8) {
+      perceive({
+        source: 'mineflayer', eventType: 'item_dropped',
+        reactionClass: 'ambient',
+        summary: `item dropped ${d}m away`,
+        where: entity.position || null,
+        occurrenceTimeKnown: true,
+        observedAt: Date.now(),
+        observationBasis: 'direct',
+        importance: 1,
+        groupKey: 'item_dropped',
+        memoryType: 'item_dropped',
+        remember: false
+      })
+      return
+    }
     perceive({
       source: 'mineflayer', eventType: isPlayer ? 'player_arrived' : 'entity_spawn',
       reactionClass: isPlayer ? 'fast' : 'ambient',
@@ -4778,17 +5157,34 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     const p = here()
     const where = p ? `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}` : 'unknown'
     hurts.flush() // name the killing blow before writing the obituary
-    logger.warn(TAG, `died at ${where}${lastHurt.text ? ` (${lastHurt.text})` : ''}`)
-    note({ type: 'death', msg: `I died at ${where}${lastHurt.text ? ` — ${lastHurt.text}` : ''}` }, { promote: true })
-    if (p) places.remember('last death', p, { dim: dim(), note: lastHurt.text })
-    try { journal.death({ where, cause: lastHurt.text || '', goalId: agenda.main?.goalId || journal.focus }) } catch { /* noop */ }
+    const now = Date.now()
+    const cause = inferDeathCause(bot, {
+      lastAttacker: (lastAttackerInfo && now - lastAttackerInfo.at <= 15_000) ? lastAttackerInfo : null,
+      lastHazard: (lastHazardInfo && now - lastHazardInfo.at <= 15_000) ? lastHazardInfo.name : null,
+      recentDeathMessage: (lastHurt.text && now - lastHurt.at <= 15_000) ? lastHurt.text : ''
+    })
+    logger.warn(TAG, `died at ${where} (${cause})`)
+    note({ type: 'death', msg: `I died at ${where} — ${cause}` }, { promote: true })
+    perceive({
+      source: 'mineflayer',
+      eventType: 'death',
+      reactionClass: 'immediate',
+      summary: `died at ${where} (${cause})`,
+      where: p,
+      occurredAt: now,
+      observationBasis: 'direct',
+      importance: 3,
+      remember: false
+    })
+    if (p) places.remember('last death', p, { dim: dim(), note: cause })
+    try { journal.death({ where, cause, goalId: agenda.main?.goalId || journal.focus }) } catch { /* noop */ }
     failGate.clearContext()
     fight = null
     // A new life, not a new plan: the main task stops running but goes back to
     // the registry as resumable, with its checkpoint. (It used to be deleted.)
     try {
-      if (agenda.main?.goalId) goalReg.suspend(agenda.main.goalId, { reason: `died at ${where}`, by: 'death' })
-      goalReg.suspendAll({ reason: `died at ${where}` })
+      if (agenda.main?.goalId) goalReg.suspend(agenda.main.goalId, { reason: `died at ${where} (${cause})`, by: 'death' })
+      goalReg.suspendAll({ reason: `died at ${where} (${cause})` })
       goalReg.save({ force: true })
     } catch (err) { logger.debug(TAG, `goal death handling: ${err.message || err}`) }
     agenda.main = null // a new life: the model is told and decides what to pick up again
@@ -4805,11 +5201,11 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     // Death is an event, not a process failure: the recovery subsystem records
     // the loss and inspects the respawn when it really happens.
     try {
-      deathRecovery.onDeath({ position: p, dimension: dim(), inventory: bot.inventory?.items?.() || [] })
+      deathRecovery.onDeath({ position: p, dimension: dim(), cause, inventory: bot.inventory?.items?.() || [] })
       owner?.markDead?.(true)
     } catch (err) { logger.debug(TAG, `death record: ${err.message || err}`) }
     try {
-      telemetry.lifecycle('death', { pos: p ? { x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z) } : null, dim: dim() })
+      telemetry.lifecycle('death', { pos: p ? { x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z) } : null, dim: dim(), cause })
       syncContinuation('death')
       telemetry.flush()
     } catch { /* noop */ }
@@ -4969,6 +5365,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     // bot that is gone.
     try { physicalGuard?.uninstall?.() } catch { /* noop */ }
     try { boundary.removeListener('refused', onRefused) } catch { /* noop */ }
+    try { goalReg.onLifecycle = null } catch { /* noop */ }
     // The listeners go with the session: nothing of this body may still be
     // wired to an event after its link is gone.
     for (const [event, fn] of botListeners) {
@@ -5092,7 +5489,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       return reconcileGoal(goal)
     },
     internals: () => ({
-      arbiter, sense, wrapper, combat, system1, skills, brain, results, agenda, telemetry,
+      arbiter, sense, wrapper, combat, system1, skills, brain, results, agenda, telemetry, survivalPlanner,
       events: pipeline, latency, redstoneEngineer, redstoneLibrary: shared.redstoneLibrary,
       goals: goalReg, continuity, journal, focusGoal, continuationBlock, resetContext, executeAction, buildActionPrompt, buildChatPrompt,
       compactionState: () => ({ actionCompactionFloor, chatCompactionFloor, consecutiveTruncations, budget: amd.budget.snapshot() }),

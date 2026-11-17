@@ -46,7 +46,7 @@ const TICK_MS = 50
 
 const { Vec3 } = require('vec3')
 const doors = require('./doors')
-const { planEscape } = require('./escape')
+const { planEscape, planSafeDetour } = require('./escape')
 
 /** Blocks that cannot be broken in vanilla survival or hold protected world structures. */
 const UNBREAKABLE_BLOCKS = Object.freeze([
@@ -76,8 +76,9 @@ const isDoorOrTrapdoorName = (name) => (/_door$/i.test(name) || /_trapdoor$/i.te
  * Hostiles relevant to movement threat. EXACT names (shared with threats.js):
  * the old substring regex also matched skeleton_horse and zombie_horse.
  */
-const { HOSTILE_NAMES } = require('../threats')
+const { HOSTILE_NAMES, RANGED_NAMES, creeperFuseLit, creeperCharged } = require('../threats')
 const HOSTILE_RE = new RegExp(`^(${[...HOSTILE_NAMES].join('|')})$`, 'i')
+const HEAVY_MELEE_NAMES = new Set(['warden', 'ravager', 'wither', 'ender_dragon', 'elder_guardian', 'piglin_brute', 'vindicator', 'evoker'])
 
 const isHostileName = (name) => HOSTILE_NAMES.has(String(name || '').toLowerCase())
 
@@ -361,16 +362,23 @@ class PredictiveThreatMap {
         const k = this.corridorClear / clen
         corridorEnd = { x: botPos.x + cdx * k, y: botPos.y + cdy * k, z: botPos.z + cdz * k }
       }
+      const name = String(entity.name || 'hostile').toLowerCase()
+      const speed = Math.hypot(velocity.x, velocity.z)
+      const weight = this._weight(entity, pos, velocity, botPos)
+      const ellipse = this._buildEllipse(entity, name, pos, velocity, botPos, speed)
       threats.push({
         id: entity.id,
-        name: String(entity.name || 'hostile').toLowerCase(),
+        name,
         position: pos,
         velocity,
         future,
         distance,
-        speed: Math.hypot(velocity.x, velocity.z),
-        weight: this._weight(entity, pos, velocity, botPos),
+        speed,
+        weight,
         radius: this.futureRadius,
+        // Weighted directional elliptical safety region aligned with entity
+        // motion (or pursuit axis toward the bot when stationary between ticks).
+        ellipse,
         // How far a route keeps away from this mob, from where it is to where
         // it will be (0 = no ring).
         standoff: this.standoff ? standoffFor(isPlayerEntity(entity) ? 'player' : entity.name, this.standoffTable) * this.standoffScale : 0,
@@ -390,37 +398,171 @@ class PredictiveThreatMap {
     return this.threats
   }
 
+  /**
+   * Build a weighted directional elliptical safety region for a hostile entity.
+   *
+   * Semi-major forward axis stretches along the threat's velocity vector (or
+   * approach vector toward the bot when speed is low), lateral axis guards side
+   * clearance, and rear axis is shorter so routes prefer slipping behind a
+   * moving threat rather than crossing its nose. Creepers expand sharply when
+   * lit or charged.
+   */
+  _buildEllipse (entity, name, pos, velocity, botPos, speedPerTick) {
+    const speedBps = speedPerTick * 20
+    let ux = 1
+    let uz = 0
+    if (speedPerTick >= 0.025) {
+      ux = velocity.x / speedPerTick
+      uz = velocity.z / speedPerTick
+    } else if (botPos) {
+      const bx = botPos.x - pos.x
+      const bz = botPos.z - pos.z
+      const blen = Math.hypot(bx, bz)
+      if (blen > 0.01) { ux = bx / blen; uz = bz / blen }
+    }
+    const isCreeper = name === 'creeper'
+    const lit = isCreeper && creeperFuseLit(entity)
+    const charged = isCreeper && creeperCharged(entity)
+    const isHeavy = HEAVY_MELEE_NAMES.has(name)
+    const isRanged = RANGED_NAMES.has(name)
+    const isPlayer = isPlayerEntity(entity)
+
+    let baseForward = 4.8
+    let baseLateral = 3.3
+    let baseRear = 2.3
+    let criticalRadius = 3.0
+    let classWeight = 1.0
+
+    if (isCreeper) {
+      baseForward = lit ? 8.6 : 6.8
+      baseLateral = lit ? 7.4 : 5.0
+      baseRear = lit ? 6.8 : 4.2
+      criticalRadius = lit ? 8.0 : 6.0
+      classWeight = lit ? 2.8 : 1.75
+      if (charged) {
+        baseForward *= 1.3
+        baseLateral *= 1.3
+        baseRear *= 1.3
+        criticalRadius *= 1.3
+        classWeight *= 1.35
+      }
+    } else if (isHeavy) {
+      baseForward = 7.6
+      baseLateral = 5.4
+      baseRear = 3.8
+      criticalRadius = 5.5
+      classWeight = 2.0
+    } else if (isRanged) {
+      baseForward = 7.0
+      baseLateral = 4.6
+      baseRear = 3.2
+      criticalRadius = 3.8
+      classWeight = 1.3
+    } else if (isPlayer) {
+      baseForward = 6.2
+      baseLateral = 4.0
+      baseRear = 2.8
+      criticalRadius = 3.6
+      classWeight = 1.35
+    }
+
+    const scale = this.standoff ? this.standoffScale : 0.7
+    const aForward = (baseForward + clamp(speedBps * 0.6, 0, 4.5)) * scale
+    const bLateral = (baseLateral + clamp(speedBps * 0.18, 0, 1.5)) * scale
+    const aRear = baseRear * scale
+    return {
+      ux,
+      uz,
+      aForward,
+      bLateral,
+      aRear,
+      criticalRadius: criticalRadius * scale,
+      classWeight,
+      isCreeper,
+      lit,
+      charged,
+      speedBps
+    }
+  }
+
+  /** Current directional elliptical safety regions (for escape/detour planners & diagnostics). */
+  ellipses () {
+    const now = this.now()
+    return this.threats
+      .filter((t) => t && t.expiresAt > now && t.ellipse)
+      .map((t) => ({ id: t.id, name: t.name, position: t.position, future: t.future, weight: t.weight, ...t.ellipse }))
+  }
+
+  /** True when a world point lies inside any threat's critical danger core (e.g. creeper blast radius). */
+  isCriticalAt (point, { yTolerance = 4.0 } = {}) {
+    if (!point) return false
+    const now = this.now()
+    for (const t of this.threats) {
+      if (!t || t.expiresAt <= now || !t.ellipse) continue
+      if (Math.abs((point.y ?? t.position.y) - t.position.y) > yTolerance) continue
+      const flat = Math.hypot(point.x - t.position.x, point.z - t.position.z)
+      if (flat <= t.ellipse.criticalRadius) return true
+    }
+    return false
+  }
+
   /** Keep the field warm even when no navigation is active. */
   tick (bot) { return this.sample(bot) }
 
   /**
-   * Cumulative threat score at a world point. 0 = safe, ~1 = standing in a
-   * projected kill sphere. Not clamped: overlapping mobs stack.
+   * Cumulative threat score at a world point. 0 = safe, ~1+ = inside a
+   * weighted elliptical safety region or projected kill sphere. Overlapping
+   * threat ellipses stack with an extra pinch-zone penalty so paths detour
+   * cleanly around multi-enemy clusters rather than threading between them.
    */
   threatScoreAt (point, { yWeight = 0.45 } = {}) {
     if (!point) return 0
+    const now = this.now()
     let score = 0
+    let ellipseHits = 0
     for (const t of this.threats) {
-      if (!t || t.expiresAt <= this.now()) continue
-      const df = Math.hypot(point.x - t.future.x, (point.y - t.future.y) * yWeight, point.z - t.future.z)
+      if (!t || t.expiresAt <= now) continue
+      const py = point.y ?? t.position.y
+      const df = Math.hypot(point.x - t.future.x, (py - t.future.y) * yWeight, point.z - t.future.z)
       if (df < t.radius) score += (1 - df / t.radius) * t.weight
-      if (t.standoff > 0) {
-        // The standoff ring: measured from the whole stretch the mob covers in
-        // the next two seconds, falling off with the square of the distance —
-        // steep next to the mob, almost free at the rim, so a route bends
-        // around it without the far side of the ring looking like a wall.
+
+      const el = t.ellipse
+      if (el && this.standoff) {
+        const dy = Math.abs(py - t.position.y)
+        if (dy <= 4.5) {
+          const dx = point.x - t.position.x
+          const dz = point.z - t.position.z
+          const along = dx * el.ux + dz * el.uz
+          const cross = -dx * el.uz + dz * el.ux
+          const semiA = along >= 0 ? el.aForward : el.aRear
+          const q = (along / Math.max(0.5, semiA)) ** 2 + (cross / Math.max(0.5, el.bLateral)) ** 2 + ((dy * yWeight) / 3.8) ** 2
+          if (q < 1.0) {
+            ellipseHits++
+            const k = 1 - Math.sqrt(q)
+            score += Math.pow(k, 1.45) * t.weight * el.classWeight * this.standoffWeight
+          }
+          const flat = Math.hypot(dx, dz)
+          if (flat < el.criticalRadius) {
+            const ck = 1 - flat / Math.max(0.5, el.criticalRadius)
+            score += Math.pow(ck, 1.6) * (el.isCreeper ? 2.2 : 0.85) * t.weight
+          }
+        }
+      } else if (t.standoff > 0) {
         const flat = pointSegmentDistance({ x: point.x, y: 0, z: point.z }, { x: t.position.x, y: 0, z: t.position.z }, { x: t.future.x, y: 0, z: t.future.z })
-        const ds = Math.hypot(flat, (point.y - t.position.y) * yWeight)
+        const ds = Math.hypot(flat, (py - t.position.y) * yWeight)
         if (ds < t.standoff) {
           const k = 1 - ds / t.standoff
           score += k * k * t.weight * this.standoffWeight
         }
       }
       if (t.corridorEnd) {
-        const dLine = pointSegmentDistance(point, t.position, t.corridorEnd)
+        const dLine = pointSegmentDistance({ x: point.x, y: py, z: point.z }, t.position, t.corridorEnd)
         if (dLine < t.corridorRadius) score += (1 - dLine / t.corridorRadius) * t.weight * 0.75
       }
     }
+    // Multi-enemy pinch-zone penalty: strongly discourage squeezing between
+    // two or more overlapping hostile ellipses when an outer detour exists.
+    if (ellipseHits >= 2) score += (ellipseHits - 1) * 0.65
     return score
   }
 
@@ -944,9 +1086,9 @@ class PathfinderWrapper {
       : new WindChargeTraversal(bot, { enabled: true, logger: this.log, ...(opts.windCharge || {}) })
     this._threatTimer = null
     const tcfg = (opts.threat && !(opts.threat instanceof PredictiveThreatMap)) ? opts.threat : {}
-    this.routeReplanMs = Number.isFinite(tcfg.routeReplanMs) ? tcfg.routeReplanMs : 1200
-    this.routeReplanCost = Number.isFinite(tcfg.routeReplanCost) ? tcfg.routeReplanCost : 12
-    this.routeReplanRise = Number.isFinite(tcfg.routeReplanRise) ? tcfg.routeReplanRise : 8
+    this.routeReplanMs = Number.isFinite(tcfg.routeReplanMs) ? tcfg.routeReplanMs : 700
+    this.routeReplanCost = Number.isFinite(tcfg.routeReplanCost) ? tcfg.routeReplanCost : 10
+    this.routeReplanRise = Number.isFinite(tcfg.routeReplanRise) ? tcfg.routeReplanRise : 6
     this._routeBaseline = 0
     this._routeBaselineAt = 0
     this._lastRouteReplanAt = 0
@@ -1026,10 +1168,10 @@ class PathfinderWrapper {
   /**
    * Threat cost of the route still ahead: the next `nodes` steps of the path
    * the pathfinder is walking, from the node nearest the bot onward.
-   * @returns {{ worst:number, sum:number, at:{x:number,y:number,z:number}|null, nodes:number }}
+   * @returns {{ worst:number, sum:number, critical:boolean, at:{x:number,y:number,z:number}|null, nodes:number }}
    */
   routeThreat ({ nodes = 14 } = {}) {
-    const out = { worst: 0, sum: 0, at: null, nodes: 0 }
+    const out = { worst: 0, sum: 0, critical: false, at: null, nodes: 0 }
     const path = this._path
     const me = this.bot?.entity?.position
     if (!Array.isArray(path) || !path.length || !me || !this.threat.threats.length) return out
@@ -1044,9 +1186,12 @@ class PathfinderWrapper {
     // standing there. What matters is what the route walks INTO.
     for (let i = start + 1; i < path.length && out.nodes < nodes; i++) {
       const n = path[i]
-      const cost = this.threat.costAt({ x: n.x + 0.5, y: n.y, z: n.z + 0.5 })
+      const pt = { x: n.x + 0.5, y: n.y, z: n.z + 0.5 }
+      const cost = this.threat.costAt(pt)
+      const crit = this.threat.isCriticalAt(pt)
       out.nodes++
       out.sum += cost
+      if (crit) out.critical = true
       if (cost > out.worst) { out.worst = cost; out.at = { x: n.x, y: n.y, z: n.z } }
     }
     return out
@@ -1059,25 +1204,28 @@ class PathfinderWrapper {
    * was simply walked into — and the escape reflex then tore the walk down.
    *
    * Every threat sample this looks at the next steps of the route. When they
-   * have become clearly more dangerous than when the route was planned, the
-   * route is planned again (with the field as it is now), at most once every
-   * `routeReplanMs`. If no better route exists the new plan carries the new
-   * baseline, so this does not spin.
+   * have become clearly more dangerous than when the route was planned — or
+   * entered a critical danger ellipse (e.g. a creeper blast zone) — the route
+   * is planned again with the updated elliptical threat field.
    * @returns {boolean} true when a re-plan was requested
    */
   _watchRoute (now = Date.now()) {
     if (this.routeReplanMs <= 0) return false
     const pf = this.bot?.pathfinder
     if (!pf || !pf.goal || (typeof pf.isMoving === 'function' && !pf.isMoving())) return false
-    if (now - (this._lastRouteReplanAt || 0) < this.routeReplanMs) return false
-    // A fresh plan gets a moment before it is second-guessed.
-    if (now - (this._routeBaselineAt || 0) < 400) return false
     const ahead = this.routeThreat()
-    if (ahead.worst < this.routeReplanCost) return false
-    if (ahead.worst < (this._routeBaseline || 0) + this.routeReplanRise) return false
+    const urgent = ahead.critical
+    const minInterval = urgent ? Math.min(400, this.routeReplanMs) : this.routeReplanMs
+    if (now - (this._lastRouteReplanAt || 0) < minInterval) return false
+    // A fresh plan gets a moment before it is second-guessed unless critical.
+    if (!urgent && now - (this._routeBaselineAt || 0) < 350) return false
+    if (!urgent) {
+      if (ahead.worst < this.routeReplanCost) return false
+      if (ahead.worst < (this._routeBaseline || 0) + this.routeReplanRise) return false
+    }
     this._lastRouteReplanAt = now
     this.threatReplans++
-    this.log('debug', `route re-planned: threat ahead rose to ${ahead.worst} (was ${this._routeBaseline || 0}) near ${ahead.at ? `${ahead.at.x},${ahead.at.y},${ahead.at.z}` : '?'}`)
+    this.log('debug', `route re-planned (${urgent ? 'critical zone' : 'threat rose'}): ahead=${ahead.worst} (was ${this._routeBaseline || 0}) near ${ahead.at ? `${ahead.at.x},${ahead.at.y},${ahead.at.z}` : '?'}`)
     try { pf.setMovements(pf.movements) } catch { return false }
     return true
   }
@@ -1170,7 +1318,9 @@ class PathfinderWrapper {
   }
 
   /**
-   * Where to run, walls and time included (escape.js). Pure planning.
+   * Where to run, walls and time included (escape.js), incorporating active
+   * weighted elliptical threat regions so escape avoids creeper blasts and
+   * multi-enemy pinch zones. Pure planning.
    * @param {Array<{x:number,y:number,z:number,speed:number,reach:number}>} pursuers
    * @param {object} [opts] passed to planEscape (radius, botSpeed, …)
    * @returns {null | (ReturnType<typeof planEscape> & { goal: object })}
@@ -1178,7 +1328,26 @@ class PathfinderWrapper {
   escapePlan (pursuers, opts = {}) {
     const m = this._escapeMovements()
     if (!m) return null
-    return escapePlanWith(this.bot, m, pursuers, opts)
+    try { this.threat.sample(this.bot) } catch { /* best-effort */ }
+    return escapePlanWith(this.bot, m, pursuers, { threatMap: this.threat, ...opts })
+  }
+
+  /**
+   * Safe detour waypoint planner around active elliptical threat regions while
+   * preserving progress toward `destination`. Pure planning.
+   * @param {{ x:number, y?:number, z:number }} destination
+   * @param {object} [opts]
+   * @returns {null | (ReturnType<typeof planSafeDetour> & { goal: object })}
+   */
+  safeDetourPlan (destination, opts = {}) {
+    const m = this._escapeMovements()
+    if (!m || !destination) return null
+    try { this.threat.sample(this.bot, true) } catch { /* best-effort */ }
+    const plan = planSafeDetour(this.bot, m, destination, this.threat, opts)
+    if (!plan) return null
+    const { goals } = require('mineflayer-pathfinder')
+    plan.goal = new goals.GoalBlock(plan.waypoint.x, plan.waypoint.y, plan.waypoint.z)
+    return plan
   }
 
   /**

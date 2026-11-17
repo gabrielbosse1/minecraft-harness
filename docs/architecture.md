@@ -93,7 +93,7 @@ All physical actuators flow through **`ControlArbiter`** (`zincai/control.js`), 
 
 ## 4. World Interaction, Gathering, Building & Redstone
 
-- **Perception (`perception.js`, `vision.js`, `places.js`, `block_inspect.js`, `region_inspect.js`)**: Reports grounded coordinates, block states, entities, inventory, remembered places, and optional flat-shaded software-rendered views (`screenshot` in `look`, `panorama`, or `map` modes).
+- **Perception (`perception.js`, `vision.js`, `places.js`, `block_inspect.js`, `region_inspect.js`)**: Reports grounded coordinates, block states, entities, inventory, remembered places, and optional `screenshot` views (`look`, `panorama`, `map`). `vision.js` now renders with the real client resource pipeline — blockstates → models → parents/multipart → real textures, vanilla render layers, shared depth buffer, and permanent fullbright — instead of procedural materials. See [`docs/native-renderer.md`](native-renderer.md) for the full design and limitations.
 - **Navigation (`custom_mineflayer/pathfinder_wrapper.js`, `doors.js`)**: Wraps `mineflayer-pathfinder` with dynamic threat-cost penalties (40-tick predictive threat map), automatic door/gate handling, pillar/bridge traversal, and posture derived purely from the active action (never a mode).
 - **Gathering & Skills (`skills.js`)**: Supports gathering any diggable vanilla block (`gather { item, count?, radius? }`), crafting via `prismarine-recipe` (`src/recipes.js`), smelting, container I/O (`look_in`/`take`/`put`), sleeping, lighting, sheltering, and corpse runs. Only truly unbreakable blocks (`UNGATHERABLE_BLOCKS`, e.g. `bedrock`, `barrier`, `end_portal_frame`) are excluded.
 - **Building (`builder.js`)**: Executes inline grid blueprints (`build`) and parametric shapes (`build_shape`: `wall`, `floor`, `box`, `tower`, `roof`, `stairs`, `bridge`, etc.) with ground-truth block verification.
@@ -123,4 +123,5 @@ All physical actuators flow through **`ControlArbiter`** (`zincai/control.js`), 
 
 `test/` verifies ZincAI end-to-end against real `flying-squid` 1.21.4 servers:
 - `test/helpers/mc-server.js` boots an ephemeral in-memory 1.21.4 server on a free localhost port with a 1.21.4 protocol bridge for respawn, player entity spawning, and movement relaying, plus helpers for blocks, inventories, health/damage/death, mobs, and real secondary Mineflayer clients (`Alice`).
+- `test/helpers/fake-world.js` builds offline prismarine-chunk scenes for the native-renderer regression suites (`test/10`, `test/11`).
 - `test/helpers/sim-harness.js` wires a local OpenAI-compatible HTTP server (`startScriptedLlmServer`) returning deterministic scripted tool calls, chat replies, and `reasoning_content` directly into `makeShared` + `createHost` + `startSession`.

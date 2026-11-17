@@ -1,9 +1,10 @@
 'use strict'
 
 /**
- * Real-server test suite 09: Minecraft screenshot vision system, procedural
- * block fidelity, full loaded-chunk coverage, lightweight footprint, and
- * session screenshot archiving + structured telemetry logging.
+ * Real-server test suite 09: Minecraft screenshot vision system backed by real
+ * client resources, block/model/texture fidelity, full loaded-chunk coverage,
+ * lightweight footprint, and session screenshot archiving + structured
+ * telemetry logging.
  */
 const test = require('node:test')
 const assert = require('node:assert/strict')
@@ -28,52 +29,96 @@ function assertValidPng (buf, expectedW, expectedH, label = 'png') {
   if (expectedH) assert.equal(h, expectedH, `${label}: height mismatch (${h} !== ${expectedH})`)
 }
 
-test('09a: Procedural Minecraft block materials & textures render iconic block identities', () => {
-  const { materialFor, sampleBlockTexture } = vision._internal
+test('09a: Native client resources resolve real blockstate models, textures, render layers and tints', () => {
+  const { createAssetProvider, BlockModelStore, buildEntityModel } = vision._internal
+  const mc = require('minecraft-data')('1.21.4')
 
-  // Birch log must be bright white bark with charcoal flecks — NOT brown oak!
-  const birch = materialFor('birch_log')
-  assert.equal(birch.pattern, 'birch_log')
-  assert.ok(birch.rgb[0] > 200 && birch.rgb[1] > 200 && birch.rgb[2] > 195, 'birch_log must be white bark')
-  const birchDarkMarks = []
-  for (let tv = 0; tv < 16; tv++) {
-    for (let tu = 0; tu < 16; tu++) {
-      const col = sampleBlockTexture(birch, 2, 0, 0, -1, (tu + 0.5) / 16, 1 - (tv + 0.5) / 16, 0, 0, 0, 0, new Uint8Array(3))
-      if (col[0] < 80) birchDarkMarks.push([tu, tv])
+  const assets = createAssetProvider({ version: '1.21.4' })
+  assert.ok(assets.info.sources.length >= 1, 'must discover a real client resource root')
+  assert.equal(assets.info.version, '1.21.4')
+
+  const average = (tex) => {
+    const sum = [0, 0, 0]
+    for (let i = 0; i < tex.rgba.length; i += 4) {
+      sum[0] += tex.rgba[i]; sum[1] += tex.rgba[i + 1]; sum[2] += tex.rgba[i + 2]
     }
+    const n = tex.width * tex.height
+    return sum.map((v) => Math.round(v / n))
   }
-  assert.ok(birchDarkMarks.length >= 6, 'birch_log side must show dark charcoal bark flecks')
 
-  // Grass block: green top, brown dirt lower side with green overhang at very top!
-  const grass = materialFor('grass_block')
-  const grassTop = sampleBlockTexture(grass, 1, 0, -1, 0, 0.5, 1, 0.5, 0, 0, 0, new Uint8Array(3))
-  assert.ok(grassTop[1] > grassTop[0] + 30, 'grass_block top must be green')
-  const grassSideTop = sampleBlockTexture(grass, 2, 0, 0, -1, 0.5, 0.95, 0, 0, 0, 0, new Uint8Array(3))
-  assert.ok(grassSideTop[1] > grassSideTop[0] + 20, 'grass_block side upper lip must be green grass')
-  const grassSideBot = sampleBlockTexture(grass, 2, 0, 0, -1, 0.5, 0.25, 0, 0, 0, 0, new Uint8Array(3))
-  assert.ok(grassSideBot[0] > grassSideBot[2] + 30, 'grass_block side lower body must be brown dirt')
+  // Vanilla ships most 16x16 block textures as 4-bit palette PNGs. Decoding
+  // them as greyscale used to turn oak planks and cherry logs nearly black, so
+  // assert the real palette colours come through.
+  const planks = assets.blockTexture('oak_planks')
+  assert.ok(planks && planks.width === 16 && planks.height === 16, 'oak_planks texture must load')
+  const planksAvg = average(planks)
+  assert.ok(planksAvg[0] > 120 && planksAvg[0] < 210, `oak planks red channel must be real wood (${planksAvg})`)
+  assert.ok(planksAvg[1] > 90 && planksAvg[2] < 130, `oak planks must be warm brown (${planksAvg})`)
 
-  // Poppy (red) vs dandelion (yellow), both with compact slender flower geometry
-  const poppy = materialFor('poppy')
-  const dandelion = materialFor('dandelion')
-  assert.equal(poppy.pattern, 'flower')
-  assert.equal(dandelion.pattern, 'flower')
-  assert.ok(poppy.rgb[0] > 190 && poppy.rgb[1] < 80, 'poppy blossom must be red')
-  assert.ok(dandelion.rgb[0] > 210 && dandelion.rgb[1] > 180 && dandelion.rgb[2] < 80, 'dandelion blossom must be yellow')
-  assert.ok(poppy.shape && (poppy.shape[3] - poppy.shape[0]) <= 0.25, 'flowers must be slender, not huge cubes')
+  // Alpha must survive exactly: glass is mostly holes with an opaque frame.
+  const glassTex = assets.blockTexture('glass')
+  let clear = 0
+  let frame = 0
+  for (let i = 3; i < glassTex.rgba.length; i += 4) {
+    if (glassTex.rgba[i] === 0) clear++
+    else if (glassTex.rgba[i] === 255) frame++
+  }
+  assert.ok(clear > 100, `glass must keep its transparent interior (${clear} clear texels)`)
+  assert.ok(frame >= 20, `glass must keep its opaque frame (${frame} frame texels)`)
 
-  // Torch: slender stick + bright emissive flame at top
-  const torch = materialFor('torch')
-  assert.equal(torch.emissive, true)
-  assert.ok(torch.shape && (torch.shape[3] - torch.shape[0]) <= 0.15, 'torch must be a thin Minecraft stick')
+  const store = new BlockModelStore({ version: '1.21.4', registry: mc }, assets)
+  const model = (name, props) => {
+    const def = mc.blocksByName[name]
+    assert.ok(def, `registry has ${name}`)
+    const id = def.defaultState
+    return store.modelForState(id, 0, 0, 0)
+  }
 
-  // Diamond ore: stone background + bright cyan mineral nugget pixels
-  const diamond = materialFor('diamond_ore')
-  assert.equal(diamond.pattern, 'ore')
-  const orePix = sampleBlockTexture(diamond, 2, 0, 0, -1, 4.5 / 16, 1 - 3.5 / 16, 0, 0, 0, 0, new Uint8Array(3))
-  const stonePix = sampleBlockTexture(diamond, 2, 0, 0, -1, 0.5 / 16, 1 - 0.5 / 16, 0, 0, 0, 0, new Uint8Array(3))
-  assert.ok(orePix[2] > 190 && orePix[1] > 190, 'diamond_ore nugget pixel must be bright cyan')
-  assert.ok(Math.abs(stonePix[0] - stonePix[2]) < 20, 'diamond_ore background must be grey stone')
+  // Real blockstate → model → parent → element baking (stairs have 11+ quads).
+  const stairs = model('oak_stairs')
+  assert.ok(stairs.quads.length >= 10, `oak_stairs must resolve its real model (${stairs.quads.length} quads)`)
+  const stairsNames = new Set(stairs.texturesUsed.map((t) => t.name))
+  assert.ok(stairsNames.has('oak_planks'), 'stairs must use the oak plank texture from its model')
+
+  // Render layers come from the model/material, not a blanket transparency.
+  assert.equal(model('stone').layer, 'opaque')
+  assert.match(model('glass').layer, /cutout/)
+  assert.match(model('cherry_leaves').layer, /cutout/)
+  const stained = model('red_stained_glass')
+  assert.equal(stained.layer, 'translucent')
+  const water = model('water')
+  assert.equal(water.layer, 'translucent')
+  assert.equal(water.fluid, true)
+  assert.ok(water.aabb[4] > 0.8 && water.aabb[4] < 1, 'water surface must sit slightly below the block top')
+
+  // Grass is a real model with a dedicated top, dirt side and overlay layer.
+  const grass = model('grass_block')
+  const grassTex = new Set(grass.texturesUsed.map((t) => t.name))
+  for (const name of ['grass_block_top', 'grass_block_side', 'grass_block_side_overlay', 'dirt']) {
+    assert.ok(grassTex.has(name), `grass_block model must include ${name}`)
+  }
+
+  // Biome tints are resolved from the real colormap/tints data.
+  const plainsGrass = store.tintColor('grass_block', 0, 'plains', {})
+  assert.deepEqual(plainsGrass, [145, 189, 89], 'plains grass tint must be the vanilla colormap value')
+  const cherryGrass = store.tintColor('grass_block', 0, 'cherry_grove', {})
+  assert.deepEqual(cherryGrass, [182, 219, 97], 'cherry grove grass tint must come from tints.json')
+
+  // Player/entity geometry: real 64x64 skin UVs, classic vs slim arms.
+  const wide = buildEntityModel('player', {})
+  const slim = buildEntityModel('player', { slim: true })
+  const armWidth = (m) => {
+    const q = m.quads.find((quad) => quad.bone === 'rightArm' && quad.side === 'up')
+    const xs = q.pos.map((p) => p[0])
+    return Math.round((Math.max(...xs) - Math.min(...xs)) * 16)
+  }
+  assert.equal(armWidth(wide), 4, 'classic player arms are 4 px wide')
+  assert.equal(armWidth(slim), 3, 'slim player arms are 3 px wide')
+  const head = wide.quads.find((q) => q.bone === 'head' && q.side === 'north')
+  assert.ok(head && head.uv.every(([u, v]) => u >= 0 && u <= 1 && v >= 0 && v <= 1), 'skin UVs are normalised')
+
+  // No fabricated texture names: every texture comes from a model reference.
+  assert.equal(store.stats.missingTextures.size, 0, `missing textures: ${[...store.stats.missingTextures].join(',')}`)
 })
 
 test('09b: Real Minecraft world renders look/panorama/map covering all loaded chunks cleanly & lightly', { timeout: 60_000 }, async () => {

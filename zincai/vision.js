@@ -29,9 +29,12 @@ const path = require('node:path')
 const { environmentSnapshot } = require('./environment')
 const { createAssetProvider } = require('./native/assets')
 const { BlockModelStore, FACE_SHADE } = require('./native/blockModels')
-const { buildEntityModel, poseEntityModel, loadEntityDefinitions } = require('./native/entityModels')
+const { buildEntityModel, poseEntityModel, buildArmorQuads, loadEntityDefinitions } = require('./native/entityModels')
 const { SkinResolver } = require('./native/skins')
-const { ItemModelStore } = require('./native/items')
+const { ItemModelStore, isEnchanted } = require('./native/items')
+const { entityAppearance, metaValue } = require('./native/entityAppearance')
+const { equipmentOf, resolveArmorLayers, elytraQuads } = require('./native/equipment')
+const specialModels = require('./native/specialModels')
 
 // Fullbright is a rendering invariant for perception. It never touches game
 // state: no effects, no light updates, no world edits.
@@ -166,6 +169,15 @@ class Canvas {
     this.rgb[i + 2] = (this.rgb[i + 2] * ia + b * a) | 0
   }
 
+  /** Additive compositing — the enchantment glint shader's blend mode. */
+  add (x, y, r, g, b, a) {
+    if (x < 0 || x >= this.w || y < 0 || y >= this.h) return
+    const i = (y * this.w + x) * 3
+    this.rgb[i] = Math.min(255, this.rgb[i] + r * a) | 0
+    this.rgb[i + 1] = Math.min(255, this.rgb[i + 1] + g * a) | 0
+    this.rgb[i + 2] = Math.min(255, this.rgb[i + 2] + b * a) | 0
+  }
+
   rect (x, y, w, h, rgb, a = 1) {
     const x0 = Math.max(0, Math.floor(x))
     const y0 = Math.max(0, Math.floor(y))
@@ -251,6 +263,7 @@ function getNativeContext (bot, opts = {}) {
   const store = new BlockModelStore(bot, assets, { debug: opts.debug })
   const items = new ItemModelStore({ version, assets, blockModels: store, registry: bot?.registry })
   const ctx = { assets, store, items }
+  activeAssetSignature = `${key}|${assets.info.version}|${assets.info.sources.join(',')}`
   nativeContexts.set(key, ctx)
   return ctx
 }
@@ -265,9 +278,14 @@ function getSkinResolver (bot, assets, opts = {}) {
   return resolver
 }
 
+// Model geometry comes from the bundled catalogue, but the *key* still carries
+// the active resource signature so a pack/version change cannot serve a stale
+// mesh (and so tests that switch packs see fresh models).
+let activeAssetSignature = 'default'
+
 const entityModelCache = new Map()
 function getEntityModel (name, { slim = false, variant = null } = {}) {
-  const key = `${name}|${slim ? 'slim' : 'wide'}|${variant || 'default'}`
+  const key = `${activeAssetSignature}|${name}|${slim ? 'slim' : 'wide'}|${variant || 'default'}`
   if (!entityModelCache.has(key)) {
     const model = buildEntityModel(name, { slim, variant })
     entityModelCache.set(key, model)
@@ -837,6 +855,108 @@ function resolveAim (bot, opts) {
   return { bearing: curBearing, pitch: curPitch }
 }
 
+/**
+ * Perspective handling.
+ *
+ * The renderer can look at the world from the bot's own eyes (first person) or
+ * from a camera outside the bot (third person / explicit camera). What may be
+ * drawn depends on that choice, exactly like the client:
+ *
+ *  * first person  — the bot's own body, armour, elytra and outer layers are
+ *    not drawn (they would be camera-space geometry blocking the view); the
+ *    held item is drawn with the real first-person display transform.
+ *  * third person  — the bot is drawn like any other player: full model, current
+ *    skin, armour + trims, elytra, both hands, outer layers, animations. The
+ *    first-person hand overlay is *not* drawn, so nothing is duplicated.
+ */
+const EYE_HEIGHT = { standing: 1.62, sneaking: 1.27, swimming: 0.4, sleeping: 0.2 }
+
+function eyeHeightFor (bot) {
+  const pose = String(bot?.entity?.pose || '')
+  if (bot?.entity?.crouching || pose === 'sneaking') return EYE_HEIGHT.sneaking
+  if (pose === 'swimming' || pose === 'crawling' || pose === 'fall_flying') return EYE_HEIGHT.swimming
+  if (pose === 'sleeping') return EYE_HEIGHT.sleeping
+  return EYE_HEIGHT.standing
+}
+
+/** The bot's own equipment in the client's slot order. */
+function selfEquipment (bot) {
+  const slots = Array.isArray(bot?.inventory?.slots) ? bot.inventory.slots : []
+  const quickBar = Number.isFinite(bot?.quickBarSlot) ? bot.quickBarSlot : 0
+  return [
+    bot?.heldItem || slots[36 + quickBar] || null,
+    bot?.offhandItem || slots[45] || null,
+    slots[8] || null, // boots
+    slots[7] || null, // leggings
+    slots[6] || null, // chestplate
+    slots[5] || null // helmet
+  ]
+}
+
+function isSolidAt (bot, x, y, z) {
+  try {
+    const block = bot.blockAt({ x: Math.floor(x), y: Math.floor(y), z: Math.floor(z) })
+    if (!block) return false
+    if (block.boundingBox === 'block' || block.boundingBox === 'empty') return block.boundingBox === 'block'
+    return Boolean(block.name && block.name !== 'air' && !/_lava|water|_water$|seagrass|kelp|bubble/.test(block.name))
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Resolve the camera: bot's eyes, an explicit camera position, or a third-person
+ * orbit behind the bot (with the vanilla-style pull-in when a wall is in the
+ * way).
+ */
+function resolvePerspective (bot, opts, aim, fwd, isPano) {
+  const baseEye = bot.entity.position.offset(0, eyeHeightFor(bot), 0)
+  const wanted = String(opts.perspective || '').toLowerCase()
+  const camera = opts.camera
+
+  if (camera && Number.isFinite(camera.x) && Number.isFinite(camera.y) && Number.isFinite(camera.z)) {
+    return {
+      eye: { x: camera.x, y: camera.y, z: camera.z },
+      baseEye,
+      perspective: 'third',
+      source: 'camera',
+      distance: Math.hypot(camera.x - baseEye.x, camera.y - baseEye.y, camera.z - baseEye.z)
+    }
+  }
+
+  const third = wanted === 'third' || wanted === 'third-person' || wanted === 'thirdperson' || wanted === '3' || opts.thirdPerson === true
+  if (!third) {
+    const known = !wanted || ['first', 'first-person', 'firstperson', '1'].includes(wanted)
+    return { eye: baseEye, baseEye, perspective: 'first', source: 'eye', distance: 0, unknown: known ? null : String(opts.perspective) }
+  }
+
+  const wantedDist = Math.max(1.5, Math.min(12, Number.isFinite(opts.cameraDistance) ? opts.cameraDistance : (isPano ? 5 : 4)))
+  const lift = Number.isFinite(opts.cameraHeight) ? opts.cameraHeight : 0.35
+  const hLen = Math.hypot(fwd[0], fwd[2]) || 1
+  const backX = -fwd[0] / hLen
+  const backZ = -fwd[2] / hLen
+  // Walk backwards from the bot and stop before the first wall (vanilla pulls
+  // the camera in the same way); the floor is 0.5m so a tight tunnel still
+  // shows the bot instead of ending up inside stone.
+  let dist = 0.5
+  for (let d = 0.5; d <= wantedDist + 1e-6; d += 0.1) {
+    const x = baseEye.x + backX * d
+    const z = baseEye.z + backZ * d
+    if (isSolidAt(bot, x, baseEye.y + lift, z) || isSolidAt(bot, x, baseEye.y + lift + 0.4, z)) {
+      dist = Math.max(0.5, d - 0.1)
+      break
+    }
+    dist = d
+  }
+  return {
+    eye: { x: baseEye.x + backX * dist, y: baseEye.y + lift, z: baseEye.z + backZ * dist },
+    baseEye,
+    perspective: 'third',
+    source: 'third-person',
+    distance: dist
+  }
+}
+
 // ── Entity list & real-model rasterization ─────────────────────────────────
 
 const HOSTILE_NAME = /zombie|skeleton|creeper|spider|enderman|witch|pillager|vindicator|evoker|ravager|phantom|blaze|ghast|slime|magma|guardian|drowned|husk|stray|wither|piglin|hoglin|zoglin|silverfish|vex|shulker|breeze|bogged|creaking|warden|elder_guardian/
@@ -847,33 +967,66 @@ function hostileFor (name, e, isHostile) {
   return HOSTILE_NAME.test(String(name || ''))
 }
 
-function entityList (bot, eye, maxDist, isHostile) {
+// Entity types the client renders with a model. `item` entities are handled by
+// the dropped-item path, item frames by the frame path below.
+const MODEL_ENTITY_TYPES = new Set(['player', 'mob', 'hostile', 'animal', 'passive', 'object', 'other', 'projectile', 'vehicle'])
+
+function entityList (bot, eye, maxDist, isHostile, opts = {}) {
   const out = []
-  for (const e of Object.values(bot.entities || {})) {
-    if (!e || e === bot.entity || !e.position) continue
+  const definitions = opts.definitions || loadEntityDefinitions()
+  const includeSelf = Boolean(opts.includeSelf)
+  const selfEntity = bot.entity
+  const selfEq = includeSelf ? selfEquipment(bot) : null
+  const entities = Object.values(bot.entities || {})
+  // The bot's own entity is always part of `bot.entities`; add it defensively
+  // for test doubles that only expose `bot.entity`.
+  if (includeSelf && selfEntity?.position && !entities.includes(selfEntity)) entities.push(selfEntity)
+  for (const e of entities) {
+    if (!e || !e.position) continue
+    const isSelf = e === selfEntity
+    if (isSelf && !includeSelf) continue
     if (droppedItemOf(e)) continue
-    if (!['player', 'mob', 'hostile', 'animal', 'passive'].includes(e.type)) continue
-    const name = e.type === 'player' ? (e.username || 'player') : (e.name || e.type || 'mob')
-    const hostile = e.type !== 'player' && hostileFor(name, e, isHostile)
-    const base = e.type === 'player' ? getEntityModel('player', { slim: false }) : getEntityModel(name, {})
-    const h = Number.isFinite(e.height) && e.height > 0 ? e.height : (base?.height || 1.4)
-    const w = Number(modelWidth(base, e))
+    const selfName = bot.username || e.username || 'you'
+    const name = isSelf ? selfName : e.type === 'player' ? (e.username || 'player') : (e.name || e.type || 'mob')
+    if (e.type === 'item_frame' || name === 'item_frame' || name === 'glow_item_frame') continue
+    // Thrown tridents are drawn by the TridentModel pass below.
+    if (name === 'trident') continue
+    const isPlayer = isSelf || e.type === 'player'
+    if (!MODEL_ENTITY_TYPES.has(e.type) && !isPlayer) continue
+    const appearance = isPlayer
+      ? { modelKey: 'player', baby: false, scale: 1, notes: [], textureRef: null, textureCandidates: [], extraLayers: [] }
+      : entityAppearance(e, { registry: bot.registry, definitions })
+    const modelKey = appearance.modelKey || name
+    const base = getEntityModel(modelKey, {})
+    if (!isPlayer && !base) continue // the renderer reports the precise reason
+    const hostile = !isPlayer && hostileFor(name, e, isHostile)
+    const scale = appearance.scale || 1
+    const rawH = Number.isFinite(e.height) && e.height > 0 ? e.height : (base?.height || 1.4)
+    const h = rawH * scale
+    const w = Number(modelWidth(base, e)) * scale
     const dist = Math.hypot(e.position.x - eye.x, e.position.y + h * 0.5 - eye.y, e.position.z - eye.z)
-    if (dist < 0.6 || dist > maxDist) continue
+    if (dist < 0.4 || dist > maxDist) continue
     out.push({
       id: e.id,
       name,
       type: e.name || e.type,
-      isPlayer: e.type === 'player',
+      isPlayer,
+      isSelf,
       hostile,
       entity: e,
+      // Own equipment comes from the inventory (the server does not re-send
+      // entity_equipment for the local player's own slots).
+      equipment: isSelf ? selfEq : null,
+      appearance,
+      scale,
+      modelKey,
       x: e.position.x,
       feetY: e.position.y,
       z: e.position.z,
       w,
       h,
       dist,
-      tag: hostile ? [255, 96, 88] : e.type === 'player' ? [96, 224, 255] : [248, 228, 112]
+      tag: hostile ? [255, 96, 88] : isPlayer ? [96, 224, 255] : [248, 228, 112]
     })
   }
   out.sort((a, b) => b.dist - a.dist)
@@ -887,8 +1040,14 @@ function modelWidth (base, e) {
 
 const animState = new WeakMap()
 
-function buildPose (entity, model, nowMs, isPlayer) {
+function dequantizeAngle (value) {
+  // Armour stand pose metadata is a byte: (angle / 360) * 256.
+  return (Number(value) || 0) * 360 / 256
+}
+
+function buildPose (entity, model, nowMs, isPlayer, opts = {}) {
   const pose = {}
+  const registry = opts.registry || null
   const last = animState.get(entity) || { x: entity.position?.x, z: entity.position?.z, t: nowMs, phase: 0 }
   const dt = Math.max(0, Math.min(1, (nowMs - last.t) / 1000))
   let speed = 0
@@ -934,9 +1093,41 @@ function buildPose (entity, model, nowMs, isPlayer) {
     pose.rightArm = [Math.PI / 2.2, 0, 0]
   }
 
-  if (isPlayer || model.bones?.head) {
+  if (isPlayer || boneNames.has('head')) {
     const pitch = Number.isFinite(entity.pitch) ? entity.pitch : 0
     if (boneNames.has('head')) pose.head = [-pitch, 0, 0]
+  }
+
+  // Vanilla crouch: the body leans forward and the head tilts up a little.
+  const sharedFlags = metaValue(entity, registry, 'shared_flags')
+  if (Number.isFinite(sharedFlags) && (sharedFlags & 0x02)) {
+    if (boneNames.has('body')) pose.body = [0.5, 0, 0]
+    if (boneNames.has('head')) pose.head = [(pose.head?.[0] || 0) - 0.5, 0, 0]
+    for (const leg of ['leftLeg', 'rightLeg']) if (boneNames.has(leg)) pose[leg] = [-0.4, 0, 0]
+    for (const arm of ['leftArm', 'rightArm']) if (boneNames.has(arm)) pose[arm] = [0.4, 0, 0]
+  }
+
+  // Armour stands: every bone pose is synced metadata (vanilla quantised Euler).
+  if (model.name === 'armor_stand') {
+    const mapping = {
+      head: 'head_pose',
+      body: 'body_pose',
+      leftarm: 'left_arm_pose',
+      rightarm: 'right_arm_pose',
+      leftleg: 'left_leg_pose',
+      rightleg: 'right_leg_pose'
+    }
+    for (const [bone, key] of Object.entries(mapping)) {
+      if (!boneNames.has(bone)) continue
+      const raw = metaValue(entity, registry, key)
+      if (raw == null) continue
+      // Each axis is a quantised byte in a packed int (x << 16 | y << 8 | z).
+      const packed = Number(raw) || 0
+      const x = dequantizeAngle((packed >> 16) & 0xff) * Math.PI / 180
+      const y = dequantizeAngle((packed >> 8) & 0xff) * Math.PI / 180
+      const z = dequantizeAngle(packed & 0xff) * Math.PI / 180
+      pose[bone] = [x, y, z]
+    }
   }
   return pose
 }
@@ -1077,6 +1268,13 @@ function rasterizeEntityQuads (canvas, zbuf, camera, quads, timeMs) {
           tex.sample(uu, vv, timeMs, 0, _texel)
           const alpha = _texel[3]
           if (alpha < 26) continue
+          if (quad.layer === 'glint') {
+            // Additive, depth-tested but non-writing, like the glint shader.
+            const shimmer = 0.35 + 0.25 * Math.sin((timeMs / 900) + uu * 6.283)
+            canvas.add(px, py, _texel[0], _texel[1], _texel[2], (alpha / 255) * shimmer)
+            drawn++
+            continue
+          }
           if (quad.layer === 'translucent' || alpha < 250) {
             canvas.blend(px, py, _texel[0], _texel[1], _texel[2], alpha / 255)
           } else {
@@ -1142,12 +1340,26 @@ function itemQuadsInWorld (baked, place) {
   return out
 }
 
-function droppedItemWorldQuads (store, entity, timeMs, eye, unsupportedItems) {
+/** The point a compass needle points at (lodestone tracker, spawn, or none). */
+function compassTargetFor (bot) {
+  try {
+    if (bot.lodestone) return { x: bot.lodestone.x, y: bot.lodestone.y, z: bot.lodestone.z, kind: 'lodestone' }
+    const spawn = bot.spawnPoint
+    if (spawn) return { x: spawn.x, y: spawn.y, z: spawn.z, kind: 'spawn' }
+  } catch { /* optional */ }
+  return null
+}
+
+function droppedItemWorldQuads (store, entity, timeMs, eye, unsupportedItems, state = {}) {
   const item = droppedItemOf(entity)
   if (!item) return null
   const name = store.itemNameOf(item)
   if (!name) return null
-  const baked = store.quadsFor(name, 'ground')
+  const baked = store.quadsForStack(item, 'ground', {
+    ...state,
+    count: item.count,
+    enchanted: isEnchanted(item)
+  }) || store.quadsFor(name, 'ground')
   if (!baked) { unsupportedItems.add(name); return null }
   const spin = ((timeMs / 1000) * 1.8 + (Number(entity.id) || 0)) % (Math.PI * 2)
   const bob = Math.sin((timeMs / 480) + (Number(entity.id) || 0)) * 0.04
@@ -1160,17 +1372,28 @@ function droppedItemWorldQuads (store, entity, timeMs, eye, unsupportedItems) {
     p[1] * scale + base.y,
     (-p[0] * sy + p[2] * cy) * scale + base.z
   ])
-  return { name, kind: baked.kind, quads, center: [base.x, base.y, base.z], dist: Math.hypot(base.x - eye.x, base.y - eye.y, base.z - eye.z) }
+  return {
+    name,
+    kind: baked.kind,
+    count: item.count,
+    quads,
+    center: [base.x, base.y, base.z],
+    dist: Math.hypot(base.x - eye.x, base.y - eye.y, base.z - eye.z)
+  }
 }
 
-function selfHeldItemQuads (store, name, eye, fwd, right, up, unsupportedItems) {
-  const baked = store.quadsFor(name, 'firstperson_righthand')
+function selfHeldItemQuads (store, stack, eye, fwd, right, up, unsupportedItems, { hand = 'right', state = {} } = {}) {
+  const name = store.itemNameOf(stack) || String(stack)
+  const context = hand === 'left' ? 'firstperson_lefthand' : 'firstperson_righthand'
+  const baked = store.quadsForStack(stack, context, { ...state, enchanted: isEnchanted(stack) }) ||
+    store.quadsFor(name, context)
   if (!baked) { unsupportedItems.add(name); return null }
   // First-person hand placement is renderer-owned in vanilla too; the model
   // and its display transform are the real resources.
+  const side = hand === 'left' ? -1 : 1
   const quads = itemQuadsInWorld(baked, (p) => {
     const s = 0.3
-    const cx = p[0] * s + 0.5
+    const cx = p[0] * s + 0.5 * side
     const cy = p[1] * s - 0.5
     const cz = p[2] * s + 1.15
     return [
@@ -1179,34 +1402,225 @@ function selfHeldItemQuads (store, name, eye, fwd, right, up, unsupportedItems) 
       eye.z + right[2] * cx + up[2] * cy + fwd[2] * cz
     ]
   })
-  return { quads, name, kind: baked.kind, center: [eye.x, eye.y, eye.z] }
+  return { quads, name, kind: baked.kind, center: [eye.x, eye.y, eye.z], display: baked.displayTransform || null }
 }
 
-function heldItemWorldQuads (store, name, pose, xform, unsupportedItems) {
-  const baked = store.quadsFor(name, 'thirdperson_righthand')
+function heldItemWorldQuads (store, stackOrName, pose, xform, unsupportedItems, { hand = 'right', state = {} } = {}) {
+  const name = store.itemNameOf(stackOrName) || String(stackOrName)
+  const context = hand === 'left' ? 'thirdperson_lefthand' : 'thirdperson_righthand'
+  const baked = store.quadsForStack(stackOrName, context, { ...state, enchanted: isEnchanted(stackOrName) }) ||
+    store.quadsFor(name, context)
   if (!baked) { unsupportedItems.add(name); return null }
   const swing = pose?.rightArm?.[0] || 0
-  const pivot = [-5 / 16, 22 / 16, 0]
-  const hand = [
+  const pivot = hand === 'left' ? [5 / 16, 22 / 16, 0] : [-5 / 16, 22 / 16, 0]
+  const handPos = [
     pivot[0],
     pivot[1] + rotateXRad([0, -10 / 16, 0], swing)[1],
     rotateXRad([0, -10 / 16, 0], swing)[2]
   ]
   const cy = Math.cos(xform.yaw)
   const sy = Math.sin(xform.yaw)
+  const scale = Number.isFinite(xform.scale) ? xform.scale : 1
   const quads = itemQuadsInWorld(baked, (p) => {
     const r = rotateXRad(p, swing)
-    const x = r[0] + hand[0]
-    const y = r[1] + hand[1]
-    const z = r[2] + hand[2]
+    const x = (r[0] + handPos[0] * (hand === 'left' ? -1 : 1)) * scale
+    const y = (r[1] + handPos[1]) * scale
+    const z = (r[2] + handPos[2]) * scale
     return [x * cy + z * sy + xform.x, y + xform.y, -x * sy + z * cy + xform.z]
   })
-  return { quads, kind: baked.kind }
+  return { quads, kind: baked.kind, name }
+}
+
+/**
+ * Item frames: the frame model (real `block/template_item_frame` when the
+ * resources have it, the vanilla ring otherwise) plus the displayed stack in
+ * the `fixed` display context, rotated by the synced `rotation` metadata
+ * (45° steps) and facing the synced yaw.
+ */
+function itemFramesWorldQuads (store, assets, entity, stack, rotation, bot, notes) {
+  const pos = entity.position
+  if (!pos) return null
+  const yaw = Number.isFinite(entity.yaw) ? entity.yaw : 0
+  const cy = Math.cos(yaw)
+  const sy = Math.sin(yaw)
+  const center = [pos.x + 0.5, pos.y + 0.5, pos.z + 0.5]
+  const built = specialModels.buildItemFrame({ assets })
+  if (!built) return null
+  const frameQuads = built.quads.map((q) => ({
+    ...q,
+    pos: q.pos.map((p) => {
+      const x = p[0]
+      const y = p[1]
+      // Ring authored around the block centre; push it to the support face.
+      const z = p[2] - 0.4375
+      return [x * cy + z * sy + center[0], y + center[1], -x * sy + z * cy + center[2]]
+    })
+  }))
+  const quads = frameQuads.slice()
+  if (stack) {
+    const itemName = store.itemNameOf(stack)
+    const state = {
+      displayContext: 'fixed',
+      dayTime: Number.isFinite(bot?.time?.timeOfDay) ? bot.time.timeOfDay : 0,
+      compassAngle: state0CompassAngle(bot, pos),
+      enchanted: isEnchanted(stack)
+    }
+    const baked = store.quadsForStack(stack, 'fixed', state)
+    if (baked) {
+      const spin = -(rotation || 0) * Math.PI / 4
+      const cs = Math.cos(spin)
+      const sn = Math.sin(spin)
+      for (const q of baked.quads) {
+        quads.push({
+          ...q,
+          pos: q.pos.map((p) => {
+            // rotation about the frame's normal (local z), 45° per metadata step
+            const x = (p[0] * cs - p[1] * sn) * 0.5
+            const y = (p[0] * sn + p[1] * cs) * 0.5
+            const z = (p[2] * 0.5) - 0.40625
+            return [x * cy + z * sy + center[0], y + center[1], -x * sy + z * cy + center[2]]
+          })
+        })
+      }
+    } else if (itemName) {
+      notes.add(`item frame holds ${itemName} with no drawable model`)
+    }
+  }
+  return { quads, center, kind: 'item_frame' }
+}
+
+/**
+ * Entities that the client draws with a *block* model (primed TNT, falling
+ * blocks) or with a painting sheet. The renderer reports precisely when the
+ * data it needs is not synced to this client.
+ */
+function blockModelEntityQuads (store, assets, entity, bot, notes) {
+  const name = String(entity?.name || '')
+  const pos = entity.position
+  if (!pos) return null
+  if (name === 'tnt') {
+    const stateId = Number(metaValue(entity, bot.registry, 'block_state')) || bot.registry.blocksByName.tnt?.defaultState
+    if (!stateId) return null
+    const model = store.modelForState(stateId, Math.floor(pos.x), Math.floor(pos.y), Math.floor(pos.z))
+    if (!model?.quads.length) return null
+    const ox = pos.x - 0.5
+    const oy = pos.y
+    const oz = pos.z - 0.5
+    return {
+      quads: model.quads.map((q) => ({ ...q, pos: q.pos.map((p) => [p[0] + ox, p[1] + oy, p[2] + oz]) })),
+      center: [pos.x, pos.y + 0.5, pos.z],
+      label: 'tnt'
+    }
+  }
+  if (name === 'falling_block') {
+    const stateId = Number(entity.blockStateId || metaValue(entity, bot.registry, 'block_state'))
+    if (!stateId) {
+      notes.add('falling_block: the client receives the block state in the spawn packet objectData, which mineflayer does not expose')
+      return null
+    }
+    const model = store.modelForState(stateId, Math.floor(pos.x), Math.floor(pos.y), Math.floor(pos.z))
+    if (!model?.quads.length) return null
+    const ox = pos.x - 0.5
+    const oy = pos.y
+    const oz = pos.z - 0.5
+    return {
+      quads: model.quads.map((q) => ({ ...q, pos: q.pos.map((p) => [p[0] + ox, p[1] + oy, p[2] + oz]) })),
+      center: [pos.x, pos.y + 0.5, pos.z],
+      label: `falling ${model.name}`
+    }
+  }
+  if (name === 'trident') {
+    // Thrown tridents use the same TridentModel, spinning around their axis.
+    const built = specialModels.buildTrident({ assets })
+    if (!built) { notes.add('trident: TridentModel texture missing'); return null }
+    const yaw = Number.isFinite(entity.yaw) ? entity.yaw : 0
+    const pitch = Number.isFinite(entity.pitch) ? entity.pitch : 0
+    const center = [pos.x, pos.y + 0.5, pos.z]
+    const spin = (Date.now() / 6) % 360
+    const quads = []
+    for (const q of built.quads) {
+      quads.push({
+        ...q,
+        pos: q.pos.map((p) => {
+          // local: spin about the pole axis (y), then point the tip along the
+          // entity's pitch, then turn to its yaw.
+          const a = spin * Math.PI / 180
+          const x1 = p[0] * Math.cos(a) - p[2] * Math.sin(a)
+          const z1 = p[0] * Math.sin(a) + p[2] * Math.cos(a)
+          const y1 = p[1] * Math.cos(pitch) - z1 * Math.sin(pitch)
+          const z2 = p[1] * Math.sin(pitch) + z1 * Math.cos(pitch)
+          return [x1 * Math.cos(yaw) + z2 * Math.sin(yaw) + center[0], y1 + center[1], -x1 * Math.sin(yaw) + z2 * Math.cos(yaw) + center[2]]
+        })
+      })
+    }
+    return { quads, center, label: 'trident' }
+  }
+  if (name === 'painting') {
+    const raw = metaValue(entity, bot.registry, 'painting_variant')
+    const variant = typeof raw === 'string' ? raw.replace(/^minecraft:/, '') : null
+    if (!variant) {
+      notes.add('painting: the variant is a registry id from the spawn packet, which mineflayer does not expose by name')
+      return null
+    }
+    const texture = assets.entityTexture(`painting/${variant}`)
+    if (!texture) return null
+    // Painting sheets are 16 px per block, so the sheet size is the size in
+    // blocks (vanilla `PaintingVariant` asset rule).
+    const bw = texture.width / 16
+    const bh = texture.height / 16
+    const yaw = Number.isFinite(entity.yaw) ? entity.yaw : 0
+    const cy = Math.cos(yaw)
+    const sy = Math.sin(yaw)
+    const center = [pos.x + 0.5, pos.y + bh / 2, pos.z + 0.5]
+    const zOff = -0.46875
+    const corners = [[-bw / 2, -bh / 2], [bw / 2, -bh / 2], [bw / 2, bh / 2], [-bw / 2, bh / 2]]
+    const posOf = ([lx, ly]) => {
+      const x = lx
+      const z = zOff
+      return [x * cy + z * sy + center[0], ly + center[1], -x * sy + z * cy + center[2]]
+    }
+    const uv = [[0, 1], [1, 1], [1, 0], [0, 0]]
+    return {
+      quads: [{
+        pos: corners.map(posOf),
+        uv,
+        tex: texture,
+        layer: 'cutout',
+        normal: [-sy, 0, -cy],
+        shadeDir: 1
+      }],
+      center,
+      label: `painting/${variant}`
+    }
+  }
+  return null
+}
+
+/** First texture reference that the loaded resources actually contain. */
+function firstEntityTexture (assets, refs) {
+  for (const ref of refs || []) {
+    if (!ref) continue
+    const texture = assets.entityTexture(ref)
+    if (texture) return texture
+  }
+  return null
+}
+
+function state0CompassAngle (bot, pos) {
+  const target = compassTargetFor(bot)
+  if (!target || !pos) return 0
+  return Math.atan2(target.z - pos.z, target.x - pos.x) * 180 / Math.PI
 }
 
 async function renderCamera (bot, opts) {
   const t0 = performance.now()
   const isPano = opts.view === 'panorama'
+  // Interface overlays are annotations, never world geometry. They default to
+  // "on for look, off for panorama" so the 360° capture is pure scenery.
+  const overlayMode = String(opts.overlays || 'auto').toLowerCase()
+  const wantOverlays = overlayMode === 'all' || (overlayMode !== 'none' && !isPano)
+  const drawHud = opts.hud === undefined ? wantOverlays : Boolean(opts.hud)
+  const drawLabels = opts.labels === undefined ? wantOverlays : Boolean(opts.labels)
   const w = Math.max(160, Math.min(800, Math.trunc(opts.width || (isPano ? 720 : 512))))
   const h = Math.max(100, Math.min(480, Math.trunc(opts.height || (isPano ? 200 : 288))))
   const configuredMax = Math.max(24, Math.min(192, Math.trunc(opts.maxDist || 128)))
@@ -1217,15 +1631,16 @@ async function renderCamera (bot, opts) {
   const skinResolver = getSkinResolver(bot, assets, opts)
   await skinResolver.prepare()
 
-  const eye = bot.entity.position.offset(0, 1.62, 0)
+  const aim = isPano ? { bearing: 0, pitch: 0 } : resolveAim(bot, opts)
+  const fwd = dirFor(aim.bearing, aim.pitch)
+  const view = resolvePerspective(bot, opts, aim, fwd, isPano)
+  const eye = view.eye
+  const firstPerson = view.perspective === 'first'
   const sampler = new WorldSampler(bot, eye.x, eye.z, configuredMax)
   const maxDist = sampler.maxDist
   const sky = skyProfile(bot)
   const canvas = new Canvas(w, h)
   const zbuf = new Float32Array(w * h).fill(maxDist + 1)
-
-  const aim = isPano ? { bearing: 0, pitch: 0 } : resolveAim(bot, opts)
-  const fwd = dirFor(aim.bearing, aim.pitch)
   const rLen = Math.hypot(-fwd[2], fwd[0]) || 1
   const right = [-fwd[2] / rLen, 0, fwd[0] / rLen]
   const up = [
@@ -1347,89 +1762,283 @@ async function renderCamera (bot, opts) {
   const seenItems = []
   const heldItems = []
   const unsupportedItems = new Set()
+  const renderNotes = new Set()
+  if (view.unknown && !isPano) {
+    // Never silently pretend a requested perspective was honoured.
+    renderNotes.add(`unknown perspective '${view.unknown}' (use 'first' or 'third'); rendered first person`)
+  }
+  const armorReport = []
+  const variantReport = []
+  const framesRendered = []
+  const definitions = loadEntityDefinitions()
 
-  for (const item of entityList(bot, eye, maxDist, opts.isHostile)) {
+  // Shared item render state: real world/player values, never static frames.
+  const worldItemState = (entity) => {
+    const state = {
+      dayTime: Number.isFinite(bot.time?.timeOfDay) ? bot.time.timeOfDay : 0,
+      dimension: String(bot.game?.dimension || 'minecraft:overworld').includes(':')
+        ? String(bot.game.dimension)
+        : `minecraft:${String(bot.game?.dimension || 'overworld')}`,
+      localDays: [],
+      count: 1
+    }
+    try {
+      const time = bot.time || {}
+      if (Number.isFinite(time.day)) {
+        const month = new Date(Date.UTC(2000, 0, 1) + (time.day * 86400000)).getUTCMonth() + 1
+        const day = new Date(Date.UTC(2000, 0, 1) + (time.day * 86400000)).getUTCDate()
+        state.localDays = [`${month}-${day}`]
+      }
+    } catch { /* optional */ }
+    const pos = entity?.position || bot.entity?.position
+    const compassTarget = compassTargetFor(bot)
+    if (pos && compassTarget) {
+      const dx = compassTarget.x - pos.x
+      const dz = compassTarget.z - pos.z
+      state.compassAngle = Math.atan2(dz, dx) * 180 / Math.PI
+      state.compassTarget = compassTarget.kind
+    } else if (Number.isFinite(bot.entity?.yaw)) {
+      // No compass target (normal compass in the overworld points to world
+      // spawn, which the client knows but the protocol does not send): use the
+      // known spawn angle when available, otherwise the player facing.
+      const spawn = bot.spawnPoint
+      if (spawn && pos) {
+        state.compassAngle = Math.atan2(spawn.z - pos.z, spawn.x - pos.x) * 180 / Math.PI
+        state.compassTarget = 'spawn'
+      }
+    }
+    return state
+  }
+
+  for (const item of entityList(bot, eye, maxDist, opts.isHostile, { definitions, includeSelf: !firstPerson })) {
     const e = item.entity
     let texture = null
     let slim = false
-    const capeTexture = null
+    let capeTexture = null
     let skinSource = null
-    let modelName = item.name
+    const modelName = item.modelKey
 
     if (item.isPlayer) {
-      modelName = 'player'
       const skin = skinResolver.get(item.name)
       if (skin) {
         texture = skin.texture
         slim = skin.model === 'slim'
+        capeTexture = skin.capeTexture || null
         skinSource = skin.source
-        skinReport.push(`${item.name}=${skin.model}/${skin.source}`)
+        skinReport.push(`${item.name}=${skin.model}/${skin.source}${capeTexture ? '+cape' : ''}`)
       } else {
         texture = assets.entityTexture('entity/player/wide/steve') || assets.missingTexture
         skinSource = 'vanilla-default'
       }
     } else {
-      const defs = loadEntityDefinitions()
-      const entry = defs[modelName] || defs[modelName.replace(/^minecraft:/, '')]
-      if (entry?.textures) {
-        const key = entry.textures.default ? 'default' : Object.keys(entry.textures)[0]
-        const ref = entry.textures[key]
-        texture = assets.entityTexture(ref)
+      const appearance = item.appearance
+      texture = firstEntityTexture(assets, appearance?.textureCandidates || [appearance?.textureRef])
+      if (!texture) {
+        const entry = definitions[modelName] || definitions[modelName.replace(/^minecraft:/, '')]
+        const key = entry?.textures?.default ? 'default' : entry?.textures ? Object.keys(entry.textures)[0] : null
+        if (key) texture = assets.entityTexture(entry.textures[key])
       }
       if (!texture) {
         const fallbackRef = { zombie: 'entity/zombie/zombie', cow: 'entity/cow/cow' }[modelName]
         texture = fallbackRef ? assets.entityTexture(fallbackRef) : null
       }
+      if (texture && appearance?.tint) texture = specialModels.tintedTexture(texture, appearance.tint)
+      if (appearance?.baby) variantReport.push(`${modelName}:baby`)
+      else if (appearance?.variant) variantReport.push(`${modelName}:${appearance.variant}`)
+      for (const note of appearance?.notes || []) renderNotes.add(`${modelName}: ${note}`)
+      if (appearance?.textureCandidates?.length && appearance.textureRef !== appearance.textureCandidates[0]) {
+        renderNotes.add(`${modelName}: ${appearance.textureCandidates[0]} missing, using ${appearance.textureRef}`)
+      }
     }
 
-    const base = getEntityModel(modelName, { slim })
-    if (!base || !texture) {
-      unsupported.add(modelName)
+    const base = getEntityModel(modelName, { slim, variant: item.appearance?.geometryVariant || null })
+    if (!base) {
+      unsupported.add(`${modelName} (no client geometry in these resources)`)
+      continue
+    }
+    if (!texture) {
+      unsupported.add(`${modelName} (no texture in these resources)`)
       continue
     }
     const model = { ...base, texture, capeTexture }
-    const pose = buildPose(e, model, timeMs, item.isPlayer)
-    const posed = poseEntityModel(model, pose, {
-      x: item.x,
-      y: item.feetY,
-      z: item.z,
-      yaw: Number.isFinite(e.yaw) ? e.yaw : 0
-    })
+    const pose = buildPose(e, model, timeMs, item.isPlayer, { registry: bot.registry })
+    const yaw = Number.isFinite(e.yaw) ? e.yaw : 0
+    const xform = { x: item.x, y: item.feetY, z: item.z, yaw, scale: item.scale }
+    const posed = poseEntityModel(model, pose, xform)
     const center = [item.x, item.feetY + item.h * 0.5, item.z]
     for (const q of posed) {
       if (!q.tex) continue
       q.center = center
       entityQuads.push(q)
     }
+
+    // Extra appearance layers (dyed wool, collars, horse markings, villager
+    // biome overlay) drawn from their own sheets over the same model.
+    for (const extra of item.appearance?.extraLayers || []) {
+      const layerTexture = firstEntityTexture(assets, extra.textureCandidates || [extra.textureRef])
+      if (!layerTexture) {
+        unsupported.add(`${modelName} layer ${extra.textureRef} (texture)`)
+        continue
+      }
+      const tinted = extra.tint ? specialModels.tintedTexture(layerTexture, extra.tint) : layerTexture
+      const bones = extra.bones ? new Set(extra.bones) : null
+      const layerQuads = posed.length
+        ? base.quads.filter((q) => !bones || bones.has(q.bone)).map((q) => ({ ...q, tex: tinted }))
+        : []
+      if (!layerQuads.length) continue
+      const posedLayer = poseEntityModel({ ...base, quads: layerQuads, texture: tinted }, pose, xform)
+      for (const q of posedLayer) {
+        if (!q.tex) continue
+        q.center = center
+        // The wool/collar/markings sheets are alpha cutouts over the skin.
+        q.layer = tinted.hasSemiAlpha ? 'translucent' : 'cutout'
+        entityQuads.push(q)
+      }
+      if (extra.note) renderNotes.add(`${modelName}: ${extra.note}`)
+    }
     item.skinSource = skinSource
     seenEnts.push(item)
 
-    // Vanilla equipment slot 0 is the main hand. Render it attached to the
-    // right arm for any model that actually has that bone.
-    let equipment = null
-    try { equipment = e.equipment?.[0] || e.heldItem || null } catch { equipment = null }
-    if (equipment && hasRightArmBone(model)) {
-      const heldName = items.itemNameOf(equipment)
-      if (heldName) {
-        const held = heldItemWorldQuads(items, heldName, pose, {
-          x: item.x, y: item.feetY, z: item.z, yaw: Number.isFinite(e.yaw) ? e.yaw : 0
-        }, unsupportedItems)
-        if (held) {
-          for (const q of held.quads) {
-            if (!q.tex) continue
-            q.center = center
-            entityQuads.push(q)
-          }
-          heldItems.push(`${item.name} holds ${heldName}`)
+    // ── Equipped armour (real equipment assets + trims) ────────────────
+    let equipment = item.equipment || []
+    if (!equipment.length) {
+      try { equipment = Array.isArray(e.equipment) ? e.equipment : [] } catch { equipment = [] }
+    }
+    const armorSlots = item.isPlayer || modelName === 'armor_stand'
+      ? [[2, 'feet'], [3, 'legs'], [4, 'chest'], [5, 'head']]
+      : []
+    for (const [slot, part] of armorSlots) {
+      const worn = equipment[slot]
+      if (!worn) continue
+      const wornName = items.itemNameOf(worn)
+      const equip = equipmentOf(worn, wornName)
+      if (!equip || equip.slot !== part) continue
+      const resolved = resolveArmorLayers(equip, { assets })
+      if (!resolved.layers.length) {
+        if (resolved.missing) renderNotes.add(`${wornName}: ${resolved.missing}`)
+        for (const note of resolved.notes) renderNotes.add(`${wornName}: ${note}`)
+        continue
+      }
+      for (const layer of resolved.layers) {
+        let armorQuads = []
+        if (layer.wings) {
+          const wings = elytraQuads(assets)
+          armorQuads = wings.quads || []
+          if (!armorQuads.length) renderNotes.add('elytra: wing geometry unavailable')
+        } else {
+          // Armour is authored against humanoid bone names; armour-stand and
+          // other models use their own (lower-case) names for the same parts.
+          const boneSet = model.boneNames || (model.boneNames = new Set(base.quads.map((q) => q.bone)))
+          const bones = layer.bones.map((b) => {
+            if (boneSet.has(b)) return b
+            const alias = { rightArm: 'rightarm', leftArm: 'leftarm', rightLeg: 'rightleg', leftLeg: 'leftleg' }[b]
+            return alias && boneSet.has(alias) ? alias : b
+          })
+          armorQuads = buildArmorQuads(model, {
+            texture: layer.texture,
+            bones,
+            deformation: layer.deformation,
+            trim: layer.trim
+          })
         }
+        if (!armorQuads.length) continue
+        const posedArmor = poseEntityModel({ quads: armorQuads, texture: layer.texture }, pose, xform)
+        for (const q of posedArmor) {
+          if (!q.tex) continue
+          q.center = center
+          entityQuads.push(q)
+        }
+        armorReport.push(`${item.name}:${wornName}${layer.trim ? '/trim' : ''}`)
+      }
+    }
+
+    // ── Both hands (vanilla slots 0 and 1) ─────────────────────────────
+    if (hasRightArmBone(model)) {
+      const handSlots = [[0, 'right'], [1, 'left']]
+      for (const [slot, hand] of handSlots) {
+        let stack = null
+        try { stack = equipment[slot] || (slot === 0 ? e.heldItem : null) } catch { stack = null }
+        if (!stack) continue
+        const heldName = items.itemNameOf(stack)
+        if (!heldName) continue
+        const state = { ...worldItemState(e), count: stack.count, enchanted: isEnchanted(stack) }
+        const held = heldItemWorldQuads(items, stack, pose, xform, unsupportedItems, { hand, state })
+        if (!held) continue
+        for (const q of held.quads) {
+          if (!q.tex) continue
+          q.center = center
+          entityQuads.push(q)
+        }
+        heldItems.push(`${item.name} holds ${heldName}${hand === 'left' ? ' (off hand)' : ''}`)
       }
     }
   }
 
+  // ── Item-model projectiles (thrown potions, firework rockets, …) ─────
+  // The client draws these with the *item* model of the stack they carry.
+  const ITEM_PROJECTILES = new Set(['potion', 'splash_potion', 'lingering_potion', 'firework_rocket', 'experience_bottle'])
+  for (const e of Object.values(bot.entities || {})) {
+    if (!e || !e.position) continue
+    const name = String(e.name || '')
+    if (!ITEM_PROJECTILES.has(name)) continue
+    let stack = null
+    try { stack = metaValue(e, bot.registry, 'item') || null } catch { stack = null }
+    if (!stack && name === 'firework_rocket') stack = { name: 'firework_rocket', count: 1 }
+    if (!stack) { renderNotes.add(`${name}: no carried item stack in metadata`); continue }
+    const baked = items.quadsForStack(stack, 'ground', { ...itemState, enchanted: isEnchanted(stack) })
+    if (!baked) { unsupportedItems.add(items.itemNameOf(stack) || name); continue }
+    const center = [e.position.x, e.position.y + 0.2, e.position.z]
+    const spin = ((timeMs / 1000) * 2.4 + (Number(e.id) || 0)) % (Math.PI * 2)
+    const cy = Math.cos(spin)
+    const sy = Math.sin(spin)
+    for (const q of baked.quads) {
+      if (!q.tex) continue
+      entityQuads.push({
+        ...q,
+        pos: q.pos.map((p) => [p[0] * cy + p[2] * sy + center[0], p[1] + center[1], -p[0] * sy + p[2] * cy + center[2]]),
+        center
+      })
+    }
+    seenItems.push({ name: items.itemNameOf(stack) || name, kind: baked.kind, dist: Math.hypot(center[0] - eye.x, center[1] - eye.y, center[2] - eye.z) })
+  }
+
+  // ── Block-model entities (primed TNT, falling blocks, paintings) ─────
+  for (const e of Object.values(bot.entities || {})) {
+    if (!e || !e.position) continue
+    if (!['tnt', 'falling_block', 'painting', 'trident'].includes(String(e.name || ''))) continue
+    const built = blockModelEntityQuads(store, assets, e, bot, renderNotes)
+    if (!built) continue
+    for (const q of built.quads) {
+      if (!q.tex) continue
+      q.center = built.center
+      entityQuads.push(q)
+    }
+    seenEnts.push({ name: built.label, id: e.id, hostile: false, dist: Math.hypot(built.center[0] - eye.x, built.center[1] - eye.y, built.center[2] - eye.z), tag: [200, 200, 200], entity: e })
+  }
+
+  // ── Item frames (entities with a synced item + rotation) ─────────────
+  for (const e of Object.values(bot.entities || {})) {
+    if (!e || !e.position) continue
+    const name = String(e.name || '')
+    if (name !== 'item_frame' && name !== 'glow_item_frame' && e.type !== 'item_frame') continue
+    const stack = metaValue(e, bot.registry, 'item')
+    const rotation = Number(metaValue(e, bot.registry, 'rotation') || 0)
+    const frame = itemFramesWorldQuads(items, assets, e, stack, rotation, bot, renderNotes)
+    if (!frame) continue
+    for (const q of frame.quads) {
+      if (!q.tex) continue
+      q.center = frame.center
+      entityQuads.push(q)
+    }
+    framesRendered.push(`${name}${stack ? ` ${items.itemNameOf(stack) || 'item'}` : ''}${name === 'glow_item_frame' ? ' (glowing)' : ''}`)
+    if (name === 'glow_item_frame') renderNotes.add('glowing item frames use the normal frame texture; the client glow outline is a shader pass')
+  }
+
   // Dropped item entities use the same real item models (ground display slot).
+  const itemState = worldItemState(bot.entity)
   for (const e of Object.values(bot.entities || {})) {
     if (!e || e === bot.entity || !e.position || !droppedItemOf(e)) continue
-    const dropped = droppedItemWorldQuads(items, e, timeMs, eye, unsupportedItems)
+    const dropped = droppedItemWorldQuads(items, e, timeMs, eye, unsupportedItems, itemState)
     if (!dropped) continue
     if (dropped.dist < 0.4 || dropped.dist > maxDist) continue
     for (const q of dropped.quads) {
@@ -1440,20 +2049,30 @@ async function renderCamera (bot, opts) {
     seenItems.push({ name: dropped.name, kind: dropped.kind, dist: dropped.dist })
   }
 
-  // The bot's own main-hand item (real item model, first-person display slot).
-  try {
-    const own = bot.heldItem || bot.entity?.equipment?.[0] || null
-    const ownName = own ? items.itemNameOf(own) : null
-    if (ownName) {
-      const self = selfHeldItemQuads(items, ownName, eye, fwd, right, up, unsupportedItems)
-      if (self) {
-        for (const q of self.quads) {
-          if (!q.tex) continue
-          q.center = self.center
-          entityQuads.push(q)
-        }
-        heldItems.push(`you hold ${ownName}`)
+  // The bot's own hands (main hand + off hand) in the first-person display slot.
+  // Third person draws them on the visible body instead — never both.
+  let firstPersonHands = false
+  if (firstPerson && (opts.firstPersonHands === undefined ? !isPano : Boolean(opts.firstPersonHands))) try {
+    const ownEquipment = Array.isArray(bot.entity?.equipment) ? bot.entity.equipment : []
+    const hands = [
+      [bot.heldItem || ownEquipment[0] || null, 'right'],
+      [bot.offhandItem || ownEquipment[1] || null, 'left']
+    ]
+    for (const [own, hand] of hands) {
+      const ownName = own ? items.itemNameOf(own) : null
+      if (!ownName) continue
+      const self = selfHeldItemQuads(items, own, eye, fwd, right, up, unsupportedItems, {
+        hand,
+        state: { ...itemState, count: own.count, enchanted: isEnchanted(own) }
+      })
+      if (!self) continue
+      for (const q of self.quads) {
+        if (!q.tex) continue
+        q.center = self.center
+        entityQuads.push(q)
       }
+      heldItems.push(`you hold ${ownName}${hand === 'left' ? ' (off hand)' : ''}`)
+      firstPersonHands = true
     }
   } catch { /* inventory not ready yet */ }
 
@@ -1465,8 +2084,9 @@ async function renderCamera (bot, opts) {
   translucentQuads.sort((a, b) => distOf(b) - distOf(a))
   rasterizeEntityQuads(canvas, zbuf, camera, translucentQuads, timeMs)
 
-  // Labels for visible creatures.
+  // Labels for visible creatures (annotation overlay, not world geometry).
   for (const e of seenEnts) {
+    if (!drawLabels) break
     const head = project(e.x, e.feetY + e.h + 0.25, e.z)
     if (!head || head.sx < -20 || head.sx > w + 20 || head.sy < -10 || head.sy > h + 10) continue
     const label = `${e.name.slice(0, 12)} ${e.hostile ? 'HOSTILE ' : ''}${Math.round(e.dist)}m${e.isPlayer && e.skinSource ? ` ${e.skinSource}` : ''}`
@@ -1512,8 +2132,10 @@ async function renderCamera (bot, opts) {
   if (nav?.destination) projectMarker(asWorld(nav.destination), [255, 90, 80], 3)
 
   // ── HUD ───────────────────────────────────────────────────────────────
+  // Drawn as a screen-space annotation only when asked for; the panorama is
+  // world imagery and never contains Minecraft UI.
   const p = bot.entity.position.floored()
-  if (isPano) {
+  if (drawHud && isPano) {
     const marks = [
       [0.0, 'S', true], [0.125, 'SW', false], [0.25, 'W', true], [0.375, 'NW', false],
       [0.5, 'N', true], [0.625, 'NE', false], [0.75, 'E', true], [0.875, 'SE', false], [1.0, 'S', true]
@@ -1527,7 +2149,7 @@ async function renderCamera (bot, opts) {
       canvas.text(lx, 3, lab, major ? [255, 232, 118] : [210, 224, 240], [12, 18, 28, 0.78])
     }
     canvas.text(4, h - 10, `360 PANORAMA  X ${p.x} Y ${p.y} Z ${p.z}`, [242, 246, 250], [10, 14, 20, 0.72])
-  } else {
+  } else if (drawHud) {
     const cx = w >> 1
     const cy = h >> 1
     for (let d = -5; d <= 5; d++) {
@@ -1548,7 +2170,9 @@ async function renderCamera (bot, opts) {
     `ACTION ${opts.action || 'none'} NAV ${nav?.status || 'unknown'} ${nav?.progress || ''}`,
     `NEXT ${formatPoint(nav?.waypoint)} DEST ${formatPoint(nav?.destination)} ${nav?.resetReason || ''}`
   ]
-  hud.forEach((line, i) => canvas.text(4, 14 + i * 9, line.slice(0, Math.max(1, Math.floor((w - 8) / 6))), [240, 245, 250], [10, 14, 20, 0.8]))
+  if (drawHud) {
+    hud.forEach((line, i) => canvas.text(4, 14 + i * 9, line.slice(0, Math.max(1, Math.floor((w - 8) / 6))), [240, 245, 250], [10, 14, 20, 0.8]))
+  }
 
   const totalPx = w * h
   const topBlocks = [...counts.entries()]
@@ -1560,15 +2184,21 @@ async function renderCamera (bot, opts) {
 
   const lines = []
   if (isPano) {
-    lines.push(`panorama from ${p.x},${p.y},${p.z} — full circle, NORTH in the middle, W left of it, E right, S at both edges; ${sky.label}`)
+    lines.push(`panorama from ${p.x},${p.y},${p.z} — full circle, NORTH in the middle${drawHud ? ', W left of it, E right, S at both edges' : ' (no compass/HUD overlay, world imagery only)'}; ${sky.label}`)
   } else {
     lines.push(`view from ${p.x},${p.y},${p.z} looking ${bearingName(aim.bearing)} (bearing ${Math.round(aim.bearing)}°, pitch ${Math.round(aim.pitch)}°, ${opts.fov || 86}° wide); ${sky.label}${aim.note ? `, ${aim.note}` : ''}`)
   }
+  if (firstPerson) {
+    lines.push(`camera: first person from your eyes (your own body, armour and outer layers are not drawn; ${firstPersonHands ? 'held item drawn in the first-person slot' : 'no first-person item overlay'})`)
+  } else {
+    lines.push(`camera: ${view.source === 'camera' ? 'fixed camera' : 'third person'} ${view.distance.toFixed(1)}m from your eyes; you are rendered like any player (skin, armour, elytra, both hands, outer layers) and no first-person overlay is drawn`)
+  }
+  if (!drawHud) lines.push('overlays: none (no HUD, crosshair, compass labels or entity labels; interface elements are never drawn as world geometry)')
   lines.push(`in frame: ${topBlocks.join(', ') || 'nothing solid'}; open sky/air ${skyPct}%`)
   if (centerHit) lines.push(`crosshair: ${centerHit.name} at ${centerHit.x},${centerHit.y},${centerHit.z} (${Math.round(centerHit.dist)}m, ${centerHit.layer})`)
   if (seenEnts.length) {
     const list = seenEnts.slice(0, 10).map((e) =>
-      `${e.name} [id=${e.id}] ${Math.round(e.dist)}m${e.hostile ? ' HOSTILE' : e.isPlayer ? ' player' : ''}${e.skinSource ? ` skin=${e.skinSource}` : ''}`
+      `${e.name} [id=${e.id}] ${Math.round(e.dist)}m${e.isSelf ? ' (you)' : e.hostile ? ' HOSTILE' : e.isPlayer ? ' player' : ''}${e.skinSource ? ` skin=${e.skinSource}` : ''}`
     )
     lines.push(`creatures in frame: ${list.join('; ')}`)
   }
@@ -1578,6 +2208,10 @@ async function renderCamera (bot, opts) {
     lines.push(`items in frame: ${[...counts].slice(0, 10).map(([n, c]) => `${n}${c > 1 ? ` x${c}` : ''}`).join('; ')}`)
   }
   if (heldItems.length) lines.push(`held items: ${heldItems.slice(0, 8).join('; ')}`)
+  if (armorReport.length) lines.push(`armour: ${[...new Set(armorReport)].slice(0, 8).join('; ')}`)
+  if (variantReport.length) lines.push(`variants: ${[...new Set(variantReport)].slice(0, 8).join('; ')}`)
+  if (framesRendered.length) lines.push(`item frames: ${framesRendered.slice(0, 6).join('; ')}`)
+  if (renderNotes.size) lines.push(`render notes: ${[...renderNotes].slice(0, 6).join('; ')}`)
   if (unsupportedItems.size) lines.push(`items without item-model geometry in these resources: ${[...unsupportedItems].slice(0, 8).join(', ')}`)
   if (unsupported.size) lines.push(`entities without a client model in these resources: ${[...unsupported].slice(0, 8).join(', ')}`)
   const chunkNote = sampler.chunksLoaded > 0
@@ -1621,6 +2255,15 @@ async function renderCamera (bot, opts) {
     itemNames: [...new Set(seenItems.map((i) => i.name))],
     selfHeldItem: heldItems.find((h) => h.startsWith('you hold '))?.slice(9) || null,
     heldItems,
+    armor: [...new Set(armorReport)],
+    variants: [...new Set(variantReport)],
+    itemFrames: framesRendered,
+    perspective: view.perspective,
+    camera: { x: Number(eye.x.toFixed(2)), y: Number(eye.y.toFixed(2)), z: Number(eye.z.toFixed(2)), distance: Number(view.distance.toFixed(2)) },
+    selfRendered: seenEnts.some((e) => e.isSelf),
+    firstPersonHands,
+    overlays: drawHud || drawLabels ? { hud: drawHud, labels: drawLabels } : null,
+    renderNotes: [...renderNotes],
     unsupportedItems: [...unsupportedItems],
     unsupportedEntities: [...unsupported]
   }
@@ -1801,6 +2444,7 @@ async function renderMap (bot, opts) {
       `${e.name} [id=${e.id}] at ${Math.floor(e.x)},${Math.floor(e.feetY)},${Math.floor(e.z)}${e.hostile ? ' HOSTILE' : e.isPlayer ? ' player' : ''}`
     ).join('; ')}`)
   }
+  if (opts.perspective) lines.push(`map is a top-down diagram, so the requested perspective '${opts.perspective}' does not apply (no first/third person here)`)
   lines.push(`you = white square, the white line shows your facing (${chunksInView}/${sampler.chunksLoaded} loaded chunks sampled)`)
   lines.push(`surface textures sampled from native block models (fullbright)`)
 

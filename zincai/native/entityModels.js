@@ -52,6 +52,31 @@ const ELEM_FACES = {
 
 const FACE_KEYS = Object.keys(ELEM_FACES)
 
+/**
+ * prismarine-viewer's `entities.json` is a Bedrock-derived transcription. Two
+ * models in it use a 64x64 (post-1.21.5 / Bedrock) texture layout while the
+ * 1.21.4 Java client ships 64x32 sheets for the same mobs. The difference is a
+ * constant V offset, verified against the real `entity/sheep/sheep_fur.png`
+ * (64x32) and `entity/vex/vex.png` (32x32) UV ranges: every wool/vex cube's V
+ * origin is 32px lower than the Java model. Shift it back so the texture is
+ * sampled where the client samples it (this is a model/texture version
+ * mismatch, not a colour tweak).
+ */
+const UV_REPAIRS = {
+  sheep: [{ dv: -32 }],
+  vex: [{ dv: -32, maxTextureHeight: 32 }]
+}
+
+function repairCubeUv (modelKey, cube) {
+  const repairs = UV_REPAIRS[modelKey]
+  if (!repairs) return cube
+  for (const repair of repairs) {
+    if (repair.maxTextureHeight && !(cube.uv[1] + cube.size[1] + cube.size[2] > repair.maxTextureHeight)) continue
+    return { ...cube, uv: [cube.uv[0], cube.uv[1] + (repair.dv || 0)] }
+  }
+  return cube
+}
+
 function deg (v) { return (v || 0) * Math.PI / 180 }
 
 function rotateX (p, a) {
@@ -195,12 +220,16 @@ function buildEntityModel (name, {
   }
 
   const quads = []
+  const chains = new Map()
   for (const bone of geometry.bones) {
     if (bone.neverRender || !bone.cubes) continue
     const chain = chainFor(bone)
-    for (const cube of bone.cubes) {
+    chains.set(bone.name, chain)
+    for (const rawCube of bone.cubes) {
+      const cube = repairCubeUv(key, rawCube)
+      if (!cube || !cube.size) continue
+      const uv = cube.uv || cube.size
       const size = cube.size
-      const uv = cube.uv
       const inflate = cube.inflate || 0
       const cubeRotation = cube.rotation || null
       for (const side of FACE_KEYS) {
@@ -308,8 +337,69 @@ function buildEntityModel (name, {
     height,
     width,
     textureWidth,
-    textureHeight
+    textureHeight,
+    geometry,
+    chains
   }
+}
+
+// ── Equipped armour geometry on the humanoid model ─────────────────────────
+
+// Armour sheet UV layout (64x32). One arm/leg texture serves both sides by
+// mirroring the u axis, exactly like `CubeListBuilder.mirror()`.
+const ARMOR_UV = {
+  head: [0, 0],
+  body: [16, 16],
+  rightArm: [40, 16],
+  leftArm: [40, 16],
+  rightLeg: [0, 16],
+  leftLeg: [0, 16]
+}
+
+/**
+ * Build the quads for one armour layer on a posed humanoid model.
+ * The cubes come from the real player model (so helmet/chest/legs/boots sit on
+ * the same bones and follow the same animation), inflate by the vanilla
+ * deformation (1px for humanoid, 0.5px for leggings) and use the armour sheet's
+ * UV layout.
+ *
+ * @returns {Array} quads with `bone`/`chain` so `poseEntityModel` animates them
+ */
+function buildArmorQuads (model, { texture, bones, deformation = 1, trim = false } = {}) {
+  if (!model?.geometry || !texture || !Array.isArray(bones) || !bones.length) return []
+  const { cubeQuads } = require('./boxGeometry')
+  const out = []
+  const layer = texture.hasSemiAlpha ? 'translucent' : 'cutout'
+  for (const boneName of bones) {
+    const bone = model.geometry.bones.find((b) => b.name === boneName)
+    if (!bone || !bone.cubes) continue
+    const chain = model.chains?.get(boneName) || []
+    const uv = ARMOR_UV[boneName]
+    if (!uv) continue
+    const mirror = boneName.startsWith('left')
+    for (const cube of bone.cubes) {
+      const quads = cubeQuads({
+        origin: [...cube.origin],
+        size: [...cube.size],
+        uv,
+        tex: texture,
+        inflate: deformation,
+        rotation: cube.rotation ? { axis: 'y', angle: -cube.rotation[1], origin: cube.pivot || [0, 0, 0] } : null
+      }, { layer, shade: true, mirrorU: mirror })
+      for (const quad of quads) {
+        out.push({
+          ...quad,
+          tex: texture,
+          bone: boneName,
+          chain,
+          armorLayer: true,
+          trim,
+          layer
+        })
+      }
+    }
+  }
+  return out
 }
 
 /**
@@ -320,6 +410,8 @@ function buildEntityModel (name, {
 function poseEntityModel (model, pose, xform) {
   const cy = Math.cos(xform.yaw || 0)
   const sy = Math.sin(xform.yaw || 0)
+  // Baby entities are the same model at 0.5 scale with their feet on the ground.
+  const s = Number.isFinite(xform.scale) && xform.scale > 0 ? xform.scale : 1
   // Model UVs are authored in texture pixels. Normalise them against the real
   // image, not the model's nominal size: 64x32 textures are often padded to
   // 64x64 (zombie) and some models omit their nominal size entirely (sheep).
@@ -345,10 +437,14 @@ function poseEntityModel (model, pose, xform) {
         if (add && (add[0] || add[1] || add[2])) p = applyRotation(p, add.map((v) => v * 180 / Math.PI), bone.pivot.map((v) => v / 16))
       }
       if (quad.cape && pose?.cape) p = applyRotation(p, pose.cape, [0, 24 / 16, 3 / 16])
-      // Model units → blocks (already /16), yaw around feet, world translate.
-      const x = p[0] * cy + p[2] * sy + xform.x
-      const z = -p[0] * sy + p[2] * cy + xform.z
-      positions.push([x, p[1] + xform.y, z])
+      // Model units → blocks (already /16), optional baby scale, yaw around
+      // the feet, then the world translate.
+      const sx = p[0] * s
+      const syPos = p[1] * s
+      const sz = p[2] * s
+      const x = sx * cy + sz * sy + xform.x
+      const z = -sx * sy + sz * cy + xform.z
+      positions.push([x, syPos + xform.y, z])
       const px = quad.uvPx?.[i]
       uvs.push(px ? [px[0] / texW, px[1] / texH] : quad.uv[i])
       let n = quad.normal
@@ -369,10 +465,12 @@ function poseEntityModel (model, pose, xform) {
       pos: positions,
       uv: uvs,
       normal: [nx / len, ny / len, nz / len],
-      tex: quad.cape ? model.capeTexture : model.texture,
-      layer: quad.cape
+      // Armour/cape/held layers bring their own sheet; body quads use the
+      // entity's skin texture.
+      tex: quad.cape ? model.capeTexture : (quad.tex || model.texture),
+      layer: quad.layer || (quad.cape
         ? 'cutout'
-        : (model.texture?.hasSemiAlpha ? 'translucent' : 'cutout')
+        : (model.texture?.hasSemiAlpha ? 'translucent' : 'cutout'))
     })
   }
   return out
@@ -381,7 +479,10 @@ function poseEntityModel (model, pose, xform) {
 module.exports = {
   buildEntityModel,
   poseEntityModel,
+  buildArmorQuads,
   loadEntityDefinitions,
   modelKeyFor,
+  repairCubeUv,
+  ARMOR_UV,
   ELEM_FACES
 }

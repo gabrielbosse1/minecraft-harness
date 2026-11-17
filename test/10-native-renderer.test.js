@@ -380,15 +380,25 @@ test('10j: real item models — generated sprites, block items, dropped entities
   assert.ok(ctx.items.bake('oak_stairs').quads.length >= 6)
   assert.ok(ctx.items.bake('stone').quads.length >= 6)
 
-  // Compass/clock are property-selected models with no base JSON; their real
-  // north/noon frame is used and labelled.
-  const compass = ctx.items.bake('compass')
-  assert.equal(compass.fallbackFrame, 'compass_16')
-  assert.match(compass.source, /static-frame:compass_16/)
+  // Compass/clock are state-selected models: with no live world state they
+  // must be reported as needing state (never a fabricated north/noon frame),
+  // and with real state they must select the real 1.21.4 frame.
+  assert.equal(ctx.items.bake('compass'), null)
+  assert.ok(ctx.items.stats.needsState.has('compass'))
+  assert.deepEqual(ctx.items.stats.needsStateReasons.get('compass'), 'minecraft:compass')
+  const compassItem = new Item(bot.registry.itemsByName.compass.id, 1)
+  const south = ctx.items.quadsForStack(compassItem, 'gui', { compassAngle: 90, dimension: 'minecraft:overworld' })
+  assert.match(south.modelName, /compass_24$/, `selected compass frame: ${south.modelName}`)
+  const noon = ctx.items.quadsForStack(new Item(bot.registry.itemsByName.clock.id, 1), 'gui', { dayTime: 6000, dimension: 'minecraft:overworld' })
+  assert.match(noon.modelName, /clock_32$/, `selected clock frame: ${noon.modelName}`)
 
-  // Builtin entity items have no JSON geometry; they must be reported.
-  assert.equal(ctx.items.bake('shield'), null)
-  assert.ok(ctx.items.stats.unsupported.has('shield'))
+  // Builtin entity items render from their real textures and vanilla geometry.
+  const shield = ctx.items.bake('shield')
+  assert.ok(shield, 'shield special renderer')
+  assert.equal(shield.kind, 'special')
+  assert.equal(shield.specialKind, 'shield')
+  assert.ok(shield.quads.length >= 6)
+  assert.ok(shield.textures.some((t) => /entity\/shield_base_nopattern/.test(t.name)))
 
   // Dropped item entity (ground display) and held equipment on a zombie.
   const held = new Item(bot.registry.itemsByName.iron_pickaxe.id, 1)

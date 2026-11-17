@@ -3617,6 +3617,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
             view: action.view,
             direction: action.direction,
             at: action.at,
+            perspective: action.perspective,
             width: isPano ? VISION.panoramaWidth : VISION.width,
             height: isPano ? VISION.panoramaHeight : VISION.height,
             maxDist: VISION.maxDistance,

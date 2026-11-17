@@ -199,6 +199,35 @@ class SkinResolver {
   }
 
   /** Resolve/download every player's current skin. Safe to call per frame. */
+  /**
+   * Cape texture for the player's *effective* profile (the same textures
+   * property SkinRestorer replaces). Cached by URL hash and dropped when the
+   * URL changes, exactly like the skin.
+   */
+  async _resolveCape (profile, revision) {
+    if (!profile?.capeUrl) return null
+    const key = `cape:${crypto.createHash('sha1').update(profile.capeUrl).digest('hex').slice(0, 16)}`
+    if (this.textureCache.has(key)) return this.textureCache.get(key)
+    if (this.downloads.has(key)) return this.downloads.get(key)
+    const promise = (async () => {
+      const file = this._cacheFile(key.replace(':', '-'))
+      let buf = null
+      try { if (fs.existsSync(file)) buf = fs.readFileSync(file) } catch { buf = null }
+      if (!buf) {
+        buf = await this._download(profile.capeUrl)
+        if (buf) { try { fs.writeFileSync(file, buf) } catch { /* non-fatal */ } }
+      }
+      if (!buf) return null
+      const decoded = decodePng(buf)
+      if (!decoded) return null
+      const tex = new Texture(`cape:${revision.slice(0, 8)}`, decoded, null)
+      this.textureCache.set(key, tex)
+      return tex
+    })()
+    this.downloads.set(key, promise)
+    return promise
+  }
+
   async prepare () {
     this._ensureCacheDir()
     const players = Object.values(this.bot.players || {})
@@ -228,7 +257,12 @@ class SkinResolver {
       const revision = crypto.createHash('sha1').update(`${profile.url}|${profile.model}`).digest('hex')
       const cached = this.textureCache.get(revision)
       if (cached) {
-        this.entries.set(username, { ...profile, texture: cached, revision, username, uuid })
+        const capeTexture = profile.capeUrl ? this.textureCache.get(`cape:${crypto.createHash('sha1').update(profile.capeUrl).digest('hex').slice(0, 16)}`) || null : null
+        this.entries.set(username, { ...profile, texture: cached, capeTexture, revision, username, uuid })
+        if (profile.capeUrl && !capeTexture) jobs.push(this._resolveCape(profile, revision).then((tex) => {
+          const entry = this.entries.get(username)
+          if (entry && entry.revision === revision) entry.capeTexture = tex
+        }))
         continue
       }
       if (seen.has(revision)) {
@@ -242,7 +276,10 @@ class SkinResolver {
       seen.add(revision)
       const p = this._resolveSkin(profile, revision, uuid, username)
       this.downloads.set(revision, p.then((r) => r.texture))
-      jobs.push(p.then((r) => this.entries.set(username, { ...profile, ...r, profileSource: profile.source, revision, username, uuid })))
+      jobs.push(p.then(async (r) => {
+        const capeTexture = await this._resolveCape(profile, revision)
+        this.entries.set(username, { ...profile, ...r, capeTexture, profileSource: profile.source, revision, username, uuid })
+      }))
     }
     await Promise.all(jobs)
     this._lastReport = [...this.entries.values()].map((e) => ({
@@ -250,7 +287,8 @@ class SkinResolver {
       model: e.model,
       source: e.source,
       profileSource: e.profileSource || 'vanilla-default',
-      revision: e.revision
+      revision: e.revision,
+      cape: Boolean(e.capeTexture)
     }))
     return this.entries
   }

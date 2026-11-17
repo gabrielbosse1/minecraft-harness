@@ -25,6 +25,7 @@ const { armorInfo } = require('./armor')
 /** Where a wearable that is not armor goes when no slot is named. */
 const NATURAL_SLOT = { elytra: 'torso', carved_pumpkin: 'head', shield: 'off-hand', totem_of_undying: 'off-hand' }
 const { chooseFood, FOODS, HEALING } = require('./system1')
+const { expectedDropsFor, collectNearbyDrops, mineResource: runMineResource, huntAndLoot: runHuntAndLoot, prepareFood: runPrepareFood } = require('./procedures')
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const fold = (text) => String(text ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim()
@@ -1154,7 +1155,7 @@ class Skills {
       const askedRadius = Math.trunc(Number(radius)) || GATHER_DEFAULT_RADIUS
       radius = Math.max(1, Math.min(GATHER_MAX_RADIUS, askedRadius))
       const cut = askedRadius > GATHER_MAX_RADIUS ? ` (${GATHER_MAX_RADIUS} is the most one gather covers — a larger radius changes nothing)` : ''
-      const matchingNames = new Set(targets.names)
+      const matchingNames = expectedDropsFor(targets.names)
       const countInventoryTargets = () => bot.inventory.items().filter((i) => matchingNames.has(i.name)).reduce((n, i) => n + (Number(i.count) || 0), 0)
       const before = countInventoryTargets()
       const progress = () => `blocks gathered: ${dug}/${wanted} ${targets.names.join('/')}; carried target items changed by ${countInventoryTargets() - before} (inventory delta; may include other pickups)`
@@ -1208,7 +1209,7 @@ class Skills {
           try {
             await bot.dig(current)
             dug++
-            await sleep(450) // let the drop pop so the pickup delta lands
+            await collectNearbyDrops(this, token, p, { radius: 4.5, maxWalks: 2, expectedItems: matchingNames, settleMs: 280 })
           } catch (err) {
             if (token.cancelled || !this.lane.isTop) break // interrupted by a reflex — handled by pause/resume
             misses++
@@ -1220,6 +1221,21 @@ class Skills {
       if (dug > 0) return ok(`${progress()}${token.cancelled ? '; interrupted' : dug < wanted ? '; stopped before requested number of calls' : ''}`, meta)
       return fail(`could not gather ${want}: targets nearby were unreachable or kept breaking (try a smaller count or get closer first)`)
     })
+  }
+
+  /** High-level resource mining procedure: ensures pickaxe tier if craftable, mines, actively collects drops, and verifies inventory gain. */
+  mineResource (opts = {}) {
+    return runMineResource(this, { ...opts, resolveGatherTargets, HARVEST_NEED, TOOL_TIERS })
+  }
+
+  /** High-level safe hunting procedure: hunts eligible non-protected food animals and actively collects/verifies loot. */
+  huntAndLoot (opts = {}, combat = null) {
+    return runHuntAndLoot(this, combat, opts)
+  }
+
+  /** High-level food preparation procedure: crafts bread or smelts raw meat/potatoes and optionally eats when hungry. */
+  prepareFood (opts = {}) {
+    return runPrepareFood(this, opts)
   }
 
   /**

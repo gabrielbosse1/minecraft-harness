@@ -90,8 +90,11 @@ test('14e: repeated failed navigation/dig calls are blocked instead of looping',
 
 test('14f: exact action tool catalog and execution lanes include every registered schema; model limits recognize MiniCPM-V', () => {
   const tools = createZincTools()
-  assert.equal(tools.length, 41)
+  assert.equal(tools.length, 44)
   assert.equal(new Set(tools.map((t) => t.function.name)).size, tools.length)
+  assert.equal(TOOL_LANES.mine_resource, LANES.BODY)
+  assert.equal(TOOL_LANES.hunt_and_loot, LANES.BODY)
+  assert.equal(TOOL_LANES.prepare_food, LANES.BODY)
   assert.equal(TOOL_LANES.memory, LANES.COMPUTATION)
   assert.equal(TOOL_LANES.redstone_engineer, LANES.WORLD_INFO)
   assert.equal(laneOfAction({ a: 'redstone_engineer', operation: 'analyze' }), LANES.WORLD_INFO)

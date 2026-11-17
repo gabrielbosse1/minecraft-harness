@@ -46,6 +46,7 @@ const { Vec3 } = require('vec3')
 const { ControlArbiter, PRIORITY } = require('./control')
 const { ThreatSense, isHostileMob, isPlayer, isGliding, isUsingItem } = require('./threats')
 const { mobSpeed, mobStats, statsOf, reachOf, cornerText, situation } = require('./tactics')
+const { ThreatResponseEngine, MODES: THREAT_MODES, evaluateRecovery } = require('./threat_response')
 const { runnableHeading, clearToRun, surveyGround } = require('./custom_mineflayer/escape')
 const { MotionTracker, forecastImpact } = require('../src/combat')
 
@@ -241,6 +242,20 @@ class System1 {
     this._autoSuppressed = new Map()
     this._autoSuppressedAllUntil = 0
     this._lastAutoEngageAt = 0
+    this.threatEngine = opts.threatEngine || new ThreatResponseEngine({
+      now: this.now,
+      criticalHealth: this.fleeBelowHealth,
+      lowHealth: this.lowHealth,
+      releaseRadius: this.releaseRadius,
+      tetherReleaseRadius: this.tetherReleaseRadius,
+      calmMs: this.calmMs,
+      tetherCalmMs: this.tetherCalmMs,
+      ...(opts.threatResponse || {})
+    })
+    this.threatMode = THREAT_MODES.NONE
+    this.lastThreatDecision = null
+    this._lastModeEmitAt = 0
+    this._postFleeRecovery = null
     this._onPhysics = this._physicsTick.bind(this)
     this._onPathUpdate = (result) => {
       if (!this._flee || !this.hands.isTop) return
@@ -305,6 +320,10 @@ class System1 {
     this._impactEvade = null
     this._autoSuppressed.clear()
     this._autoSuppressedAllUntil = 0
+    this.threatEngine?.reset?.()
+    this.threatMode = THREAT_MODES.NONE
+    this.lastThreatDecision = null
+    this._postFleeRecovery = null
     this.live = []
     this.chasers = []
     this._fall = { startY: null, fallen: 0 }
@@ -493,84 +512,124 @@ class System1 {
     if (this._tickHazardEscape(now)) return
     if (this._impactEvade && now < this._impactEvade.until) return
 
-    // 1. Real threats → smart fight-odds assessment vs flee (model retains final choice).
-    //    A threat inside the trigger ring STARTS an escape or auto-kite; once
-    //    running, an escape lasts while anything still follows inside the wider
-    //    release ring.
+    // 1. Real threats → explicit 3-mode ThreatResponseEngine (AVOID / ENGAGE / FLEE).
+    //    - AVOID: keep active objective running; elliptical threat costs + route watcher steer around danger.
+    //    - ENGAGE: manageable non-explosive/non-player hostiles with strong win odds + weapon + HP + food.
+    //    - FLEE: creepers in blast range / lit fuses, critical HP, overwhelming odds, bosses, or attacking players.
     this.sense.assess()
     const live = this._refreshLive()
     const tether = this._tetherNow()
-    // With an errand under way, a mob at the edge of the ring is the route's
-    // problem (it is priced into the path); the reflex takes over only when one
-    // is close, has hurt the body, or cannot be argued with.
-    const starters = tether && !this._flee
-      ? live.filter((t) => t.hard || t.lit || t.attacker || t.distance <= this.tetherTriggerRadius)
-      : live
-    const from = (this._flee || starters.length) ? this._chasers(now, tether) : []
-    if (from.length) {
-      const sit = situation(bot, from)
-      const hpNow = Number(bot.health ?? 20)
-      // If an auto-defense fight became unfavorable (low HP, lit creeper, huge horde), break off and flee.
-      if (this.combat?.isEngaged && this.combat.autoDefense) {
-        if (hpNow <= this.lowHealth || (sit && (sit.lit > 0 || sit.players > 0 || sit.fight.winChance < 55))) {
-          this.combat.disengage('outmatched', { cooldown: false })
-        }
+    const watchLive = (this.sense.last.watch || []).filter((t) => this._isLive(t, now) && t.distance <= this.releaseRadius)
+    const chasersNow = this._flee ? this._chasers(now, tether) : []
+    const byId = new Map()
+    for (const t of [...live, ...chasersNow, ...watchLive]) {
+      if (t && !byId.has(t.id)) byId.set(t.id, t)
+    }
+    const assessedThreats = [...byId.values()].sort(byDistance)
+    const decision = this.threatEngine.evaluate(bot, assessedThreats, {
+      hasObjective: Boolean(tether),
+      tether,
+      autoFightSuppressed: (entity) => this._isAutoSuppressed([{ id: entity?.id }], now),
+      combatAvailable: Boolean(this.combat),
+      combatCooldown: now < (this.combat?.cooldownUntil || 0),
+      chooseFood
+    })
+    const nearestThreat = decision.situation?.nearest || assessedThreats[0] || null
+    this.threatMode = decision.mode
+    this.lastThreatDecision = decision
+    if (decision.changed) {
+      const importantTransition = decision.mode === THREAT_MODES.FLEE || decision.mode === THREAT_MODES.ENGAGE || decision.prevMode === THREAT_MODES.FLEE || decision.critical
+      if (importantTransition || now - this._lastModeEmitAt >= 2000) {
+        this._lastModeEmitAt = now
+        this.onEvent({
+          type: 'threat_mode_change',
+          mode: decision.mode,
+          prevMode: decision.prevMode,
+          reason: decision.reason,
+          critical: Boolean(decision.critical),
+          threatCount: assessedThreats.length,
+          nearest: nearestThreat ? { name: nearestThreat.name, distance: Math.round(nearestThreat.distance * 10) / 10 } : null,
+          text: `threat mode: ${decision.prevMode} → ${decision.mode} (${decision.reason}${nearestThreat ? `; nearest ${nearestThreat.name} ${Math.round(nearestThreat.distance)}m` : ''})`,
+          wake: false,
+          urgent: false
+        })
       }
-      // Unnamed, unowned, non-tamable hostiles with solid win odds & a real weapon:
-      // auto-target & kite instead of blindly fleeing, while waking the model so it keeps final say.
-      const canAutoEngage = Boolean(
-        !this._flee &&
-        this.combat &&
-        !this.combat.isEngaged &&
-        !tether &&
-        now >= (this.combat.cooldownUntil || 0) &&
-        sit?.fight?.autoEngage &&
-        !this._isAutoSuppressed(from, now)
-      )
-      if (canAutoEngage) {
-        const target = from[0]
+    }
+
+    // Break off an auto-defense fight immediately if threat evaluation escalates to FLEE.
+    if (decision.mode === THREAT_MODES.FLEE && this.combat?.isEngaged && this.combat.autoDefense) {
+      this.combat.disengage('outmatched', { cooldown: false })
+    }
+
+    let fleeThreats = []
+    if (decision.mode === THREAT_MODES.ENGAGE) {
+      const target = decision.target || assessedThreats[0]
+      if (this._flee) this._endFlee('engaged', 'auto-engage')
+      if (this.combat && !this.combat.isEngaged && target) {
         const res = await this.combat.engage(target.entity?.name || 'any', { autoDefense: true }).catch(() => ({ ok: false }))
         if (res?.ok) {
           this.chasers = []
-          this.acknowledge(from.map((t) => t.id), { types: [...new Set(from.map((t) => t.name))], label: 'fight', ttlMs: 60_000 })
+          this.acknowledge(assessedThreats.map((t) => t.id), { types: [...new Set(assessedThreats.map((t) => t.name))], label: 'fight', ttlMs: 60_000 })
           if (now - this._lastAutoEngageAt >= 4000) {
             this._lastAutoEngageAt = now
+            const wc = decision.situation?.fight?.winChance ?? 70
+            const wName = decision.situation?.me?.weapon?.name || 'weapon'
             this.onEvent({
               type: 'combat',
-              text: `reflex: auto-kiting ${this._kinds(from)} (win ~${sit.fight.winChance}% with ${sit.me.weapon.name}) — attack, hold, or stop overrides`,
+              text: `reflex: ENGAGE auto-kiting ${this._kinds(assessedThreats)} (win ~${wc}% with ${wName}${tether ? `; clearing path for "${tether.label}"` : ''}) — attack, hold, or stop overrides`,
               wake: true,
               urgent: false
             })
           }
-          // Skip flee for this tick; continue to health/food/water checks below.
-          from.length = 0
+        } else if (target.distance <= 5.5) {
+          // Engage couldn't start (e.g. target vanished/unreachable); keep safe distance.
+          fleeThreats = [target]
         }
       }
+    } else if (decision.mode === THREAT_MODES.AVOID) {
+      // AVOID preserves the active objective while routing around elliptical threat regions.
+      try {
+        this.pathfinder?.threat?.sample?.(bot, true)
+        this.pathfinder?._watchRoute?.(now)
+      } catch { /* best-effort */ }
+    } else if (decision.mode === THREAT_MODES.FLEE) {
+      const chasers = this._chasers(now, tether)
+      fleeThreats = chasers.length ? chasers : assessedThreats
     }
-    if (from.length) {
-      this.chasers = from
+
+    if (fleeThreats.length) {
+      this.chasers = fleeThreats
       // Back from a look-back pause: the "not making ground" clock starts afresh.
       if (this._calmSince && this._flee) this._flee.lastMoveAt = now
       this._calmSince = 0
       // Move first, then tell: the first report already knows whether there is a way out.
-      await this.registry.evaluate({ type: 'threat_near', distance: from[0].distance, entity: from[0].entity, item: from[0].name, threats: from }, ctx)
-      if (this._flee) this._trackEpisode(from, now)
+      await this.registry.evaluate({ type: 'threat_near', distance: fleeThreats[0].distance, entity: fleeThreats[0].entity, item: fleeThreats[0].name, threats: fleeThreats }, ctx)
+      if (this._flee) this._trackEpisode(fleeThreats, now, decision.reason)
     } else if (this._flee) {
       this.chasers = []
       if (!this._calmSince) {
-        // Nothing follows right now: stop and look back instead of running on
-        // to a goal chosen a second ago. If they are still coming they will be
-        // seen closing, and the same escape simply continues.
+        // Nothing requires fleeing right now: pause and verify calm before resuming.
         this._calmSince = now
         this._flee.target = null
         this._flee.planAt = -Infinity
         this.hands.setGoal(null)
         this.hands.clearControlStates()
       }
-      if (now - this._calmSince >= (tether ? this.tetherCalmMs : this.calmMs)) this._endFlee('safe')
+      const neededCalm = tether ? this.tetherCalmMs : this.calmMs
+      if (now - this._calmSince >= neededCalm) this._endFlee('safe')
       else this.hands.touch(1500)
     } else {
       this.chasers = []
+    }
+
+    // Post-flee recovery check: eat/heal when safe before letting health stay critical.
+    if (this._postFleeRecovery) {
+      const rec = evaluateRecovery(bot, { chooseFood })
+      if (!rec.shouldEat || now - this._postFleeRecovery.startedAt > 12_000) {
+        this._postFleeRecovery = null
+      } else if (!this._flee && !this.combat?.isEngaged) {
+        this.eat({ type: rec.lowHp ? 'health_low' : 'food_low' })
+      }
     }
 
     // 2. Health and hunger.
@@ -611,7 +670,7 @@ class System1 {
    * often than every `reportGapMs`, except for a lit fuse or being cornered),
    * and every `stillFleeingMs` while it drags on.
    */
-  _trackEpisode (from, now) {
+  _trackEpisode (from, now, triggerReason = '') {
     const bot = this.bot
     const pos = bot.entity.position
     const hp = Number(bot.health ?? 20)
@@ -622,6 +681,7 @@ class System1 {
       ep = this._episode = {
         startedAt: now,
         start: { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) },
+        triggerReason: triggerReason || 'threat_near',
         ids: new Set(),
         kinds: new Map(),
         peak: 0,
@@ -645,11 +705,13 @@ class System1 {
       const expired = this._expired && now - this._expired.endedAt <= 10_000 ? this._expired : null
       this._expired = null
       const why = expired ? ` (your "${expired.label}" decision from ${Math.round((now - expired.at) / 1000)}s ago ran out)` : ''
+      const causeTag = triggerReason ? ` [${triggerReason}]` : ''
       // On an errand this is a dodge: say so, and say that the errand resumes
       // by itself, so the answer to this wake is not to start it all over.
       const errand = this._tether && !ep.cornered ? `; dodging — "${this._tether.label}" is only paused and resumes by itself when clear (idle keeps both)` : ''
-      const text = `reflex: started FLEEING — ${this._kinds(from, { counts: false })} came close (${from[0].where})${why}${ep.cornered ? `; ${cornerText(ep.corneredWhy)}` : ''}${errand}`
+      const text = `reflex: started FLEEING${causeTag} — ${this._kinds(from, { counts: false })} came close (${from[0].where})${why}${ep.cornered ? `; ${cornerText(ep.corneredWhy)}` : ''}${errand}`
       this.logger?.info?.('reflex', text)
+      this.onEvent({ type: 'flee_start', reason: ep.triggerReason, from: this._kinds(from), cornered: ep.cornered, text, wake: false, urgent: false, threatIds: [...ep.ids] })
       this.onEvent({ type: 'threat', text, wake: true, urgent: !errand, threatIds: [...ep.ids] })
       return
     }
@@ -704,6 +766,15 @@ class System1 {
       if (errand) return `DODGING ${this._kinds(ep.kinds)} for ${secs}s — ran ${Math.round(ep.run)}m from ${at(ep.start)}${lost > 0 ? `, lost ${lost} hp` : ''}${state}. The body did this by itself and goes straight back to "${errand}" when there is room; idle keeps both, do not start it again.`
       if (brief) return `FLEEING by reflex ${secs}s, ran ${Math.round(ep.run)}m${lost > 0 ? `, lost ${lost} hp` : ''}${state}`
       return `FLEEING for ${secs}s from ${this._kinds(ep.kinds)} — ran ${Math.round(ep.run)}m from ${at(ep.start)}${lost > 0 ? `, lost ${lost} hp` : ''}${state}. The body did this by itself; idle keeps it running.`
+    }
+    if (this.threatMode === THREAT_MODES.AVOID && this.lastThreatDecision?.situation?.nearest) {
+      const n = this.lastThreatDecision.situation.nearest
+      if (brief) return `AVOIDING ${n.name} (${Math.round(n.distance)}m) — routing around threat ellipses`
+      return `AVOIDING nearby ${n.name} (${Math.round(n.distance)}m, ${this.lastThreatDecision.reason}) — threat-aware elliptical routing active without cancelling your current task.`
+    }
+    if (this._postFleeRecovery) {
+      if (brief) return `recovering after flee (${this._postFleeRecovery.reason})`
+      return `Post-flee recovery active (${this._postFleeRecovery.reason}): eating/regenerating safely before resuming.`
     }
     const last = this.lastEpisode
     if (last && now - last.endedAt <= this.recallMs) {
@@ -1059,17 +1130,30 @@ class System1 {
     }
     this.lastEpisode = summary
     const cost = summary.lost > 0 ? `, lost ${summary.lost} hp` : ''
+    let recoveryNote = ''
     if (why === 'safe') {
+      if (this.threatEngine?.mode === THREAT_MODES.FLEE) this.threatEngine.interruptFlee('safe')
+      const rec = evaluateRecovery(this.bot, { chooseFood })
+      if (rec.shouldEat) {
+        const recReason = rec.lowHp ? `hp ${rec.hp}/20` : `food ${rec.food}/20`
+        this._postFleeRecovery = { startedAt: now, reason: recReason, hp: rec.hp, food: rec.food, foodItem: rec.foodItem }
+        recoveryNote = `; recovering (${recReason}, eating ${rec.foodItem})`
+        try { this.eat({ type: rec.lowHp ? 'health_low' : 'food_low' }) } catch { /* best-effort */ }
+      }
       const tether = this._tether
       const text = tether
-        ? `reflex: dodged ${summary.from} for ${secs}s (ran ${summary.ran}m${cost}); nothing hostile within ${this.tetherReleaseRadius}m — back to "${tether.label}"`
-        : `reflex: safe again — fled ${secs}s from ${summary.from} (ran ${summary.ran}m${cost}); nothing hostile follows within ${this.releaseRadius}m`
+        ? `reflex: dodged ${summary.from} for ${secs}s (ran ${summary.ran}m${cost}); nothing hostile within ${this.tetherReleaseRadius}m — back to "${tether.label}"${recoveryNote}`
+        : `reflex: safe again — fled ${secs}s from ${summary.from} (ran ${summary.ran}m${cost}); nothing hostile follows within ${this.releaseRadius}m${recoveryNote}`
       this.logger?.info?.('reflex', text)
+      this.onEvent({ type: 'flee_end', why, from: summary.from, seconds: secs, ran: summary.ran, lost: summary.lost, recovering: Boolean(this._postFleeRecovery), text, wake: false, episode: summary })
       // A dodge that ends with the errand resuming needs no decision.
       this.onEvent({ type: 'safe', text, wake: !tether, episode: summary })
     } else {
+      if (this.threatEngine?.mode === THREAT_MODES.FLEE) this.threatEngine.interruptFlee(label || why)
+      const text = `fled ${secs}s from ${summary.from} (ran ${summary.ran}m${cost}), then chose ${label || 'to stop'}`
+      this.onEvent({ type: 'flee_end', why, label, from: summary.from, seconds: secs, ran: summary.ran, lost: summary.lost, recovering: false, text, wake: false, episode: summary })
       // The model ended it; it does not need waking, but the escape is still part of what happened.
-      this.onEvent({ type: 'fled', text: `fled ${secs}s from ${summary.from} (ran ${summary.ran}m${cost}), then chose ${label || 'to stop'}`, wake: false, episode: summary })
+      this.onEvent({ type: 'fled', text, wake: false, episode: summary })
     }
   }
 
@@ -1583,4 +1667,4 @@ class System1 {
   }
 }
 
-module.exports = { System1, FOOD_RE, FOODS, HEALING, chooseFood }
+module.exports = { System1, FOOD_RE, FOODS, HEALING, chooseFood, THREAT_MODES }

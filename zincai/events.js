@@ -23,6 +23,46 @@ function cleanText (s, max = 220) {
   return String(s || '').replace(/\s+/g, ' ').trim().slice(0, max)
 }
 
+/**
+ * Default reaction class & importance for canonical survival, threat,
+ * objective, inventory, tool, and lifecycle events.
+ */
+const EVENT_DEFAULTS = Object.freeze({
+  death: { reactionClass: 'immediate', importance: 3 },
+  respawn: { reactionClass: 'immediate', importance: 3 },
+  attacked: { reactionClass: 'immediate', importance: 3 },
+  immediate_threat: { reactionClass: 'immediate', importance: 3 },
+  flee_start: { reactionClass: 'immediate', importance: 3 },
+  flee_end: { reactionClass: 'fast', importance: 2 },
+  threat_mode_change: { reactionClass: 'fast', importance: 2 },
+  hostile_approaching: { reactionClass: 'fast', importance: 2 },
+  player_approaching: { reactionClass: 'deliberate', importance: 1 },
+  health_threshold: { reactionClass: 'immediate', importance: 3 },
+  hunger_threshold: { reactionClass: 'fast', importance: 2 },
+  objective_started: { reactionClass: 'deliberate', importance: 1 },
+  objective_paused: { reactionClass: 'fast', importance: 2 },
+  objective_resumed: { reactionClass: 'deliberate', importance: 1 },
+  objective_completed: { reactionClass: 'deliberate', importance: 2 },
+  objective_failed: { reactionClass: 'fast', importance: 2 },
+  item_dropped: { reactionClass: 'ambient', importance: 1 },
+  item_pickup: { reactionClass: 'ambient', importance: 1 },
+  inventory_capacity: { reactionClass: 'fast', importance: 2 },
+  tool_low_durability: { reactionClass: 'fast', importance: 2 },
+  tool_broken: { reactionClass: 'fast', importance: 2 },
+  repeated_action_failure: { reactionClass: 'fast', importance: 2 }
+})
+
+/** Convert Minecraft worldTime into readable `day N HH:MM` (tick 0 = 06:00). */
+function formatWorldClock (worldTime) {
+  if (!worldTime || !Number.isFinite(worldTime.timeOfDay)) return ''
+  const ticks = ((worldTime.timeOfDay % 24000) + 24000) % 24000
+  const totalMinutes = Math.floor(((ticks + 6000) % 24000) * 1440 / 24000)
+  const hh = String(Math.floor(totalMinutes / 60)).padStart(2, '0')
+  const mm = String(totalMinutes % 60).padStart(2, '0')
+  const dayPart = Number.isFinite(worldTime.day) ? `d${worldTime.day} ` : ''
+  return `${dayPart}${hh}:${mm}`
+}
+
 function worldTimeOf (bot) {
   const t = bot?.time
   if (!t) return null
@@ -31,7 +71,9 @@ function worldTimeOf (bot) {
   const day = Number.isFinite(t.day) ? t.day : (tod !== null && age !== null ? Math.floor(age / 24000) : null)
   if (tod === null && age === null) return null
   const phase = tod === null ? 'unknown' : (tod < 12000 ? 'day' : (tod < 13000 ? 'dusk' : (tod < 23000 ? 'night' : 'dawn')))
-  return { age, timeOfDay: tod, day, phase }
+  const wt = { age, timeOfDay: tod, day, phase }
+  wt.clock = formatWorldClock(wt)
+  return wt
 }
 
 function roundWhere (pos, dim = 'overworld') {
@@ -272,12 +314,13 @@ class EventPipeline {
     this.sequence += 1
     const worldTime = spec.worldTime !== undefined ? spec.worldTime : worldTimeOf(bot)
     const where = spec.where ? roundWhere(spec.where, spec.where.dim || bot?.game?.dimension) : null
+    const defaults = EVENT_DEFAULTS[eventType] || null
     const reactionClass = ['immediate', 'fast', 'deliberate', 'ambient'].includes(spec.reactionClass)
       ? spec.reactionClass
-      : 'deliberate'
+      : (defaults?.reactionClass || 'deliberate')
     const importance = Number.isFinite(spec.importance)
       ? spec.importance
-      : (reactionClass === 'immediate' ? 3 : reactionClass === 'fast' ? 2 : reactionClass === 'ambient' ? 0 : 1)
+      : (defaults?.importance ?? (reactionClass === 'immediate' ? 3 : reactionClass === 'fast' ? 2 : reactionClass === 'ambient' ? 0 : 1))
 
     const queuedMono = this.mono()
     this.latency.record('receiptToQueueMs', Math.max(0, queuedMono - recvMono))
@@ -403,9 +446,14 @@ class EventPipeline {
     const lines = prioritized.map((e) => {
       const ageSec = Math.max(0, Math.round((nowMs - e.timestampMs) / 1000))
       const ageStr = ageSec < 90 ? `${ageSec}s ago` : `${Math.round(ageSec / 60)}m ago`
+      const mcClock = e.worldTime?.clock || formatWorldClock(e.worldTime)
+      const worldPart = mcClock
+        ? `, mc ${mcClock}${e.worldTime?.phase ? ` ${e.worldTime.phase}` : ''}`
+        : (e.worldTime?.phase ? `, ${e.worldTime.phase}` : '')
       const timeTag = e.occurrenceTimeKnown
-        ? `${ageStr} (${e.timestamp.slice(11, 19)}Z${e.worldTime?.phase ? `, ${e.worldTime.phase}` : ''})`
-        : `observed ${ageStr} (${e.timestamp.slice(11, 19)}Z, exact occurrence time unknown)`
+        ? `${ageStr} (${e.timestamp.slice(11, 19)}Z${worldPart})`
+        : `observed ${ageStr} (${e.timestamp.slice(11, 19)}Z${worldPart}, exact occurrence time unknown)`
+      const sevTag = (e.importance || 0) >= 3 ? '[CRITICAL] ' : ((e.importance || 0) === 2 ? '[HIGH] ' : '')
       const locTag = e.where ? ` @${e.where.x},${e.where.y},${e.where.z}` : ''
       const whoTag = e.entities?.length ? ` [${e.entities.join(',')}]` : ''
       const basisTag = e.observationBasis !== 'direct' ? ` (${e.observationBasis})` : ''
@@ -414,7 +462,7 @@ class EventPipeline {
       const burstTag = e.groupCount > 1
         ? ` (x${e.groupCount}${e.samples?.length > 1 ? `: ${e.samples.slice(0, 3).join(' / ')}` : ''})`
         : ''
-      return `  - #${e.sequence} [${timeTag}] ${e.eventType}${locTag}${whoTag}: ${e.summary}${burstTag}${basisTag}${selfTag}${recTag}`
+      return `  - #${e.sequence} ${sevTag}[${timeTag}] ${e.eventType}${locTag}${whoTag}: ${e.summary}${burstTag}${basisTag}${selfTag}${recTag}`
     })
 
     return {
@@ -425,4 +473,4 @@ class EventPipeline {
   }
 }
 
-module.exports = { EventPipeline, LatencyTracker, worldTimeOf, monoNow }
+module.exports = { EventPipeline, LatencyTracker, EVENT_DEFAULTS, formatWorldClock, worldTimeOf, monoNow }

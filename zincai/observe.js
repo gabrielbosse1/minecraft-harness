@@ -14,6 +14,8 @@
 const { whereIs, isPlayer, isDecor, isNamed, isTamed, isHostileMob, HOSTILE_NAMES } = require('./threats')
 const { heldItemName } = require('../src/combat')
 const { environmentSnapshot } = require('./environment')
+const { formatWorldClock, worldTimeOf } = require('./events')
+const { inspectTools } = require('./survival_planner')
 
 const ARMOR_SLOTS = [5, 6, 7, 8]
 
@@ -22,8 +24,8 @@ function selfLine (bot) {
   const p = bot.entity?.position
   const pos = p ? `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}` : '?'
   const dim = String(bot.game?.dimension || 'overworld').replace(/^minecraft:/, '')
-  const t = bot.time?.timeOfDay
-  const tod = !Number.isFinite(t) ? '?' : (t < 12000 ? 'day' : (t < 13000 ? 'dusk' : (t < 23000 ? 'night' : 'dawn')))
+  const wt = worldTimeOf(bot)
+  const tod = wt?.phase && wt.phase !== 'unknown' ? `${wt.phase}${wt.clock ? ` (${wt.clock})` : ''}` : '?'
   const held = bot.heldItem?.name || 'nothing'
   const worn = []
   for (const slot of ARMOR_SLOTS) {
@@ -53,7 +55,13 @@ function inventoryLine (bot, { max = 28 } = {}) {
   for (const it of items) counts.set(it.name, (counts.get(it.name) || 0) + (it.count || 1))
   const list = [...counts.entries()].map(([n, c]) => (c > 1 ? `${n} x${c}` : n))
   const more = list.length > max ? `, +${list.length - max} more kinds` : ''
-  return `inventory (${items.length}/36 slots): ${list.slice(0, max).join(', ')}${more}`
+  const capWarn = items.length >= 36 ? ' [FULL]' : (items.length >= 32 ? ' [NEAR FULL]' : '')
+  let lowDurNote = ''
+  try {
+    const low = inspectTools(bot).lowDurability
+    if (low.length) lowDurNote = ` | low durability: ${low.slice(0, 3).map((x) => `${x.name} ${x.remaining}/${x.maxDur}`).join(', ')}`
+  } catch { /* ignore */ }
+  return `inventory (${items.length}/36 slots${capWarn}): ${list.slice(0, max).join(', ')}${more}${lowDurNote}`
 }
 
 /** Players in view: name, distance, direction, absolute position, what they hold. */

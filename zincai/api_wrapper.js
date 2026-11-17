@@ -214,6 +214,22 @@ const ACTION_TOOLS = [
     count: INT('Count 1–64 (default 1).'),
     radius: INT('Radius 1–64 (default 32).')
   }, ['item']),
+  tool('mine_resource', 'High-level mining procedure: ensures a suitable pickaxe if craftable from carried materials, mines the requested resource, actively walks over and collects dropped items, and verifies inventory gain.', {
+    item: STR('Resource block id or alias (wood, oak_log, stone, coal, iron, diamond, sand…).'),
+    count: INT('Target blocks to mine 1–64 (default 4).'),
+    radius: INT('Search radius 4–48 (default 32).'),
+    ensure_tool: { type: 'boolean', description: 'Auto-craft wooden/stone pickaxe from carried materials if missing (default true).' }
+  }, ['item']),
+  tool('hunt_and_loot', 'High-level safe hunting procedure: finds eligible non-protected food animals (cow, pig, sheep, chicken, rabbit) or a named safe mob, kills it, and actively collects and verifies dropped loot. Never targets players, villagers, golems, named or tamed mobs.', {
+    target: STR('Animal or mob name, or "food" for any nearby food animal (default "food").'),
+    count: INT('How many targets to hunt 1–8 (default 1).'),
+    radius: INT('Search radius 8–48 (default 32).')
+  }),
+  tool('prepare_food', 'High-level food preparation procedure: crafts bread from carried wheat, cooks raw meat/potatoes in a nearby or crafted furnace with carried fuel, collects cooked food, and optionally eats if hungry.', {
+    item: STR('Optional food name to prioritize (e.g. beef, porkchop, bread, potato).'),
+    count: INT('How many food items to prepare 1–32 (default 4).'),
+    eat_after: { type: 'boolean', description: 'Eat immediately after preparing if hungry or hurt (default false).' }
+  }),
   tool('light_up', 'Place carried torches on dark walkable floors nearby.', {
     radius: INT('Radius 2–16 (default 8).')
   }),

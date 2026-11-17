@@ -243,6 +243,9 @@ function situation (bot, hostiles, { canRun = null } = {}) {
 
   // --- what a fight would cost -------------------------------------------
   const hp = Number(bot.health ?? 20)
+  const food = Number.isFinite(Number(bot.food)) ? Number(bot.food) : 20
+  const canSprint = food > 6
+  const canRegen = food >= 18
   const armor = armorPoints(bot)
   const through = (dmg, points) => dmg * (1 - Math.min(0.8, points * 0.04))
   const weapon = bestWeapon(bot)
@@ -261,15 +264,18 @@ function situation (bot, hostiles, { canRun = null } = {}) {
   // Half a second of immunity after each hit: at most two hits a second land, however many mobs.
   const perSecond = meleeCount ? (meleeHit / meleeCount) * Math.min(meleeCount, 2) : 0
   // Kiting + knockback reduces contact rate on melee mobs (single targets take ~0.3x, small packs ~0.48x, big hordes ~0.78x).
-  const kiteFactor = weapon.kind !== 'none'
+  // Without sprint (food <= 6) kiting is significantly less effective.
+  const sprintPenalty = canSprint ? 1.0 : 1.35
+  const kiteFactor = (weapon.kind !== 'none'
     ? (meleeCount <= 1 ? 0.3 : (meleeCount <= 3 ? 0.48 : 0.78))
-    : (meleeCount <= 1 ? 0.45 : (meleeCount === 2 ? 0.7 : 1.0))
+    : (meleeCount <= 1 ? 0.45 : (meleeCount === 2 ? 0.7 : 1.0))) * sprintPenalty
   const pressure = perSecond * kiteFactor + duel
   const cost = pressure * seconds
   const ratio = cost / Math.max(1, hp)
   let winChance = Math.round(100 / (1 + Math.pow(ratio / 0.72, 2.1)))
   winChance -= lit * 35 + Math.max(0, explosive - lit) * 8 + players * 10
   if (hp <= 10) winChance -= 15
+  if (!canSprint) winChance -= 12
   if (weapon.kind === 'none') winChance -= 20
   winChance = Math.max(5, Math.min(99, winChance))
 
@@ -281,6 +287,7 @@ function situation (bot, hostiles, { canRun = null } = {}) {
     explosive === 0 &&
     weapon.dmg >= 4 &&
     hp > 10 &&
+    food > 6 &&
     lit === 0 &&
     winChance >= 65
   )
@@ -304,7 +311,7 @@ function situation (bot, hostiles, { canRun = null } = {}) {
     contactIn: Number.isFinite(contactIn) ? contactIn : null,
     open,
     blocked,
-    me: { hp, armor, weapon },
+    me: { hp, food, canSprint, canRegen, armor, weapon },
     fight: { seconds, cost, perSecond: pressure, winChance, autoEngage, verdict }
   }
 }

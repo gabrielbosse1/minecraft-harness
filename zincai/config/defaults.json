@@ -116,9 +116,20 @@
     "maxThreats": 48,
     "corridorClear": 3,
     "standoffScale": 1,
-    "routeReplanMs": 1200,
-    "routeReplanCost": 12,
-    "routeReplanRise": 8
+    "routeReplanMs": 700,
+    "routeReplanCost": 10,
+    "routeReplanRise": 6
+  },
+  "survival": {
+    "enabled": true,
+    "autoExecuteUrgent": true,
+    "minCookedPoints": 20,
+    "urgentFoodThreshold": 8,
+    "urgentHealthThreshold": 12,
+    "idleGraceMs": 25000,
+    "needCooldownMs": 90000,
+    "urgentCooldownMs": 25000,
+    "scanRadius": 24
   },
   "traversal": {
     "maxChain": 3,

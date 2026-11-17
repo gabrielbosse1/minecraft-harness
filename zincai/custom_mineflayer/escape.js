@@ -138,6 +138,48 @@ function crowdAt (crowd, x, y, z) {
   return c
 }
 
+/**
+ * Evaluate weighted directional elliptical safety regions at (x, y, z).
+ * Returns `{ score, hits, critical }` where `hits >= 2` adds a multi-enemy
+ * pinch-zone penalty so paths detour cleanly around threat clusters rather
+ * than squeezing between overlapping ellipses.
+ */
+function ellipseThreatCost (ellipses, x, y, z, { yWeight = 0.45 } = {}) {
+  if (!Array.isArray(ellipses) || !ellipses.length) return { score: 0, hits: 0, critical: false }
+  let score = 0
+  let hits = 0
+  let critical = false
+  for (const el of ellipses) {
+    if (!el || !el.position) continue
+    const dy = Math.abs(y - el.position.y)
+    if (dy > 4.5) continue
+    const dx = x - el.position.x
+    const dz = z - el.position.z
+    const ux = Number.isFinite(el.ux) ? el.ux : 1
+    const uz = Number.isFinite(el.uz) ? el.uz : 0
+    const along = dx * ux + dz * uz
+    const cross = -dx * uz + dz * ux
+    const semiA = along >= 0 ? (el.aForward || 5) : (el.aRear || 2.5)
+    const semiB = el.bLateral || 3.5
+    const q = (along / Math.max(0.5, semiA)) ** 2 + (cross / Math.max(0.5, semiB)) ** 2 + ((dy * yWeight) / 3.8) ** 2
+    const weight = (el.weight || 1) * (el.classWeight || 1)
+    if (q < 1.0) {
+      hits++
+      const k = 1 - Math.sqrt(q)
+      score += Math.pow(k, 1.45) * weight * 1.4
+    }
+    const flat = Math.hypot(dx, dz)
+    const critR = el.criticalRadius || 3.0
+    if (flat < critR) {
+      critical = true
+      const ck = 1 - flat / Math.max(0.5, critR)
+      score += Math.pow(ck, 1.6) * (el.isCreeper ? 3.5 : 1.2) * weight
+    }
+  }
+  if (hits >= 2) score += (hits - 1) * 0.9
+  return { score, hits, critical }
+}
+
 /** A per-plan cache of "can a body stand at x, y, z" straight from the blocks. */
 function standableCache (bot) {
   if (!bot || typeof bot.blockAt !== 'function') return null
@@ -296,8 +338,28 @@ function planEscape (bot, movements, pursuers, opts = {}) {
   const heading = opts.heading && Number.isFinite(opts.heading.x) && Number.isFinite(opts.heading.z) ? opts.heading : null
   const standable = opts.terrain === false ? null : standableCache(bot)
   const maxDrop = opts.maxDrop ?? 3 // a longer fall costs health the escape needs
-  const avoid = (baseAvoid || crowd.length)
-    ? (x, y, z) => (baseAvoid ? baseAvoid(x, y, z) : 0) + (crowd.length ? crowdAt(crowd, x + 0.5, y, z + 0.5) * 5 : 0)
+  const threatMap = opts.threatMap || null
+  const ellipses = Array.isArray(opts.ellipses) ? opts.ellipses : (typeof threatMap?.ellipses === 'function' ? threatMap.ellipses() : [])
+  const threatFieldAt = (x, y, z) => {
+    if (ellipses.length) return ellipseThreatCost(ellipses, x, y, z)
+    if (threatMap && typeof threatMap.threatScoreAt === 'function') {
+      const score = threatMap.threatScoreAt({ x, y, z })
+      const critical = typeof threatMap.isCriticalAt === 'function' ? threatMap.isCriticalAt({ x, y, z }) : false
+      return { score, hits: score > 0 ? 1 : 0, critical }
+    }
+    return { score: 0, hits: 0, critical: false }
+  }
+  const hasField = ellipses.length > 0 || Boolean(threatMap)
+  const avoid = (baseAvoid || crowd.length || hasField)
+    ? (x, y, z) => {
+        let penalty = baseAvoid ? baseAvoid(x, y, z) : 0
+        if (crowd.length) penalty += crowdAt(crowd, x + 0.5, y, z + 0.5) * 5
+        if (hasField) {
+          const tf = threatFieldAt(x + 0.5, y, z + 0.5)
+          penalty += Math.min(12, tf.score * 2.2) + (tf.critical ? 5 : 0)
+        }
+        return penalty
+      }
     : null
   // `toward`: somewhere the body has business (the player it follows, the
   // place it was walking to). Among cells that are equally safe, prefer the
@@ -315,6 +377,12 @@ function planEscape (bot, movements, pursuers, opts = {}) {
   const cheapGroundBonus = (node) => {
     let b = 0
     if (crowd.length) { node.crowd = crowdAt(crowd, node.x + 0.5, node.y, node.z + 0.5); b -= Math.min(6, node.crowd * 3) }
+    if (hasField) {
+      const tf = threatFieldAt(node.x + 0.5, node.y, node.z + 0.5)
+      node.threatScore = tf.score
+      b -= Math.min(8, tf.score * 2.4)
+      if (tf.critical) b -= 7
+    }
     const dx = node.x + 0.5 - pos.x; const dz = node.z + 0.5 - pos.z
     const len = Math.hypot(dx, dz)
     if (sectors) b += sectorScore(sectors, dx, dz) * 3
@@ -622,4 +690,124 @@ function runnableHeading (bot, dir, opts = {}) {
   return null
 }
 
-module.exports = { planEscape, mobClock, encircled, clearToRun, runnableHeading, surveyGround, sectorScore, openness, standableCache, crowdAt }
+/**
+ * Terrain-aware safe detour planner for AVOID mode: given a desired
+ * `destination` and active threat ellipses (or `PredictiveThreatMap`), searches
+ * real walkable ground (`movements.getNeighbors`, no digging/building) to pick
+ * an intermediate safe waypoint that makes progress toward `destination` while
+ * skirting outside weighted threat ellipses, critical blast radii, obstacles,
+ * and dead ends.
+ *
+ * Pure: reads blocks through `movements`, touches no controls or timers.
+ */
+function planSafeDetour (bot, movements, destination, threatSource, opts = {}) {
+  const pos = bot?.entity?.position
+  if (!pos || !movements || typeof movements.getNeighbors !== 'function' || !destination) return null
+  const dxDest = Number(destination.x) - pos.x
+  const dzDest = Number(destination.z) - pos.z
+  const distToDest = Math.hypot(dxDest, dzDest)
+  if (!Number.isFinite(distToDest) || distToDest < 1.5) return null
+
+  const radius = Math.min(opts.radius ?? 16, Math.max(8, Math.ceil(distToDest) + 4))
+  const maxNodes = opts.maxNodes ?? 450
+  const maxDrop = opts.maxDrop ?? 3
+  const threatWeight = opts.threatWeight ?? 7.5
+  const ellipses = Array.isArray(threatSource)
+    ? threatSource
+    : (typeof threatSource?.ellipses === 'function' ? threatSource.ellipses() : [])
+  const hasThreatMap = Boolean(threatSource && typeof threatSource.threatScoreAt === 'function')
+  const standable = opts.terrain === false ? null : standableCache(bot)
+
+  const evalThreat = (x, y, z) => {
+    if (ellipses.length) return ellipseThreatCost(ellipses, x, y, z)
+    if (hasThreatMap) {
+      const score = threatSource.threatScoreAt({ x, y, z })
+      const critical = typeof threatSource.isCriticalAt === 'function' ? threatSource.isCriticalAt({ x, y, z }) : false
+      return { score, hits: score > 0 ? 1 : 0, critical }
+    }
+    return { score: 0, hits: 0, critical: false }
+  }
+
+  const sx = Math.floor(pos.x); const sy = Math.floor(pos.y); const sz = Math.floor(pos.z)
+  const keyOf = (x, y, z) => x + ',' + y + ',' + z
+  const nodes = new Map()
+  const heap = new Heap()
+  const rootThreat = evalThreat(sx + 0.5, sy, sz + 0.5)
+  const root = { x: sx, y: sy, z: sz, cost: 0, g: 0, maxThreat: rootThreat.score, anyCritical: rootThreat.critical, parent: null, closed: false }
+  nodes.set(keyOf(sx, sy, sz), root)
+  heap.push({ key: 0, node: root })
+
+  let explored = 0
+  const cands = []
+  while (heap.size && explored < maxNodes) {
+    const { node } = heap.pop()
+    if (node.closed) continue
+    node.closed = true
+    explored++
+    const flatFromStart = Math.hypot(node.x - sx, node.z - sz)
+    if (flatFromStart >= 3.0) {
+      const rem = Math.hypot(destination.x - (node.x + 0.5), destination.z - (node.z + 0.5))
+      const progress = distToDest - rem
+      const endTf = evalThreat(node.x + 0.5, node.y, node.z + 0.5)
+      const score = progress * 1.4 - endTf.score * 6.0 - node.maxThreat * 3.5 - (node.anyCritical ? 25 : 0) - (endTf.critical ? 20 : 0) - node.g * 0.2
+      cands.push({ node, base: score, endTf, progress, rem })
+    }
+    if (flatFromStart >= radius) continue
+    let neighbors = []
+    try { neighbors = movements.getNeighbors({ x: node.x, y: node.y, z: node.z, remainingBlocks: 0 }) } catch { neighbors = [] }
+    for (const n of neighbors) {
+      if (n.toBreak?.length || n.toPlace?.length) continue
+      if (node.y - n.y > maxDrop) continue
+      const tf = evalThreat(n.x + 0.5, n.y, n.z + 0.5)
+      const step = Math.max(0.5, Number(n.cost) || 1)
+      const penalty = tf.score * threatWeight + (tf.critical ? 35 : 0)
+      const cost = node.cost + step + penalty
+      const key = keyOf(n.x, n.y, n.z)
+      const seen = nodes.get(key)
+      if (seen && (seen.closed || seen.cost <= cost)) continue
+      const next = {
+        x: n.x,
+        y: n.y,
+        z: n.z,
+        cost,
+        g: node.g + step,
+        maxThreat: Math.max(node.maxThreat, tf.score),
+        anyCritical: node.anyCritical || tf.critical,
+        parent: node,
+        closed: false
+      }
+      nodes.set(key, next)
+      const h = Math.hypot(destination.x - (n.x + 0.5), destination.z - (n.z + 0.5)) * 0.55
+      heap.push({ key: cost + h, node: next })
+    }
+  }
+
+  if (!cands.length) return null
+  cands.sort((a, b) => b.base - a.base)
+  let best = null
+  let bestScore = -Infinity
+  const topN = Math.min(cands.length, 24)
+  for (let i = 0; i < topN; i++) {
+    const c = cands[i]
+    const open = standable ? openness(standable, c.node.x, c.node.y, c.node.z) : null
+    const openBonus = open !== null ? (open - 0.45) * 5.0 : 0
+    const score = c.base + openBonus
+    if (score > bestScore) { bestScore = score; best = { ...c, open } }
+  }
+  if (!best) return null
+  const path = []
+  for (let n = best.node; n; n = n.parent) path.push({ x: n.x, y: n.y, z: n.z })
+  path.reverse()
+  return {
+    waypoint: { x: best.node.x, y: best.node.y, z: best.node.z },
+    path,
+    maxThreat: best.node.maxThreat,
+    endThreat: best.endTf.score,
+    safe: !best.node.anyCritical && best.endTf.score < 0.85,
+    progress: best.progress,
+    open: best.open,
+    explored
+  }
+}
+
+module.exports = { planEscape, planSafeDetour, ellipseThreatCost, mobClock, encircled, clearToRun, runnableHeading, surveyGround, sectorScore, openness, standableCache, crowdAt }

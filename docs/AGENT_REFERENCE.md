@@ -6,7 +6,7 @@ Dense, factual specification of `minecraft-harness` for AI coding agents and con
 
 ## 1. Non-Negotiable Architectural Invariants
 
-1. **Zero behavioral modes or permission switches.** Never add persona modes (`explorer`/`builder`/`hunter`), `set_mode`, `actions.allowDig`/`allowPlace`/`allowCombat`, `dig_policy`, `equip.auto`, chat relevance filters, language guards, or trusted-player UUID lists. Model agency is unconstrained; all **41 tools** are sent with a byte-identical schema every turn.
+1. **Zero behavioral modes or permission switches.** Never add persona modes (`explorer`/`builder`/`hunter`), `set_mode`, `actions.allowDig`/`allowPlace`/`allowCombat`, `dig_policy`, `equip.auto`, chat relevance filters, language guards, or trusted-player UUID lists. Model agency is unconstrained; all **44 tools** are sent with a byte-identical schema every turn.
 2. **Vanilla client-only boundary.** No RCON, no server plugins, no op commands. `installVanillaGuard` (`zincai/vanilla_guard.js`) blocks any `/...` chat line except guarded `/msg <onlinePlayer> <text>` whispers and emits `vanilla_command_blocked`.
 3. **Physical boundary is lifecycle + anti-flood only.** `PhysicalBoundary` (`zincai/boundary.js`) gates 19 Mineflayer primitives strictly on `connected`, `alive`, `!paused`, and sliding-window `limits.maxPhysicalActionsPerMinute` (default `600`, `0` = unlimited).
 4. **Defer Mineflayer method wrapping to `inject_allowed`.** Immediately after `mineflayer.createBot(...)` returns, plugins have not attached `bot.chat`, `bot.dig`, `bot.placeBlock`, etc. Both `installVanillaGuard` and `installPhysicalGuard` MUST hook `bot.once('inject_allowed', ...)` (with a `login` fallback) when methods are absent at call time.

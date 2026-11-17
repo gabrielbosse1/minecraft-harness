@@ -210,7 +210,7 @@ test('08c: Real-server Action-lane length truncation -> reactive compaction + 3-
     const burst = sim.llm.actionRequests().slice(startIdx)
     assert.equal(burst.length, 4, `expected 1 primary + 3 recovery attempts, got ${burst.length}`)
 
-    // Primary call omitted max_tokens (model standard limit) and sent all 41 tools
+    // Primary call omitted max_tokens (model standard limit) and sent every tool schema
     assert.equal('max_tokens' in burst[0].body, false, 'primary call must omit max_tokens')
     assert.ok(burst[0].toolNames.length >= 35, 'primary call uses full toolset')
 

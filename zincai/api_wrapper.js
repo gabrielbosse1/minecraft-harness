@@ -94,8 +94,8 @@ const ACTION_TOOLS = [
     jump: { type: 'boolean', description: 'True = perform one normal jump.' }
   }),
   tool('stop', 'Stop the currently running body task/follow/fight. The durable goal is retained (suspended) rather than cancelled; use goal cancel with its id only when you intentionally abandon that objective. A stopped task may finish its current cancellation cleanup before the body is idle.'),
-  tool('goal', 'Manage persistent objectives (survive death/restart/context reset): list|show|add|resume|suspend|cancel|complete|update|combine|verify.', {
-    operation: { type: 'string', enum: ['list', 'show', 'add', 'resume', 'suspend', 'cancel', 'complete', 'update', 'combine', 'verify'] },
+  tool('goal', 'Manage persistent objectives (survive death/restart/context reset): list|show|add|resume|suspend|cancel|complete|update|replan|combine|verify. Use `replan` the moment a plan step turns out to be impossible or unmeasurable — one call retires the dead steps and writes the real next one.', {
+    operation: { type: 'string', enum: ['list', 'show', 'add', 'resume', 'suspend', 'cancel', 'complete', 'update', 'replan', 'combine', 'verify'] },
     id: STR('Goal id (g3), or comma-separated ids for combine ("g1,g2").'),
     description: STR('Goal description (for add/update/combine).'),
     reason: STR('Why this goal matters (motivation).'),
@@ -105,9 +105,11 @@ const ACTION_TOOLS = [
     player: STR('Player name(s) when player_requested or shared_project.'),
     note: STR('Progress or status note.'),
     percent: INT('For update: 0–100.'),
-    steps: { type: 'array', description: 'add/update: an ordered plan of up to 10 short steps. Shown with done marks across turns, so continue rather than re-planning.', items: { type: 'string' }, maxItems: 10 },
+    steps: { type: 'array', description: 'add/update/replan: an ordered plan of up to 10 short steps. Shown with done marks across turns, so continue rather than re-planning. Each step should be something the world can confirm (a task you can run, a block you can inspect), not a judgement like "organize everything".', items: { type: 'string' }, maxItems: 10 },
     done: INT('update: number of the plan step you just finished (1 = first).'),
-    next: STR('update: the very next concrete thing to do (survives death/restart).')
+    drop: { type: 'array', description: 'update/replan: plan step numbers to retire (1 = first). Retiring a step that the world keeps refusing is correct, not a failure — the reason is kept with the step. Examples: a barrel that is full, ore that is not in reach.', items: { type: 'integer' }, minItems: 1, maxItems: 10 },
+    impossible: { type: 'boolean', description: 'update/replan with drop: mark the retired step(s) as impossible rather than merely dropped (use it when the world refused them, not when you changed your mind).' },
+    next: STR('update/replan: the very next concrete thing to do (survives death/restart). Name the tool call you will make.')
   }, ['operation']),
   tool('attack', 'Start an explicit melee/ranged attack. Survival reflexes may independently evade or auto-kite a threat while you decide; this tool starts the deliberate attack task. Use `target` for mobs (e.g. "zombie", "any") when fighting is safer/useful than retreating, or `player` for an exact PvP opponent only when explicitly authorized by the configured policy (never auto-initiate PvP).', {
     target: STR('Mob type or "any" (for mobs, not players).'),
@@ -117,7 +119,7 @@ const ACTION_TOOLS = [
   tool('hold', 'Accept current threats and continue the task unless hit/new threat/lit fuse. Pass the [id=…] values from the threats lines to hold specific ones (never guessed numbers); with none, all listed threats are held.', {
     ids: { type: 'array', description: 'Threat ids to hold (the numbers in [id=7]). Omit = every listed threat.', items: INT('Threat id.'), minItems: 1, maxItems: 12 }
   }),
-  tool('look_in', 'Open container and list contents (empty = nearest).', { where: STR('Id, label, or empty.') }),
+  tool('look_in', 'Open container and list contents (empty = nearest). One look answers the question: if the answer is the same as last time, the container is finished — act on it (take, put elsewhere, move on) instead of looking again. An empty furnace is not a task.', { where: STR('Id, label, or empty.') }),
   tool('take', 'Take items from a container or furnace output.', {
     item: STR('Item id.'),
     count: INT('Amount (default all).'),
@@ -155,7 +157,7 @@ const ACTION_TOOLS = [
     at: { type: 'array', description: 'look only: face this block [x,y,z] instead.', items: { type: 'integer' }, minItems: 3, maxItems: 3 },
     perspective: { type: 'string', enum: ['first', 'third'], description: 'look only: first = from your eyes (default, no own body); third = camera behind you so you see your own body, skin, armour, elytra and both hands.' }
   }),
-  tool('find', 'Find block type, item in opened containers, chest label, or "storage".', {
+  tool('find', 'Find block type, item in opened containers, chest label, or "storage". It only knows what you have seen: "nothing known" means go and look somewhere new (walk, mine, screenshot), not ask again. Page through a storage list once, then decide.', {
     what: STR('Id, label, or "storage".'),
     page: INT('Storage page (default 1).')
   }, ['what']),
@@ -291,7 +293,7 @@ const ACTION_TOOLS = [
     stage: STAGE
   }, ['shape', 'block']),
   tool('run_script', 'Run saved script in zincai/scripts/.', { name: STR('Script name.') }, ['name']),
-  tool('idle', 'End your turn when no new action is needed: the body carries on with what it is already doing (or keeps fleeing). Do not call idle to procrastinate when an active goal has a next step you can execute now.')
+  tool('idle', 'End your turn when no new action is needed: the body carries on with what it is already doing (or keeps fleeing). Do not call idle to procrastinate when an active goal has a next step you can execute now. Do call idle when the remaining steps are blocked, impossible, or belong to someone else — idling on a dead step is correct; repeating it is not.')
 ]
 
 /**
@@ -1457,7 +1459,7 @@ class AmdToolsClient {
         if (est.totalTokens <= plan.hardPromptBudget) break
       }
       // If even survival-level user compaction cannot leave minimum output headroom
-      // because the endpoint's context window is too small for all 41 tool schemas,
+      // because the endpoint's context window is too small for every tool schema,
       // proactively degrade to the compact core toolset before hitting HTTP 400.
       const minFitLimit = plan.contextWindow - Math.max(1_024, Math.min(plan.outputReserve, 2_048))
       if (lane === 'action' && est.totalTokens > minFitLimit && Array.isArray(activeTools) && activeTools.length > 15) {

@@ -80,6 +80,8 @@ const { LaneScheduler, JobRegistry, laneOf, laneOfAction, LANES } = require('./l
 const { TelemetryRecorder } = require('./telemetry')
 const { SurvivalPlanner, inspectTools } = require('./survival_planner')
 const { inferDeathCause } = require('./death_recovery')
+// The turn's decision frame (`your move:`). See docs/INCIDENT-2026-11-17-inventory-loop.md.
+const moveFrame = require('./nextmove')
 const ZINC_TOOLS = createZincTools()
 
 // logger.js is plain text with ISO timestamps — Pufferpanel-safe by design.
@@ -152,6 +154,9 @@ function loadConfig () {
     inference: raw.inference || {},
     memory: raw.memory || {},
     identity: raw.identity || {},
+    // The per-turn decision frame (`your move:`). On by default; `false` (or
+    // DECISION_FRAME=0) restores the old snapshot-only prompt for comparison.
+    decisionFrame: settings.bool(['DECISION_FRAME', 'decisionFrame'], raw.decisionFrame !== false),
     behavior: raw.behavior || {},
     build: raw.build || {},
     system1: raw.system1 || {},
@@ -988,7 +993,10 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     const r = result && typeof result === 'object' ? result : { ok: true, msg: String(result ?? 'done') }
     // What the model asked to be told (a chest's contents, a storage list) is
     // not cut to a headline: at 220 characters a full chest lost its second half.
-    const msg = String(r.msg || (r.ok ? 'done' : 'failed')).slice(0, INFORMATIONAL.has(label) ? 900 : 260)
+    // A completed-goal summary is the same kind of text — it is what the next
+    // decision is made from — so it gets the same room.
+    const roomy = INFORMATIONAL.has(label) || String(label).startsWith('completed ')
+    const msg = String(r.msg || (r.ok ? 'done' : 'failed')).slice(0, roomy ? 900 : 260)
     if (gateCtx && String(gateCtx.a) === label) {
       if (!r.ok) failGate.recordFailure(gateCtx, msg, here())
       else failGate.recordSuccess(gateCtx)
@@ -1078,6 +1086,22 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         pos: here()
       })
     } catch { /* the journal never breaks reporting */ }
+    // A failure belongs to the plan step it was trying to advance. Two of them
+    // and the step is BLOCKED — rendered as ⊘ with the reason instead of "do
+    // this now". This is the fact the prompt never carried: the recorded session
+    // kept starting "organize inventory into barrels" after `destination full`.
+    try {
+      const owner = execGoalId || journal.focus || null
+      if (!r.ok && owner) {
+        const hit = journal.noteStepFailure(owner, label, execArgs || {}, msg)
+        if (hit?.blocked) logger.info(TAG, `plan step ${hit.step} "${hit.text}" is blocked after ${hit.fails} failures (${msg.slice(0, 80)}) — the plan now says so`)
+      }
+      // The parent objective is being worked on: a child attempt is progress
+      // evidence, so "has had no progress for N min" cannot fire on a goal that
+      // is in fact the thing every recent action belonged to (it did, for 2h19m).
+      const parent = owner ? goalReg.get(owner)?.parentId : null
+      if (parent) { try { goalReg.update(parent, { detail: { lastTouchedAt: resultTs } }) } catch { /* noop */ } }
+    } catch { /* the journal never breaks reporting */ }
     try {
       telemetry.toolExec({ tool: label, args: execArgs, ok: Boolean(r.ok), msg, goalId: execGoalId })
     } catch { /* telemetry best effort */ }
@@ -1105,8 +1129,19 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         }
       } catch { /* never let memory persistence break reporting */ }
     }
-    const shouldWake = wake === null ? (!r.ok || INFORMATIONAL.has(label)) : wake
+    // A successful inspection is information — but only once. The recorded
+    // session burned an hour on `look_in` → wake → `look_in`: every read woke
+    // the model, the model read again, and nothing in the world changed. When
+    // the same subject has been read twice already and the answer is identical,
+    // the result stays in `results` (the model sees it next turn) but does not
+    // buy its own call. A read that CHANGED is still news: something moved.
+    const streak = journal.readStreakSafe()
+    const redundantRead = Boolean(
+      r.ok && INFORMATIONAL.has(label) && streak && streak.n >= 2 && !streak.changed
+    )
+    const shouldWake = wake === null ? (!r.ok || (INFORMATIONAL.has(label) && !redundantRead)) : wake
     const wakeText = `${label} ${r.ok ? 'done' : 'failed'}: ${msg}`
+    if (redundantRead) logger.debug(TAG, `${label}: answer unchanged after ${streak.n} reads — not waking the model`)
     if (resultTap) resultTap.push({ label, ok: Boolean(r.ok), msg, wakeText: shouldWake ? wakeText : null })
     if (shouldWake) brain?.wake(wakeText, { external: false })
   }
@@ -1254,6 +1289,12 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     if (r && r.ok && r.complete !== false) {
       goalReg.complete(goalId, { note: msg })
       try { telemetry.goalEvent({ op: 'complete', goalId, description: goal.label, status: 'completed', note: msg }); syncContinuation('goal_complete') } catch { /* noop */ }
+      // A finished objective is the moment the model has the most to decide
+      // from and the least text to decide with: its plan slot is about to be
+      // pruned. Report what was achieved, what it cost, what it unlocked, and
+      // what is still open — in the tool result itself, so it survives any
+      // later compaction. "g33 completed" alone is a dead end, not a decision.
+      try { report(`completed ${goalId}`, { ok: true, msg: achievementLine(goalId, goal, msg) }, { wake: false }) } catch { /* noop */ }
     } else if (r && r.ok) {
       goalReg.suspend(goalId, { reason: `stopped before finishing: ${msg.slice(0, 90)}`, by: 'task' })
       try { telemetry.goalEvent({ op: 'suspend', goalId, description: goal.label, status: 'suspended', note: msg }); syncContinuation('goal_suspend') } catch { /* noop */ }
@@ -1262,6 +1303,43 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       try { telemetry.goalEvent({ op: 'fail', goalId, description: goal.label, status: 'failed', note: msg }); syncContinuation('goal_fail') } catch { /* noop */ }
     }
   }
+
+  /**
+   * What finishing something actually means, in the model's own terms.
+   *
+   * The old completion path recorded `g33 completed` and stopped there. A goal
+   * boundary is the one place where the next decision is genuinely free, so it
+   * gets the full picture: result, what changed in the inventory, which plan
+   * steps are left (and which are dead), what this unlocks, and what else is
+   * open. Everything here comes from recorded state — nothing is invented.
+   */
+  function achievementLine (goalId, goal, msg) {
+    const bits = [`${goalId} "${cleanText(goal?.description, 70)}" done: ${msg}`]
+    // What the plan still owes, and what it can no longer deliver.
+    const plan = journal.planLine(goalId)
+    const blocked = journal.blockedSteps(goalId)
+    const next = journal.nextStep(goalId)
+    if (next) bits.push(`next step: ${next}`)
+    else if (goal?.kind === 'declared') bits.push('no next step is written for it — write one (goal update) or complete it')
+    if (blocked.length) bits.push(`still blocked: ${blocked.map((b) => `step ${b.index} "${cleanText(b.text, 40)}" (${b.why})`).join('; ')}`)
+    if (plan && !next && !blocked.length && goal?.kind === 'declared') bits.push(`plan: ${plan}`)
+    // What it unlocked is the question a person asks next.
+    const inv = (bot.inventory?.items?.() || []).map((i) => i.name)
+    const unlocks = []
+    if (inv.includes('iron_pickaxe') || inv.includes('diamond_pickaxe')) unlocks.push('ores that needed a stone pickaxe (gold, redstone, diamond)')
+    if (inv.includes('bucket')) unlocks.push('water/lava control and a farm')
+    if (inv.includes('iron_sword') || inv.includes('diamond_sword')) unlocks.push('safe night travel')
+    if (inv.some((n) => /_armor|helmet|chestplate|leggings|boots/.test(n))) unlocks.push('longer trips away from base')
+    if (unlocks.length) bits.push(`now that you carry it: ${unlocks.slice(0, 2).join(', ')}`)
+    // What else is asking for attention.
+    const others = goalReg.openGoals().filter((g) => g.id !== goalId)
+    if (others.length) bits.push(`still open: ${others.slice(0, 3).map((g) => `${g.id} ${cleanText(g.description, 40)} (${g.status})`).join('; ')}`)
+    else bits.push('nothing else is open — this is the moment to choose what is next, not to stop')
+    return bits.join(' | ')
+  }
+
+  /** One-line text, never undefined. */
+  const cleanText = (s, max = 120) => String(s ?? '').replace(/\s+/g, ' ').trim().slice(0, max)
 
   /** Start (or restart after a pause) the main task. */
   function launch (main) {
@@ -1759,7 +1837,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   async function runGoalOp (action, snap = null) {
     const op = String(action.operation || 'list').toLowerCase()
     const wanted = String(action.id || action.description || '').trim()
-    const goal = action.id ? goalReg.get(action.id) : (op === 'resume' || op === 'show' || op === 'cancel' || op === 'suspend' || op === 'complete' || op === 'verify' ? goalReg.find(wanted) : null)
+    const goal = action.id ? goalReg.get(action.id) : (op === 'resume' || op === 'show' || op === 'cancel' || op === 'suspend' || op === 'complete' || op === 'verify' || op === 'replan' || op === 'update' ? goalReg.find(wanted) : null)
     switch (op) {
       case 'list': {
         const open = goalReg.openGoals()
@@ -1828,6 +1906,9 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         }
         // The plan: ordered steps, which of them are done, and what comes next.
         if (action.steps) journal.setPlan(goal.id, action.steps)
+        const dropped = action.drop !== undefined
+          ? journal.retire(goal.id, action.drop, { why: action.note || action.reason || 'retired by the model', status: action.impossible ? 'impossible' : 'dropped' })
+          : []
         const marked = action.done !== undefined ? journal.markDone(goal.id, action.done) : []
         if (action.next !== undefined) journal.setNext(goal.id, action.next)
         else if (marked.length) journal.setNext(goal.id, '') // the old "next" was the step just finished
@@ -1835,7 +1916,27 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
           return { ok: false, msg: `${goal.id} has no open step number ${[].concat(action.done).join(', ')} — plan: ${journal.planLine(goal.id) || 'none (set steps first)'}` }
         }
         const planNow = journal.planLine(goal.id)
-        return { ok: true, msg: `updated: ${goalReg.describe(goalReg.get(goal.id))}${planNow ? ` — plan: ${planNow}` : ''}${journal.nextStep(goal.id) ? ` — next: ${journal.nextStep(goal.id)}` : ''}` }
+        return { ok: true, msg: `updated: ${goalReg.describe(goalReg.get(goal.id))}${planNow ? ` — plan: ${planNow}` : ''}${journal.nextStep(goal.id) ? ` — next: ${journal.nextStep(goal.id)}` : ''}${dropped.length ? ` — retired: ${dropped.join('; ')}` : ''}` }
+      }
+      case 'replan': {
+        // One call to fix a plan the world contradicted: retire the dead steps,
+        // write the new ones, and say what to do now. Without this, retiring a
+        // step costs four calls, so a model under budget pressure just repeats
+        // the dead step instead — which is the loop this exists to break.
+        if (!goal) return { ok: false, msg: `no goal matches "${wanted || '?'}"` }
+        const retired = action.drop !== undefined
+          ? journal.retire(goal.id, action.drop, { why: action.reason || action.note || 'the world refused it', status: action.impossible ? 'impossible' : 'dropped' })
+          : []
+        if (action.steps) journal.setPlan(goal.id, action.steps)
+        if (action.next !== undefined) journal.setNext(goal.id, action.next)
+        const planNow = journal.planLine(goal.id)
+        if (!retired.length && !action.steps && action.next === undefined) {
+          return { ok: false, msg: `replan needs something to change: drop:[step numbers], steps:[…], or next:"…" — current plan: ${planNow || 'none'}` }
+        }
+        return {
+          ok: true,
+          msg: `replanned ${goal.id}${retired.length ? ` (retired: ${retired.join('; ')})` : ''}${planNow ? ` — plan: ${planNow}` : ''}${journal.nextStep(goal.id) ? ` — next: ${journal.nextStep(goal.id)}` : ' — no next step left: write one, or complete/cancel the goal'}. A retired step is not a failure: it is information.`
+        }
       }
       case 'combine': {
         const ids = String(action.id || '').split(/[\s,]+/).map((s) => s.trim()).filter(Boolean)
@@ -1965,12 +2066,30 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       brain?.wake(`${running.id} looks blocked (${running.fails} failures, no progress: ${running.lastError || 'unknown'}); it is suspended. Check the world before resuming, or cancel it`, { external: true })
     }
     // A waiting objective must not starve silently when nothing is running.
+    //
+    // The version that shipped nudged a `pending` top-level goal that the model
+    // was ALREADY working through a child task, after 2h19m, with advice —
+    // "resume it (goal resume g6)" — that cannot apply to a declared goal the
+    // model never suspended. It cost a model call and taught the model nothing,
+    // so it was ignored. Three things are fixed here: only real waiting counts
+    // (no undo work in the last `starveMs`), the frame is the decision surface
+    // rather than a goal-management hint, and the nudge says what is blocked.
     if (!agenda.main && !combat?.isEngaged && !skills?.current()) {
-      const waiting = goalReg.waiting({ now, minAgeMs: GOALS.starveMs ?? 300_000 })[0]
+      const waiting = goalReg.waiting({ now, minAgeMs: GOALS.starveMs ?? 300_000 })
+        .find((g) => {
+          const touched = Math.max(Number(g.progressAt) || 0, Number(g.detail?.lastTouchedAt) || 0, Number(g.updatedAt) || 0)
+          return now - touched >= (GOALS.starveMs ?? 300_000)
+        })
       const lastNudge = Number(waiting?.detail?.starveNudgedAt) || 0
       if (waiting && now - lastNudge > (GOALS.starveRemindMs ?? 600_000)) {
         goalReg.update(waiting.id, { detail: { starveNudgedAt: now } })
-        brain?.wake(`unfinished goal ${waiting.id} "${waiting.description}" has been waiting ${Math.round((now - (waiting.suspendedAt || waiting.updatedAt || waiting.createdAt)) / 60000)} min; resume it (goal resume ${waiting.id}) or cancel it`, { external: true })
+        const plan = journal.planLine(waiting.id)
+        const blocked = journal.blockedSteps(waiting.id)
+        const mins = Math.round((now - (waiting.suspendedAt || waiting.progressAt || waiting.createdAt)) / 60000)
+        const what = blocked.length
+          ? `step ${blocked[0].index} "${blocked[0].text}" is blocked (${blocked[0].why})`
+          : (journal.nextStep(waiting.id) ? `next step: ${journal.nextStep(waiting.id)}` : 'no next step is written')
+        brain?.wake(`unfinished goal ${waiting.id} "${waiting.description}" has had no progress for ${mins} min — ${what}. Decide now: do it, replan it (goal replan ${waiting.id}), or cancel it (goal cancel ${waiting.id}).${plan ? ` plan: ${plan}` : ''}`, { external: true })
       }
     }
   }
@@ -2206,6 +2325,84 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     } catch { return false }
   }
 
+  /**
+   * `your move:` — the turn's actual question.
+   *
+   * The prompt used to be all snapshot and no question: state, inventory, goals,
+   * and a `continue` block telling the model to trust a plan. A session with a
+   * full barrel and an unmeasurable step ("organize inventory") therefore had
+   * nothing to answer, so it answered the only thing there was — another
+   * inspection. This builds the question out of live facts and names 2–4 moves
+   * that are actually available, each with the reason it is available.
+   *
+   * It is deliberately placed AFTER the goal/continuation block: the frame reads
+   * as "this is the state → so, what now", which is the order a person decides in.
+   */
+  function yourMoveBlock (reasons, { level = 0 } = {}) {
+    if (cfg.decisionFrame === false) return null // operator escape hatch
+    // A decision frame that can throw would take the whole turn down with it:
+    // degrade to nothing rather than to a broken prompt.
+    try { return buildYourMove(reasons, level) } catch (err) {
+      logger.debug(TAG, `your move: ${err.message || err}`)
+      return null
+    }
+  }
+
+  function buildYourMove (reasons, level) {
+    const pos = here()
+    const focused = focusGoal()
+    const gid = focused?.id || null
+    const plan = gid ? journal.plans[gid] : null
+    // Grounded inventory, in the shape nextmove wants.
+    const inv = (bot.inventory?.items?.() || []).map((i) => ({ name: String(i.name || ''), count: Number(i.count) || 0 }))
+    const food = Number(bot.food ?? 20)
+    const health = Number(bot.health ?? 20)
+    // A container that just refused a `put` is a fact about the world, not a
+    // chore to retry; pass it through so the frame can say "stop trying this".
+    let storageFull = null
+    const lastPut = [...results].reverse().find((x) => x.label === 'put')
+    if (lastPut && !lastPut.ok && /destination full|no room|full\b/i.test(String(lastPut.msg || ''))) {
+      storageFull = (String(lastPut.msg).match(/\binto (\S+)/) || [])[1] || 'that container'
+    }
+    const planNext = gid ? journal.nextStep(gid) : null
+    const blocked = gid ? journal.blockedSteps(gid).map((b) => ({ ...b, goalId: gid })) : []
+    // Stall: how long the focused objective has gone without a real change.
+    const stalled = focused ? Math.max(0, Date.now() - Number(focused.progressAt || focused.updatedAt || focused.createdAt || Date.now())) : 0
+    const streak = journal.readStreakSafe()
+    const reasonText = (reasons || []).filter((r) => !/^autonomous check-in/.test(r)).join('; ')
+    const frame = moveFrame.render({
+      inv,
+      food,
+      health,
+      openGoals: goalReg.openGoals(),
+      plan: planNext ? { next: planNext, goalId: gid } : null,
+      blocked,
+      storageFull,
+      hasBuildingMaterials: holdingBuildMaterials(),
+      survival: survivalPlanner.promptLine(bot),
+      nearby: nearbyContext(pos),
+      reason: reasonText,
+      stalled: stalled > 10 * 60_000 ? stalled : 0,
+      inspectRepeat: streak.n >= 2 && !streak.changed ? { subject: streak.subject, n: streak.n } : null,
+      idleStreak: Number(brain?.idleStreak) || 0,
+      max: level >= 3 ? 2 : 4
+    })
+    return frame.text
+  }
+
+  /** Players and useful stations close by, in the shape the decision frame uses. */
+  function nearbyContext (pos) {
+    if (!pos) return null
+    try {
+      const out = { players: [], containers: 0 }
+      out.players = Object.keys(bot.players || {}).filter((n) => n !== bot.username && bot.players[n]?.entity?.position)
+      const near = places.near(pos, { dim: dim(), radius: 24 })
+      out.containers = near.filter((e) => e.kind !== 'sign' && e.kind !== 'bed').length
+      out.emptyKnown = near.filter((e) => e.contents && !Object.keys(e.contents).length).length
+      return out
+    } catch { return null }
+  }
+
   function coreIdentity () {
     const creator = cfg.identity?.creator || {}
     const name = String(creator.name || '').trim().slice(0, 40)
@@ -2336,6 +2533,10 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       agendaLine(),
       level >= 4 ? goalBriefLine() : goalLines(),
       level < 4 ? continuationBlock(res ? Math.min(resKeep, results.length) : 0) : null,
+      // THE QUESTION. Always present, always built from live state, always last
+      // before the raw evidence — so a turn can never be "here is a snapshot,
+      // continue" with nothing to continue.
+      yourMoveBlock(reasons, { level }),
       ...threatLines(),
       level < 4 ? observe.playersLine(bot) : null,
       level < 3 ? observe.mobsLine(bot, { threatIds: sense.last.dangerIds, notes: hostileNotes() }) : null,

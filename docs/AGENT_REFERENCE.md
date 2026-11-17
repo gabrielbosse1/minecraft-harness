@@ -148,7 +148,7 @@ CLI: node zincai/index.js [--dry-run | --check]
 | `logic_test.js` | Abstract Boolean combinational logic truth-table verifier |
 | `circuit_projects.js` | `CircuitProjectStore` (`data/circuit_projects.json`) |
 | `perception.js` | `buildVisionBlock`, `VISION_LEGEND` — grounded text world summary |
-| `vision.js` | Lightweight chunk-column software voxel renderer for `screenshot` (`look`, `panorama`, `map`) with procedural 16×16 Minecraft block textures, AO, translucent water/glass, sky/sun/clouds, and blocky entities |
+| `vision.js` | Native-asset software renderer for `screenshot` (`look`, `panorama`, `map`): real blockstate/model/texture, entity and equipment geometry, AO, translucent water/glass, sky/sun/clouds; first-person (no own body) or third-person (bot rendered like any player) cameras |
 | `places.js` | `PlaceIndex` (`places.named`, containers, workstations; `data/places.json`) |
 | `block_search.js`, `block_inspect.js`, `region_inspect.js` | Fast block lookup and honest paginated inspection |
 | `goals.js` | `GoalRegistry` (`STATUS`: `active`, `queued`, `waiting`, `resumable`, `blocked`, `completed`, `failed`, `cancelled`; `list()`, `openGoals()`, `suspendAll()`) |
@@ -212,7 +212,7 @@ CLI: node zincai/index.js [--dry-run | --check]
 | | `inspect_region` | `{ x, y, z, radius?, page? }` |
 | | `find` | `{ what, radius? }` |
 | | `remember_here` | `{ name, note? }` |
-| | `screenshot` | `{ view: 'look'\|'panorama'\|'map', fov?, range? }` |
+| | `screenshot` | `{ view: 'look'\|'panorama'\|'map', direction?, at?, perspective?: 'first'\|'third' }` |
 | **Redstone & Logic** | `redstone_scan` | `{ x, y, z, radius? }` (returns snapshot id `rs<N>`) |
 | | `redstone_component` | `{ snapshot, x, y, z }` |
 | | `redstone_engineer` | `{ operation: 'analyze'\|'design'\|'place'\|'verify'\|..., ... }` |

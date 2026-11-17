@@ -44,6 +44,12 @@ function compareVersions (a, b) {
   return 0
 }
 
+/** `1.21.4` → `1.21` (model/definition formats are stable within a minor line). */
+function versionLine (v) {
+  if (!v) return ''
+  return String(v).replace(/^v/i, '').split('.').slice(0, 2).join('.')
+}
+
 function listDirs (dir) {
   try {
     return fs.readdirSync(dir, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name)
@@ -127,7 +133,11 @@ class ZipArchive {
 
 // ── Resource packs ──────────────────────────────────────────────────────────
 
-/** Directory laid out like the client resource tree (`assets/minecraft/...`). */
+/**
+ * Directory laid out like the client resource tree
+ * (`assets/<namespace>/<path>`, e.g. `assets/minecraft/blockstates/oak_sign.json`
+ * or `assets/mymod/models/block/reactor.json`).
+ */
 class DirectoryPack {
   constructor (root, name, opaque = false) {
     this.root = root
@@ -143,43 +153,64 @@ class DirectoryPack {
     return null
   }
 
-  readResource (rel) {
-    // rel is namespace-relative: blockstates/x.json, textures/block/x.png
+  readNamespace (namespace, rel) {
+    const ns = namespace || 'minecraft'
     if (!this.opaque) {
-      const direct = this._try(path.join('assets', 'minecraft', rel))
+      const direct = this._try(path.join('assets', ns, rel))
       if (direct) return direct
-      const bare = this._try(rel)
-      if (bare) return bare
+      // Bundled/flat layouts (prismarine-viewer extraction) only carry vanilla.
+      if (ns === 'minecraft') {
+        const bare = this._try(rel)
+        if (bare) return bare
+        return this._try(path.join('assets', 'minecraft', rel))
+      }
+      return null
     }
-    return null
-  }
-
-  readBundled (rel) {
+    if (ns !== 'minecraft') return null
     return this._try(rel)
   }
 
-  read (rel) {
-    return this.readResource(rel) || this.readBundled(rel)
+  readResource (rel) { return this.readNamespace('minecraft', rel) }
+  readBundled (rel) { return this._try(rel) }
+  read (rel) { return this.readResource(rel) || this.readBundled(rel) }
+
+  namespaces () {
+    const out = listDirs(path.join(this.root, 'assets'))
+    if (!this.opaque && !out.includes('minecraft')) {
+      // A loose pack dir (assets/minecraft/... is created lazily) still serves
+      // vanilla names by convention.
+      out.push('minecraft')
+    }
+    return out
   }
 }
 
-/** Official client jar as a resource pack. */
+/** Official client jar (or a packed resource pack) as a resource pack. */
 class JarPack {
   constructor (file) {
     this.name = `client-jar:${path.basename(file)}`
     this.zip = new ZipArchive(file)
   }
 
-  readResource (rel) {
-    return this.zip.read(path.posix.join('assets/minecraft', rel))
+  readNamespace (namespace, rel) {
+    return this.zip.read(path.posix.join('assets', namespace || 'minecraft', rel))
   }
 
-  readBundled (rel) {
-    return this.zip.read(path.posix.join('assets/minecraft', rel))
-  }
+  readResource (rel) { return this.readNamespace('minecraft', rel) }
+  readBundled (rel) { return this.readNamespace('minecraft', rel) }
+  read (rel) { return this.readResource(rel) }
 
-  read (rel) {
-    return this.readResource(rel)
+  namespaces () {
+    if (this._namespaces) return this._namespaces
+    const out = new Set()
+    if (this.zip.load()) {
+      for (const name of this.zip.entries.keys()) {
+        const m = /^assets\/([^/]+)\//.exec(name)
+        if (m) out.add(m[1])
+      }
+    }
+    this._namespaces = [...out]
+    return this._namespaces
   }
 }
 
@@ -195,8 +226,8 @@ class ObjectStorePack {
     } catch { this.index = {} }
   }
 
-  read (rel) {
-    const key = `minecraft/${rel}`
+  readNamespace (namespace, rel) {
+    const key = `${namespace || 'minecraft'}/${rel}`
     const obj = this.index[key]
     if (!obj || !obj.hash) return null
     try {
@@ -205,7 +236,19 @@ class ObjectStorePack {
     } catch { return null }
   }
 
+  read (rel) { return this.readNamespace('minecraft', rel) }
   readResource (rel) { return this.read(rel) }
+
+  namespaces () {
+    if (this._namespaces) return this._namespaces
+    const out = new Set()
+    for (const key of Object.keys(this.index || {})) {
+      const slash = key.indexOf('/')
+      if (slash > 0) out.add(key.slice(0, slash))
+    }
+    this._namespaces = [...out]
+    return this._namespaces
+  }
 }
 
 // ── Texture objects (with real alpha, frames and mip levels) ────────────────
@@ -228,8 +271,10 @@ const MISSING_TEXTURE = (() => {
 })()
 
 class Texture {
-  constructor (name, png, mcmeta) {
+  constructor (name, png, mcmeta, opts = {}) {
     this.name = name
+    this.namespace = opts.namespace || 'minecraft'
+    this.logicalPath = opts.logicalPath || name
     this.width = png.width
     this.height = png.height
     this.rgba = png.rgba
@@ -348,10 +393,41 @@ class Texture {
 
 // ── Asset provider ──────────────────────────────────────────────────────────
 
-function namespacePath (ref) {
-  let s = String(ref || '').replace(/^minecraft:/, '')
+/**
+ * Split a resource identifier into `{ namespace, path }`.
+ * `minecraft:block/stone`, `block/stone` and `stone` are the same vanilla
+ * resource; `mymod:block/reactor` keeps its namespace so mod assets never
+ * collide with vanilla names.
+ */
+function splitRef (ref) {
+  let s = String(ref == null ? '' : ref)
+  let namespace = 'minecraft'
+  const colon = s.indexOf(':')
+  if (colon >= 0) {
+    namespace = s.slice(0, colon).trim() || 'minecraft'
+    s = s.slice(colon + 1)
+  }
   s = s.replace(/^minecraft\//, '')
-  return s
+  return { namespace: namespace.toLowerCase(), path: s }
+}
+
+/**
+ * Cache/display key for a resource reference. Vanilla paths stay bare
+ * (`block/stone`) so existing caches/statistics keep working; other
+ * namespaces are prefixed (`mymod:block/stone`).
+ */
+function namespacePath (ref) {
+  const { namespace, path: p } = splitRef(ref)
+  return namespace === 'minecraft' ? p : `${namespace}:${p}`
+}
+
+/** `textures/block/x.png` → `{ namespace, path: 'block/x' }` (extension dropped). */
+function textureRef (ref) {
+  const split = splitRef(ref)
+  let p = split.path.replace(/^textures\//, '')
+  if (p.endsWith('.png')) p = p.slice(0, -4)
+  if (p.endsWith('.png.mcmeta')) p = p.slice(0, -10)
+  return { namespace: split.namespace, path: p }
 }
 
 class AssetProvider {
@@ -370,27 +446,60 @@ class AssetProvider {
     this._itemModelCache = new Map()
     this._colormaps = new Map()
     this._atlas = null
-    this.stats = { texturesLoaded: 0, textureMisses: 0 }
+    this._itemDefinitions = new Map()
+    this._equipmentDefinitions = new Map()
+    this._modelJsonCache = new Map()
+    this._namespaces = null
+    this.stats = { texturesLoaded: 0, textureMisses: 0, packMisses: 0 }
   }
 
   get label () {
     return this.info.label || `minecraft ${this.version}`
   }
 
-  _read (rel) {
+  /** Read a resource from the pack stack (later packs win, like the client). */
+  _readNamespace (namespace, rel) {
     for (let i = this.packs.length - 1; i >= 0; i--) {
       try {
-        const buf = this.packs[i].read(rel)
+        const pack = this.packs[i]
+        const buf = typeof pack.readNamespace === 'function'
+          ? pack.readNamespace(namespace, rel)
+          : (namespace === 'minecraft' ? pack.read(rel) : null)
         if (buf && buf.length) return buf
       } catch { /* pack failure is a miss, try the next pack */ }
     }
     return null
   }
 
-  _readJson (rel) {
-    const buf = this._read(rel)
+  _read (rel) {
+    return this._readNamespace('minecraft', rel)
+  }
+
+  _readJsonNamespace (namespace, rel) {
+    const buf = this._readNamespace(namespace, rel)
     if (!buf) return null
     try { return JSON.parse(buf.toString('utf8')) } catch { return null }
+  }
+
+  _readJson (rel) {
+    return this._readJsonNamespace('minecraft', rel)
+  }
+
+  /**
+   * Namespaces that actually contain assets in the active pack stack
+   * (`minecraft` plus any mod/resource-pack namespaces).
+   */
+  namespaces () {
+    if (this._namespaces) return this._namespaces
+    const out = new Set(['minecraft'])
+    for (const pack of this.packs) {
+      if (typeof pack.namespaces !== 'function') continue
+      try {
+        for (const ns of pack.namespaces()) out.add(ns)
+      } catch { /* a broken pack must not break resolution */ }
+    }
+    this._namespaces = [...out].sort()
+    return this._namespaces
   }
 
   getBundledJson (name) {
@@ -412,33 +521,115 @@ class AssetProvider {
     return this._models
   }
 
-  /** Real `assets/minecraft/blockstates/<block>.json` with bundled fallback. */
+  /**
+   * Real `assets/<namespace>/blockstates/<block>.json` with the bundled
+   * vanilla extraction as a fallback.
+   */
   blockstate (blockName) {
-    if (this._blockstateFileCache.has(blockName)) return this._blockstateFileCache.get(blockName)
-    let def = this._readJson(`blockstates/${blockName}.json`)
-    if (!def) {
+    const { namespace, path: name } = splitRef(blockName)
+    const key = namespace === 'minecraft' ? name : `${namespace}:${name}`
+    if (this._blockstateFileCache.has(key)) return this._blockstateFileCache.get(key)
+    let def = this._readJsonNamespace(namespace, `blockstates/${name}.json`)
+    if (!def && namespace === 'minecraft') {
       const all = this.blockstatesAll()
-      def = all[blockName] || all[`minecraft:${blockName}`] || null
+      def = all[name] || all[`minecraft:${name}`] || null
     }
-    this._blockstateFileCache.set(blockName, def)
+    if (!def) this.stats.packMisses++
+    this._blockstateFileCache.set(key, def)
     return def
   }
 
   /**
    * Real model JSON by resource reference (`minecraft:block/cherry_leaves`,
-   * `block/cube_all`, ...). Official per-file lookup first, bundled second.
+   * `block/cube_all`, `mymod:block/reactor`, ...). Official per-file lookup
+   * first, bundled vanilla extraction second.
    */
   model (ref) {
-    let clean = namespacePath(ref)
-    if (clean.startsWith('block/')) clean = clean.slice(6)
-    if (this._modelFileCache.has(clean)) return this._modelFileCache.get(clean)
-    let def = this._readJson(`models/block/${clean}.json`)
-    if (!def) def = this._readJson(`models/${clean}.json`)
-    if (!def) {
+    const { namespace, path: original } = splitRef(ref)
+    let clean = original
+    let bare = clean
+    if (bare.startsWith('block/')) bare = bare.slice(6)
+    const key = namespace === 'minecraft' ? bare : `${namespace}:${clean}`
+    if (this._modelFileCache.has(key)) return this._modelFileCache.get(key)
+    let def = null
+    if (bare !== clean) def = this._readJsonNamespace(namespace, `models/block/${bare}.json`)
+    if (!def) def = this._readJsonNamespace(namespace, `models/${clean}.json`)
+    if (!def) def = this._readJsonNamespace(namespace, `models/block/${bare}.json`)
+    if (!def && namespace === 'minecraft') {
       const all = this.modelsAll()
-      def = all[clean] || all[`block/${clean}`] || all[`minecraft:block/${clean}`] || null
+      def = all[bare] || all[clean] || all[`block/${bare}`] || all[`minecraft:block/${bare}`] || null
     }
-    this._modelFileCache.set(clean, def)
+    if (!def) this.stats.packMisses++
+    this._modelFileCache.set(key, def)
+    return def
+  }
+
+  /** Any model JSON: `item/template_banner`, `block/oak_sign`, `entity/x`. */
+  modelJson (ref) {
+    const { namespace, path: clean } = splitRef(ref)
+    const key = namespace === 'minecraft' ? clean : `${namespace}:${clean}`
+    if (this._modelJsonCache.has(key)) return this._modelJsonCache.get(key)
+    let def = this._readJsonNamespace(namespace, `models/${clean}.json`)
+    if (!def) def = this.model(ref)
+    this._modelJsonCache.set(key, def)
+    return def
+  }
+
+  /**
+   * 1.21.4+ item model definition (`assets/<ns>/items/<id>.json`): the file
+   * that says which model/tints/special renderer an item uses. Resource pack
+   * and jar files win; the vendored 1.21.4 set is a fallback for the matching
+   * version line only, so an older/newer runtime never silently gets 1.21.4
+   * semantics.
+   */
+  itemDefinition (itemName) {
+    const { namespace, path: raw } = splitRef(itemName)
+    const name = raw.replace(/^item\//, '').replace(/\.json$/, '')
+    const key = namespace === 'minecraft' ? name : `${namespace}:${name}`
+    if (this._itemDefinitions.has(key)) return this._itemDefinitions.get(key)
+    let def = this._readJsonNamespace(namespace, `items/${name}.json`)
+    let source = 'resource'
+    if (!def && namespace === 'minecraft' && this.itemDefinitionBundle()) {
+      const bundle = this.itemDefinitionBundle()
+      def = bundle.definitions[name] || null
+      source = def ? `bundled:${bundle._meta.version}` : source
+    }
+    if (def) def = { ...def, _source: source }
+    this._itemDefinitions.set(key, def)
+    return def
+  }
+
+  itemDefinitionBundle () {
+    if (this._itemDefBundle !== undefined) return this._itemDefBundle
+    this._itemDefBundle = null
+    try {
+      const bundle = require('./item-definitions-1.21.4.json')
+      if (versionLine(bundle._meta?.version) === versionLine(this.version)) this._itemDefBundle = bundle
+    } catch { /* no vendored definitions */ }
+    return this._itemDefBundle
+  }
+
+  /**
+   * Equipment (armour) layer definition: `assets/<ns>/equipment/<id>.json`,
+   * e.g. `minecraft:iron` → humanoid + humanoid_leggings texture layers.
+   */
+  equipmentDefinition (id) {
+    const { namespace, path: name } = splitRef(id)
+    const key = namespace === 'minecraft' ? name : `${namespace}:${name}`
+    if (this._equipmentDefinitions.has(key)) return this._equipmentDefinitions.get(key)
+    let def = this._readJsonNamespace(namespace, `equipment/${name}.json`)
+    let source = 'resource'
+    if (!def && namespace === 'minecraft') {
+      try {
+        const bundle = require('./equipment-1.21.4.json')
+        if (versionLine(bundle._meta?.version) === versionLine(this.version)) {
+          def = bundle.equipment[name] || null
+          if (def) source = `bundled:${bundle._meta.version}`
+        }
+      } catch { /* none */ }
+    }
+    if (def) def = { ...def, _source: source }
+    this._equipmentDefinitions.set(key, def)
     return def
   }
 
@@ -448,17 +639,31 @@ class AssetProvider {
    * missing-texture checkerboard.
    */
   blockTexture (ref) {
-    let clean = namespacePath(ref)
+    const { namespace, path: raw } = textureRef(ref)
+    let clean = raw
     if (clean.startsWith('block/')) clean = clean.slice(6)
-    const key = `block:${clean}`
+    const vanilla = namespace === 'minecraft'
+    const key = vanilla ? `block:${clean}` : `block:${namespace}:${clean}`
     if (this._textures.has(key)) return this._textures.get(key)
     if (this._textureMisses.has(key)) return null
-    let buf = this._read(`textures/block/${clean}.png`)
-    if (!buf && this.bundledRoot) buf = this._read(`blocks/${clean}.png`)
+    // Explicit directories (`entity/...`, `models/...`) are honoured as-is.
+    const rels = clean.includes('/')
+      ? [`textures/${clean}.png`]
+      : [`textures/block/${clean}.png`]
+    let buf = null
+    let usedRel = rels[0]
+    for (const rel of rels) {
+      buf = this._readNamespace(namespace, rel)
+      if (buf) { usedRel = rel; break }
+    }
+    if (!buf && vanilla && this.bundledRoot) {
+      buf = this._read(`blocks/${clean}.png`)
+      usedRel = `blocks/${clean}.png`
+    }
     let meta = null
     if (buf) {
-      const mc = this._read(`textures/block/${clean}.png.mcmeta`) ||
-        (this.bundledRoot ? this._read(`blocks/${clean}.png.mcmeta`) : null)
+      const mc = this._readNamespace(namespace, `${usedRel}.mcmeta`) ||
+        (vanilla && this.bundledRoot ? this._read(`blocks/${clean}.png.mcmeta`) : null)
       meta = decodeMcmeta(mc)
     }
     const png = buf ? decodePng(buf) : null
@@ -467,7 +672,10 @@ class AssetProvider {
       this.stats.textureMisses++
       return null
     }
-    const tex = new Texture(clean, png, meta)
+    const tex = new Texture(key.replace(/^block:/, ''), png, meta, {
+      namespace,
+      logicalPath: rels[0].replace(/^textures\//, '').replace(/\.png$/, '')
+    })
     this.stats.texturesLoaded++
     this._textures.set(key, tex)
     return tex
@@ -491,20 +699,50 @@ class AssetProvider {
    * Returns a Texture with alpha, or null.
    */
   itemTexture (ref) {
-    let clean = namespacePath(ref).replace(/^textures\//, '').replace(/\.png$/, '')
-    if (clean.startsWith('block/')) return this.blockTexture(clean)
-    const name = clean.replace(/^items?\//, '')
-    const key = `item:${name}`
+    const { namespace, path: raw } = textureRef(ref)
+    // Armour trim item layers: `trims/items/chestplate_trim_diamond` is a
+    // palette permutation of the shared `.../chestplate_trim` sheet.
+    const trim = /^trims\/items\/(.+)_trim_([a-z_]+)$/.exec(raw)
+    if (trim) {
+      const paletted = this.palettedTexture(`trims/items/${trim[1]}_trim`, trim[2], { label: `item/${raw}` })
+      if (paletted) return paletted
+    }
+    if (raw.startsWith('block/')) return this.blockTexture(ref)
+    if (raw.includes('/') && !raw.startsWith('item/') && !raw.startsWith('items/')) {
+      // e.g. `minecraft:entity/decorated_pot/...` used by an item tint
+      return this.blockTexture(ref) || this.entityTexture(ref)
+    }
+    const name = raw.replace(/^items?\//, '')
+    const vanilla = namespace === 'minecraft'
+    const key = vanilla ? `item:${name}` : `item:${namespace}:${name}`
     if (this._textures.has(key)) return this._textures.get(key)
     if (this._textureMisses.has(key)) return null
-    let buf = this._read(`textures/item/${name}.png`)
-    if (!buf && this.bundledRoot) {
+    const rels = [`textures/item/${name}.png`]
+    let buf = null
+    let usedRel = rels[0]
+    for (const rel of rels) {
+      buf = this._readNamespace(namespace, rel)
+      if (buf) { usedRel = rel; break }
+    }
+    if (!buf) {
+      // Armour trim item layers are palette permutations of a shared greyscale
+      // sheet: `trims/items/chestplate_trim_diamond` → source + palette.
+      const trim = /^trims\/items\/(.+)_trim_([a-z_]+)$/.exec(name)
+      if (trim) {
+        const paletted = this.palettedTexture(`trims/items/${trim[1]}_trim`, trim[2], {
+          label: `item/${name}`
+        })
+        if (paletted) return paletted
+      }
+    }
+    if (!buf && vanilla && this.bundledRoot) {
       buf = this._read(`items/${name}.png`) || this._read(`textures/items/${name}.png`)
+      usedRel = `items/${name}.png`
     }
     let meta = null
     if (buf) {
-      const mc = this._read(`textures/item/${name}.png.mcmeta`) ||
-        (this.bundledRoot ? this._read(`items/${name}.png.mcmeta`) : null)
+      const mc = this._readNamespace(namespace, `${usedRel}.mcmeta`) ||
+        (vanilla && this.bundledRoot ? this._read(`items/${name}.png.mcmeta`) : null)
       meta = decodeMcmeta(mc)
     }
     const png = buf ? decodePng(buf) : null
@@ -513,7 +751,10 @@ class AssetProvider {
       this.stats.textureMisses++
       return null
     }
-    const tex = new Texture(`item/${name}`, png, meta)
+    const tex = new Texture(`item/${name}`, png, meta, {
+      namespace,
+      logicalPath: `item/${name}`
+    })
     this.stats.texturesLoaded++
     this._textures.set(key, tex)
     return tex
@@ -521,17 +762,29 @@ class AssetProvider {
 
   /** Entity texture (`textures/entity/...` from the real client assets). */
   entityTexture (ref) {
-    let clean = namespacePath(ref)
-    clean = clean.replace(/^textures\//, '')
+    const { namespace, path: raw } = textureRef(ref)
+    let clean = raw.replace(/^textures\//, '')
     if (clean.endsWith('.png')) clean = clean.slice(0, -4)
-    const key = `entity:${clean}`
+    const vanilla = namespace === 'minecraft'
+    const key = vanilla ? `entity:${clean}` : `entity:${namespace}:${clean}`
     if (this._textures.has(key)) return this._textures.get(key)
     if (this._textureMisses.has(key)) return null
-    let buf = this._read(`textures/${clean}.png`)
-    if (!buf && this.bundledRoot) buf = this._read(`${clean}.png`)
-    if (!buf && this.bundledRoot) {
+    let buf = this._readNamespace(namespace, `textures/${clean}.png`)
+    let usedRel = `textures/${clean}.png`
+    if (!buf && vanilla && this.bundledRoot) {
+      buf = this._read(`${clean}.png`)
+      usedRel = `${clean}.png`
+    }
+    if (!buf && vanilla && this.bundledRoot) {
       // Some packs flatten `textures/entity/player/wide/steve` differently.
       buf = this._read(`entity/${clean.replace(/^entity\//, '')}.png`)
+      usedRel = `entity/${clean.replace(/^entity\//, '')}.png`
+    }
+    let meta = null
+    if (buf) {
+      const mc = this._readNamespace(namespace, `${usedRel}.mcmeta`) ||
+        (vanilla && this.bundledRoot ? this._read(`${clean}.png.mcmeta`) : null)
+      meta = decodeMcmeta(mc)
     }
     const png = buf ? decodePng(buf) : null
     if (!png) {
@@ -539,10 +792,100 @@ class AssetProvider {
       this.stats.textureMisses++
       return null
     }
-    const tex = new Texture(clean, png, null)
+    const tex = new Texture(clean, png, meta, { namespace, logicalPath: clean })
     this.stats.texturesLoaded++
     this._textures.set(key, tex)
     return tex
+  }
+
+  /** Any other client texture (`gui/...`, `misc/enchanted_glint_item`, ...). */
+  miscTexture (ref) {
+    const { namespace, path: raw } = textureRef(ref)
+    const clean = raw.replace(/^textures\//, '')
+    const vanilla = namespace === 'minecraft'
+    const key = vanilla ? `misc:${clean}` : `misc:${namespace}:${clean}`
+    if (this._textures.has(key)) return this._textures.get(key)
+    if (this._textureMisses.has(key)) return null
+    const rel = `textures/${clean}.png`
+    let buf = this._readNamespace(namespace, rel)
+    if (!buf && vanilla && this.bundledRoot) buf = this._read(`${clean}.png`)
+    const png = buf ? decodePng(buf) : null
+    if (!png) {
+      this._textureMisses.add(key)
+      this.stats.textureMisses++
+      return null
+    }
+    const tex = new Texture(clean, png, decodeMcmeta(this._readNamespace(namespace, `${rel}.mcmeta`)), {
+      namespace,
+      logicalPath: clean
+    })
+    this.stats.texturesLoaded++
+    this._textures.set(key, tex)
+    return tex
+  }
+
+  /**
+   * Palette permutations — the client's `paletted_permutations` sprite source.
+   * Armour trim textures are shipped as one greyscale sheet
+   * (`trims/items/chestplate_trim.png`, `trims/entity/humanoid/coast.png`) plus
+   * a palette per material (`trims/color_palettes/diamond.png`). The client
+   * builds `<source>_<palette>` at atlas bake time; this does the same, cached.
+   */
+  palettedTexture (sourceRef, paletteName, { keyRef = 'trims/color_palettes/trim_palette', label = null } = {}) {
+    const { namespace, path: src } = textureRef(sourceRef)
+    const palette = String(paletteName || '').replace(/^minecraft:/, '')
+    const key = `paletted:${namespace}:${src}:${palette}`
+    if (this._textures.has(key)) return this._textures.get(key)
+    if (this._textureMisses.has(key)) return null
+    const source = this.miscTexture(sourceRef)
+    const keyImg = this.miscTexture(keyRef)
+    const paletteImg = this.miscTexture(`trims/color_palettes/${palette}`)
+    if (!source || !keyImg || !paletteImg) {
+      this._textureMisses.add(key)
+      return null
+    }
+    // palette_key pixel i ↔ palette pixel i
+    const pairs = []
+    const n = Math.min(keyImg.width * keyImg.height, paletteImg.width * paletteImg.height)
+    for (let i = 0; i < n; i++) {
+      const ki = i * 4
+      const pi = i * 4
+      pairs.push({
+        from: [keyImg.rgba[ki], keyImg.rgba[ki + 1], keyImg.rgba[ki + 2]],
+        to: [paletteImg.rgba[pi], paletteImg.rgba[pi + 1], paletteImg.rgba[pi + 2]]
+      })
+    }
+    const rgba = new Uint8Array(source.rgba)
+    for (let i = 0; i < rgba.length; i += 4) {
+      if (rgba[i + 3] === 0) continue
+      for (const pair of pairs) {
+        if (rgba[i] === pair.from[0] && rgba[i + 1] === pair.from[1] && rgba[i + 2] === pair.from[2]) {
+          rgba[i] = pair.to[0]
+          rgba[i + 1] = pair.to[1]
+          rgba[i + 2] = pair.to[2]
+          break
+        }
+      }
+    }
+    const tex = new Texture(label || `${src}_${palette}`, {
+      width: source.width,
+      height: source.height,
+      rgba
+    }, null, { namespace, logicalPath: `${src}_${palette}` })
+    this.stats.texturesLoaded++
+    this._textures.set(key, tex)
+    return tex
+  }
+
+  /**
+   * Armour trim sheet for a material, e.g.
+   * `trimTexture('humanoid', 'coast', 'minecraft:diamond')`.
+   */
+  trimTexture (layer, pattern, material) {
+    const mat = String(material || '').replace(/^minecraft:/, '').replace(/^trims\//, '')
+    if (!mat) return null
+    const ref = `trims/entity/${layer}/${String(pattern || '').replace(/^minecraft:/, '')}`
+    return this.palettedTexture(ref, mat, { label: `${ref}_${mat}` })
   }
 
   /** Vanilla colormaps (grass.png / foliage.png) used for biome tinting. */
@@ -672,23 +1015,44 @@ function discoverOfficialRoots (version) {
   return { jars: jars.filter((j) => { try { return fs.existsSync(j) } catch { return false } }), indexes }
 }
 
+function minecraftHome () {
+  return process.env.MINECRAFT_HOME ||
+    (process.env.APPDATA ? path.join(process.env.APPDATA, '.minecraft') : null) ||
+    path.join(require('node:os').homedir(), '.minecraft')
+}
+
+/**
+ * The resource packs the client actually has enabled, read from
+ * `.minecraft/options.txt` (`resourcePacks:["vanilla","file/MyPack.zip"]`).
+ * Built-in entries that are not files (`vanilla`, `fabric`, `mod_resources`,
+ * `programmer_art`) are skipped; `file/<name>` entries resolve against
+ * `.minecraft/resourcepacks/`. Order is the client's, so later packs win.
+ */
+function enabledResourcePacks (home = minecraftHome()) {
+  const out = []
+  let text = ''
+  try { text = fs.readFileSync(path.join(home, 'options.txt'), 'utf8') } catch { return out }
+  const line = text.split(/\r?\n/).find((l) => l.startsWith('resourcePacks:'))
+  if (!line) return out
+  let list = null
+  try { list = JSON.parse(line.slice('resourcePacks:'.length)) } catch { return out }
+  if (!Array.isArray(list)) return out
+  const builtin = new Set(['vanilla', 'fabric', 'mod_resources', 'programmer_art', 'high_contrast'])
+  for (const entry of list) {
+    if (typeof entry !== 'string' || builtin.has(entry)) continue
+    const rel = entry.startsWith('file/') ? entry.slice(5) : entry
+    const direct = path.join(home, 'resourcepacks', rel)
+    if (fs.existsSync(direct)) out.push(direct)
+  }
+  return out
+}
+
 function discoverResourcePackRoots () {
   const roots = []
-  const add = (p) => { if (p) roots.push(p) }
   for (const p of String(process.env.ZINC_RESOURCE_PACKS || '').split(path.delimiter)) {
-    if (p.trim()) add(p.trim())
+    if (p.trim()) roots.push(p.trim())
   }
-  const home = process.env.MINECRAFT_HOME || (process.env.APPDATA ? path.join(process.env.APPDATA, '.minecraft') : path.join(require('node:os').homedir(), '.minecraft'))
-  const rpDir = path.join(home, 'resourcepackater')
-  const legacy = path.join(home, 'resourcepacks')
-  for (const dir of [rpDir, legacy]) {
-    for (const name of listDirs(dir)) {
-      // Enabled packs are unknown without options.txt; load all as overlays is
-      // wrong, so only explicit packs are honoured. This list is informational.
-      add(null)
-    }
-    add(dir) // kept for diagnostics only
-  }
+  for (const p of enabledResourcePacks()) roots.push(p)
   return roots.filter((r, i, a) => a.indexOf(r) === i)
 }
 
@@ -767,10 +1131,28 @@ function createAssetProvider (opts = {}) {
     sources.push(`official asset index ${path.basename(index)}`)
   }
 
-  // Explicit resource packs (applied last: overlay order like the client).
-  const extraPacks = (opts.resourcePacks || []).concat(
-    String(process.env.ZINC_RESOURCE_PACKS || '').split(path.delimiter).filter(Boolean)
+  // Mod-provided assets (lower precedence than resource packs: mods add new
+  // namespaces, packs are allowed to override them).
+  const modAssets = (opts.modAssets || []).concat(
+    String(process.env.ZINC_MOD_ASSETS || '').split(path.delimiter).filter(Boolean)
   )
+  for (const dir of modAssets) {
+    try {
+      if (!dir || !fs.existsSync(dir)) continue
+      if (fs.statSync(dir).isDirectory()) {
+        packs.push(new DirectoryPack(dir, `mod-assets:${path.basename(dir)}`, false))
+        sources.push(`mod assets ${path.basename(dir)}`)
+      } else if (dir.endsWith('.zip') || dir.endsWith('.jar')) {
+        packs.push(new JarPack(dir))
+        sources.push(`mod assets ${path.basename(dir)}`)
+      }
+    } catch { /* ignore unreadable mod */ }
+  }
+
+  // Explicit resource packs (applied last: overlay order like the client).
+  const extraPacks = (opts.resourcePacks || [])
+    .concat(opts.useClientPacks === false ? [] : enabledResourcePacks())
+    .concat(String(process.env.ZINC_RESOURCE_PACKS || '').split(path.delimiter).filter(Boolean))
   for (const rp of extraPacks) {
     try {
       if (!fs.existsSync(rp)) continue
@@ -806,6 +1188,12 @@ module.exports = {
   Texture,
   createAssetProvider,
   compareVersions,
+  versionLine,
+  splitRef,
+  textureRef,
+  enabledResourcePacks,
+  discoverResourcePackRoots,
+  minecraftHome,
   namespacePath,
   ZipArchive,
   DirectoryPack,

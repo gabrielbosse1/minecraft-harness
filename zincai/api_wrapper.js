@@ -152,7 +152,8 @@ const ACTION_TOOLS = [
   tool('screenshot', 'SEE: rendered image of the world around you. Use BEFORE digging/breaking/clearing (to make sure you are not digging in front of a house or inside a cave), BEFORE picking a build site (panorama/map for open surface terrain), and DURING/AFTER building stages to inspect proportions, depth, and flaws. Use inspect_block / inspect_region / find / redstone tools for exact coordinates and block IDs.', {
     view: { type: 'string', enum: ['look', 'panorama', 'map'], description: 'look = first person (default); panorama = full 360° strip, north in the middle; map = top-down with a labelled x/z grid.' },
     direction: { type: 'string', enum: ['north', 'northeast', 'east', 'southeast', 'south', 'southwest', 'west', 'northwest', 'up', 'down'], description: 'look only: where to face (default: where you face now).' },
-    at: { type: 'array', description: 'look only: face this block [x,y,z] instead.', items: { type: 'integer' }, minItems: 3, maxItems: 3 }
+    at: { type: 'array', description: 'look only: face this block [x,y,z] instead.', items: { type: 'integer' }, minItems: 3, maxItems: 3 },
+    perspective: { type: 'string', enum: ['first', 'third'], description: 'look only: first = from your eyes (default, no own body); third = camera behind you so you see your own body, skin, armour, elytra and both hands.' }
   }),
   tool('find', 'Find block type, item in opened containers, chest label, or "storage".', {
     what: STR('Id, label, or "storage".'),

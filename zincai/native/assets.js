@@ -367,6 +367,7 @@ class AssetProvider {
     this._models = null
     this._blockstateFileCache = new Map()
     this._modelFileCache = new Map()
+    this._itemModelCache = new Map()
     this._colormaps = new Map()
     this._atlas = null
     this.stats = { texturesLoaded: 0, textureMisses: 0 }
@@ -467,6 +468,52 @@ class AssetProvider {
       return null
     }
     const tex = new Texture(clean, png, meta)
+    this.stats.texturesLoaded++
+    this._textures.set(key, tex)
+    return tex
+  }
+
+  /** Real `assets/minecraft/models/item/<item>.json` (resource packs first). */
+  itemModel (itemName) {
+    let clean = namespacePath(itemName)
+    clean = clean.replace(/^item\//, '').replace(/^models\/item\//, '')
+    if (clean.endsWith('.json')) clean = clean.slice(0, -5)
+    if (this._itemModelCache.has(clean)) return this._itemModelCache.get(clean)
+    let def = this._readJson(`models/item/${clean}.json`)
+    if (def) def = { ...def, _source: 'resource' }
+    this._itemModelCache.set(clean, def)
+    return def
+  }
+
+  /**
+   * Real item texture (`textures/item/...`, or a block texture for block
+   * items). The prismarine extraction stores the same files under `items/`.
+   * Returns a Texture with alpha, or null.
+   */
+  itemTexture (ref) {
+    let clean = namespacePath(ref).replace(/^textures\//, '').replace(/\.png$/, '')
+    if (clean.startsWith('block/')) return this.blockTexture(clean)
+    const name = clean.replace(/^items?\//, '')
+    const key = `item:${name}`
+    if (this._textures.has(key)) return this._textures.get(key)
+    if (this._textureMisses.has(key)) return null
+    let buf = this._read(`textures/item/${name}.png`)
+    if (!buf && this.bundledRoot) {
+      buf = this._read(`items/${name}.png`) || this._read(`textures/items/${name}.png`)
+    }
+    let meta = null
+    if (buf) {
+      const mc = this._read(`textures/item/${name}.png.mcmeta`) ||
+        (this.bundledRoot ? this._read(`items/${name}.png.mcmeta`) : null)
+      meta = decodeMcmeta(mc)
+    }
+    const png = buf ? decodePng(buf) : null
+    if (!png) {
+      this._textureMisses.add(key)
+      this.stats.textureMisses++
+      return null
+    }
+    const tex = new Texture(`item/${name}`, png, meta)
     this.stats.texturesLoaded++
     this._textures.set(key, tex)
     return tex

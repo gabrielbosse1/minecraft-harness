@@ -16,6 +16,7 @@ const path = require('node:path')
 const { Vec3 } = require('vec3')
 const vision = require('../zincai/vision')
 const { createFakeWorld } = require('../test/helpers/fake-world')
+const Item = require('prismarine-item')('1.21.4')
 
 async function main () {
   const outDir = path.resolve(process.argv[2] || path.join(__dirname, '..', '.zinc-test-run', 'renders'))
@@ -88,10 +89,12 @@ async function main () {
   world.set(14, ground, 27, 'poppy')
   world.set(15, ground, 27, 'dandelion')
 
-  const bot = world.makeBot({ x: 10.5, y: ground, z: 24.5 })
+  const bot = world.makeBot({ x: 10.5, y: ground + 1, z: 24.5 })
+  bot.heldItem = new Item(bot.registry.itemsByName.diamond_pickaxe.id, 1)
   bot.entities = {
-    101: { id: 101, type: 'animal', name: 'cow', position: new Vec3(10.5, ground, 15.5), yaw: Math.PI, height: 1.4, width: 0.9 },
-    102: { id: 102, type: 'hostile', name: 'zombie', position: new Vec3(4.5, ground, 9.5), yaw: Math.PI / 2, height: 1.95, width: 0.6 }
+    101: { id: 101, type: 'animal', name: 'cow', position: new Vec3(10.5, ground + 1, 15.5), yaw: Math.PI, height: 1.4, width: 0.9 },
+    102: { id: 102, type: 'hostile', name: 'zombie', position: new Vec3(4.5, ground + 1, 9.5), yaw: Math.PI / 2, height: 1.95, width: 0.6, equipment: [new Item(bot.registry.itemsByName.iron_sword.id, 1)] },
+    103: { id: 103, type: 'animal', name: 'item', position: new Vec3(12.5, ground + 1, 14.5), width: 0.25, height: 0.25, getDroppedItem: () => new Item(bot.registry.itemsByName.diamond_sword.id, 1) }
   }
 
   const views = [

@@ -31,6 +31,7 @@ const { createAssetProvider } = require('./native/assets')
 const { BlockModelStore, FACE_SHADE } = require('./native/blockModels')
 const { buildEntityModel, poseEntityModel, loadEntityDefinitions } = require('./native/entityModels')
 const { SkinResolver } = require('./native/skins')
+const { ItemModelStore } = require('./native/items')
 
 // Fullbright is a rendering invariant for perception. It never touches game
 // state: no effects, no light updates, no world edits.
@@ -248,7 +249,8 @@ function getNativeContext (bot, opts = {}) {
     resourcePacks: opts.resourcePacks
   })
   const store = new BlockModelStore(bot, assets, { debug: opts.debug })
-  const ctx = { assets, store }
+  const items = new ItemModelStore({ version, assets, blockModels: store, registry: bot?.registry })
+  const ctx = { assets, store, items }
   nativeContexts.set(key, ctx)
   return ctx
 }
@@ -849,6 +851,7 @@ function entityList (bot, eye, maxDist, isHostile) {
   const out = []
   for (const e of Object.values(bot.entities || {})) {
     if (!e || e === bot.entity || !e.position) continue
+    if (droppedItemOf(e)) continue
     if (!['player', 'mob', 'hostile', 'animal', 'passive'].includes(e.type)) continue
     const name = e.type === 'player' ? (e.username || 'player') : (e.name || e.type || 'mob')
     const hostile = e.type !== 'player' && hostileFor(name, e, isHostile)
@@ -1111,6 +1114,96 @@ function drawDepthRect (canvas, zbuf, x0, y0, x1, y1, dist, col, alpha = 1) {
   return drawn
 }
 
+// ── Item entities & held items ────────────────────────────────────────────
+
+function hasRightArmBone (model) {
+  return Boolean(model?.quads?.some((q) => q.bone === 'rightArm' || q.chain?.some((b) => b.name === 'rightArm')))
+}
+
+function droppedItemOf (entity) {
+  if (!entity) return null
+  try { if (typeof entity.getDroppedItem === 'function') return entity.getDroppedItem() } catch { /* partial metadata */ }
+  return entity.droppedItem || entity.item || null
+}
+
+function rotateXRad (p, angle) {
+  if (!angle) return p.slice()
+  const c = Math.cos(angle)
+  const s = Math.sin(angle)
+  return [p[0], p[1] * c - p[2] * s, p[1] * s + p[2] * c]
+}
+
+function itemQuadsInWorld (baked, place) {
+  const out = []
+  for (const q of baked.quads) {
+    const pos = q.pos.map((p) => place(p))
+    out.push({ ...q, pos })
+  }
+  return out
+}
+
+function droppedItemWorldQuads (store, entity, timeMs, eye, unsupportedItems) {
+  const item = droppedItemOf(entity)
+  if (!item) return null
+  const name = store.itemNameOf(item)
+  if (!name) return null
+  const baked = store.quadsFor(name, 'ground')
+  if (!baked) { unsupportedItems.add(name); return null }
+  const spin = ((timeMs / 1000) * 1.8 + (Number(entity.id) || 0)) % (Math.PI * 2)
+  const bob = Math.sin((timeMs / 480) + (Number(entity.id) || 0)) * 0.04
+  const scale = 0.9
+  const cy = Math.cos(spin)
+  const sy = Math.sin(spin)
+  const base = { x: entity.position.x, y: entity.position.y + 0.25 + bob, z: entity.position.z }
+  const quads = itemQuadsInWorld(baked, (p) => [
+    (p[0] * cy + p[2] * sy) * scale + base.x,
+    p[1] * scale + base.y,
+    (-p[0] * sy + p[2] * cy) * scale + base.z
+  ])
+  return { name, kind: baked.kind, quads, center: [base.x, base.y, base.z], dist: Math.hypot(base.x - eye.x, base.y - eye.y, base.z - eye.z) }
+}
+
+function selfHeldItemQuads (store, name, eye, fwd, right, up, unsupportedItems) {
+  const baked = store.quadsFor(name, 'firstperson_righthand')
+  if (!baked) { unsupportedItems.add(name); return null }
+  // First-person hand placement is renderer-owned in vanilla too; the model
+  // and its display transform are the real resources.
+  const quads = itemQuadsInWorld(baked, (p) => {
+    const s = 0.3
+    const cx = p[0] * s + 0.5
+    const cy = p[1] * s - 0.5
+    const cz = p[2] * s + 1.15
+    return [
+      eye.x + right[0] * cx + up[0] * cy + fwd[0] * cz,
+      eye.y + right[1] * cx + up[1] * cy + fwd[1] * cz,
+      eye.z + right[2] * cx + up[2] * cy + fwd[2] * cz
+    ]
+  })
+  return { quads, name, kind: baked.kind, center: [eye.x, eye.y, eye.z] }
+}
+
+function heldItemWorldQuads (store, name, pose, xform, unsupportedItems) {
+  const baked = store.quadsFor(name, 'thirdperson_righthand')
+  if (!baked) { unsupportedItems.add(name); return null }
+  const swing = pose?.rightArm?.[0] || 0
+  const pivot = [-5 / 16, 22 / 16, 0]
+  const hand = [
+    pivot[0],
+    pivot[1] + rotateXRad([0, -10 / 16, 0], swing)[1],
+    rotateXRad([0, -10 / 16, 0], swing)[2]
+  ]
+  const cy = Math.cos(xform.yaw)
+  const sy = Math.sin(xform.yaw)
+  const quads = itemQuadsInWorld(baked, (p) => {
+    const r = rotateXRad(p, swing)
+    const x = r[0] + hand[0]
+    const y = r[1] + hand[1]
+    const z = r[2] + hand[2]
+    return [x * cy + z * sy + xform.x, y + xform.y, -x * sy + z * cy + xform.z]
+  })
+  return { quads, kind: baked.kind }
+}
+
 async function renderCamera (bot, opts) {
   const t0 = performance.now()
   const isPano = opts.view === 'panorama'
@@ -1120,7 +1213,7 @@ async function renderCamera (bot, opts) {
   const timeMs = Number.isFinite(opts.timeMs) ? opts.timeMs : Date.now()
 
   const ctx = getNativeContext(bot, opts)
-  const { assets, store } = ctx
+  const { assets, store, items } = ctx
   const skinResolver = getSkinResolver(bot, assets, opts)
   await skinResolver.prepare()
 
@@ -1251,6 +1344,9 @@ async function renderCamera (bot, opts) {
   const unsupported = new Set()
   const skinReport = []
   const entityQuads = []
+  const seenItems = []
+  const heldItems = []
+  const unsupportedItems = new Set()
 
   for (const item of entityList(bot, eye, maxDist, opts.isHostile)) {
     const e = item.entity
@@ -1307,7 +1403,59 @@ async function renderCamera (bot, opts) {
     }
     item.skinSource = skinSource
     seenEnts.push(item)
+
+    // Vanilla equipment slot 0 is the main hand. Render it attached to the
+    // right arm for any model that actually has that bone.
+    let equipment = null
+    try { equipment = e.equipment?.[0] || e.heldItem || null } catch { equipment = null }
+    if (equipment && hasRightArmBone(model)) {
+      const heldName = items.itemNameOf(equipment)
+      if (heldName) {
+        const held = heldItemWorldQuads(items, heldName, pose, {
+          x: item.x, y: item.feetY, z: item.z, yaw: Number.isFinite(e.yaw) ? e.yaw : 0
+        }, unsupportedItems)
+        if (held) {
+          for (const q of held.quads) {
+            if (!q.tex) continue
+            q.center = center
+            entityQuads.push(q)
+          }
+          heldItems.push(`${item.name} holds ${heldName}`)
+        }
+      }
+    }
   }
+
+  // Dropped item entities use the same real item models (ground display slot).
+  for (const e of Object.values(bot.entities || {})) {
+    if (!e || e === bot.entity || !e.position || !droppedItemOf(e)) continue
+    const dropped = droppedItemWorldQuads(items, e, timeMs, eye, unsupportedItems)
+    if (!dropped) continue
+    if (dropped.dist < 0.4 || dropped.dist > maxDist) continue
+    for (const q of dropped.quads) {
+      if (!q.tex) continue
+      q.center = dropped.center
+      entityQuads.push(q)
+    }
+    seenItems.push({ name: dropped.name, kind: dropped.kind, dist: dropped.dist })
+  }
+
+  // The bot's own main-hand item (real item model, first-person display slot).
+  try {
+    const own = bot.heldItem || bot.entity?.equipment?.[0] || null
+    const ownName = own ? items.itemNameOf(own) : null
+    if (ownName) {
+      const self = selfHeldItemQuads(items, ownName, eye, fwd, right, up, unsupportedItems)
+      if (self) {
+        for (const q of self.quads) {
+          if (!q.tex) continue
+          q.center = self.center
+          entityQuads.push(q)
+        }
+        heldItems.push(`you hold ${ownName}`)
+      }
+    }
+  } catch { /* inventory not ready yet */ }
 
   // Opaque/cutout entity surfaces first (depth-writing), then translucent.
   const opaqueQuads = entityQuads.filter((q) => q.layer !== 'translucent')
@@ -1424,6 +1572,13 @@ async function renderCamera (bot, opts) {
     )
     lines.push(`creatures in frame: ${list.join('; ')}`)
   }
+  if (seenItems.length) {
+    const counts = new Map()
+    for (const it of seenItems) counts.set(it.name, (counts.get(it.name) || 0) + 1)
+    lines.push(`items in frame: ${[...counts].slice(0, 10).map(([n, c]) => `${n}${c > 1 ? ` x${c}` : ''}`).join('; ')}`)
+  }
+  if (heldItems.length) lines.push(`held items: ${heldItems.slice(0, 8).join('; ')}`)
+  if (unsupportedItems.size) lines.push(`items without item-model geometry in these resources: ${[...unsupportedItems].slice(0, 8).join(', ')}`)
   if (unsupported.size) lines.push(`entities without a client model in these resources: ${[...unsupported].slice(0, 8).join(', ')}`)
   const chunkNote = sampler.chunksLoaded > 0
     ? `${chunksInView}/${sampler.chunksLoaded} loaded chunks in view, out to ${maxDist}m`
@@ -1462,6 +1617,11 @@ async function renderCamera (bot, opts) {
     assetSources: assets.info.sources,
     texturesLoaded: assets.stats.texturesLoaded,
     skins: skinResolver.report(),
+    itemsSeen: seenItems.length,
+    itemNames: [...new Set(seenItems.map((i) => i.name))],
+    selfHeldItem: heldItems.find((h) => h.startsWith('you hold '))?.slice(9) || null,
+    heldItems,
+    unsupportedItems: [...unsupportedItems],
     unsupportedEntities: [...unsupported]
   }
 }
@@ -1684,6 +1844,7 @@ module.exports = {
   _internal: {
     skyProfile,
     createAssetProvider,
+    ItemModelStore,
     getNativeContext,
     BlockModelStore,
     buildEntityModel,

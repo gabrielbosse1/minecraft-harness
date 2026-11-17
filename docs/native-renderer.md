@@ -158,7 +158,53 @@ The summary's `skins:` line and `result.skins` list `username`,
 `profileSource` (`player_info.textures` / `profile.properties.textures`) and the
 revision hash.
 
-## 6. Object coverage
+## 6. Items
+
+Items are models, not blocks. `zincai/native/items.js` resolves the same
+`assets/minecraft/models/item/<item>.json` chain the client loads
+(`item/handheld` → `item/generated` → `builtin/generated`, or a `block/...`
+parent). Because the prismarine extraction ships only flattened item textures,
+the 1.21.4 item-model JSONs are vendored in
+`zincai/native/item-models-1.21.4.json` (1,076 models, 151 KB, generated
+from the `misode/mcmeta` `1.21.4-assets` tag). A resource-pack or official-jar
+item model is used first when present.
+
+Geometry is the client's actual rule:
+
+- `item/generated` has no JSON elements. The renderer runs the equivalent of
+  `ItemModelGenerator`: it scans the real 16×16 sprite and extrudes each opaque
+  pixel run into a one-pixel-thick cuboid (front, back, and only the exposed
+  side faces). Multi-layer sprites (potion `layer0` + `layer1`) are stacked.
+- Block items use the block's default-state model from `BlockModelStore`
+  (`stone`, `oak_planks`, `oak_stairs`, saplings, torches, ...).
+- The real `display` transforms (`ground`, `thirdperson_righthand`,
+  `firstperson_righthand`) are applied, including Y/X/Z rotation order,
+  1/16-block translations and scale.
+- Item textures use the same alpha-aware atlas as blocks (cutout, or translucent
+  when the sprite has semi-transparent pixels).
+
+What is drawn:
+
+- **Dropped item entities** (`entity.getDroppedItem()`), spinning with the
+  vanilla ground display transform and reported as `items in frame: ...`.
+- **Main-hand equipment of players and mobs** (`entity.equipment[0]` /
+  `entity.heldItem`), attached to the right arm and rotated by the arm pose.
+- **The bot's own held item**, using the real first-person display transform as
+  a camera-space overlay (`selfHeldItem` in the result). No hand/arm mesh is
+  drawn for the overlay.
+
+Coverage across the 1.21.4 registry: **1,263 of 1,384 items** draw (1,260 with
+a real item model or block model, plus compass/recovery compass/clock using
+their real north/noon frame as a reported static fallback). 40 builtin entity
+items are reported unsupported, and 81 spawn eggs have no drawable model
+because vanilla applies their colours in code, not in client resources.
+
+`itemsSeen`, `itemNames`, `selfHeldItem`, `heldItems` and `unsupportedItems`
+are additive result fields. Items without a drawable model (shield, beds,
+chests, banners, skulls, conduit, decorated pot, spyglass-in-hand) are counted
+in `unsupportedItems` and named in the summary instead of being approximated.
+
+## 7. Object coverage
 
 Rendered from real definitions: terrain and every blockstate variant present in
 the loaded version (logs, planks, leaves, grass, dirt, ores, bricks, etc.),
@@ -168,9 +214,9 @@ stained glass, water/lava, chests, and real entity models for players and the
 supported mobs (cow, pig, zombie, skeleton, creeper, chicken, spider, enderman,
 villager, etc. — anything with an entry in `entities.json` and a texture).
 
-Known gaps are listed in §8; they are reported in the summary rather than hidden.
+Known gaps are listed in §9; they are reported in the summary rather than hidden.
 
-## 7. Tests actually run
+## 8. Tests actually run
 
 ```bash
 npm install --no-audit --no-fund
@@ -179,8 +225,8 @@ node --test test/09-screenshot-vision-and-logging.test.js \
            test/11-native-renderer-real-server.test.js
 ```
 
-Result: **15/15 passing** on 2026-11-17. The whole repository suite
-(`npm test`, every `test/*.test.js` file, 8 suites) also passes: **79/79**.
+Result: **16/16 passing** on 2026-11-17. The whole repository suite
+(`npm test`, every `test/*.test.js` file, 8 suites) also passes: **80/80**.
 
 - `09a` (rewritten): real client resources discovered; palette PNG decode;
   glass alpha histogram; blockstate/model resolution for stairs, grass,
@@ -202,6 +248,10 @@ Result: **15/15 passing** on 2026-11-17. The whole repository suite
 - `10h` cow + zombie + player models rasterize into the frame and are reported.
 - `10i` animated `.mcmeta` textures advance; a real resource pack overrides a
   blockstate and texture.
+- `10j` real item models: generated diamond sword extrusion, block items
+  (`oak_planks`, `oak_stairs`, `stone`), `shield` reported as unsupported,
+  dropped item entity, zombie main-hand pickaxe, bot first-person apple, and
+  cyan sword pixels instead of a missing-texture checkerboard.
 - `11` real server: real chunks, cow/zombie, chest, glass, water, stairs, cherry
   leaves, poppy, panorama and map.
 
@@ -223,7 +273,7 @@ Performance on this machine (real server, 1.21.4 resources): look 512×288
 existing 4 s / 4 s / 1.5 s budgets. The renderer remains pure JS, no new
 dependencies.
 
-## 8. Remaining limitations (not hidden)
+## 9. Remaining limitations (not hidden)
 
 1. **Signs, beds, skulls, banners and hanging signs.** The bundled
    `prismarine-viewer` model extraction is missing the `template_sign`,
@@ -240,11 +290,16 @@ dependencies.
    pig, chicken, zombie, skeleton, creeper, spider, enderman, villager and
    player models were checked. This is a resource/version mismatch, not a
    colour tweak.
-3. **Held items, armour, equipment, item frames, particles.** Item models and
-   the item-in-hand layer are not rendered yet; `bot.heldItem` / entity
-   `equipment` data is available but unused. Mineflayer emits particles as
-   events and the harness does not keep a particle ring buffer, so world
-   particles are not drawn. Entity animation is likewise limited to the idle
+3. **Item gaps.** Dropped items, main-hand equipment and the bot's own held
+   item render; armour, off-hand items, item frames (block-entity inventory is
+   not exposed by prismarine-chunk), chest/shulker contents, enchantment glint,
+   durability bars, stack counts and `custom_model_data`/`overrides` predicates
+   are not drawn. Builtin entity items (shield, bed, chest, banner, skull,
+   conduit, decorated pot) are reported as unsupported rather than faked, as
+   are the 81 spawn eggs whose tints only exist in vanilla code. Compasses and
+   clocks use a real static frame and are labelled `static-frame:<frame>`.
+   Mineflayer emits particles as events and the harness does not keep a particle
+   ring buffer, so world particles are not drawn. Entity animation is likewise limited to the idle
    humanoid arm poses (zombie/skeleton arms forward), leg/arm walk swing, head
    pitch and yaw; there is no vanilla animation-state machine (eating, attacking,
    sleeping, riding, baby scaling).

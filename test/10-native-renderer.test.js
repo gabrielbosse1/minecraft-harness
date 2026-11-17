@@ -16,6 +16,7 @@ const vision = require('../zincai/vision')
 const { decodePng } = require('../zincai/native/png')
 const { upgradeLegacySkin } = require('../zincai/native/skins')
 const { createFakeWorld } = require('./helpers/fake-world')
+const Item = require('prismarine-item')('1.21.4')
 
 const PNG_SIG = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])
 
@@ -354,4 +355,72 @@ test('10i: animated client textures advance frames and resource packs override r
   const store = new BlockModelStore({ version: '1.21.4', registry: mc }, packed)
   const stone = store.modelForState(mc.blocksByName.stone.defaultState, 0, 0, 0)
   assert.ok(stone.texturesUsed.some((t) => t.name === 'oak_planks'), 'pack blockstate must redirect the stone model')
+})
+
+test('10j: real item models — generated sprites, block items, dropped entities and held equipment', { timeout: 30_000 }, async () => {
+  const world = createFakeWorld({ minX: 0, maxX: 20, minZ: 0, maxZ: 24, groundY: 64 })
+  const bot = world.makeBot({ x: 10.5, y: 65, z: 16.5 })
+  const ctx = vision._internal.getNativeContext(bot, {})
+
+  // Generated item: the real models/item/diamond_sword.json chain
+  // (item/handheld → item/generated) and the real 16x16 sprite, extruded by
+  // the client's ItemModelGenerator rule.
+  const sword = ctx.items.bake('diamond_sword')
+  assert.ok(sword, 'diamond_sword model')
+  assert.equal(sword.kind, 'generated')
+  assert.ok(sword.quads.length > 20, `extruded quads: ${sword.quads.length}`)
+  assert.match(sword.textures[0].name, /item\/diamond_sword/)
+  assert.ok(sword.display.thirdperson_righthand, 'real display transform')
+
+  // Block item without an item model falls back to the block's default state.
+  const planks = ctx.items.bake('oak_planks')
+  assert.ok(planks)
+  assert.equal(planks.kind, 'block')
+  assert.equal(planks.quads.length, 6)
+  assert.ok(ctx.items.bake('oak_stairs').quads.length >= 6)
+  assert.ok(ctx.items.bake('stone').quads.length >= 6)
+
+  // Compass/clock are property-selected models with no base JSON; their real
+  // north/noon frame is used and labelled.
+  const compass = ctx.items.bake('compass')
+  assert.equal(compass.fallbackFrame, 'compass_16')
+  assert.match(compass.source, /static-frame:compass_16/)
+
+  // Builtin entity items have no JSON geometry; they must be reported.
+  assert.equal(ctx.items.bake('shield'), null)
+  assert.ok(ctx.items.stats.unsupported.has('shield'))
+
+  // Dropped item entity (ground display) and held equipment on a zombie.
+  const held = new Item(bot.registry.itemsByName.iron_pickaxe.id, 1)
+  bot.entities = {
+    201: { id: 201, type: 'animal', name: 'item', position: new Vec3(10.5, 65, 12.5), getDroppedItem: () => new Item(bot.registry.itemsByName.diamond_sword.id, 1), height: 0.25, width: 0.25 },
+    202: { id: 202, type: 'hostile', name: 'zombie', position: new Vec3(8.5, 65, 12.5), yaw: Math.PI / 2, height: 1.95, width: 0.6, equipment: [held] }
+  }
+  bot.heldItem = new Item(bot.registry.itemsByName.golden_apple.id, 1)
+
+  const look = await vision.screenshot(bot, { view: 'look', direction: 'north', width: 640, height: 420, maxDist: 32, timeMs: 0 })
+  const img = pngOf(look, 'items')
+  assert.equal(look.itemsSeen, 1)
+  assert.deepEqual(look.itemNames, ['diamond_sword'])
+  assert.equal(look.selfHeldItem, 'golden_apple')
+  assert.ok(look.heldItems.some((h) => /zombie holds iron_pickaxe/.test(h)))
+  assert.ok(look.heldItems.some((h) => /you hold golden_apple/.test(h)))
+  assert.match(look.summary, /items in frame: diamond_sword/)
+  assert.doesNotMatch(look.summary, /entities without a client model.*item/)
+  assert.deepEqual(look.unsupportedItems, [])
+
+  // The dropped sword sprite is visibly cyan in the region where it projects
+  // (centre-bottom, 4 m ahead), not a missing-texture magenta checkerboard.
+  let cyan = 0
+  let magenta = 0
+  for (let y = 230; y < 330; y++) {
+    for (let x = 280; x < 365; x++) {
+      const i = (y * img.width + x) * 4
+      const r = img.rgba[i]; const g = img.rgba[i + 1]; const b = img.rgba[i + 2]
+      if (g > 130 && b > 130 && r < 130) cyan++
+      if (r > 180 && b > 180 && g < 100) magenta++
+    }
+  }
+  assert.ok(cyan > 20, `diamond-sword pixels: ${cyan}`)
+  assert.ok(magenta < 20, `missing-texture pixels: ${magenta}`)
 })

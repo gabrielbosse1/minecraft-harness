@@ -229,7 +229,10 @@ function trimIncompleteSentence (text) {
  * Determine whether a line carries high-value memory, goal, threat, or
  * immediate trigger context that compaction MUST preserve longest.
  */
-const PRESERVE_LINE_RE = /^(?:recalled|remembered|known|prefs|about\s+\S+|goals?|plan|continue|progress|THREAT|threats|danger|you|inventory|doing|why now|asked|proposals?|pending|direct|room|player|\[?\d{2}:\d{2}\]?.*(?:whispered|said))/i
+// `your move` is the turn's actual question: under pressure it is the LAST line
+// that may be dropped. A compacted prompt that keeps the state but loses the
+// question is how a session ends up re-reading instead of deciding.
+const PRESERVE_LINE_RE = /^(?:your move|recalled|remembered|known|prefs|about\s+\S+|goals?|plan|continue|progress|BLOCKED|THREAT|threats|danger|you|inventory|doing|why now|asked|proposals?|pending|direct|room|player|\[?\d{2}:\d{2}\]?.*(?:whispered|said))/i
 
 /**
  * Generic message-level compactor for callers that do not supply a domain

@@ -40,8 +40,11 @@ The LLM layer (`brain.js`, `api_wrapper.js`, `lanes.js`, `src/amdClient.js`) spl
 
 ### Action Lane
 - Uses `system_prompt.txt` plus the live world snapshot (`perception.js`, `observe.js`, block-derived `environment.js`), IRC timeline, threat summary (`tactics.js`), open goals (`goals.js`), active plan digest (`journal.js`), and one budgeted memory block (dossiers of the players present, curated recall for the goal/position/request, and a short `past attempts (raw log)` warning). House/site preflight lives in `build_site.js`; failed repeated calls are tracked by `failgate.js`.
-- Exposes all **41 function tools** identically on every call (`ACTION_TOOLS` in `api_wrapper.js`) so prompt prefix caching stays warm.
+- **Ends every turn with a `your move:` frame** (`nextmove.js`): what just happened or what is blocked, then 2–4 concrete moves that are available *now*, each with the reason it is available. It is derived only from live state (inventory, position, nearby index, plan, failures) and never invents an option. This is what makes each turn a question rather than a snapshot — see `docs/INCIDENT-2026-11-17-inventory-loop.md` for the session that motivated it. Disable with `DECISION_FRAME=0` (or `decisionFrame: false`).
+- **Plan steps can end.** `journal.js` counts attempts per step, and after two failures of the tool that advances a step it renders as `⊘ blocked` with the reason instead of `→ do this now`; `goal {operation:"replan", drop:[n], next:"…"}` retires a dead step in one call and keeps the reason. A `next` note is invalidated when the plan is known to be broken, so a stale note cannot outlive the world that made it.
+- Exposes all **44 function tools** identically on every call (`ACTION_TOOLS` in `api_wrapper.js`) so prompt prefix caching stays warm.
 - Executes multi-step tool loops (`think → tool calls → tool outputs → think`) up to `inference.maxStepsPerTurn` (default 6).
+- A successful **read-only** result only buys its own model call when it is news: if the same subject has been read twice already and the answer is unchanged, the result stays in `results` but does not wake the model. Reads that changed always wake it.
 - Extracts and records `reasoning` (`reasoning_content` / `reasoning` / `<think>`) alongside tool calls and token usage in session telemetry.
 - Uses a `situationVersion` counter so stale decisions formed before a sudden reflex interrupt (damage, flee start, death) are discarded instead of executing outdated actions.
 

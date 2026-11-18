@@ -43,7 +43,7 @@
 ### Model, Prompts & Lanes
 | Module | Responsibility |
 | --- | --- |
-| `api_wrapper.js` | OpenAI-compatible tool definitions (41 tools), request/response normalization, reasoning extraction |
+| `api_wrapper.js` | OpenAI-compatible tool definitions (44 tools), request/response normalization, reasoning extraction |
 | `brain.js` | Action-lane agent loop, wake scheduling, `situationVersion` staleness checks, tool-result feedback |
 | `lanes.js` | Two-lane scheduler (`chat` + `action`) sharing one RPM budget with reserved chat capacity |
 | `irc.js` | Unified chronological IRC-style timeline of chat, whispers, and world events |
@@ -92,7 +92,7 @@
 
 ## Tool Surface (39 Tools)
 
-All 41 tools are always registered on every action turn:
+All 44 tools are always registered on every action turn:
 
 - **Movement & Navigation:** `go_to`, `follow`, `stop`, `dig`, `corpse_run`
 - **Gathering, Crafting & Storage:** `gather`, `craft`, `smelt`, `look_in`, `take`, `put`, `give`

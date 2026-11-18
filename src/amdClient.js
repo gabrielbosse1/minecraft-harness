@@ -43,6 +43,31 @@ function redactSecrets (s, literalKey) {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const backoffMs = (attempt) => Math.min(8_000, 500 * 2 ** attempt) + Math.floor(Math.random() * 250)
 
+// Statuses that indicate a transient server/rate-limit fault and MAY be retried.
+// 501 Not Implemented (e.g. unsupported model or endpoint feature) is NOT here:
+// it is permanent for this endpoint, not a transient fault.
+const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504])
+const MAX_RETRY_AFTER_MS = 60_000
+
+/**
+ * Parse an HTTP `Retry-After` header into a wait duration in ms.
+ * Accepts a delay in seconds or an HTTP-date. Returns null when absent or
+ * unparseable. The result is clamped to [1s, 60s] so a misbehaving endpoint
+ * cannot stall the client forever or turn a 429 into a near-instant retry.
+ */
+function parseRetryAfter (headerValue) {
+  if (!headerValue) return null
+  const raw = String(headerValue).trim()
+  if (!raw) return null
+  const secs = Number(raw)
+  if (Number.isFinite(secs) && secs >= 0) return Math.min(MAX_RETRY_AFTER_MS, Math.max(1_000, Math.round(secs * 1000)))
+  const at = Date.parse(raw)
+  if (Number.isFinite(at)) return Math.min(MAX_RETRY_AFTER_MS, Math.max(1_000, at - Date.now()))
+  return null
+}
+
+/** Redact anything that looks like our API key material before logging. */
+
 /** Pure: build the request body. Exported for tests. */
 function buildChatPayload ({ model, messages, temperature, maxTokens }) {
   return {
@@ -100,6 +125,8 @@ class AmdClient {
       requests: 0,
       failures: 0,
       retries: 0,
+      timeouts: 0,
+      rateWaits: 0,
       promptTokens: 0,
       completionTokens: 0,
       cachedTokens: 0,
@@ -145,25 +172,43 @@ class AmdClient {
 
     let attempt = 0
     let lastError = null
+    let lastRetryAfterMs = null // Retry-After owed from the previous attempt's 429/503
     while (attempt <= this.maxRetries) {
       if (attempt > 0) {
         this.stats.retries += 1
-        await sleep(backoffMs(attempt - 1))
+        // Exactly one wait between attempts: honor the server's Retry-After when
+        // it gave one (rate limits must not turn into request storms), otherwise
+        // exponential backoff with jitter. The original request payload is
+        // rebuilt identically on every attempt — conversation context and model
+        // configuration are preserved across retries.
+        await sleep(lastRetryAfterMs ?? backoffMs(attempt - 1))
+        lastRetryAfterMs = null
       }
       attempt += 1
       this.stats.requests += 1
       try {
         const res = await this._fetchWithTimeout(url, { method: 'POST', headers, body: JSON.stringify(payload) }, this.timeoutMs)
 
-        // Retryable: rate limiting and server-side faults.
-        if (res.status === 429 || res.status >= 500) {
+        // Retryable: rate limiting and transient server faults (500/502/503/504).
+        // A successful status is never retried: the model already answered, so
+        // repeating could execute the same tool call twice.
+        if (RETRYABLE_STATUS.has(res.status)) {
           const snippet = redactSecrets((await res.text().catch(() => '')).slice(0, 200), this._apiKey)
           lastError = new Error(`HTTP ${res.status}: ${snippet}`)
-          logger.warn(TAG, `retryable HTTP ${res.status} (attempt ${attempt}/${this.maxRetries + 1})`)
+          const retryAfterMs = parseRetryAfter(res.headers?.get?.('retry-after'))
+          if (retryAfterMs) {
+            this.stats.rateWaits += 1
+            lastRetryAfterMs = retryAfterMs
+            logger.warn(TAG, `retryable HTTP ${res.status} (Retry-After ${Math.round(retryAfterMs / 1000)}s) (attempt ${attempt}/${this.maxRetries + 1})`)
+          } else {
+            logger.warn(TAG, `retryable HTTP ${res.status} (attempt ${attempt}/${this.maxRetries + 1})`)
+          }
           continue
         }
 
-        // Non-retryable client error: surface it immediately.
+        // Non-retryable: 4xx (invalid key, malformed request, unsupported
+        // model) and any 5xx outside the retryable set (e.g. 501). Fail
+        // immediately and loudly — retrying cannot fix these.
         if (!res.ok) {
           const snippet = redactSecrets((await res.text().catch(() => '')).slice(0, 300), this._apiKey)
           this.stats.failures += 1
@@ -194,6 +239,7 @@ class AmdClient {
         if (isAbort || isNetwork) {
           lastError = new Error(redactSecrets(err.message || String(err), this._apiKey))
           if (err?.zincaiTimedOut) {
+            this.stats.timeouts += 1
             // Say which deadline rang and for how long, so a retry burst reads as one event.
             logger.warn(TAG, `retryable timeout: no response within ${Math.round(this.timeoutMs / 1000)}s (attempt ${attempt}/${this.maxRetries + 1})`)
           } else {
@@ -206,7 +252,10 @@ class AmdClient {
     }
 
     this.stats.failures += 1
-    throw lastError || new Error('AMD request failed after retries')
+    const message = lastError
+      ? `AMD request failed after ${attempt} attempt(s); last error: ${lastError.message}`
+      : `AMD request failed after ${attempt} attempt(s)`
+    throw new Error(message)
   }
 
   /** Rolling telemetry for the cache-hit report. */

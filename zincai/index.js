@@ -128,6 +128,10 @@ function loadConfig () {
       auth,
       version: version || false
     },
+    events: {
+      batchWindowMs: settings.int(['EVENT_BATCH_WINDOW_MS', 'events.batchWindowMs'], raw.events?.batchWindowMs ?? 3_000, { min: 0, max: 300_000 }),
+      maxBatchEvents: settings.int(['EVENT_MAX_BATCH_EVENTS', 'events.maxBatchEvents'], raw.events?.maxBatchEvents ?? 64, { min: 1, max: 1_000 })
+    },
     amd: {
       apiKey: settings.apiKey() || raw.amd.apiKey || null,
       baseUrl: settings.str(['AMD_API_BASE_URL', 'amd.baseUrl'], raw.amd.baseUrl).replace(/\/+$/, ''),
@@ -275,7 +279,11 @@ function makeShared (cfg, { dataDir = DATA_DIR } = {}) {
       }
     }),
     parser: new BlueprintParser({ scaffoldBlocks: cfg.build.scaffoldBlocks, reach: cfg.build.reach }),
-    events: new (require('./events').EventPipeline)({ file: at(cfg.events?.journalFile, 'events-journal.json') }),
+    events: new (require('./events').EventPipeline)({
+      file: at(cfg.events?.journalFile, 'events-journal.json'),
+      batchWindowMs: cfg.events.batchWindowMs,
+      maxBatchEvents: cfg.events.maxBatchEvents
+    }),
     redstoneLibrary: new (require('./redstone_engine').RedstoneLibrary)(at(cfg.redstone?.libraryFile, 'redstone-library.json')),
     convo: new Map(),
     chatLog: [],
@@ -2485,12 +2493,33 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     // with the chat they happened between.)
     // Timestamped perception window: what happened, when (occurrence vs
     // observation), where, to whom, and whether it was seen or only inferred.
+    const nowMs = Date.now()
     const perceivedMax = level >= 3 ? 0 : level === 2 ? 2 : level === 1 ? 4 : 8
-    const perceived = perceivedMax > 0
-      ? pipeline.formatForPrompt({ max: perceivedMax, excludeTypes: OWN_SECTION })
-      : { text: '', shownSequences: [] }
-    if (markDelivered && level === 0 && perceived.shownSequences.length) {
-      try { pipeline.markProcessed(perceived.shownSequences, { via: 'model' }) } catch { /* noop */ }
+    // 1. CRITICAL EVENTS FIRST — bypass the batch window and are delivered
+    //    immediately (death, critical health, being attacked, imminent threat).
+    //    They are never mixed into the chronological batch below.
+    const critical = pipeline.drainCritical({ nowMs })
+    const criticalText = critical.events.length
+      ? critical.events.map((e) => pipeline.formatCriticalEventLine(e, nowMs)).join('\n')
+      : null
+    const criticalSequences = critical.events.map((e) => e.sequence)
+
+    // 2. EVENT BATCH — everything else accumulated since the last model
+    //    decision, delivered together as one chronological history (not a
+    //    single event happening now). Repeated low-priority events are
+    //    coalesced with a count + first/last timestamps.
+    let batchText = ''
+    const batchSequences = []
+    if (perceivedMax > 0) {
+      const batch = pipeline.formatBatch({ maxEvents: perceivedMax, excludeTypes: OWN_SECTION, nowMs })
+      if (batch.events.length) {
+        batchText = pipeline.formatBatchForPrompt({ batch, nowMs }).text
+        batchSequences.push(...batch.events.map((e) => e.sequence))
+      }
+    }
+    const shownSequences = [...criticalSequences, ...batchSequences]
+    if (markDelivered && level === 0 && shownSequences.length) {
+      try { pipeline.markProcessed(shownSequences, { via: 'model' }) } catch { /* noop */ }
     }
     const ephItems = level === 0
       ? (memory.ephemeral?.snapshot?.() || [])
@@ -2548,7 +2577,8 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       recalled || null,
       chat ? `${logHeader('log')}:\n${chat}` : null,
       res ? `results (your last actions):\n${res}` : null,
-      perceived.text ? `perceived (timestamped; [NEW] = not yet delivered, "(scanned_diff)" = you discovered it late, exact time unknown):\n${perceived.text}` : null,
+      criticalText ? `critical (delivered immediately, bypassing the batch):\n${criticalText}` : null,
+      batchText ? `${batchText}` : null,
       level < 3 ? (failGate.advisoryLine(pos) || null) : null,
       level < 4 ? boundaryLine() : null,
       justNow,

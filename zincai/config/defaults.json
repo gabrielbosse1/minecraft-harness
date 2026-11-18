@@ -25,6 +25,10 @@
     "actionReasoningEffort": "low",
     "chatReasoningEffort": "low"
   },
+  "events": {
+    "batchWindowMs": 3000,
+    "maxBatchEvents": 64
+  },
   "inference": {
     "minIntervalMs": 1500,
     "urgentMinIntervalMs": 300,

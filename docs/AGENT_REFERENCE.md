@@ -164,7 +164,7 @@ CLI: node zincai/index.js [--dry-run | --check]
 | `connection.js` | `ConnectionManager` — exponential backoff reconnect state machine |
 | `host.js` | `Host` — process-lifetime owner & stdin console bridge |
 | `protocol_keepalive.js` | Exact keep-alive echo + silent server timeout |
-| `failgate.js`, `events.js`, `observe.js`, `filter.js`, `reflex_registry.js`, `supervisor.js`, `updater.js`, `watchdog.js` | Supporting runtime services |
+| `failgate.js`, `events.js`, `observe.js`, `filter.js`, `reflex_registry.js`, `supervisor.js`, `updater.js`, `watchdog.js` | Supporting runtime services; `events.js` now also does event batching/aggregation (§10) |
 | `custom_mineflayer/pathfinder_wrapper.js` | Threat-aware pathfinder wrapper (40-tick threat penalty grid, action-derived posture) |
 | `custom_mineflayer/escape.js` | Node-bounded BFS escape planner (`open`/`pocket`/`chased`/`surrounded`/`trapped`) |
 | `custom_mineflayer/doors.js` | Door/gate/trapdoor walkability & opening |
@@ -371,27 +371,61 @@ npm run pufferpanel:validate
 
 ---
 
-## 9. Inference Timeouts & Retries (`zincai/api_wrapper.js`)
+## 9. Inference Timeouts & Retries (`zincai/api_wrapper.js`, `src/amdClient.js`)
 
 The endpoint is the slowest moving part of the process, and "retryable timeout"
-lines in the log are the symptom operators ask about most. The policy:
+lines in the log are the symptom operators ask about most. The retry policy is
+shared by `AmdToolsClient` (the lane client used by the bot) and `AmdClient`
+(`src/amdClient.js`, used by the canary and any direct callers):
 
 | Rule | Why |
 | --- | --- |
-| A **caller cancellation** (a chat line preempting an action thought, session ending) is an `AbortError` with `code: ZINCAI_ABORTED` — never retried, never logged as a timeout. | The old code could not tell the two abort sources apart, so a preempted turn re-sent the same request 3× and printed 3 "retryable timeout" lines for nothing. |
-| Backoff between retries is cancellable. | A cancelled turn must die immediately, not after its remaining retries have been slept through. |
-| A **real expired deadline** is counted (`stats.timeouts`), logged with the deadline and the next attempt's room, and *remembered* (`_noteTimeout`). | The next call of that lane then starts with a budget that already fits, instead of timing out on the same too-short number again. |
-| Deadlines are **per lane** (action / chat) and **adaptive both ways**: they rise at once to `p90 × 1.5` of that lane's samples and decay 10 % per successful call back to the configured base. | Mixing the two lanes made chat inherit the action lane's slow p90; a factor that only grew left a recovered endpoint stuck on a 3-minute deadline. |
-| The retry of a timed-out attempt gets `× 1.5` more room, up to the lane ceiling. | Waiting out a genuinely slow reasoning call beats burning all attempts on the same wall. |
+| **What is retried**: transient network failures, client timeouts, HTTP `429`, and transient server faults `500`/`502`/`503`/`504`. | These are transient; a repeat attempt with fresh backoff commonly succeeds. |
+| **What is never retried**: caller cancellation (`ZINCAI_ABORTED`), `4xx` (invalid API key `401`/`403`, malformed request `400`, unsupported model `404`/`422`), and `501 Not Implemented`. | These are permanent for this endpoint — repeating cannot fix them, and retrying an invalid key or bad request just hammers the endpoint. |
+| **A successful response is never retried.** | The model already answered; repeating a completed call could execute the same tool call twice. |
+| **`Retry-After` is honored.** On `429`/`503` the client waits the server's requested delay (capped to 60 s, never below 1 s) before retrying, so rate limits do not turn into request storms. Without the header, exponential backoff with jitter is used (`500 ms × 2ⁿ`, capped 8 s, + up to 250 ms jitter). | The server knows best how long to wait; a fixed short retry after `429` is a request storm. |
+| **Sensible limits**: `maxRetries` attempts total (default 2, configurable 0–5 via `AMD_API_MAX_RETRIES` / `AMD_CHAT_MAX_RETRIES`); on exhaustion a clear error reports the attempt count and the last error. | Bounds worst-case latency and avoids infinite loops. |
+| Backoff between retries is cancellable (lane client). | A cancelled turn dies immediately, not after its remaining retries have been slept through. |
+| A **real expired deadline** is counted (`stats.timeouts`), logged with the deadline and the next attempt's room, and *remembered* (`_noteTimeout`, lane client). | The next call of that lane starts with a budget that already fits. |
+| Deadlines are **per lane** (action / chat) and **adaptive both ways**: `p90 × 1.5` rise, 10 % decay per success back to base. | Mixing lanes made chat inherit the action lane's slow p90. |
+| The retry of a timed-out attempt gets `× 1.5` more room, up to the lane ceiling. | Waiting out a slow reasoning call beats burning all attempts on the same wall. |
+| The original request payload is rebuilt identically on every attempt; conversation context and model configuration are preserved across retries. | A retry must not silently change what the model sees. |
 
 Config (env / `defaults.json` `amd.*`): `AMD_API_TIMEOUT_MS` (base, 120 s),
 `AMD_MAX_TIMEOUT_MS` (action ceiling, 180 s), `AMD_CHAT_TIMEOUT_MS` (base, 90 s),
 `AMD_CHAT_MAX_TIMEOUT_MS` (chat ceiling, 120 s), `AMD_API_MAX_RETRIES` (2),
-`AMD_CHAT_MAX_RETRIES` (1). `getStats()` publishes `timeouts`, `aborted`, and
-`effectiveTimeouts: { action, chat }` so a burst is readable at a glance.
+`AMD_CHAT_MAX_RETRIES` (1). `getStats()` publishes `requests`, `failures`,
+`retries`, `timeouts`, `rateWaits`, and `effectiveTimeouts: { action, chat }` so
+a burst is readable at a glance.
 
-Regression tests: `08e` (cancellation is not retried / not a timeout) and `08f`
-(a real timeout is remembered and stays inside its own lane).
+Regression tests: `08e` (cancellation is not retried / not a timeout), `08f`
+(a real timeout is remembered and stays inside its own lane),
+`amd-retry` (timeouts, `429` + `Retry-After`, `5xx`, permanent errors, SSE
+interruption, caller abort, no duplicate tool calls) and
+`events-batching` (event batching/aggregation).
+
+### `events.js` — Event Batching & Aggregation
+
+`EventPipeline` is the single funnel for world/internal events (`perceive()` in
+`zincai/index.js` records every event). Between two model decisions events
+accumulate and are delivered **together** as one chronological `event_batch`
+instead of separate notifications:
+
+| Rule | How |
+| --- | --- |
+| **Collection window** | Events accumulate until the next model decision; `batchWindowMs` (default 3 s, `EVENT_BATCH_WINDOW_MS`) bounds how long they may wait. A batch is delivered once per decision, capped at `maxBatchEvents` (default 64, `EVENT_MAX_BATCH_EVENTS`); leftovers form the next consecutive batch (`moreRemaining`), so nothing is dropped. |
+| **One structured batch** | `{ type: 'event_batch', event_count, first_event_at, last_event_at, windowMs, events: [...] }`. Each entry keeps its UTC `timestamp`, `elapsedMs`/`ageSec`, `severity`, `description`, `where`, `entities`, `cause`, plus `count`/`first_event_at`/`last_event_at` when repeated events are coalesced. |
+| **Chronological history** | The prompt block reads "recent events (chronological batch: N over Xs, oldest Ys ago)" — a history of what happened, not a single event happening now. |
+| **No duplicates** | Delivered batches are marked processed (`markProcessed`, via `model`); already-delivered events never re-enter a batch. |
+| **Coalescing** | Repeated identical low-priority events (same type + summary + place) merge into one entry with a count and first/last timestamps. Distinct events are never merged. |
+| **Telemetry keeps everything** | The full history stays in `events.jsonl`; only relevant recent events go to the model. |
+
+**Priority lanes** (built on the existing `reactionClass`/`importance`):
+
+- **Critical** (`immediate` / importance ≥ 3: death, respawn, attacked, critical health, imminent threat) — `drainCritical()` returns them immediately, bypassing the batch window; they are rendered out of band ahead of the batch and marked delivered at once.
+- **Important** (`fast` / importance 2: objective interrupted/paused/failed, approaching hostile mobs, player interactions, resource changes, tool breakage) — included in the next batch, prioritized when the batch cap binds.
+- **Low** (ambient item pickups/drops, routine environmental updates) — aggregated/coalesced into the batch.
+
 
 ### Vision navigation snapshots and live viewer
 

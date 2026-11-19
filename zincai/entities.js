@@ -408,6 +408,15 @@ class ProfileStore {
       entry.sections.description = [{ at: ts, text: `${display || 'subject'} first encountered ${nowIso(ts)}.`, source: 'observation', ref: null }]
     }
     entry.lastSeenAt = ts
+    if (u && display && entry.kind === 'player') {
+      entry.aliasPeriods ||= []
+      const last = entry.aliasPeriods.at(-1)
+      if ((!last || fold(last.name) !== fold(display)) && (!last || ts >= last.observedFrom)) {
+        if (last) last.replacedByObservationAt = ts
+        entry.aliasPeriods.push({ name: display, observedFrom: ts, replacedByObservationAt: null })
+        dirty = true
+      }
+    }
     if (entry.kind === 'player' && display && fold(entry.displayName) !== fold(display)) {
       // A rename is identity evidence worth keeping: record the previous name.
       if (!entry.aliasesStale.includes(entry.displayName)) entry.aliasesStale = [...new Set([...(entry.aliasesStale || []), entry.displayName])].slice(-20)

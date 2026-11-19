@@ -147,7 +147,8 @@ class WorkJournal {
       fs.renameSync(tmp, this.file)
       this._dirty = false
       this._savedAt = this.now()
-    } catch (err) { this.log('debug', `journal save: ${err.message || err}`) }
+      return true
+    } catch (err) { this.log('debug', `journal save: ${err.message || err}`); return false }
   }
 
   _touch () { this._dirty = true; this.save() }
@@ -163,7 +164,7 @@ class WorkJournal {
    * One finished tool call.
    * @param {{ tool: string, args?: object, ok: boolean, msg?: string, goalId?: string|null, pos?: {x:number,y:number,z:number}|null }} step
    */
-  record ({ tool, args = {}, ok, msg = '', goalId = null, pos = null }) {
+  record ({ tool, args = {}, ok, msg = '', goalId = null, pos = null, evidence = null }) {
     if (!tool || tool === 'idle' || tool === 'reply') return null
     const sig = signature(tool, args)
     const text = phrase(tool, args)
@@ -186,8 +187,10 @@ class WorkJournal {
       last.msg = next
       last.t = this.now()
       if (where) last.pos = where
+      if (evidence) last.evidence = evidence
+      if (pos?.dim) last.dimension = pos.dim
     } else {
-      this.recent.push({ t: this.now(), tool, sig, text, ok: Boolean(ok), msg: clean(msg, 200), n: 1, goal: goalId || null, pos: where })
+      this.recent.push({ t: this.now(), tool, sig, text, ok: Boolean(ok), msg: clean(msg, 200), n: 1, goal: goalId || null, pos: where, dimension: pos?.dim || null, evidence })
     }
     if (this.recent.length > this.keepRecent + 4) this.compact()
     this._touch()
@@ -216,12 +219,24 @@ class WorkJournal {
       if (e.tool === 'DIED') continue // already counted in deaths
       const b = this._bucket(e.goal)
       b.steps += e.n || 1
-      if (QUIET.has(e.tool)) continue
+      if (QUIET.has(e.tool)) {
+        // Quiet observations are evidence, not progress. Keep a small recent
+        // locator list; older evidence remains in independently searchable history.
+        if (e.evidence) {
+          b.observations ||= []
+          b.observations.push({ tool: e.tool, t: e.t, pos: e.pos, dimension: e.dimension, ref: e.evidence })
+          if (b.observations.length > this.maxDigest) b.observations.shift()
+        }
+        continue
+      }
       const side = e.ok ? b.done : b.failed
       const cur = side[e.sig] || { text: e.text, n: 0 }
       cur.n += e.n || 1
       cur.t = e.t
       cur.text = e.text
+      if (e.evidence) cur.ref = e.evidence
+      if (e.pos) cur.pos = e.pos
+      if (e.dimension) cur.dimension = e.dimension
       if (e.ok) cur.last = clean(e.msg, 90); else cur.why = clean(e.msg, 110)
       side[e.sig] = cur
       // A thing that now works is no longer "what keeps failing".
@@ -482,6 +497,7 @@ class WorkJournal {
       const failed = Object.values(b.failed).sort((x, y) => (y.t || 0) - (x.t || 0)).slice(0, this.maxDigest)
       if (done.length) lines.push(`  done earlier${goal ? '' : ' (no goal set)'}: ${done.map((d) => `${d.text}${d.n > 1 ? ` ×${d.n}` : ''}${d.last ? ` → ${d.last}` : ''}`).join('; ')}`)
       if (failed.length) lines.push(`  still failing: ${failed.map((f) => `${f.text}${f.n > 1 ? ` ×${f.n}` : ''} — ${f.why || 'failed'}`).join('; ')}`)
+      if (b.observations?.length) lines.push(`  recent inspection evidence: ${b.observations.slice(-3).map((x) => `${x.tool} ${x.ref}`).join('; ')}`)
       if (b.deaths.length) {
         const d = b.deaths.slice(-3)
         lines.push(`  deaths on this ${goal ? 'goal' : 'stretch'}: ${b.deaths.length} (${d.map((x) => `${x.where}${x.cause ? ` ${x.cause}` : ''}, ${this._age(x.t)} ago`).join('; ')}) — what killed you before will kill you again: change the approach, not just the place`)

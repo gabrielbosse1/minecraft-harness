@@ -651,6 +651,7 @@ class Skills {
     if (!near.ok) return { err: `could not reach ${entry.id}: ${near.why}` }
     const block = this._blockAt(entry)
     if (!block) return { err: `${entry.id} is not loaded` }
+    if (block.name !== entry.block || this.places.blocks.get(this.places._key(entry))?.objectId !== entry.objectId) return { err: `${entry.id} changed; scan again before accessing it` }
     try {
       const win = entry.kind === 'furnace' ? await this.bot.openFurnace(block) : await this.bot.openContainer(block)
       return { win }
@@ -823,7 +824,10 @@ class Skills {
       const near = await this._approachBlock(token, entry)
       if (!near.ok) return fail(`could not reach ${entry.id}: ${near.why}`)
       try {
-        await bot.sleep(this._blockAt(entry))
+        const block = this._blockAt(entry)
+        if (!block || block.name !== entry.block || this.places.blocks.get(this.places._key(entry))?.objectId !== entry.objectId) return fail('bed changed; scan again')
+        await bot.sleep(block)
+        this.places.noteBedUse(entry)
         return ok(`sleeping in ${entry.id}`)
       } catch (err) {
         return fail(`cannot sleep: ${String(err?.message || err).slice(0, 80)}`)

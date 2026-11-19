@@ -60,6 +60,7 @@
     "episodicTtlMs": 2592000000,
     "maxEntries": 500,
     "recallBudgetChars": 820,
+    "checkpointExchanges": 5,
     "history": {
       "dir": "data/history",
       "retainDays": 0

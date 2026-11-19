@@ -263,12 +263,14 @@ class Brain {
    * The batch is not a filter: nothing is dropped, nothing is scored for
    * relevance, and the model decides what (if anything) concerns it.
    */
-  hear (sender, text, { whisper = false } = {}) {
+  hear (sender, text, { whisper = false, eventId = null, at = this.now() } = {}) {
+    if (eventId && this.chatQueue.some((line) => line.eventId === eventId)) return
     this.chatQueue.push({
       sender,
       text: String(text).slice(0, 240),
       whisper: Boolean(whisper),
-      at: this.now(),
+      at,
+      eventId,
       mono: performance.now()
     })
     if (this.chatQueue.length > 64) this.chatQueue.splice(0, this.chatQueue.length - 64)

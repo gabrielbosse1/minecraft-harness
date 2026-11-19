@@ -174,7 +174,7 @@ const ACTION_TOOLS = [
     home: { type: 'boolean', description: 'True ONLY if this is your verified home (built by you or explicitly assigned to you).' }
   }, ['name']),
   tool('memory', 'Memory: `recall`/`search` (curated memories), `read` one record with its evidence, `remember`/`update` (short facts; pass entity+section or entity+doc to grow that subject\'s long dossier), `archive`/`delete`/`restore` (raw history is never affected), `merge` duplicates, `duplicates`, `link` a history reference, `profile`/`profiles` (long-form dossiers), `history` (search the raw log), `organize` (idle-time maintenance).', {
-    operation: { type: 'string', enum: ['recall', 'search', 'read', 'remember', 'update', 'archive', 'delete', 'restore', 'merge', 'duplicates', 'link', 'profile', 'profiles', 'history', 'organize'] },
+    operation: { type: 'string', enum: ['recall', 'search', 'read', 'remember', 'update', 'archive', 'delete', 'restore', 'merge', 'duplicates', 'link', 'profile', 'profiles', 'history', 'organize', 'objects', 'alias', 'regions', 'region', 'routes', 'rules', 'learn', 'retire'] },
     query: STR('Search text (recall/search/history/profile).'),
     text: STR('Memory text, or the note to append to a dossier section.'),
     category: { type: 'string', enum: ['episodic', 'semantic', 'procedural', 'continuity', 'identity', 'relationship', 'preference', 'world', 'chat', 'actions', 'decisions', 'relationships', 'errors', 'maintenance'], description: 'Curated: episodic|semantic|procedural|continuity. Raw history: world|chat|actions|decisions|relationships|errors|maintenance.' },
@@ -188,7 +188,7 @@ const ACTION_TOOLS = [
     section: { type: 'string', enum: ['identity', 'description', 'interactions', 'preferences', 'behavior', 'facts', 'uncertainties', 'timeline', 'notes'], description: 'Dossier section to append to (with entity).' },
     doc: STR('Full Markdown body for an entity dossier (with entity); replaces the written notes.'),
     profile: STR('Profile key (alias of entity).'),
-    status: { type: 'string', enum: ['active', 'archived', 'all'], description: 'Which records to consider (recall/profiles).' },
+    status: { type: 'string', enum: ['active', 'archived', 'outdated', 'contradicted', 'all'], description: 'Which records to consider (recall/profiles).' },
     importance: INT('0–5; higher survives compaction and eviction.'),
     confidence: INT('0–100 (update).'),
     threshold: { type: 'number', description: 'Duplicate similarity 0.5–0.99 (default 0.9).' },
@@ -199,7 +199,32 @@ const ACTION_TOOLS = [
     x: INT('Nearby X (recall).'),
     y: INT('Y.'),
     z: INT('Z.'),
-    sinceDays: INT('History: only records newer than N days.')
+    sinceDays: INT('History: only records newer than N days.'),
+    sinceMs: INT('Earliest observation time, Unix milliseconds.'),
+    untilMs: INT('Latest observation time, Unix milliseconds.'),
+    createdSinceMs: INT('Earliest curated creation time, Unix milliseconds.'),
+    createdUntilMs: INT('Latest curated creation time, Unix milliseconds.'),
+    cursor: STR('Next page cursor returned by the same search with the same filters.'),
+    mode: { type: 'string', enum: ['current', 'historical', 'include_stale'] },
+    dimension: STR('Exact Minecraft dimension, e.g. overworld or the_nether.'),
+    world: STR('Exact world namespace.'),
+    radius: INT('Maximum 3D distance from the supplied coordinates or current position.'),
+    minY: INT('Minimum elevation.'),
+    maxY: INT('Maximum elevation.'),
+    minConfidence: INT('Minimum curated confidence, 0–100.'),
+    maxConfidence: INT('Maximum curated confidence, 0–100.'),
+    subjectKey: STR('Exact curated subject key.'),
+    objectId: STR('Exact world-object generation ID, short ID or alias for objects.'),
+    eventType: STR('Exact raw history event type; use object_inventory or object_removed for object evidence.'),
+    objectKind: STR('Object type, e.g. chest, barrel, shulker, bed.'),
+    item: STR('Exact item ID for object contents search.'),
+    uncertainty: STR('Uncertainty note for a curated update.'),
+    region: STR('Exact region ID; filters objects or specifies parent region.'),
+    min: { type: 'array', items: INT('Minimum axis coordinate.'), minItems: 3, maxItems: 3 },
+    max: { type: 'array', items: INT('Maximum inclusive axis coordinate.'), minItems: 3, maxItems: 3 },
+    evidenceRefs: { type: 'array', items: STR('Raw observed tool outcome reference.'), maxItems: 12 },
+    expiresAt: INT('Learned rule expiry time, Unix milliseconds.'),
+    revision: INT('Read a saved previous revision (1 = first).')
   }, ['operation']),
   tool('note', 'Record a durable discovery, lesson, or ownership observation in long-term memory, or add/drop a personal interest.', {
     text: STR('Short factual note or lesson learned.'),
@@ -729,6 +754,7 @@ class AmdToolsClient {
     chatReserve = 4,
     actionReasoningEffort = 'low',
     chatReasoningEffort = 'low',
+    onCreditsExhausted = null,
     onRequest = null
   }) {
     if (!apiKey) {
@@ -741,6 +767,7 @@ class AmdToolsClient {
     this.temperature = temperature
     this.maxTokens = positiveInt(maxTokens, 16, 500_000)
     this._apiKey = String(apiKey)
+    this.onCreditsExhausted = onCreditsExhausted
 
     this.budget = new ContextBudget({
       model,
@@ -1204,6 +1231,7 @@ class AmdToolsClient {
     toolChoice = null,
     extraParams = null
   }) {
+    if (this.creditError) throw this.creditError
     const url = `${this.baseUrl}/chat/completions`
     const headers = {
       Authorization: `Bearer ${this._apiKey}`,
@@ -1244,6 +1272,7 @@ class AmdToolsClient {
         throw cancelled
       }
       await this._waitForRateSlot(lane, signal, attempt > 0)
+      if (this.creditError) throw this.creditError
       attempt += 1
       this.stats.requests += 1
       const withImages = hasImages(messages)
@@ -1267,20 +1296,32 @@ class AmdToolsClient {
         if (signal?.aborted) { const err = new Error('aborted'); err.name = 'AbortError'; throw err }
         const res = await this._fetchWithTimeout(url, { method: 'POST', headers, body: JSON.stringify(payload) }, timeoutMs, signal)
 
+        const errorBody = !res.ok ? await res.text().catch(() => '') : ''
+        let providerCode
+        try { providerCode = JSON.parse(errorBody)?.error?.code } catch { /* non-JSON provider */ }
+        if (res.status === 402 || ([400, 403, 429].includes(res.status) &&
+          ['insufficient_quota', 'insufficient_credits', 'billing_hard_limit_reached', 'credit_balance_exhausted'].includes(providerCode))) {
+          if (!this.creditError) {
+            this.creditError = Object.assign(new Error('Provider credits exhausted'), { code: 'ZINCAI_CREDITS', status: res.status })
+            this.stats.failures += 1
+            try { this.onCreditsExhausted?.(this.creditError) } catch { /* checkpoint callback reports its own failures */ }
+          }
+          throw this.creditError
+        }
         if (RETRYABLE_STATUS.has(res.status)) {
           const retryAfterMs = parseRetryAfterMs(res.headers?.get?.('retry-after'))
           if (retryAfterMs) {
             this._cooldownUntil = Math.max(this._cooldownUntil, Date.now() + retryAfterMs)
             lastRetryAfterMs = retryAfterMs
           }
-          const snippet = redactSecrets((await res.text().catch(() => '')).slice(0, 200), this._apiKey)
+          const snippet = redactSecrets(errorBody.slice(0, 200), this._apiKey)
           lastError = new Error(`HTTP ${res.status}: ${snippet}`)
           logger.warn(TAG, `retryable HTTP ${res.status}${retryAfterMs ? ` (Retry-After ${Math.round(retryAfterMs / 1000)}s)` : ''} (attempt ${attempt}/${maxRetries + 1})`)
           continue
         }
 
         if (!res.ok) {
-          const snippet = redactSecrets((await res.text().catch(() => '')).slice(0, 350), this._apiKey)
+          const snippet = redactSecrets(errorBody.slice(0, 350), this._apiKey)
           if (res.status === 400 && payload.stream_options && /stream_options|include_usage/i.test(snippet)) {
             if (this.streamOptionsSupported !== false) logger.warn(TAG, 'endpoint rejected stream_options — omitting stream_options for this session')
             this.streamOptionsSupported = false
@@ -1535,7 +1576,7 @@ class AmdToolsClient {
       lane: 'action',
       timeoutMs: this._effectiveTimeoutMs(this.timeoutMs, this.maxTimeoutMs, 'action'),
       ...extra
-    })
+    }).then((response) => ({ ...response, acceptedPrompt: msgs.find((m) => m.role === 'user')?.content }))
 
     const notifyReactive = (info) => {
       this.stats.compactions += 1
@@ -1768,6 +1809,7 @@ class AmdToolsClient {
               finishReason: next.finishReason,
               usage: totalUsage,
               raw: next.raw,
+              acceptedPrompt: next.acceptedPrompt,
               rescued: true,
               degraded,
               recoveryStage,
@@ -1802,6 +1844,7 @@ class AmdToolsClient {
       finishReason: current.finishReason,
       usage: totalUsage,
       raw: current.raw,
+      acceptedPrompt: current.acceptedPrompt,
       compactionLevel,
       degraded,
       recoveryStage

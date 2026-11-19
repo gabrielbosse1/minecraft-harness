@@ -21,6 +21,7 @@
 const { Vec3 } = require('vec3')
 const { findBlocksFast } = require('./block_search')
 const fs = require('fs')
+const { randomUUID } = require('crypto')
 const path = require('path')
 const { whereIs } = require('./threats')
 
@@ -104,9 +105,14 @@ class PlaceIndex {
   /**
    * @param {{ file?: string, now?: () => number, logger?: (level:string,msg:string)=>void }} [opts]
    */
-  constructor ({ file = null, now = () => Date.now(), logger = () => {} } = {}) {
+  constructor ({ file = null, now = () => Date.now(), logger = () => {}, world = null, evidence = null } = {}) {
     this.file = file
     this.now = now
+    this.world = world
+    this.evidence = evidence
+    this.removed = []
+    this.regions = new Map()
+    this.routes = new Map()
     this.log = logger
     /** name(folded) -> { name, x, y, z, dim, note, by, ts } */
     this.named = new Map()
@@ -125,10 +131,18 @@ class PlaceIndex {
     if (!this.file) return
     try {
       const data = JSON.parse(fs.readFileSync(this.file, 'utf8'))
+      if (this.world && data.world && data.world !== this.world) throw new Error('place index belongs to another world; use separate data directories')
+      this.removed = Array.isArray(data.removed) ? data.removed : []
+      for (const region of data.regions || []) this.regions.set(region.id, region)
+      for (const route of data.routes || []) this.routes.set(route.id, route)
       for (const p of data.named || []) if (p?.name) this.named.set(fold(p.name), p)
-      for (const b of data.blocks || []) if (b?.id) this.blocks.set(this._key(b), b)
+      for (const b of data.blocks || []) if (b?.id) this.blocks.set(this._key(b), { ...b, world: b.world || this.world, objectId: b.objectId || `${b.world || this.world || 'legacy'}:${this._key(b)}:${b.id}`, validity: 'unknown' })
       this.counters = data.counters || {}
-    } catch { /* first run or corrupt file: start empty */ }
+      for (const entry of [...this.blocks.values(), ...this.removed]) {
+        const n = Number(String(entry.id || '').match(/\d+$/)?.[0])
+        if (entry.kind && Number.isFinite(n)) this.counters[entry.kind] = Math.max(n, this.counters[entry.kind] || 0)
+      }
+    } catch (err) { if (err.message?.startsWith('place index belongs')) throw err }
   }
 
   save (force = false) {
@@ -136,10 +150,11 @@ class PlaceIndex {
     try {
       fs.mkdirSync(path.dirname(this.file), { recursive: true })
       const tmp = this.file + '.tmp'
-      fs.writeFileSync(tmp, JSON.stringify({ named: [...this.named.values()], blocks: [...this.blocks.values()], counters: this.counters }), 'utf8')
+      fs.writeFileSync(tmp, JSON.stringify({ world: this.world, removed: this.removed, regions: [...this.regions.values()], routes: [...this.routes.values()], named: [...this.named.values()], blocks: [...this.blocks.values()], counters: this.counters }), 'utf8')
       fs.renameSync(tmp, this.file)
       this._dirty = false
-    } catch (err) { this.log('debug', `places save failed: ${err.message || err}`) }
+      return true
+    } catch (err) { this.log('debug', `places save failed: ${err.message || err}`); return false }
   }
 
   _key (b) { return `${b.dim || 'overworld'}:${b.x},${b.y},${b.z}` }
@@ -178,6 +193,134 @@ class PlaceIndex {
   }
 
   // ---------------------------------------------------------- block index --
+
+  rememberRegion ({ id, name, dim, min, max, parent = null, evidence = null }) {
+    if (!name || !min || !max || !['x', 'y', 'z'].every((k) => Number.isInteger(min[k]) && Number.isInteger(max[k]) && min[k] <= max[k])) return null
+    const container = parent ? this.regions.get(parent) : null
+    if (parent && (!container || container.dim !== dim || !this.contains(container, min) || !this.contains(container, max))) return null
+    const old = id ? this.regions.get(id) : null
+    if (id && (!old || old.dim !== dim || id === parent)) return null
+    for (let ancestor = container; ancestor; ancestor = this.regions.get(ancestor.parent)) if (ancestor.id === id) return null
+    const region = { id: id || randomUUID(), name: String(name).slice(0, 80), dim, world: this.world,
+      min, max, parent, evidence, basis: 'agent-estimated bounds', at: this.now() }
+    this.regions.set(region.id, region)
+    this.evidence?.('world', `region ${region.id} ${region.name} bounds`, { kind: 'region_bounds', where: { ...min, dim, world: this.world }, entities: [region.id], data: region })
+    this._dirty = true
+    this.save()
+    return region
+  }
+
+  contains (region, pos) {
+    return pos && ['x', 'y', 'z'].every((k) => Math.floor(pos[k]) >= region.min[k] && Math.floor(pos[k]) <= region.max[k])
+  }
+
+  regionsAt (pos, dim) {
+    return [...this.regions.values()].filter((r) => r.dim === dim && this.contains(r, pos))
+  }
+
+  noteRoute ({ from, to, dim, ok, reason, ref }) {
+    if (!from || !to || !ref) return
+    const id = `${dim}:${Math.floor(from.x)},${Math.floor(from.y)},${Math.floor(from.z)}>${to}`
+    this.routes.set(id, { id, from, to, dim, world: this.world, lastAttemptAt: this.now(),
+      status: ok ? 'traversed' : 'failed', reason, ref, recheck: 'revalidate with live pathfinder; terrain may have changed' })
+    this._dirty = true
+    this.save()
+  }
+
+  _observeCustomName (entry, block) {
+    if (!CONTAINER_KINDS.has(entry.kind)) return
+    // Use the actual CustomName NBT field, not a localized window title or
+    // nearby sign. The server might not send this field to clients at all.
+    const field = block?.entity?.value?.CustomName ?? block?.entity?.CustomName
+    const unwrap = (value) => value && typeof value === 'object' && 'value' in value ? value.value : value
+    let value = unwrap(field)
+    if (typeof value === 'string' && /^\s*[{"]/.test(value)) {
+      try { value = JSON.parse(value) } catch { /* literal string */ }
+    }
+    const name = typeof value === 'string' ? value : unwrap(value?.text)
+    if (typeof name !== 'string' || !name.trim() || name === entry.customName) return
+    entry.customName = name.slice(0, 120)
+    this._observe(entry, 'custom_name', { customName: entry.customName })
+    this._dirty = true
+  }
+
+  _observe (entry, kind, data = {}) {
+    if (!CONTAINER_KINDS.has(entry.kind) && entry.kind !== 'bed') return null
+    const where = { world: entry.world, dim: entry.dim, x: entry.x, y: entry.y, z: entry.z }
+    const text = `${entry.kind} ${entry.id} ${entry.objectId} ${kind}${entry.alias ? ` alias ${entry.alias}` : ''}${data.contents ? ` ${JSON.stringify(data.contents)}` : ''}`
+    const row = this.evidence?.('world', text, { kind: `object_${kind}`, where, at: this.now(), entities: [entry.objectId, entry.id], data, dedupeKey: null })
+    if (row?.ref) entry.evidence = row.ref
+    return row?.ref || null
+  }
+
+  _newBlock (kind, block, dim, p) {
+    const entry = { id: this._nextId(kind), kind, block, x: p.x, y: p.y, z: p.z, dim, world: this.world,
+      objectId: randomUUID(), label: '', contents: null, seenAt: this.now(), lookedAt: 0, validity: 'present' }
+    this._observe(entry, 'discovered')
+    return entry
+  }
+
+  _retire (key, entry, reason) {
+    const removed = { ...entry, validity: 'removed', removedAt: this.now(), removalReason: reason }
+    this._observe(removed, 'removed', { reason, contents: entry.contents, contentsObservedAt: entry.lookedAt })
+    if (CONTAINER_KINDS.has(entry.kind) || entry.kind === 'bed') this.removed.push(removed)
+    this.blocks.delete(key)
+    this._dirty = true
+  }
+
+  alias (id, name) {
+    const entry = [...this.blocks.values()].find((e) => (e.id === id || e.objectId === id) && (CONTAINER_KINDS.has(e.kind) || e.kind === 'bed'))
+    if (!entry) return null
+    entry.alias = String(name || '').trim().slice(0, 80)
+    this._observe(entry, 'alias', { alias: entry.alias })
+    this._dirty = true
+    this.save()
+    return entry
+  }
+
+  noteBedUse (entry) {
+    const current = this.blocks.get(this._key(entry))
+    if (!current || current.objectId !== entry.objectId || current.kind !== 'bed') return
+    current.lastUsedAt = this.now()
+    current.accessibility = 'accessed'
+    this._observe(current, 'bed_used', { spawn: 'unknown' })
+    this._dirty = true
+    this.save()
+  }
+
+  revalidateObjects (bot, pos, { dim, radius = 32 } = {}) {
+    for (const e of this.near(pos, { dim, radius })) {
+      if (!CONTAINER_KINDS.has(e.kind) && e.kind !== 'bed') continue
+      const key = this._key(e)
+      const current = this.blocks.get(key)
+      if (!current) continue
+      const block = bot.blockAt(new Vec3(e.x, e.y, e.z))
+      if (!block) { current.validity = 'unknown'; continue }
+      if (block.name !== e.block) {
+        this._retire(key, current, `replaced by ${block.name}`)
+        const kind = kindOf(block.name)
+        if (kind && (kind !== 'chest' || !this._twinOf(dim, block.position, block))) {
+          this.blocks.set(key, this._newBlock(kind, block.name, dim, e))
+        }
+      } else {
+        current.validity = 'present'
+        current.seenAt = this.now()
+        this._observeCustomName(current, block)
+      }
+    }
+    this.save()
+  }
+
+  searchObjects ({ pos = null, dim = null, radius = 32, mode = 'current', kind = null, id = null, item = null, region = null, minY = null, maxY = null } = {}) {
+    const rows = mode === 'current' ? [...this.blocks.values()] : [...this.blocks.values(), ...this.removed]
+    return rows.filter((e) => (CONTAINER_KINDS.has(e.kind) || e.kind === 'bed') && (!dim || e.dim === dim) &&
+      (!kind || e.kind === kind) && (!id || [e.id, e.objectId, e.alias].some((key) => key && fold(key) === fold(id))) &&
+      (!item || (e.contents?.[item] || 0) > 0) && (!region || (this.regions.get(region)?.dim === e.dim && this.contains(this.regions.get(region), e))) && (minY == null || e.y >= minY) && (maxY == null || e.y <= maxY) &&
+      (mode !== 'current' || e.validity === 'present'))
+      .map((e) => ({ ...e, distance: pos ? Math.hypot(e.x - pos.x, e.y - pos.y, e.z - pos.z) : null }))
+      .filter((e) => e.distance == null || e.distance <= radius)
+      .sort((a, b) => (a.distance ?? 0) - (b.distance ?? 0) || a.objectId.localeCompare(b.objectId))
+  }
 
   _searchIds (bot) {
     const registry = bot.registry
@@ -224,17 +367,22 @@ class PlaceIndex {
       const key = `${dim}:${p.x},${p.y},${p.z}`
       seen.add(key)
       let entry = this.blocks.get(key)
+      if (entry && (entry.kind !== kind || entry.block !== block.name)) {
+        this._retire(key, entry, `replaced by ${block.name}`)
+        entry = null
+      }
       if (!entry) {
-        // The second half of a double chest is the same inventory: keep one entry.
         if (kind === 'chest' && this._twinOf(dim, p, block)) continue
-        entry = { id: this._nextId(kind), kind, block: block.name, x: p.x, y: p.y, z: p.z, dim, label: '', contents: null, seenAt: this.now(), lookedAt: 0 }
+        entry = this._newBlock(kind, block.name, dim, p)
         this.blocks.set(key, entry)
         this._dirty = true
         touched++
       } else {
+        if (entry.validity !== 'present') this._dirty = true
         entry.seenAt = this.now()
-        if (entry.block !== block.name) { entry.block = block.name; this._dirty = true }
+        entry.validity = 'present'
       }
+      this._observeCustomName(entry, block)
       if (kind === 'sign') {
         const text = signTextOf(block)
         signs.push({ x: p.x, y: p.y, z: p.z, text, entry, support: signSupport(block, p) })
@@ -247,10 +395,9 @@ class PlaceIndex {
       if (Math.hypot(e.x - pos.x, e.y - pos.y, e.z - pos.z) > radius - 2) continue
       let block = null
       try { block = bot.blockAt(new Vec3(e.x, e.y, e.z)) } catch { block = null }
-      if (block && kindOf(block.name) === e.kind) continue
-      if (!block) continue // chunk not loaded: keep the memory
-      this.blocks.delete(key)
-      this._dirty = true
+      if (!block) { e.validity = 'unknown'; continue }
+      if (block.name === e.block) { e.validity = 'present'; e.seenAt = this.now(); continue }
+      this._retire(key, e, `replaced by ${block.name}`)
     }
     this._attachLabels(bot, dim, pos, radius, signs)
     if (this._dirty) this.save()
@@ -368,7 +515,7 @@ class PlaceIndex {
   /** Record what was inside a container when the bot looked. */
   noteContents (pos, counts, { dim = 'overworld', freeSlots = null } = {}) {
     const e = this.blocks.get(`${dim}:${Math.floor(pos.x)},${Math.floor(pos.y)},${Math.floor(pos.z)}`) || this._twinAt(dim, pos)
-    if (!e) return null
+    if (!e || (pos.objectId && pos.objectId !== e.objectId)) return null
     let diff = null
     if (e.contents && typeof e.contents === 'object') {
       const deltas = []
@@ -380,10 +527,13 @@ class PlaceIndex {
       }
       if (deltas.length) diff = deltas.slice(0, 4).join(', ')
     }
+    const previous = e.contents
     e.contents = counts
     e.freeSlots = freeSlots
     e.lastDiff = diff
     e.lookedAt = this.now()
+    e.accessibility = 'accessed'
+    this._observe(e, 'inventory', { contents: counts, previous, freeSlots })
     this._dirty = true
     this.save()
     return e
@@ -438,8 +588,8 @@ class PlaceIndex {
     const stem = q.length > 3 ? q.replace(/(es|s)$/, '') : q
     const out = []
     for (const e of this.near(pos, { dim, radius })) {
-      if (e.kind === 'sign' || !e.label) continue
-      const label = fold(e.label).replace(/^\[|\]$/g, '')
+      if (e.kind === 'sign' || !(e.alias || e.label)) continue
+      const label = fold(e.alias || e.label).replace(/^\[|\]$/g, '')
       let rank = 0
       if (label === q) rank = 3
       else if (label.split(/[^a-z0-9_]+/).some((w) => w === q || w === stem || (w.length > 3 && w.replace(/(es|s)$/, '') === stem))) rank = 2
@@ -482,7 +632,8 @@ class PlaceIndex {
     if (e.kind === 'bed') s += ` (${String(e.block).replace(/_bed$/, '')})`
     else if (e.kind === 'furnace' && e.block !== 'furnace') s += ` (${e.block})`
     else if (e.kind === 'station') s = e.block
-    if (e.label) s += ` "${e.label}"`
+    if (e.alias || e.label) s += ` "${e.alias || e.label}"`
+    if (e.validity === 'unknown') s += ' [presence unverified]'
     if (e.contents) {
       const top = Object.entries(e.contents).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([n, c]) => `${n} x${c}`)
       s += top.length ? ` [${top.join(', ')}${Object.keys(e.contents).length > 5 ? ', …' : ''}]` : ' [empty]'
@@ -618,21 +769,12 @@ PlaceIndex.prototype.onBlockChange = function (oldBlock, newBlock, { dim = null 
   const kind = newBlock ? kindOf(newBlock.name || '') : null
   let matched = false
   for (const [key, e] of this.blocks) {
-    if (e.x !== x || e.y !== y || e.z !== z) continue
-    if (dim && e.dim !== dim) continue
+    if (e.x !== x || e.y !== y || e.z !== z || (dim && e.dim !== dim)) continue
     matched = true
-    if (kind === e.kind && String(newBlock?.name) === e.block) continue // nothing structural changed
-    if (!kind) {
-      this.blocks.delete(key) // broken or replaced by air — gone from the index
-      this._dirty = true
-    } else {
-      // Same spot, changed identity (e.g. chest → trapped chest): re-index clean.
-      e.kind = kind
-      e.block = newBlock.name
-      e.contents = null
-      e.lookedAt = 0
-      this._dirty = true
-    }
+    if (!newBlock) { e.validity = 'unknown'; continue }
+    if (kind === e.kind && String(newBlock.name) === e.block) { e.validity = 'present'; e.seenAt = this.now(); continue }
+    this._retire(key, e, `replaced by ${newBlock.name}`)
+    if (kind) this.blocks.set(key, this._newBlock(kind, newBlock.name, e.dim, { x, y, z }))
   }
   if (matched || !kind || kind === 'sign') { if (this._dirty) this.save(); return }
   // Not indexed yet: adopt only if it sits inside the last scanned box.
@@ -644,7 +786,7 @@ PlaceIndex.prototype.onBlockChange = function (oldBlock, newBlock, { dim = null 
   const useDim = dim || last.dim || 'overworld'
   const pos = { x, y, z }
   if (kind === 'chest' && this._twinOf(useDim, pos, newBlock)) return // other half indexed
-  const entry = { id: this._nextId(kind), kind, block: String(newBlock.name), x, y, z, dim: useDim, label: '', contents: null, seenAt: this.now(), lookedAt: 0 }
+  const entry = this._newBlock(kind, String(newBlock.name), useDim, pos)
   this.blocks.set(`${useDim}:${x},${y},${z}`, entry)
   this._dirty = true
   this.save()

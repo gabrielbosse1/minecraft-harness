@@ -12,7 +12,6 @@ const { performance } = require('node:perf_hooks')
 
 const JOURNAL_VERSION = 1
 const MAX_BUFFER_EVENTS = 128
-const MAX_PERSISTED_EVENTS = 64
 const MAX_LATENCY_SAMPLES = 256
 
 function monoNow () {
@@ -253,7 +252,7 @@ class EventPipeline {
       // Already-processed events (`processedAt !== null`) are NEVER replayed as new events!
       if (Array.isArray(raw.undelivered)) {
         for (const e of raw.undelivered) {
-          if (!e || e.processedAt !== null || (e.importance || 0) < 2) continue
+          if (!e || e.processedAt !== null || !this.isDurable(e)) continue
           this.events.push({
             ...e,
             recoveredFromRestart: true,
@@ -265,13 +264,14 @@ class EventPipeline {
     } catch { /* corrupt journal: start clean without crashing */ }
   }
 
+  isDurable (e) { return e.importance >= 2 || this.deliveryLane(e) === 'critical' }
+
   save () {
     if (!this.file) return
     try {
       fs.mkdirSync(path.dirname(this.file), { recursive: true })
       const undelivered = this.events
-        .filter((e) => e.processedAt === null && (e.importance || 0) >= 2)
-        .slice(-MAX_PERSISTED_EVENTS)
+        .filter((e) => e.processedAt === null && this.isDurable(e))
         .map(({ _queuedMono, ...rest }) => rest)
       const tmp = `${this.file}.tmp`
       fs.writeFileSync(tmp, JSON.stringify({
@@ -283,7 +283,8 @@ class EventPipeline {
       }))
       fs.renameSync(tmp, this.file)
       this._dirty = false
-    } catch { /* best-effort persistence */ }
+      return true
+    } catch { return false }
   }
 
   _pruneDedupe (nowMs) {
@@ -341,7 +342,7 @@ class EventPipeline {
     if (groupKey) {
       for (let i = this.events.length - 1; i >= Math.max(0, this.events.length - 8); i--) {
         const prev = this.events[i]
-        if (prev.processedAt === null && prev.groupKey === groupKey && (receivedAt - prev.receivedAt) <= this.coalesceWindowMs) {
+        if (!this.isDurable(prev) && prev.processedAt === null && prev.groupKey === groupKey && (receivedAt - prev.receivedAt) <= this.coalesceWindowMs) {
           prev.groupCount = (prev.groupCount || 1) + 1
           prev.lastTimestampMs = timestampMs
           prev.lastReceivedAt = receivedAt
@@ -405,6 +406,7 @@ class EventPipeline {
       causalActId: spec.causalActId || null,
       delta: spec.delta ? cleanText(spec.delta, 120) : null,
       groupKey,
+      chat: spec.chat || null,
       groupCount: 1,
       samples: null,
       deliveryLane,
@@ -415,7 +417,7 @@ class EventPipeline {
     this.events.push(evt)
     this.stats.emitted += 1
     this._enforceBounds()
-    if (importance >= 2 && evt.processedAt === null) {
+    if (this.isDurable(evt) && evt.processedAt === null) {
       this._dirty = true
       this.save()
     }
@@ -427,14 +429,14 @@ class EventPipeline {
     // Evict processed or ambient (importance === 0) oldest entries first so a
     // flood of irrelevant ambient updates NEVER drops undelivered important events!
     while (this.events.length > this.maxEvents) {
-      const idx = this.events.findIndex((e) => e.processedAt !== null || (e.importance || 0) === 0)
+      const idx = this.events.findIndex((e) => e.processedAt !== null || !this.isDurable(e))
       if (idx >= 0) {
         if ((this.events[idx].importance || 0) === 0 && this.events[idx].processedAt === null) {
           this.stats.droppedAmbient += 1
         }
         this.events.splice(idx, 1)
       } else {
-        this.events.shift()
+        break // never evict unacknowledged durable envelopes
       }
     }
   }
@@ -453,7 +455,7 @@ class EventPipeline {
         if (via === 'reflex') this.latency.record('receiptToReflexMs', waitMs)
         else this.latency.record('queueToModelMs', waitMs)
       }
-      if ((e.importance || 0) >= 2) dirty = true
+      if (this.isDurable(e)) dirty = true
     }
     if (dirty) this.save()
   }
@@ -464,7 +466,7 @@ class EventPipeline {
    * with their original timestamps so mid-reset emergencies or discoveries are never lost!
    */
   onContextReset () {
-    this.events = this.events.filter((e) => e.processedAt === null && (e.importance || 0) >= 2)
+    this.events = this.events.filter((e) => e.processedAt === null && this.isDurable(e))
     this.save()
     return this.events.slice()
   }
@@ -502,11 +504,11 @@ class EventPipeline {
     this._batchOpenedAt = null
 
     const candidates = this.events.filter((e) => {
-      if (excludeTypes.has(e.eventType) && !e.recoveredFromRestart) return false
+      if (e.chat || (excludeTypes.has(e.eventType) && !this.isDurable(e))) return false
       if (this.deliveryLane(e) === 'critical') return false // bypasses the batch entirely
       const ageMs = Math.max(0, nowMs - e.receivedAt)
       return e.processedAt === null
-        ? (ageMs <= 10 * 60_000 || e.recoveredFromRestart)
+        ? (ageMs <= 10 * 60_000 || this.isDurable(e))
         : false // already delivered: never injected into a later batch
     })
 
@@ -533,6 +535,7 @@ class EventPipeline {
       windowMs: waitedMs,
       overdue: this.batchWindowMs > 0 && waitedMs > this.batchWindowMs,
       events,
+      sequences: prioritized.map((e) => e.sequence),
       moreRemaining
     }
   }
@@ -603,7 +606,7 @@ class EventPipeline {
 
   /** Render one critical event as an immediate (out-of-batch) prompt line. */
   formatCriticalEventLine (e, nowMs) {
-    return formatEventLine(e, nowMs, { badge: 'CRITICAL', batch: false })
+    return formatEventLine(this.batchEventEntry(e, nowMs), nowMs, { badge: 'CRITICAL', batch: false })
   }
 
   /**
@@ -637,7 +640,7 @@ class EventPipeline {
    */
   formatForPrompt ({ max = 8, excludeTypes = new Set(), nowMs = this.now() } = {}) {
     const candidates = this.events.filter((e) => {
-      if (excludeTypes.has(e.eventType) && !e.recoveredFromRestart) return false
+      if (e.chat || (excludeTypes.has(e.eventType) && !this.isDurable(e))) return false
       const ageMs = Math.max(0, nowMs - e.receivedAt)
       // Keep undelivered events (up to 10m) and recent delivered context (up to 90s).
       if (e.processedAt === null) return ageMs <= 10 * 60_000 || e.recoveredFromRestart

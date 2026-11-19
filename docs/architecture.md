@@ -52,23 +52,61 @@ The LLM layer (`brain.js`, `api_wrapper.js`, `lanes.js`, `src/amdClient.js`) spl
 
 ## 2b. Memory Architecture
 
-Memory is three separate stores behind one facade (`zincai/memory.js`), because
-they answer different questions and have different costs:
+Memory distinguishes evidence, current projections, curated beliefs, and prompt context.
+Persistent paths below are relative to `ZINC_DATA_DIR`.
 
-| Layer | Question it answers | Store | Fed to the prompt |
-| --- | --- | --- | --- |
-| Working memory | "what is happening right now?" | in-process rings (`working`, `shortTerm`, `ephemeral`) | yes, small and volatile |
-| Curated memories | "what do I know that matters?" | `data/memories.json` (id, category, basis, confidence, importance, evidence refs, status) | yes, ranked and budgeted |
-| Entity dossiers | "who/what is this, in depth?" | `data/entities/*.json` (Markdown section bodies, UUID identity, relationship, evidence, linked memories) | one summary line per visible player; the full document only on request |
-| Raw history | "what exactly happened?" | `data/history/<category>/<day>.jsonl` + keyword sidecars | never automatically; bounded search only |
+| Layer | Store | Access |
+| --- | --- | --- |
+| Raw evidence | `history/<category>/<day>.jsonl` and rebuildable `.idx.json` keyword sidecars | `memory history` by exact ref or cursor; short past-attempt excerpts may be selected automatically |
+| Diagnostics | `sessions/<id>/events.jsonl`, screenshots and `continuation.json` | Telemetry; not a replacement for raw search |
+| Curated beliefs | `memories.json`: scope, status, evidence, confidence, revisions | strict `memory search` and `read`; automatic recall remains bounded and relevance-based |
+| People and social context | `entities/*.json`, `continuity.json`, `conversations.json`, `preferences.json` | UUID dossiers and new runtime UUID-keyed social records; provisional and legacy name records kept separate |
+| World projection | `places.json`: points, object generations and tombstones, estimated boundaries and route attempts | `memory objects`, `alias`, `region`, `regions`, `routes`, plus current skills and storage lookup |
+| Learning | `learned-rules.json`: scoped agent advice with tool evidence and revisions | `memory learn`, `rules`, `retire`; at most two applicable rules in dynamic action context |
+| Delivery and recovery | `events-journal.json`, `goals.json`, `journal.json`, `memory-checkpoint.json`, `lifecycle.json` | operational state; oldest evidence remains independently searchable |
 
-Invariants: curated records are never the only copy of a fact (raw history is
-append-only and independent); archive/soft-delete never touches history; player
-identity is the Minecraft UUID; telemetry and ordinary chat are history-only;
-maintenance (idle, or ≥400 active records / every 6 h) merges true duplicates,
-supersedes outdated versions, archives noise and reports gaps — it never deletes
-foundational records or evidence. Retrieval is budgeted per compaction level and
-cached for 3 seconds; measured cost is well under a millisecond for a full store.
+```mermaid
+flowchart TD
+    W[Mineflayer observations, chat, tool outcomes] --> H[(HistoryLog JSONL)]
+    W --> E[(EventPipeline pending envelopes)]
+    W --> P[(PlaceIndex objects, generations, regions and route attempts)]
+    W --> D[(ProfileStore and UUID-scoped continuity)]
+    W --> J[(GoalRegistry and WorkJournal)]
+    P --> H
+    H --> F[Watermark-checked sidecars and bounded physical-line cursor search]
+    H -. exact evidence refs .-> J
+    H -. exact evidence refs .-> M[(Curated memories and revisions)]
+    H -. validated execution evidence .-> R[(Scoped learned advice)]
+    E --> S[Action draft and frozen chat snapshot]
+    J --> S
+    D --> S
+    M --> S
+    P --> S
+    R --> S
+    S --> B[ContextBudget rebuilds request only]
+    C[Static action and chat system prompts] --> B
+    B --> L[Model response and harness decision handling]
+    L -->|accepted request and handled decision| A[Idempotent acknowledgement]
+    A --> E
+    L -->|memory operations| F
+    L -->|curation, non-privileged advice and aliases| M & R & P
+    L -->|failed, cancelled, or unusable| N[No acknowledgement]
+    N --> E
+    O[Periodic, shutdown or confirmed billing failure] --> K[(Model-independent checkpoint)]
+    E & J --> K
+    K --> X[Startup reloads authoritative stores]
+    X --> E & J
+```
+
+### Retrieval and persistence details
+
+- **Raw history:** new rows carry random record IDs, byte offsets, physical line refs and `repeatOf` where applicable. A bad or stale sidecar can cost I/O, not hide a record. History pages report files/records/bytes scanned, incomplete coverage, and a cursor; page ordering is deterministic by file traversal, with relevance ranking within the page. Continue with the same filters. The cursor is not a multi-process snapshot. `HistoryLog.rebuildIndex(file)` can recreate sidecars. Maintenance only previews age-based pruning; it does not remove history.
+- **Curated search:** category, identity/profile, subject, object, goal, mode/status, dimension/world, estimated region, radius/elevation, confidence, and observation or creation range constrain candidates before ranking. Match reasons and evidence are shown. Similarity suggests duplicate candidates; automatic maintenance merges only exact text in matching scopes. Prior curated revisions are available via `memory read` with `revision`. Historical and include-stale modes can include nonactive rows; current curated results are *active beliefs*, not live verification.
+- **Objects:** block updates and loaded-world verification maintain presence; unknown/unloaded is not removal. On confirmed replacement the projection allocates a new generation instead of transferring label or stock. Agent aliases do not rename blocks. Inventory observations and removals are appended as structured evidence. Successful bed use is recorded separately, with spawn status unknown. Configure `ZINC_WORLD_ID` for a stable logical world identifier when host/port is insufficient; use separate data directories for different worlds.
+- **Spatial:** estimated inclusive XYZ boxes support off-center containment, nested room candidates, and object filters. They do not prove connectivity or access. Named points remain waypoints. Route attempt evidence records success/failure and reason, never a promise of a live path. No automatic interior graph, authoritative spawn detection, or persistent path-distance cache is inferred.
+- **Delivery:** draft assembly does not acknowledge events. Action acknowledgements are limited to the successful request's actual prompt and made after decision handling. Chat lines carry durable envelope IDs; a failed chat can be replayed, and the IRC cursor advances only after handling the frozen snapshot. Durable unacknowledged events are not evicted at the old 64-record limit. This is **at-least-once recovery**: a crash after a Minecraft side effect but before its receipt can require live reconciliation.
+- **Checkpoints:** `memory-checkpoint.json` records the reason, open goals, pending IDs, working survival snapshot and recent conversation fragments (target five exchanges, `ZINC_CHECKPOINT_EXCHANGES`). It does not replace authoritative stores. HTTP 402 or explicit supported billing codes latch inference and checkpoint without another model call; generic 429/network/auth failures do not latch billing. Restart reloads journals and goals; there is no autonomous consolidation-job replay yet.
+- **Compaction and advice:** request compaction does not run durable maintenance. WorkJournal keeps bounded evidence locators and progress headlines, not full inventory detail; follow the original refs. Learned advice is scoped by objective/world/dimension, tied to matching execution evidence, and rendered as data, never as a new system message.
 
 ---
 

@@ -19,62 +19,15 @@ Dense, factual specification of `minecraft-harness` for AI coding agents and con
 
 ---
 
-## 1b. Memory Architecture (three stores, one facade)
+## 1b. Memory Architecture
 
-`MemorySystem` (`zincai/memory.js`) is the only memory object the runtime talks
-to. It owns three physically separate stores plus volatile working context.
+See [Memory Architecture](architecture.md#2b-memory-architecture) for the current flow and Mermaid diagram. Key implementation constraints:
 
-| Store | Path | Contents | Automatic prompt use |
-| --- | --- | --- | --- |
-| Raw history | `data/history/<category>/<YYYY-MM-DD>.jsonl` (+ `<day>.idx.json` keyword sidecars) | every observation, chat line, tool outcome, decision, relationship event and error; append-only | **never** — only explicit `memory {operation:"history"}` searches (newest files first, ≤`maxScanFiles` files, ≤`maxFileBytes` each) |
-| Entity dossiers | `data/entities/<kind>-<id>.json`, `data/entities/index.json` | long-form Markdown-backed documents: player (UUID-keyed), self, place, group, event; sections `identity, description, interactions, preferences, behavior, facts, uncertainties, timeline, notes`; `evidence[]`, `memoryIds[]` | `recognitionBlock()` for visible/speaking/referenced players, budgeted |
-| Curated memories | `data/memories.json` | short records: category, `basis` (`observed`/`reported`/`inferred`), confidence, importance, stable id, `evidence[]` (history refs), `profileId`, `status` (`active`/`outdated`/`contradicted`/`archived`/`deleted`) | `contextBlock()` (goal + position + entity + players), budgeted per compaction level |
-| Working context | in-process | `working` (last 5), `shortTerm` (10 min), `ephemeral` (30 s), preferences | prompt sections, never persisted as knowledge |
-
-Hard rules enforced by the implementation:
-
-- Telemetry types (`hurt`, `heal`, `entity_hurt`, `player_arrived`, `player_left`,
-  `dimension`, `inventory`, `weather`, `move`, …) are history-only; curated
-  promotion requires importance ≥ 3 **and** a non-telemetry type, or an explicit
-  `promote: true`.
-- Player identity is the UUID. A name-only dossier is upgraded in place on first
-  UUID sighting; a different UUID reusing a username gets its own dossier.
-- `archive`/`delete` only change the curated row (`deleted`/`archived`, restorable);
-  raw history files are never touched. `maintain()` merges true duplicates
-  (cosine ≥ 0.94, same category/basis/location), supersedes old `subjectKey`
-  versions as `outdated`, archives expired low-value episodes, and never evicts
-  `foundational` records.
-- Corrupt dossiers are quarantined as `<file>.corrupt-<ts>` and rebuilt; corrupt
-  curated JSON starts empty; partial NDJSON lines are skipped on read.
-- `HistoryLog.append` coalesces an identical line inside a 45 s window into
-  `repeats` instead of appending a second record.
-- Only durable chat is curated: a player line becomes a `reported` claim when it
-  carries a coordinate, a structure/container, ownership or a stated preference
-  (or an agreement). Small talk stays in raw history and in the dossier's
-  evidence. A reported claim recorded without explicit evidence is anchored to
-  the most recent chat/relationship history record.
-- `maintain()` also archives rows written by older builds that promoted ordinary
-  telemetry ("X took damage 16m away") and clears their `foundational` flag, and
-  seeds name-only player dossiers from recurring legacy memories (upgraded in
-  place when the UUID is later observed).
-
-### Automatic retrieval (one budgeted block per turn)
-
-`MemorySystem.contextBlock()` composes, in this order, inside
-`memory.recallBudgetChars` (820 at L0 → 220 at L4, shrinking with compaction):
-
-1. `recognitionBlock()` — up to 2 players in front of Zinc, resolved by UUID →
-   one dossier line each (identity basis, relationship stance/trust, last fact).
-2. Curated recall — sparse-embedding + keyword + entity + proximity + goal +
-   recency ranking, `recallTopK` 3 (2 at L4), 45% of the budget.
-3. `past attempts (raw log):` — at L0/L1 only, a ≤4-file keyword search of
-   `errors`/`decisions`/`actions` for the current goal/query, 2 lines. Never a
-   dump; skipped when less than 140 characters of budget remain.
-
-The block is cached for 3 s keyed by query/goal/position/players/level, so a
-prompt rebuild does not re-rank. `memory {operation:"history"}` is the way to ask
-for more; measured cost with 400 curated records and 60 history files is
-~0.6 ms per uncached build (test 13n).
+- `HistoryLog` is independent evidence: use cursor continuation when coverage is incomplete, or exact `category/day.jsonl#line` refs. Sidecars are optional accelerators checked against data-file byte watermarks. Do not delete evidence during automatic curation or request compaction.
+- Use `memory search` for strict filters; `MemorySystem.contextBlock` uses separate relevance-based, budgeted selection. `memory objects` queries scoped generations in `PlaceIndex`; current means loaded positive presence, never live contents. `region` boxes are estimates and routes are recorded attempts.
+- `EventPipeline` persists important envelopes until the accepted action/chat context has been handled. Draft prompts must not acknowledge. Checkpointing is model-independent and credit exhaustion latches inference for the process.
+- `WorkJournal` evidence locators survive compaction; result detail lives in the history file. `LearnedRules` can add narrowly scoped evidence-backed advice to user context only.
+- `node scripts/audit-memory.js` replays the synthetic storage workload and verifies strict filters, history paging, scoped rules, replacement, compaction locators and SIGKILL recovery at a saved-event boundary. `test/17-memory-delivery.test.js` tests real-server runtime delivery with a local scripted model provider.
 
 ---
 

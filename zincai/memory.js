@@ -162,6 +162,19 @@ class ShortTermMemory {
   }
 }
 
+function identityScope (e) {
+  const loc = e.location
+  return JSON.stringify([e.category, e.basis, e.subjectKey || null, e.objectId || null, e.generation ?? null,
+    e.profileId || null, [...(e.entities || [])].map(fold).sort(),
+    loc ? [loc.world || null, loc.dim || null, loc.x, loc.y, loc.z] : null])
+}
+
+function snapshotRevision (entry, reason, at) {
+  const { _vec, revisions, ...value } = entry
+  entry.revisions ||= []
+  entry.revisions.push({ at, reason, value: JSON.parse(JSON.stringify(value)) })
+}
+
 class LongTermMemory {
   /**
    * @param {string} file absolute path of the JSON store
@@ -228,7 +241,8 @@ class LongTermMemory {
       const persistable = this.entries.map(({ _vec, ...rest }) => rest)
       fs.writeFileSync(tmp, JSON.stringify(persistable), 'utf8')
       fs.renameSync(tmp, this.file)
-    } catch { /* non-fatal */ }
+      return true
+    } catch { return false }
   }
 
   /**
@@ -252,16 +266,21 @@ class LongTermMemory {
       ? Boolean(meta.foundational)
       : (importance >= 3 && basis !== 'reported')
 
+    const scope = { category, basis, subjectKey, location, entities, profileId: meta.profileId,
+      objectId: meta.objectId, generation: meta.generation }
+    const key = identityScope(scope)
     // If a subjectKey is supplied for an observed belief, update the existing active entry!
     if (subjectKey && basis === 'observed') {
-      const existing = this.entries.find((e) => e.subjectKey === subjectKey && e.basis === 'observed' && e.status === 'active')
+      const existing = this.entries.find((e) => e.status === 'active' && identityScope(e) === key)
       if (existing) {
+        if (now < (existing.lastVerifiedAt || 0)) return existing
+        snapshotRevision(existing, 'observed state update', now)
         if (existing.text !== clean) existing.previousText = existing.text
         existing.text = clean
         existing.updatedAt = now
         existing.ts = now
         existing.lastVerifiedAt = now
-        existing.confidence = Math.max(existing.confidence || 0.9, confidence)
+        existing.confidence = confidence
         existing.importance = Math.max(existing.importance || 1, importance)
         existing.tags = [...new Set([...(existing.tags || []), ...(tags || [])])]
         if (location) existing.location = location
@@ -279,28 +298,18 @@ class LongTermMemory {
 
     const vector = embed(clean)
     for (const e of this.entries) {
-      if (e.status !== 'active') continue
+      if (e.status !== 'active' || identityScope(e) !== key) continue
       if (e.text === clean && JSON.stringify(e.provenance || null) === JSON.stringify(provenance) && e.basis === basis) {
-        e.updatedAt = now
+        e.updatedAt = Math.max(e.updatedAt || 0, now)
         e.occurrences = (e.occurrences || 1) + 1
-        if (basis === 'observed') e.lastVerifiedAt = now
+        if (basis === 'observed') e.lastVerifiedAt = Math.max(e.lastVerifiedAt || 0, now)
         if (Array.isArray(meta.evidence) && meta.evidence.length) e.evidence = [...new Set([...(e.evidence || []), ...meta.evidence.map(String)])].slice(-40)
         if (entities.length) e.entities = [...new Set([...(e.entities || []), ...entities])]
         this._invalidateCache()
         this.save()
         return e
       }
-      const ev = e._vec || (e._vec = embed(e.text))
-      if (!provenance && !e.provenance && e.basis === basis && e.category === category && cosine(ev, vector) > 0.92 && Math.abs(e.importance - importance) <= 1) {
-        e.updatedAt = now
-        e.ts = now
-        e.occurrences = (e.occurrences || 1) + 1
-        if (basis === 'observed') e.lastVerifiedAt = now
-        if (Array.isArray(meta.evidence) && meta.evidence.length) e.evidence = [...new Set([...(e.evidence || []), ...meta.evidence.map(String)])].slice(-40)
-        this._invalidateCache()
-        this.save()
-        return e
-      }
+
     }
 
     const entry = {
@@ -320,6 +329,8 @@ class LongTermMemory {
       location,
       goalIds,
       subjectKey,
+      objectId: meta.objectId || null,
+      generation: meta.generation ?? null,
       status: 'active',
       occurrences: 1,
       revision: 0,
@@ -389,6 +400,7 @@ class LongTermMemory {
     const entry = this.get(id)
     if (!entry) return { ok: false, msg: `memory #${id} not found` }
     if (entry.status === 'deleted') return { ok: false, msg: `memory #${id} is deleted; restore it first` }
+    const before = { ...entry }
     let dirty = false
     if (patch.text !== undefined && String(patch.text).trim()) {
       const next = clip(String(patch.text), MAX_MEMORY_TEXT)
@@ -415,6 +427,8 @@ class LongTermMemory {
       dirty = true
     }
     if (!dirty) return { ok: true, unchanged: true, entry }
+    snapshotRevision(before, reason || 'edit', this.now())
+    entry.revisions = before.revisions
     entry.revision = (entry.revision || 0) + 1
     entry.updatedAt = this.now()
     entry.lastEditReason = reason ? clip(reason, 160) : entry.lastEditReason || null
@@ -442,6 +456,8 @@ class LongTermMemory {
     const entry = this.get(id)
     if (!entry) return { ok: false, msg: `memory #${id} not found` }
     if (entry.status === 'archived') return { ok: true, unchanged: true, entry }
+    snapshotRevision(entry, reason || 'archive', this.now())
+    entry.revision++
     entry.status = 'archived'
     entry.archivedAt = this.now()
     entry.archiveReason = reason ? clip(reason, 160) : null
@@ -454,6 +470,9 @@ class LongTermMemory {
   restore (id) {
     const entry = this.get(id)
     if (!entry) return { ok: false, msg: `memory #${id} not found` }
+    if (entry.status === 'active') return { ok: true, unchanged: true, entry }
+    snapshotRevision(entry, 'restore', this.now())
+    entry.revision++
     entry.status = 'active'
     entry.archivedAt = null
     entry.deletedAt = null
@@ -479,6 +498,9 @@ class LongTermMemory {
       this.save()
       return { ok: true, hard: true, removed: entry.id, historyRefs: entry.evidence || [] }
     }
+    if (entry.status === 'deleted') return { ok: true, unchanged: true, entry }
+    snapshotRevision(entry, reason || 'delete', this.now())
+    entry.revision++
     entry.status = 'deleted'
     entry.deletedAt = this.now()
     entry.deleteReason = reason ? clip(reason, 160) : null
@@ -500,6 +522,8 @@ class LongTermMemory {
     if (!target) return { ok: false, msg: `merge target #${into} not found` }
     const sources = list.filter((e) => e.id !== target.id)
     if (!sources.length) return { ok: false, msg: 'merge needs records distinct from the target' }
+    if (sources.some((e) => identityScope(e) !== identityScope(target))) return { ok: false, msg: 'merge refused: different identity scope, category, or basis' }
+    snapshotRevision(target, reason || 'merge', this.now())
     if (text) {
       target.previousText = target.text
       target.text = clip(String(text), MAX_MEMORY_TEXT)
@@ -538,7 +562,7 @@ class LongTermMemory {
   }
 
   /** Groups of active records that say nearly the same thing. Non-destructive. */
-  duplicates ({ threshold = 0.9, limit = 25, categories = null } = {}) {
+  duplicates ({ threshold = 0.9, limit = 25, categories = null, exact = false } = {}) {
     const active = this.entries.filter((e) => e.status === 'active' && (!categories || categories.includes(e.category)))
     const groups = []
     const taken = new Set()
@@ -550,7 +574,7 @@ class LongTermMemory {
       for (let j = i + 1; j < active.length; j++) {
         const b = active[j]
         if (taken.has(b.id) || b.category !== a.category || b.basis !== a.basis) continue
-        if (JSON.stringify(b.location || null) !== JSON.stringify(a.location || null)) continue
+        if (identityScope(b) !== identityScope(a) || (exact && a.text !== b.text)) continue
         const sim = cosine(av, b._vec || (b._vec = embed(b.text)))
         if (sim >= threshold) group.push(b)
       }
@@ -611,7 +635,7 @@ class LongTermMemory {
       report.legacyArchived++
     }
     // 2. Merge true duplicates (same category/basis/location, >= threshold).
-    for (const group of this.duplicates({ threshold: duplicateThreshold })) {
+    for (const group of this.duplicates({ threshold: duplicateThreshold, exact: true })) {
       const res = this.merge({ ids: group.ids, reason: 'maintenance: duplicate merge' })
       if (res.ok) report.merged.push({ into: res.entry.id, archived: res.archived })
     }
@@ -619,9 +643,10 @@ class LongTermMemory {
     const bySubject = new Map()
     for (const entry of this.entries) {
       if (entry.status !== 'active' || !entry.subjectKey || entry.category !== 'semantic') continue
-      const list = bySubject.get(entry.subjectKey) || []
+      const key = identityScope(entry)
+      const list = bySubject.get(key) || []
       list.push(entry)
-      bySubject.set(entry.subjectKey, list)
+      bySubject.set(key, list)
     }
     for (const list of bySubject.values()) {
       if (list.length < 2) continue
@@ -719,7 +744,7 @@ class LongTermMemory {
     if (!q || !this.entries.length) return []
     const terms = tokenize(q)
     if (!terms.length) return []
-    const activeEntries = this.entries.filter((e) => e.status !== 'outdated' && e.status !== 'archived')
+    const activeEntries = this.entries.filter((e) => ['active', 'contradicted'].includes(e.status))
     const literal = activeEntries.filter((e) => fold(e.text).includes(q))
     const scored = []
     if (literal.length) {
@@ -878,35 +903,51 @@ class LongTermMemory {
    * tool. Unlike `retrieve` (which is for automatic prompt context), this is
    * allowed to browse archived records and to report *why* something matched.
    */
-  search ({
-    query = '',
-    category = null,
-    entity = null,
-    status = 'active',
-    near = null,
-    goalId = null,
-    sinceMs = null,
-    k = 8,
-    budgetChars = 1400
-  } = {}) {
-    const res = this.retrieve({
-      query,
-      category,
-      entity,
-      near,
-      goalId,
-      sinceMs,
-      includeContradicted: true,
-      includeArchived: status === 'archived' || status === 'all',
-      k,
-      budgetChars
-    })
-    const entries = res.entries.filter((e) => {
-      if (status === 'all') return e.status !== 'deleted'
-      if (status === 'archived') return e.status === 'archived'
-      return e.status === 'active' || e.status === 'contradicted'
-    })
-    return { ...res, entries, totalStoreSize: this.entries.length }
+  search ({ query = '', category = null, entity = null, profileId = null, subjectKey = null, objectId = null,
+    status = null, mode = null, near = null, radius = 32, dimension = near?.dim || null,
+    world = null, regionBounds = null, goalId = null, sinceMs = null, untilMs = null, createdSinceMs = null, createdUntilMs = null,
+    minY = null, maxY = null, minConfidence = null, maxConfidence = null, k = 8, cursor = null } = {}) {
+    mode ||= status && status !== 'active' ? 'historical' : 'current'
+    const q = fold(query).trim(); const vec = q ? embed(q) : null
+    const hits = []
+    const matchedFilters = Object.entries({ category, entity: profileId || entity, subject: subjectKey, object: objectId, status, mode, dimension, world,
+      goal: goalId, radius: near ? radius : null, region: regionBounds?.id, minY, maxY, sinceMs, untilMs, createdSinceMs, createdUntilMs,
+      minConfidence, maxConfidence }).filter(([, value]) => value != null).map(([key]) => key)
+    for (const e of this.entries) {
+      if (e.status === 'deleted') continue
+      if (status && status !== 'all' && e.status !== status) continue
+      if (mode === 'current' && e.status !== 'active') continue
+      if (mode === 'include_stale' && e.status === 'archived') continue
+      if (category && e.category !== category) continue
+      if (profileId ? e.profileId !== profileId : entity && ![...(e.entities || []), ...(e.tags || [])].some((s) => fold(s) === fold(entity))) continue
+      if (subjectKey && e.subjectKey !== subjectKey) continue
+      if (objectId && e.objectId !== objectId) continue
+      if (goalId && !(e.goalIds || []).includes(goalId) && !(e.tags || []).includes(goalId)) continue
+      const loc = e.location
+      if (regionBounds && (!loc || loc.dim !== regionBounds.dim || !['x', 'y', 'z'].every((k) => loc[k] >= regionBounds.min[k] && loc[k] <= regionBounds.max[k]))) continue
+      if ((dimension && loc?.dim !== dimension) || (world && loc?.world !== world)) continue
+      if ((minY !== null && !(loc?.y >= minY)) || (maxY !== null && !(loc?.y <= maxY))) continue
+      if ((minConfidence !== null && e.confidence < minConfidence) || (maxConfidence !== null && e.confidence > maxConfidence)) continue
+      const observedAt = e.lastVerifiedAt ?? null
+      if ((sinceMs !== null && !(observedAt !== null && observedAt >= sinceMs)) || (untilMs !== null && !(observedAt !== null && observedAt <= untilMs))) continue
+      const created = Date.parse(e.createdAt)
+      if ((createdSinceMs !== null && !(created >= createdSinceMs)) || (createdUntilMs !== null && !(created <= createdUntilMs))) continue
+      const distance = near && loc ? Math.hypot(loc.x - near.x, loc.y - near.y, loc.z - near.z) : null
+      if (near && (!Number.isFinite(distance) || distance > radius)) continue
+      const exact = q && fold(e.text).includes(q)
+      const lexical = vec ? cosine(vec, e._vec || (e._vec = embed(e.text))) : 0
+      if (q && !exact && lexical <= 0) continue
+      const score = ((q ? lexical + (exact ? 1 : 0) : 1) + (distance === null ? 0 : 0.3 / (1 + distance))) * (1 + (e.importance || 0) / 4) * (0.45 + e.confidence * 0.55)
+      hits.push({ ...e, score, distance, observedAt, validity: e.status === 'active' ? 'active belief (not a live check)' : e.status,
+        why: exact ? 'text match' : lexical ? 'lexical/synonym match' : 'structured filters' })
+    }
+    hits.sort((a, b) => b.score - a.score || a.id.localeCompare(b.id))
+    const previous = cursor ? hits.findIndex((e) => e.id === cursor) : -1
+    if (cursor && previous < 0) return { entries: [], found: false, error: 'cursor no longer matches; restart search', totalStoreSize: this.entries.length }
+    const entries = hits.slice(previous + 1, previous + 1 + k)
+    return { entries, matchedFilters, found: Boolean(entries.length), totalStoreSize: this.entries.length, matched: hits.length,
+      nextCursor: previous + 1 + k < hits.length ? entries.at(-1)?.id : null,
+      unknownReason: entries.length ? null : 'no matching records in this scope; use history or inspect live state' }
   }
 
   /** Counting metadata only; never returns memory text. */
@@ -1104,9 +1145,9 @@ class MemorySystem {
   }
 
   /** Mirror Zinc's own considered relationship view into the dossier. */
-  syncProfileFromRelationship (name, relationship = {}) {
+  syncProfileFromRelationship (name, relationship = {}, { uuid = null } = {}) {
     if (!name || !relationship) return null
-    const profile = this.profiles.get(name) || this.observePlayer(name, { at: relationship.lastSeenAt || this.now() })
+    const profile = this.profiles.get(uuid || name) || this.observePlayer(name, { uuid, at: relationship.lastSeenAt || this.now() })
     if (!profile) return null
     const evidence = Array.isArray(relationship.experiences)
       ? relationship.experiences.slice(-3).map((e) => `relationship ${e.kind || 'note'}: ${clip(e.text, 180)}${e.at ? ` (${new Date(e.at).toISOString().slice(0, 10)})` : ''}`)
@@ -1200,13 +1241,13 @@ class MemorySystem {
    * a character budget. Cached for a couple of seconds so a prompt rebuild does
    * not re-run the ranking on every token.
    */
-  contextBlock ({ query = '', goal = null, near = null, players = [], entity = null, budgetChars = 700, topK = 3, level = 0, includePlayers = true } = {}) {
+  contextBlock ({ query = '', goal = null, near = null, players = [], entity = null, budgetChars = 700, topK = 3, level = 0, includePlayers = true, uuidOf = null } = {}) {
     const parts = []
-    const key = JSON.stringify({ query, goal: goal?.id || goal?.description || goal, near: near ? `${Math.round(near.x / 8)}:${Math.round(near.z / 8)}:${near.dim || ''}` : null, players, entity, budgetChars, level, includePlayers })
+    const key = JSON.stringify({ query, goal: goal?.id || goal?.description || goal, near: near ? `${Math.round(near.x / 8)}:${Math.round(near.z / 8)}:${near.dim || ''}` : null, players: players.map((name) => [name, uuidOf?.(name)]), entity, budgetChars, level, includePlayers })
     const now = this.now()
     if (this._contextCache.key === key && now - this._contextCache.at < 3000) return this._contextCache.text
     const recognition = includePlayers
-      ? this.recognitionBlock(players, { maxChars: Math.min(budgetChars, Math.max(180, budgetChars * 0.55)) })
+      ? this.recognitionBlock(players, { uuidOf, maxChars: Math.min(budgetChars, Math.max(180, budgetChars * 0.55)) })
       : ''
     if (recognition) parts.push(recognition)
     const q = String(query || (goal ? goal.description || '' : '')).trim()
@@ -1257,13 +1298,13 @@ class MemorySystem {
    * later session can see what was reorganised and why.
    */
   maintainAll ({ episodicTtlMs = 30 * 24 * 60 * 60_000, duplicateThreshold = 0.94, maxActive = null, retainDays = this.history.retainDays, now = this.now() } = {}) {
-    // Age pruning is opt-in (`history.retainDays` > 0) and never touches the
-    // evidence-bearing categories. Complete history is the default.
+    // Retention settings are advisory here. A day can contain evidence linked
+    // from journals, profiles, learned rules and current projections.
     let historyPruned = null
-    try { historyPruned = this.history.prune({ retainDays, dryRun: true }) } catch (err) { historyPruned = { error: String(err?.message || err) } }
-    if (historyPruned && historyPruned.removed > 0) {
-      try { historyPruned = this.history.prune({ retainDays }) } catch (err) { historyPruned = { error: String(err?.message || err) } }
-    }
+    try {
+      const preview = this.history.prune({ retainDays, dryRun: true })
+      historyPruned = { ...preview, candidates: preview.removed, removed: [], dryRun: true }
+    } catch (err) { historyPruned = { error: String(err?.message || err) } }
     const curated = this.longTerm.maintain({
       now,
       episodicTtlMs,
@@ -1395,7 +1436,7 @@ class MemorySystem {
    * modest confidence (`0.35..0.42`) so a player claim is NEVER mistaken for
    * verified world truth!
    */
-  rememberChat (sender, text, { addressed = false, evidence = null } = {}) {
+  rememberChat (sender, text, { addressed = false, evidence = null, uuid = null } = {}) {
     const t = String(text || '').trim()
     if (!sender || t.length < 8) return null
     const f = fold(t)
@@ -1409,7 +1450,7 @@ class MemorySystem {
       /\b(prefiro|prefer|odeio|hate|adoro|love|alergic\w*|allergic\w*)\b/.test(f) ||
       /\b(meu|minha|my|nosso|nossa|our)\b.{0,30}\b(chest|base|farm|house|casa|mine|mina|portal|barrel)\b/.test(f)
     if ((!durable && !isAgreement) || /\?\s*$/.test(t)) return null
-    const profile = this.profiles.ensure({ kind: 'player', name: String(sender), at: this.now() })
+    const profile = this.profiles.ensure({ kind: 'player', name: String(sender), uuid, at: this.now() })
     const entry = this.longTerm.add(
       `${sender} claimed/said: ${t.slice(0, 160)}`,
       ['chat', String(sender), ...(isAgreement ? ['agreement'] : ['claim'])],
@@ -1438,12 +1479,12 @@ class MemorySystem {
    * Stored strictly as an UNVERIFIED reported statement (`basis: 'reported'`),
    * unless it is an explicit social agreement with that player.
    */
-  rememberFact (text, { about = '', evidence = null } = {}) {
+  rememberFact (text, { about = '', evidence = null, uuid = null } = {}) {
     const t = String(text || '').replace(/\s+/g, ' ').trim().slice(0, 400)
     if (t.length < 6) return null
     const who = String(about || '').trim()
     const isAgreement = /\b(agreed|agreement|combinad\w*|deal|shared|public)\b/i.test(t)
-    const profile = who ? this.profiles.ensure({ kind: 'player', name: who, at: this.now() }) : null
+    const profile = who ? this.profiles.ensure({ kind: 'player', name: who, uuid, at: this.now() }) : null
     const entry = this.longTerm.add(
       t,
       who ? ['fact', who] : ['fact'],
@@ -1467,12 +1508,15 @@ class MemorySystem {
     return entry
   }
 
-  factsAbout (name, limit = 6) {
+  factsAbout (name, limit = 6, { uuid = null } = {}) {
     const who = String(name || '').trim()
     if (!who) return []
     const low = fold(who)
+    const profileId = uuid ? this.profiles.get(uuid)?.id : null
+    if (uuid && !profileId) return []
     const mine = this.longTerm.entries.filter((e) => {
-      if (e.status === 'outdated') return false
+      if (!['active', 'contradicted'].includes(e.status)) return false
+      if (profileId) return e.profileId === profileId
       const tags = e.tags || []
       if (!tags.includes('fact') && !tags.includes('chat') && !(e.entities || []).some((x) => fold(x) === low)) return false
       return (e.tags || []).some((t) => fold(t) === low) || (e.entities || []).some((x) => fold(x) === low) ||
@@ -1493,10 +1537,10 @@ class MemorySystem {
   preferencesLine (who) { return this.preferences.line(5, who) }
 
   save () {
-    this.longTerm.save()
-    this.preferences.save()
-    try { this.history.save() } catch { /* best effort */ }
-    return { memories: this.longTerm.entries.length, profiles: Object.keys(this.profiles.index.entries).length }
+    const curated = this.longTerm.save()
+    const preferences = this.preferences.save()
+    const history = this.history.save()
+    return { ok: Boolean(curated && preferences && history.ok), memories: this.longTerm.entries.length, profiles: Object.keys(this.profiles.index.entries).length }
   }
 
   stats () {
@@ -1568,7 +1612,8 @@ class PreferenceTracker {
       const tmp = this.file + '.tmp'
       fs.writeFileSync(tmp, JSON.stringify(this.prefs.slice(0, 100)), 'utf8')
       fs.renameSync(tmp, this.file)
-    } catch { /* non-fatal */ }
+      return true
+    } catch { return false }
   }
 
   observe (text, who = '') {

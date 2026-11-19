@@ -219,7 +219,8 @@ class ContinuityStore {
       }
       fs.writeFileSync(tmp, JSON.stringify(payload, null, 2))
       fs.renameSync(tmp, this.file)
-    } catch { /* best-effort persistence */ }
+      return true
+    } catch { return false }
   }
 
   _trimmedFrontier () {
@@ -625,8 +626,12 @@ class ContinuityStore {
   }
 
   _relKey (player) {
+    const value = String(player || '')
+    if (/^uuid:[0-9a-f]{32}$/i.test(value)) return value.toLowerCase()
     const raw = clean(player, 32)
     if (!raw || raw.toLowerCase() === this.botName.toLowerCase()) return null
+    const identity = this.resolvePlayerIdentity?.(raw)
+    if (identity) return identity
     const low = raw.toLowerCase()
     const existing = Object.keys(this.identity.relationships || {}).find((k) => k.toLowerCase() === low)
     return existing || raw
@@ -661,6 +666,7 @@ class ContinuityStore {
         for (const drop of keys.slice(MAX_RELATIONSHIPS)) delete this.identity.relationships[drop]
       }
     } else {
+      entry.name = clean(player, 32)
       if (entry.stance === undefined) entry.stance = null
       if (entry.trust === undefined) entry.trust = null
       if (entry.confidence === undefined) entry.confidence = 0
@@ -712,7 +718,7 @@ class ContinuityStore {
   }
 
   listRelationships () {
-    return Object.values(this.identity.relationships || {})
+    return Object.entries(this.identity.relationships || {}).map(([identityKey, row]) => ({ ...row, identityKey }))
       .sort((a, b) => (b.updatedAt || b.lastSeenAt || 0) - (a.updatedAt || a.lastSeenAt || 0))
   }
 
@@ -801,8 +807,8 @@ class ContinuityStore {
   }
 
   formatRelationship (player) {
-    const entry = this.getRelationship(player)
-    const who = clean(player, 32)
+    const entry = typeof player === 'object' ? player : this.getRelationship(player)
+    const who = clean(entry?.name || player, 40)
     if (!entry) return `${who}: no prior relationship record (stance=unassessed; form your own view from evidence)`
     const bits = [
       `stance=${entry.stance || 'unassessed'}`,
@@ -836,8 +842,9 @@ class ContinuityStore {
     }
     if (chosen.length < 4) {
       for (const entry of this.listRelationships()) {
-        const key = this._relKey(entry.name)
+        const key = entry.identityKey
         if (!key || seenKeys.has(key)) continue
+        if (this.resolvePlayerIdentity && this._relKey(entry.name) !== key) continue
         if (entry.stance === null && entry.trust === null && !(entry.experiences || []).length) continue
         seenKeys.add(key)
         chosen.push(entry)

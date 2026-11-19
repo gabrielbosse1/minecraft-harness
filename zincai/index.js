@@ -156,7 +156,8 @@ function loadConfig () {
       chatReasoningEffort: settings.str(['AMD_CHAT_REASONING_EFFORT', 'amd.chatReasoningEffort'], raw.amd.chatReasoningEffort ?? 'low')
     },
     inference: raw.inference || {},
-    memory: raw.memory || {},
+    memory: { ...raw.memory, worldId: settings.str(['ZINC_WORLD_ID', 'memory.worldId'], raw.memory?.worldId || ''),
+      checkpointExchanges: settings.int(['ZINC_CHECKPOINT_EXCHANGES', 'memory.checkpointExchanges'], raw.memory?.checkpointExchanges ?? 5, { min: 1, max: 50 }) },
     identity: raw.identity || {},
     // The per-turn decision frame (`your move:`). On by default; `false` (or
     // DECISION_FRAME=0) restores the old snapshot-only prompt for comparison.
@@ -220,6 +221,7 @@ function makeShared (cfg, { dataDir = DATA_DIR } = {}) {
   const { GoalRegistry } = require('./goals')
   const at = (configured, fallback) => path.join(dataDir, String(configured || fallback).replace(/^(?:zincai-data|data)[/\\]/, ''))
   const memoryFile = at(cfg.memory.file, 'memories.json')
+  const worldKey = cfg.memory.worldId || (cfg.server?.host ? `${cfg.server.host}:${cfg.server.port || 25565}` : null)
   const LifecycleStore = require('./lifecycle').LifecycleStore
   const lifecycle = new LifecycleStore({ file: at(cfg.lifecycle?.file, 'lifecycle.json') })
   const shared = {
@@ -239,7 +241,7 @@ function makeShared (cfg, { dataDir = DATA_DIR } = {}) {
       shortTermMinutes: cfg.memory.shortTermMinutes,
       ephemeralMs: cfg.memory.ephemeralMs ?? 30_000
     }),
-    places: new PlaceIndex({ file: at(cfg.places.file, 'places.json'), logger: (level, msg) => logger[level]?.(TAG, msg) }),
+    places: new PlaceIndex({ file: at(cfg.places.file, 'places.json'), world: worldKey, evidence: (...args) => shared.memory.history.append(...args), logger: (level, msg) => logger[level]?.(TAG, msg) }),
     goals: new GoalRegistry({
       file: at(cfg.goals?.file, 'goals.json'),
       logger: (level, msg) => logger[level]?.(TAG, msg),
@@ -272,6 +274,9 @@ function makeShared (cfg, { dataDir = DATA_DIR } = {}) {
       chatReserve: cfg.inference?.chatReserve ?? 4,
       actionReasoningEffort: cfg.amd.actionReasoningEffort ?? 'low',
       chatReasoningEffort: cfg.amd.chatReasoningEffort ?? 'low',
+      onCreditsExhausted: () => {
+        try { shared.checkpoint?.('credits_exhausted') } finally { shared.shutdown?.(0, 'credits_exhausted') }
+      },
       onRequest: (lane, meta) => {
         if (meta?.isRetry) {
           try { shared.session?.internals?.()?.brain?.spent?.(lane) } catch { /* noop */ }
@@ -307,12 +312,51 @@ function makeShared (cfg, { dataDir = DATA_DIR } = {}) {
   }
   // Conversations survive a restart: "what were we talking about" used to be
   // lost with the process.
+  // Individual stores remain authoritative. The checkpoint is a diagnostic
+  // recovery manifest, not a second writer of goal or event state.
+  shared.checkpoint = (reason = 'periodic', live = null) => {
+    live ||= shared.liveCheckpoint?.() || null
+    const failed = []
+    for (const [name, flush] of Object.entries({
+      memory: () => shared.memory.save().ok,
+      places: () => shared.places.save(true),
+      goals: () => shared.goals.save({ force: true }),
+      journal: () => shared.journal.save({ force: true }),
+      events: () => shared.events.save(),
+      continuity: () => shared.continuity.save(),
+      conversations: () => shared.saveConvo(),
+      telemetry: () => shared.telemetry.flush({ reason })
+    })) {
+      try { if (flush() === false) failed.push(name) } catch { failed.push(name) }
+    }
+    const file = path.join(dataDir, 'memory-checkpoint.json')
+    const conversations = Object.fromEntries([...shared.convo].map(([name, lines]) => {
+      let complete = 0; let start = lines.length
+      let awaitingInput = false
+      const limit = Math.max(1, cfg.memory.checkpointExchanges ?? 5)
+      while (start > 0 && complete < limit) {
+        const line = lines[--start]
+        if (line.who === 'me') awaitingInput = true
+        else if (awaitingInput) { complete++; awaitingInput = false }
+      }
+      return [name, lines.slice(start)]
+    }))
+    try {
+      fs.writeFileSync(`${file}.tmp`, JSON.stringify({
+        version: 1, at: Date.now(), reason, failed, live,
+        openGoals: shared.goals.openGoals(), conversations,
+        pendingEventIds: shared.events.undelivered({ minImportance: 0 }).filter((e) => shared.events.isDurable(e)).map((e) => e.sequence)
+      }))
+      fs.renameSync(`${file}.tmp`, file)
+    } catch (err) { logger.warn(TAG, `memory checkpoint failed: ${err.message}`) }
+  }
+  shared.learnedRules = new (require('./learned_rules').LearnedRules)({ file: path.join(dataDir, 'learned-rules.json'), history: shared.memory.history })
   const convoFile = path.join(dataDir, 'conversations.json')
   try {
     const saved = JSON.parse(fs.readFileSync(convoFile, 'utf8'))
     const fresh = Date.now() - 7 * 24 * 3600_000
     for (const [name, lines] of Object.entries(saved.convo || {})) {
-      const kept = (Array.isArray(lines) ? lines : []).filter((l) => l && l.text && l.ts > fresh).slice(-10)
+      const kept = (Array.isArray(lines) ? lines : []).filter((l) => l && l.text && l.ts > fresh).slice(-Math.max(24, (cfg.memory.checkpointExchanges ?? 5) * 4))
       if (kept.length) shared.convo.set(name, kept)
     }
   } catch { /* first run */ }
@@ -321,7 +365,8 @@ function makeShared (cfg, { dataDir = DATA_DIR } = {}) {
       const tmp = convoFile + '.tmp'
       fs.writeFileSync(tmp, JSON.stringify({ convo: Object.fromEntries(shared.convo) }), 'utf8')
       fs.renameSync(tmp, convoFile)
-    } catch { /* best effort */ }
+      return true
+    } catch { return false }
   }
   return shared
 }
@@ -396,6 +441,7 @@ function main () {
     if (shared.shuttingDown) return
     shared.shuttingDown = true
     logger.info(TAG, `shutting down (${reason})`)
+    try { shared.checkpoint(reason) } catch { /* best effort */ }
     try { host.shutdown({ reason, quit: true }) } catch { /* already gone */ }
     try {
       const open = shared.goals.openGoals().map(g => ({ id: g.id, description: g.description, status: g.status }))
@@ -762,6 +808,12 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     const entry = bot.players?.[name]
     return entry?.uuid || entry?.entity?.uuid || null
   }
+  const playerKey = (name) => {
+    const uuid = uuidOf(name)
+    if (uuid) return `uuid:${String(uuid).replace(/-/g, '').toLowerCase()}`
+    return `provisional:${String(name).toLowerCase()}`
+  }
+  continuity.resolvePlayerIdentity = playerKey
   /**
    * Every failure worth investigating lands in the raw error log. The model is
    * never shown this automatically; `memory {operation:"history"}` can search it.
@@ -790,6 +842,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         causalActId: spec.causalActId || null,
         delta: spec.delta || null,
         groupKey: spec.groupKey || null,
+        chat: spec.chat || null,
         dedupeKey: spec.dedupeKey,
         importance: spec.importance
       }, bot)
@@ -810,6 +863,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     // memory. This is what a curated memory's `evidence` reference points at,
     // and it is never fed to the model automatically.
     let historyRef = null
+    const historicalPos = spec.where === undefined ? here() : spec.where
     try {
       const saved = memory.history.recordPerceived({
         eventType: spec.memoryType || spec.eventType || spec.type || 'event',
@@ -817,13 +871,16 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         summary: spec.summary || spec.text || spec.msg,
         entities: spec.entities || [],
         uuid: spec.uuid || (spec.sender ? uuidOf(spec.sender) : null),
-        where: spec.where === undefined ? here() : (spec.where || null),
+        where: historicalPos ? { x: historicalPos.x, y: historicalPos.y, z: historicalPos.z, dim: historicalPos.dim || dim(), world: places.world } : null,
         importance: spec.importance ?? 0,
         observedAt: spec.observedAt || Date.now(),
         dedupeKey: spec.dedupeKey
       })
       historyRef = saved?.ref || null
-      if (rec && historyRef) rec.historyRef = historyRef
+      if (rec?.event && historyRef) {
+        rec.event.historyRef = historyRef
+        if (pipeline.isDurable(rec.event)) pipeline.save()
+      }
     } catch { /* history is evidence, never a reason to fail the event */ }
     if (spec.remember !== false) {
       note({
@@ -906,9 +963,10 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   // ------------------------------------------------------------- speech --
   const convoOf = (name) => { if (!shared.convo.has(name)) shared.convo.set(name, []); return shared.convo.get(name) }
   function pushConvo (name, who, text) {
-    const list = convoOf(name)
+    const list = convoOf(playerKey(name))
     list.push({ who, text, ts: Date.now() })
-    if (list.length > 10) list.splice(0, list.length - 10)
+    const keep = Math.max(24, (cfg.memory.checkpointExchanges ?? 5) * 4)
+    if (list.length > keep) list.splice(0, list.length - keep)
   }
   function logChat (who, text) {
     shared.chatLog.push({ who, text, ts: Date.now() })
@@ -943,6 +1001,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       logChat('me', whispered ? `(to ${to}) ${text}` : text)
       timeline.said(text, { to: whispered ? to : null })
       if (to || about) pushConvo(to || about, 'me', text)
+      memory.history.append('chat', `${selfNick()}: ${text}`, { kind: 'chat_out', entities: [to || about].filter(Boolean), uuid: uuidOf(to || about), data: { to, about, whisper: whispered }, dedupeKey: null })
       note({ type: 'said', msg: `I said${whispered ? ` to ${to}` : ''}: ${text}` })
       try { telemetry.chatOut({ text, to: whispered ? to : null, about, sent: true }) } catch { /* noop */ }
     } catch (err) { logger.debug(TAG, `chat failed: ${err.message || err}`) }
@@ -1004,7 +1063,8 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     // A completed-goal summary is the same kind of text — it is what the next
     // decision is made from — so it gets the same room.
     const roomy = INFORMATIONAL.has(label) || String(label).startsWith('completed ')
-    const msg = String(r.msg || (r.ok ? 'done' : 'failed')).slice(0, roomy ? 900 : 260)
+    const rawMsg = String(r.msg || (r.ok ? 'done' : 'failed'))
+    const msg = rawMsg.slice(0, label === 'memory' ? 5500 : roomy ? 900 : 260)
     if (gateCtx && String(gateCtx.a) === label) {
       if (!r.ok) failGate.recordFailure(gateCtx, msg, here())
       else failGate.recordSuccess(gateCtx)
@@ -1015,21 +1075,28 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       try { finalActId = continuity.finishAction(resolvedActId, { tool: label, summary: null, ok: Boolean(r.ok), msg }) } catch { /* noop */ }
     }
     const resultTs = Date.now()
+    const execGoalId = agenda.main?.goalId || journal.focus || null
+    const pos = here()
+    const where = pos ? { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z), dim: dim(), world: places.world } : null
+    let evidence = null
     results.push({ label, ok: Boolean(r.ok), msg, ts: resultTs, at: new Date(resultTs).toISOString(), actId: finalActId })
     // RAW HISTORY: every tool outcome, with who asked for it and whether it
     // worked. This is the evidence trail a curated "lesson" points back to.
     try {
       const args = (gateCtx && String(gateCtx.a) === label) ? gateCtx : null
-      memory.history.append('actions', `${label}${r.ok ? '' : ' FAILED'}: ${msg}`, {
+      evidence = memory.history.append('actions', `${label}${r.ok ? '' : ' FAILED'}: ${rawMsg}`, {
         kind: r.ok ? 'action_ok' : 'action_failed',
         at: resultTs,
         entities: [args?.player, args?.place, agenda.main?.askedBy].filter(Boolean),
         importance: r.ok ? 1 : 2,
-        maxText: 600,
+        maxText: 12000,
+        where,
+        dedupeKey: null,
         data: {
           tool: label,
           ok: Boolean(r.ok),
           actId: finalActId,
+          goalId: execGoalId,
           // Only small scalar arguments are kept: a build grid does not belong
           // in an evidence line.
           args: args
@@ -1083,7 +1150,6 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     note({ type: 'result', msg: `${label}: ${msg}` })
     // The work journal: what was done for which goal (compacted, persisted).
     const execArgs = gateCtx && String(gateCtx.a) === label ? goalArgs(gateCtx) : (agenda.main?.tool === label ? (agenda.main.detail?.args || {}) : {})
-    const execGoalId = agenda.main?.goalId || journal.focus || null
     try {
       journal.record({
         tool: label,
@@ -1091,7 +1157,8 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         ok: Boolean(r.ok),
         msg,
         goalId: execGoalId,
-        pos: here()
+        pos: where,
+        evidence: evidence?.ref
       })
     } catch { /* the journal never breaks reporting */ }
     // A failure belongs to the plan step it was trying to advance. Two of them
@@ -1125,12 +1192,6 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
                 break
               }
             }
-          }
-          if (!/is empty\b/i.test(msg)) {
-            const tag = cid ? `container:${cid.toLowerCase()}` : null
-            const summary = `container ${msg}`.slice(0, 220)
-            if (tag && typeof memory.longTerm?.upsertByTag === 'function') memory.longTerm.upsertByTag(tag, summary, ['container', cid.toLowerCase()], 2)
-            else memory.longTerm?.add(summary, ['container'], 2)
           }
         } else if (label === 'circuit_project' && /^(bound|saved)\b/i.test(msg)) {
           memory.longTerm?.add(`circuit project: ${msg}`.slice(0, 220), ['redstone', 'circuit'], 2)
@@ -2419,7 +2480,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     return `operator config: ${name || 'name unknown'}${uuid ? ` (UUID ${uuid})` : ''} — not independently authenticated and carries NO automatic authority over your goals, priorities, or relationships (requests remain optional proposals).`
   }
 
-  function buildActionPrompt (reasons, { compactionLevel = 0, markDelivered = true } = {}) {
+  function buildActionPrompt (reasons, { compactionLevel = 0 } = {}) {
     const level = Math.max(0, Math.min(4, Math.trunc(Number(compactionLevel) || 0)))
     const pos = here()
     sense.assess()
@@ -2475,6 +2536,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         .filter(([name, p]) => name !== bot.username && p?.entity?.position)
         .slice(0, level >= 4 ? 1 : 2)
         .map(([name]) => name),
+      uuidOf,
       budgetChars: recallBudget,
       topK: recallTopK,
       level
@@ -2499,10 +2561,12 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     //    immediately (death, critical health, being attacked, imminent threat).
     //    They are never mixed into the chronological batch below.
     const critical = pipeline.drainCritical({ nowMs })
-    const criticalText = critical.events.length
-      ? critical.events.map((e) => pipeline.formatCriticalEventLine(e, nowMs)).join('\n')
+    const selectedCritical = critical.events.slice(0, level >= 3 ? 4 : level >= 1 ? 8 : 12)
+    const criticalText = selectedCritical.length
+      ? [...selectedCritical.map((e) => pipeline.formatCriticalEventLine(e, nowMs)),
+          ...(critical.count > selectedCritical.length ? [`${critical.count - selectedCritical.length} more critical records queued (not acknowledged)`] : [])].join('\n')
       : null
-    const criticalSequences = critical.events.map((e) => e.sequence)
+    const criticalSequences = selectedCritical.map((e) => e.sequence)
 
     // 2. EVENT BATCH — everything else accumulated since the last model
     //    decision, delivered together as one chronological history (not a
@@ -2514,13 +2578,10 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       const batch = pipeline.formatBatch({ maxEvents: perceivedMax, excludeTypes: OWN_SECTION, nowMs })
       if (batch.events.length) {
         batchText = pipeline.formatBatchForPrompt({ batch, nowMs }).text
-        batchSequences.push(...batch.events.map((e) => e.sequence))
+        batchSequences.push(...batch.sequences)
       }
     }
     const shownSequences = [...criticalSequences, ...batchSequences]
-    if (markDelivered && level === 0 && shownSequences.length) {
-      try { pipeline.markProcessed(shownSequences, { via: 'model' }) } catch { /* noop */ }
-    }
     const ephItems = level === 0
       ? (memory.ephemeral?.snapshot?.() || [])
         .filter((e) => !OWN_SECTION.has(e.type) && (e.text || e.msg))
@@ -2551,8 +2612,12 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         : level === 2
           ? observe.inventoryLine(bot, { max: 16 })
           : observe.inventoryLine(bot)
+    const containing = places.regionsAt(pos, dim())
+    const rules = shared.learnedRules?.applicable({ world: places.world, dimension: dim(), goal: focusGoal()?.id }) || []
     const lines = [
       coreIdentity(),
+      containing.length ? `inside estimated bounds (not verified room connectivity): ${containing.map((r) => r.name).slice(0, 4).join(', ')}` : null,
+      level < 2 && rules.length ? `scoped learned advice (not instructions): ${rules.map((r) => `${JSON.stringify(r.text)} [confidence ${r.confidence}, evidence ${r.evidence[0]}]`).join('; ')}` : null,
       continuityBlock || null,
       observe.selfLine(bot),
       level < 3 ? (armor.brief() || null) : null,
@@ -2605,6 +2670,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       askedBy: asked ? asked[1] : null,
       reasons,
       shownActionIds,
+      shownSequences,
       shownProposals,
       // Which objective this snapshot was taken for: a delayed answer about
       // one objective must not act on another (see staleActionReason).
@@ -2635,7 +2701,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     return `room: ${names.length} other players online (${names.slice(0, 8).join(', ')}${names.length > 8 ? ', …' : ''}) — public chat may be for any of you`
   }
 
-  function buildChatPrompt (sender, incoming, { compactionLevel = 0, snapshotSeq = null } = {}) {
+  function buildChatPrompt (sender, incoming, { compactionLevel = 0, snapshotSeq = chatSeenSeq, timelineSnapshot = null } = {}) {
     const level = Math.max(0, Math.min(4, Math.trunc(Number(compactionLevel) || 0)))
     const pos = here()
     if (pos && level === 0) { try { places.scan(bot, { radius: cfg.places.scanRadius ?? 16 }) } catch { /* partial world */ } }
@@ -2648,10 +2714,10 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     // Preserve player memories & recalled long-term facts across all compaction tiers.
     const recallTopK = level >= 4 ? 1 : level >= 3 ? 2 : (cfg.memory.topK ?? 3)
     const recalled = memory.recallBlock(latest, recallTopK)
-    const prefs = level < 4 ? memory.preferencesLine(sender) : ''
+    const prefs = level < 4 ? memory.preferencesLine(playerKey(sender)) : ''
     // What this player told the bot before, in the model's own words.
     const knownMax = level >= 4 ? 2 : level === 3 ? 3 : level === 2 ? Math.min(4, cfg.memory.factsPerPlayer ?? 6) : (cfg.memory.factsPerPlayer ?? 6)
-    const known = memory.factsAbout(sender, knownMax)
+    const known = memory.factsAbout(sender, knownMax, { uuid: uuidOf(sender) })
     const relLine = level < 4 ? continuity.formatRelationship(sender) : null
     // Recognition before answering: the dossier of the person speaking, kept
     // short; the full document is one `memory` call away.
@@ -2664,8 +2730,8 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     // the last time this lane answered — the lines to react to, and whatever
     // happened in the world between them.
     const windowMax = cfg.inference?.chatLogLines ?? 16
-    const seenSeq = snapshotSeq !== null ? snapshotSeq : chatSeenSeq
-    const all = timeline.tail({ max: 400 })
+    const seenSeq = snapshotSeq
+    const all = timelineSnapshot || timeline.tail({ max: 400 })
     const fresh = all.filter((e) => e.seq > seenSeq)
     // A line that reached the brain without passing through the chat handler
     // (a test, a replay) is still part of the window.
@@ -2678,13 +2744,12 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     fresh.sort((x, y) => x.ts - y.ts)
     const olderCap = level >= 3 ? 0 : level === 2 ? 3 : level === 1 ? 6 : Math.max(4, windowMax - Math.min(fresh.length, windowMax - 4))
     const older = olderCap > 0 ? all.filter((e) => e.seq <= seenSeq).slice(-olderCap) : []
-    if (snapshotSeq === null) chatSeenSeq = timeline.seq
     const fmt = (e) => `  ${ircLine(e, { self })}`
     const newChat = fresh.filter((e) => e.kind === 'chat' || e.kind === 'whisper')
     // Lines from before this process's log (a restart ago): what was said, how long ago.
     const oldestShown = older.length ? older[0].ts : (fresh.length ? fresh[0].ts : Date.now())
     const earlier = level < 2
-      ? convoOf(sender).filter((l) => l.ts < oldestShown).slice(-4)
+      ? convoOf(playerKey(sender)).filter((l) => l.ts < oldestShown).slice(-4)
         .map((l) => `  [${ircAgo(Date.now() - l.ts)} ago] <${l.who === 'me' ? self : sender}> ${l.text}`).join('\n')
       : ''
     const lines = [
@@ -2825,9 +2890,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
 
   function onCompactionEvent (info) {
     try { telemetry.record('context_compaction', info) } catch { /* telemetry best effort */ }
-    // Consolidate redundant memories and compact journal entries instead of wiping memory.
-    try { journal.compact() } catch { /* noop */ }
-    try { memory.longTerm?.consolidate?.() } catch { /* noop */ }
+    // Request pressure does not mutate durable knowledge or work digests.
   }
 
   function compactHistoryForLevel (history, level) {
@@ -2857,20 +2920,20 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   }
 
   async function act (reasons, meta = null) {
-    if (!alive || ended) return { idle: true }
-    const snap = buildActionPrompt(reasons, { compactionLevel: 0, markDelivered: true })
+    if (!alive || ended || shared.amd.creditError || shared.shuttingDown) return { idle: true }
+    const snap = buildActionPrompt(reasons, { compactionLevel: 0 })
     const epoch = decisionEpoch
     const life = lifeEpoch
     logger.debug(TAG, `action turn (${reasons.join(' | ')})`)
     const tools = ALL_TOOLS
     const maxSteps = Math.max(1, Math.min(12, Math.trunc(Number(cfg.inference.maxStepsPerTurn ?? 6)) || 1))
-    const promptCache = new Map([[0, snap.text]])
+    const promptCache = new Map([[0, snap]])
     const promptTextForLevel = (level) => {
       const lvl = Math.max(0, Math.min(4, Math.trunc(Number(level) || 0)))
       if (!promptCache.has(lvl)) {
-        promptCache.set(lvl, buildActionPrompt(reasons, { compactionLevel: lvl, markDelivered: false }).text)
+        promptCache.set(lvl, buildActionPrompt(reasons, { compactionLevel: lvl }))
       }
-      return promptCache.get(lvl)
+      return promptCache.get(lvl).text
     }
     /** What each earlier step of this turn called and got back: [{ calls, content }]. */
     const history = []
@@ -2981,7 +3044,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       // A turn cancelled mid-thought is not a failure and not an idle: nothing
       // it "decided" may run. On the first step, ask again; on a later one the
       // request that preempted it is already queued.
-      if (actions[0] && actions[0]._interrupted) {
+      if (controller.signal.aborted || (actions[0] && actions[0]._interrupted)) {
         const onlyLoop = reasons.every((r) => /^autonomous check-in\b/.test(r))
         const preemptWhy = String(brain.lastPreemptReason || '')
         const supersededByWorld = life !== lifeEpoch || epoch !== decisionEpoch || preemptWhy === 'external event preempted idle check-in'
@@ -3000,8 +3063,9 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         }
         return { idle: false }
       }
-      // The model successfully received all action outcomes included in this snapshot.
-      if (step === 1 && snap.shownActionIds?.length) continuity.markActionsDelivered(snap.shownActionIds)
+      const accepted = [...promptCache.values()].find((p) => p.text === result.acceptedPrompt)
+      const usableDecision = !controller.signal.aborted && actions.length && actions.every((a) => a && !isBrokenCall(a) && !a._truncated && !a._interrupted)
+
 
       // ---- run every call of this answer, in order ----
       const calls = []
@@ -3054,11 +3118,16 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         if (!plainIdle && !isBrokenCall(action) && !startedBody && wantsFollowUp(action, tap)) followUp = true
       }
 
+      if (accepted && usableDecision && !ended && life === lifeEpoch && calls.length) {
+        pipeline.markProcessed(accepted.shownSequences, { via: 'model' })
+        continuity.markActionsDelivered(accepted.shownActionIds.filter((id) => accepted.text.includes(`[${id}]`)))
+      }
       if (!followUp || wantsEnd || bodyStarted || ended || !alive) break
       if (step >= maxSteps) { logger.info(TAG, `turn reached its step limit (${maxSteps}); the next turn continues`); break }
       if (brain.preempted || epoch !== decisionEpoch || life !== lifeEpoch) break
       if (!brain.takeCall('action')) { logger.debug(TAG, 'turn paused: model budget for this minute is spent'); break }
       brain.unwake(consumedWakes)
+      promptCache.clear()
       history.push({ calls, content: result.content || '', images: stepImages })
     }
 
@@ -3110,9 +3179,19 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     return `(chose not to answer${reply.decision ? `: ${reply.decision}` : ''})`
   }
 
+  function enqueuePendingChat () {
+    if (!brain || brain.busyChat || ended || shared.amd.creditError) return
+    for (const e of pipeline.undelivered().filter((e) => e.chat && (!e.chat.uuid || uuidOf(e.chat.sender) === e.chat.uuid)).slice(0, Math.max(0, 64 - brain.chatQueue.length))) {
+      brain.hear(e.chat.sender, e.chat.text, { whisper: e.chat.whisper, at: e.observedAt, eventId: e.sequence })
+    }
+  }
+
   async function talk (sender, lines, meta = null) {
+    if (shared.amd.creditError || shared.shuttingDown || ended) return
     const seenSeqBefore = chatSeenSeq
-    const text = buildChatPrompt(sender, lines, { compactionLevel: 0 })
+    const timelineEnd = timeline.seq
+    const timelineSnapshot = timeline.tail({ max: 400 })
+    const text = buildChatPrompt(sender, lines, { compactionLevel: 0, snapshotSeq: seenSeqBefore, timelineSnapshot })
     const messages = [
       { role: 'system', content: CHAT_PROMPT },
       { role: 'user', content: text }
@@ -3138,7 +3217,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     const compactChat = (level) => {
       const lvl = Math.max(0, Math.min(4, Math.trunc(Number(level) || 0)))
       if (!chatCache.has(lvl)) {
-        chatCache.set(lvl, buildChatPrompt(sender, lines, { compactionLevel: lvl, snapshotSeq: seenSeqBefore }))
+        chatCache.set(lvl, buildChatPrompt(sender, lines, { compactionLevel: lvl, snapshotSeq: seenSeqBefore, timelineSnapshot }))
       }
       return [{ role: 'system', content: CHAT_PROMPT }, { role: 'user', content: chatCache.get(lvl) }]
     }
@@ -3171,19 +3250,17 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         finishReason: chatFinish || null
       })
     } catch { /* telemetry best effort */ }
-    if (ended || epoch !== lifeEpoch) return
+    if (ended || epoch !== lifeEpoch || reply._empty) return
     logUsage('chat', `${sender}: ${lines.map((l) => l.text).join(' / ').slice(0, 60)}`, chatUsage, chatElapsed, 'reply')
     if (ended || epoch !== lifeEpoch) return
     const target = replyTarget(reply, sender, lines)
     const whisper = lines.some((l) => l.whisper)
     const whisperTo = whisper ? (lines.some((l) => l.whisper && l.sender === target) ? target : lines.find((l) => l.whisper).sender) : null
     if (reply.text) {
-      const unseen = timeline.tail({ max: 400, afterSeq: chatSeenSeq }).some((e) => e.kind === 'chat' || e.kind === 'whisper')
       speak(reply.text, { to: whisperTo, about: target })
-      if (!unseen) chatSeenSeq = timeline.seq
     }
     if (reply.remember) {
-      const kept = memory.rememberFact(reply.remember, { about: target })
+      const kept = memory.rememberFact(reply.remember, { about: target, uuid: uuidOf(target), evidence: lines.length === 1 ? pipeline.events.find((e) => e.sequence === lines[0].eventId)?.historyRef : null })
       if (kept) logger.info(TAG, `remembered (from ${target}): ${kept.text}`)
     }
     for (const who of new Set([sender, target])) continuity.touchPlayer(who, { interacted: true })
@@ -3226,6 +3303,8 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       continuity.addPendingEvent({ kind: 'player_request', from: target, text: reply.task })
       brain.wake(`chat request from ${target}: ${reply.task}`, { external: true, fast: true, important: true, preempt: true })
     }
+    pipeline.markProcessed(lines.map((line) => line.eventId).filter(Boolean), { via: 'chat' })
+    chatSeenSeq = Math.max(chatSeenSeq, timelineEnd)
     logger.info(TAG, `chat ${sender}: "${lines.map((l) => l.text).join(' / ').slice(0, 80)}" -> ${reply.text ? `"${reply.text.slice(0, 80)}"` : silentWhy(reply)}${reply.do ? ` [do: ${reply.do} ${target}]` : ''}${reply.task ? ` [task: ${reply.task.slice(0, 60)}]` : ''}`)
   }
 
@@ -3569,7 +3648,17 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         const target = { player: action.player, place: action.place, x: action.x, y: action.y, z: action.z, gait: action.gait }
         const where = action.player || action.place || (Number.isFinite(Number(action.x)) ? `${Math.round(Number(action.x))},${Math.round(Number(action.z))}` : 'somewhere')
         const askedBy = resolveActionAttribution('go_to', action, snap)
-        return startMain({ tool: 'go_to', label: `go to ${where}`, askedBy, detail: goalDetailFor('go_to', target), decision: decided(snap, { label: 'go_to' }), run: () => skills.goTo(target) })
+        return startMain({ tool: 'go_to', label: `go to ${where}`, askedBy, detail: goalDetailFor('go_to', target), decision: decided(snap, { label: 'go_to' }), run: async () => {
+          const from = here()
+          const start = from ? { x: from.x, y: from.y, z: from.z } : null
+          const dimension = dim()
+          const result = await skills.goTo(target)
+          if (start && !target.player && dim() === dimension) {
+            const row = memory.history.append('actions', `route to ${where}: ${result.msg}`, { kind: 'route_attempt', where: { ...start, world: places.world, dim: dimension }, data: { target, ok: result.ok }, dedupeKey: null })
+            places.noteRoute({ from: start, to: where, dim: dimension, ok: result.ok, reason: String(result.msg).slice(0, 180), ref: row?.ref })
+          }
+          return result
+        } })
       }
       case 'dig': {
         const target = { player: action.player, place: action.place, x: action.x, y: action.y, z: action.z, materials: action.materials, avoid: action.avoid, gait: action.gait }
@@ -3803,7 +3892,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         const near = [action.x, action.y, action.z].every(Number.isInteger)
           ? { x: action.x, y: action.y, z: action.z, dim: dim() }
           : null
-        const res = memory.longTerm.retrieve({
+        const res = memory.longTerm.search({
           query: String(action.query || ''),
           category: ['episodic', 'semantic', 'procedural', 'continuity'].includes(String(action.category)) ? String(action.category) : null,
           entity: action.entity ? String(action.entity) : null,
@@ -3956,29 +4045,88 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
           return report('memory', res)
         }
 
+        const explicitPosition = [action.x, action.y, action.z].every(Number.isFinite)
+        const searchOrigin = explicitPosition ? { x: action.x, y: action.y, z: action.z } : Number.isFinite(action.radius) ? here() : null
+        const near = searchOrigin ? { x: searchOrigin.x, y: searchOrigin.y, z: searchOrigin.z, dim: action.dimension || dim() } : null
+        const radius = Math.max(0, action.radius ?? 32)
+        const limit = Math.max(1, Math.min(10, action.limit ?? 4))
+        const mode = action.mode || (action.status && action.status !== 'active' ? 'historical' : 'current')
+        const dimension = action.dimension || near?.dim || null
+        const world = action.world || null
+        const regionBounds = action.region ? places.regions.get(action.region) : null
+        if (action.region && !regionBounds) return report('memory', { ok: false, msg: 'unknown region ID; use memory regions' })
+        const spatial = { near, radius, dimension, world, regionBounds, minY: action.minY, maxY: action.maxY }
+        const placeScoped = world && world !== places.world
+        if (operation === 'region') {
+          const vec = (v) => Array.isArray(v) && v.length === 3 ? { x: v[0], y: v[1], z: v[2] } : null
+          const r = !placeScoped && places.rememberRegion({ id: action.id, name: action.text, dim: dimension || dim(),
+            min: vec(action.min), max: vec(action.max), parent: action.region, evidence: action.evidence })
+          return remember(r ? { ok: true, msg: `recorded estimated bounds for ${r.name}: ${r.id}` } : { ok: false, msg: 'region needs valid inclusive min/max XYZ bounds, name, and valid parent if supplied' })
+        }
+        if (operation === 'regions') {
+          const rows = placeScoped ? [] : [...places.regions.values()].filter((r) => r.dim === (dimension || dim()) && (!action.id || r.id === action.id))
+          const p = near || here()
+          return report('memory', { ok: true, msg: `regions (${rows.length}): ${rows.slice(0, limit).map((r) => `${r.id} ${r.name} ${JSON.stringify([r.min, r.max])} ${places.contains(r, p) ? 'inside' : 'outside'} estimated box`).join(' | ')}` })
+        }
+        if (operation === 'routes') {
+          const rows = placeScoped ? [] : [...places.routes.values()].filter((r) => r.dim === (dimension || dim()) && (!action.query || String(r.to).toLowerCase().includes(String(action.query).toLowerCase())))
+          rows.sort((a, b) => b.lastAttemptAt - a.lastAttemptAt)
+          return report('memory', { ok: true, msg: `past route attempts, not live paths: ${JSON.stringify(rows.slice(0, limit))}` })
+        }
+        if (operation === 'rules') {
+          const rows = shared.learnedRules.rows.filter((r) => !action.id || r.id === action.id)
+          return report('memory', { ok: true, msg: `learned advice: ${JSON.stringify(rows.slice(0, limit).map((r) => shared.learnedRules.view(r)))}` })
+        }
+        if (operation === 'learn' || operation === 'retire') {
+          return remember(shared.learnedRules.edit({ id: action.id, text: action.text, world: places.world, dimension: dimension || dim(),
+            goal: action.goal || (!action.id ? focusGoal()?.id : undefined), evidence: action.evidenceRefs, expiresAt: action.expiresAt,
+            confidence: Number.isFinite(action.confidence) ? action.confidence / 100 : undefined, retire: operation === 'retire' }))
+        }
+        if (operation === 'objects') {
+          const position = near || here()
+          if (mode === 'current' && position && (!dimension || dimension === dim()) && !placeScoped) {
+            places.scan(bot, { radius: cfg.places.scanRadius ?? 16 })
+            places.revalidateObjects(bot, position, { dim: dim(), radius })
+          }
+          const all = placeScoped ? [] : places.searchObjects({ pos: position, dim: dimension || dim(), radius, mode, kind: action.objectKind, id: action.objectId, item: action.item, region: action.region, minY: action.minY, maxY: action.maxY })
+          const offset = action.cursor ? all.findIndex((e) => e.objectId === action.cursor) + 1 : 0
+          if (action.cursor && !offset) return report('memory', { ok: false, msg: 'object cursor no longer valid' })
+          const page = all.slice(offset, offset + limit)
+          const next = offset + page.length < all.length ? `; next cursor: ${page.at(-1).objectId}` : ''
+          return report('memory', { ok: true, msg: `objects (${all.length} matches${next}):\n${page.map((e) =>
+            `${e.id} ${e.objectId} [${e.kind}; ${e.validity}]${e.alias ? ` alias ${JSON.stringify(e.alias)}` : ''}${e.customName ? ` custom name ${JSON.stringify(e.customName)}` : ''} at ${e.x},${e.y},${e.z} ${e.dim}, ${e.distance?.toFixed(1)}m; presence observed ${e.seenAt || 'unknown'}; contents as of ${e.lookedAt || 'never'} (freshness unverified): ${e.contents ? JSON.stringify(e.contents).slice(0, 240) : 'unknown'}${e.lastUsedAt ? `; slept ${e.lastUsedAt}, spawn unknown` : ''}${e.evidence ? `; evidence ${e.evidence}` : ''}`).join('\n')}` })
+        }
+        if (operation === 'alias') {
+          const e = places.alias(String(action.objectId || action.id || ''), action.text)
+          return remember(e ? { ok: true, msg: `agent alias for ${e.id}: ${e.alias || '(cleared)'}; no in-game rename` } : { ok: false, msg: 'no matching current object' })
+        }
         if (operation === 'recall' || operation === 'search') {
-          const near = [action.x, action.y, action.z].every(Number.isInteger)
-            ? { x: action.x, y: action.y, z: action.z, dim: dim() }
-            : null
           const found = memory.longTerm.search({
             query: String(action.query || ''),
             category: ['episodic', 'semantic', 'procedural', 'continuity'].includes(String(action.category)) ? String(action.category) : null,
-            entity,
-            near,
-            goalId: action.goal ? String(action.goal) : null,
-            status: String(action.status || 'active'),
-            k: Number.isInteger(action.limit) ? Math.max(1, Math.min(20, action.limit)) : (cfg.memory.topK ?? 4)
+            entity, profileId: entity ? memory.profiles.get(uuidOf(entity) || entity)?.id : null, ...spatial,
+            subjectKey: action.subjectKey, objectId: action.objectId, goalId: action.goal,
+            status: action.status, mode, cursor: action.cursor,
+            sinceMs: action.sinceMs, untilMs: action.untilMs, createdSinceMs: action.createdSinceMs, createdUntilMs: action.createdUntilMs,
+            minConfidence: Number.isFinite(action.minConfidence) ? action.minConfidence / 100 : null,
+            maxConfidence: Number.isFinite(action.maxConfidence) ? action.maxConfidence / 100 : null, k: limit
           })
-          const lines = found.entries.length ? found.entries.map(fmtHit).join('\n') : `nothing relevant found — ${found.unknownReason}`
-          return report('memory', { ok: true, msg: `recall "${String(action.query || entity || '').slice(0, 60)}" (${found.entries.length}/${found.totalStoreSize} stored memories considered)\n${lines}` })
+          if (found.error) return report('memory', { ok: false, msg: found.error })
+          const lines = found.entries.length ? found.entries.map((e) => `${fmtHit({ ...e, text: e.text.slice(0, 230) })} — ${e.why}; ${e.validity}; ${e.distance == null ? '' : `${e.distance.toFixed(1)}m; `} observed ${e.observedAt ?? 'unknown'}`).join('\n') : found.unknownReason
+          return report('memory', { ok: true, msg: `recall (${found.matched} matches; constrained by ${found.matchedFilters.join(', ')}${found.nextCursor ? `; next cursor: ${found.nextCursor}` : ''})\n${lines}` })
         }
 
         if (operation === 'read') {
-          const entry = entryOf(action.id)
+          const current = entryOf(action.id)
+          const version = Number.isInteger(action.revision) ? current?.revisions?.[action.revision - 1] : null
+          if (action.revision !== undefined && !version) return report('memory', { ok: false, msg: 'unknown prior revision' })
+          const entry = version?.value || current
           if (!entry) return report('memory', { ok: false, msg: `memory #${action.id || '?'} not found` })
           const bits = [
             `#${entry.id} [${entry.category} | ${entry.basis} | ${entry.status}] importance ${entry.importance}, confidence ${Math.round((entry.confidence ?? 0) * 100)}%, created ${String(entry.createdAt).slice(0, 10)}, updated ${new Date(entry.updatedAt || entry.ts).toISOString().slice(0, 10)}`,
             entry.text,
+            version ? `historical revision saved ${version.at}: ${version.reason}` : null,
+            entry.revisions?.length ? `previous revisions: ${entry.revisions.length}` : null,
             entry.previousText ? `previous version: ${entry.previousText}` : null,
             (entry.tags || []).length ? `tags: ${entry.tags.join(', ')}` : null,
             (entry.entities || []).length ? `entities: ${entry.entities.join(', ')}` : null,
@@ -4015,7 +4163,10 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
             confidence: basis === 'observed' ? 0.92 : basis === 'reported' ? 0.4 : 0.65,
             importance: Number.isInteger(action.importance) ? action.importance : (mapped === 'episodic' ? 2 : 3),
             tags: [category, 'agent_selected'],
-            entities: entity ? [entity] : [],
+            entities: entity ? [uuidOf(entity) || entity] : [],
+            location: explicitPosition ? { ...near, world: world || places.world } : undefined,
+            subjectKey: action.subjectKey,
+            goalIds: action.goal ? [action.goal] : [],
             source: basis === 'reported' ? String(entity || 'player') : 'Zinc',
             evidence: action.evidence ? [String(action.evidence)] : []
           })
@@ -4035,6 +4186,9 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
             confidence: Number.isFinite(action.confidence) ? action.confidence / 100 : undefined,
             importance: Number.isInteger(action.importance) ? action.importance : undefined,
             entities: entity ? [entity] : undefined,
+            uncertainty: action.uncertainty,
+            status: ['active', 'outdated', 'contradicted'].includes(action.status) ? action.status : undefined,
+            location: explicitPosition ? { ...near, world: world || places.world } : undefined,
             evidence: action.evidence ? [String(action.evidence)] : undefined
           }, { reason: String(action.reason || 'agent correction') })
           return remember(res.ok ? { ok: true, msg: `updated memory #${res.entry.id}; previous text kept as history${res.entry.profileId ? `; dossier ${res.entry.profileId} unaffected` : ''}` } : res)
@@ -4053,7 +4207,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
           }
           const res = memory.longTerm.remove(id, { hard: action.hard === true, reason: String(action.reason || 'agent delete') })
           return remember(res.ok
-            ? { ok: true, msg: action.hard === true ? `permanently removed curated record #${id}; raw history untouched` : `removed #${id} from active memory (soft delete; restore with operation "restore"); raw history untouched` }
+            ? { ok: true, msg: action.hard === true ? `permanently removed curated record #${id} only; raw history, telemetry, dossiers and other copies were not changed` : `removed #${id} from active memory (soft delete; restore with operation "restore"); raw history untouched` }
             : res)
         }
 
@@ -4101,25 +4255,25 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         if (operation === 'history') {
           const ref = String(action.ref || '').trim()
           if (ref) {
-            const read = memory.readHistory(ref, { context: 1 })
+            const read = memory.readHistory(ref, { context: 0 })
             if (!read.ok) return report('memory', { ok: false, msg: read.msg })
             return report('memory', {
               ok: true,
-              msg: `history ${ref}:\n${read.records.map((r) => `${r.current ? '>>' : '  '} [${String(r.iso || '').slice(0, 19)}] ${r.kind}: ${r.text}`).join('\n')}`
+              msg: `history ${ref}:\n${read.records.map((r) => `${r.current ? '>>' : '  '} [${String(r.iso || '').slice(0, 19)}] ${r.kind}: ${r.text}${r.data ? ` | structured: ${JSON.stringify(r.data).slice(0, 2200)}` : ''}`).join('\n')}`
             })
           }
-          const since = Number.isFinite(action.sinceMs) ? action.sinceMs : (Number.isFinite(action.sinceDays) ? Date.now() - action.sinceDays * 24 * 3600_000 : null)
+          const since = action.sinceMs ?? null
           const res = memory.searchHistory({
             query: String(action.query || ''),
             category: ['world', 'chat', 'actions', 'decisions', 'relationships', 'errors', 'maintenance'].includes(String(action.category)) ? String(action.category) : null,
-            entity,
-            since,
-            limit: Number.isInteger(action.limit) ? Math.max(1, Math.min(20, action.limit)) : 8
+            entity: entity ? (uuidOf(entity) || entity) : null,
+            since, sinceDays: action.sinceDays, until: action.untilMs, kind: action.eventType, goalId: action.goal, cursor: action.cursor,
+            ...spatial, limit
           })
-          if (!res.hits.length) return report('memory', { ok: true, msg: `no raw history matched (${res.scannedFiles} files scanned)${res.truncated ? '; older files were not scanned' : ''}` })
-          return report('memory', {
-            ok: true,
-            msg: `history matches (${res.hits.length}; scanned ${res.scannedFiles} files${res.truncated ? ', older not scanned' : ''}):\n${res.hits.map((h) => `- [${String(h.iso || '').slice(0, 10)}] ${h.cat}/${h.kind}: ${h.text} (${h.ref})`).join('\n')}`
+          if (res.error) return report('memory', { ok: false, msg: res.error })
+          const coverage = `${res.scannedFiles} files, ${res.scannedRecords} records, ${res.scannedBytes} bytes${res.truncated ? '; incomplete coverage' : '; candidate scan complete'}${res.unreadable ? `; ${res.unreadable} unreadable` : ''}`
+          return report('memory', { ok: true,
+            msg: `history: ${res.hits.length} matches on this page (${coverage})${res.nextCursor ? `; next cursor: ${res.nextCursor}` : ''}\n${res.hits.map((h) => `- [${h.iso}] ${h.cat}/${h.kind}: ${h.text} (${h.ref})`).join('\n')}`
           })
         }
 
@@ -4159,12 +4313,14 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         if (op === 'list') {
           const all = continuity.listRelationships()
           if (!all.length) return report('social', { ok: true, msg: 'no player relationships recorded yet — form your own opinions as you observe and interact' })
-          return report('social', { ok: true, msg: `relationships (${all.length}): ${all.slice(0, 8).map((e) => continuity.formatRelationship(e.name)).join(' || ')}` })
+          return report('social', { ok: true, msg: `relationships (${all.length}): ${all.slice(0, 8).map((e) => continuity.formatRelationship(e)).join(' || ')}` })
         }
         const who = String(action.player || snap?.askedBy || '').trim()
         if (!who) return report('social', { ok: false, msg: `social ${op} requires a player name` })
         if (op === 'show') {
-          return report('social', { ok: true, msg: continuity.formatRelationship(who) })
+          const offline = !uuidOf(who) ? memory.profiles.get(who)?.uuid : null
+          const explicit = offline ? `uuid:${offline.replace(/-/g, '').toLowerCase()}` : who
+          return report('social', { ok: true, msg: continuity.formatRelationship(explicit) })
         }
         if (op === 'update' || op === 'decide') {
           const matchProp = (snap?.shownProposals || agenda.asked || []).find((p) => p.from?.toLowerCase() === who.toLowerCase())
@@ -4185,15 +4341,15 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
           }
           if (action.opinion || action.evidence) {
             const memSummary = `opinion on ${updated.name}: stance=${updated.stance || 'unassessed'}${updated.trust !== null ? `, trust=${updated.trust}` : ''}${updated.summary ? ` — ${updated.summary}` : ''}${action.evidence ? ` (evidence: ${action.evidence})` : ''}`.slice(0, 220)
-            try { memory.longTerm?.upsertByTag?.(`rel:${updated.name.toLowerCase()}`, memSummary, ['relationship', updated.name], 2) } catch { /* noop */ }
+            try { memory.longTerm?.upsertByTag?.(`rel:${playerKey(who)}`, memSummary, ['relationship', updated.name], 2) } catch { /* noop */ }
           }
           // The dossier and the social store are two views of the same
           // relationship: keep the long-form profile in step with the model's
           // considered stance, and record the decision itself.
           try {
-            memory.syncProfileFromRelationship(updated.name, updated)
+            memory.syncProfileFromRelationship(updated.name, updated, { uuid: uuidOf(who) })
             memory.history.append('decisions', `social ${op} for ${updated.name}: stance=${updated.stance || 'unassessed'}${action.decision ? `, decision=${action.decision}` : ''}${action.evidence ? ` — ${action.evidence}` : ''}`, {
-              kind: 'relationship_update', entities: [updated.name], importance: 2
+              kind: 'relationship_update', entities: [updated.name], uuid: uuidOf(who), importance: 2
             })
           } catch { /* memory best-effort */ }
           return report('social', { ok: true, msg: `updated ${continuity.formatRelationship(who)}` })
@@ -4379,6 +4535,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   }
 
   telemetry.setContinuationProvider(buildLiveContinuation)
+  shared.liveCheckpoint = buildLiveContinuation
 
   function syncContinuation (reason = 'tick') {
     try {
@@ -4718,13 +4875,6 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         })
         const c = result.curated
         logger.info(TAG, `memory maintenance: ${c.merged.length} merged, ${c.archived} archived, ${c.outdated} superseded; ${c.active} active / ${c.total} historical records; ${result.profiles?.checked ?? 0} dossiers checked`)
-        // Age-based pruning is opt-in (`memory.history.retainDays`); evidence
-        // categories are never pruned, and curated memories never depend on it.
-        const retainDays = cfg.memory.history?.retainDays ?? 0
-        if (retainDays > 0) {
-          const pruned = memory.history.prune({ retainDays })
-          if (pruned.removed.length) logger.info(TAG, `history pruned: ${pruned.removed.length} files older than ${retainDays}d`)
-        }
       } catch (err) {
         recordError('memory_maintenance', err)
         logger.warn(TAG, `memory maintenance failed: ${err?.message || err}`)
@@ -4964,7 +5114,8 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       } catch { /* best-effort monitor */ }
     })
     every(10_000, () => { syncContinuation('periodic') })
-    every(60_000, () => { try { memory.save(); places.save(); continuity.save(); shared.saveConvo?.(); telemetry.flush() } catch { /* best effort */ } })
+    every(60_000, () => shared.checkpoint?.('periodic', buildLiveContinuation()))
+    every(15_000, enqueuePendingChat)
     every(GOALS.tickMs ?? 15_000, () => { try { goalTick() } catch (err) { logger.debug(TAG, `goal tick: ${err.message || err}`) } })
 
     try { armor.attach(); armor.poke() } catch (err) { logger.debug(TAG, `armor keeper: ${err.message || err}`) }
@@ -4988,6 +5139,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         : ''
       brain.wake(`joined the server — orient yourself, check open goals or surroundings, or idle if content${carried}`)
       if (restored) logger.info(TAG, `goals: re-checked ${restored} restored objective(s) at startup`)
+      enqueuePendingChat()
       syncContinuation('first_spawn')
     }
   })
@@ -5484,7 +5636,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     if (parsed.sender === bot.username) return // never react to ourselves
     const { sender, text, whisper } = parsed
     if (!systemsReady) return
-    const pref = memory.observeChat(sender, text)
+    const pref = memory.observeChat(playerKey(sender), text)
     if (pref) logger.debug(TAG, `preference learned from ${sender} (${pref.polarity}): ${pref.text}`)
     system1?.onChatLine(sender, text)
     logChat(sender, whisper ? `(whisper) ${text}` : text)
@@ -5497,7 +5649,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       entities: [sender],
       sender,
       dedupeKey: null,
-      groupKey: `chat:${sender}`,
+      chat: { sender, text, whisper, uuid: uuidOf(sender) },
       occurrenceTimeKnown: true, observationBasis: 'direct', importance: 2,
       memoryType: 'chat', remember: false
     })
@@ -5507,10 +5659,10 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       // history, and only durable claims become curated memories.
       if (profile && chatRec?.historyRef) memory.profiles.linkEvidence(profile.id, [chatRec.historyRef])
     } catch { /* memory best-effort */ }
-    memory.rememberChat(sender, text, { addressed: null, evidence: chatRec?.historyRef || null })
+    memory.rememberChat(sender, text, { uuid: uuidOf(sender), addressed: null, evidence: chatRec?.historyRef || null })
     logger.debug(TAG, `chat from ${sender}: ${text}`)
     pushConvo(sender, 'them', text)
-    brain.hear(sender, text, { whisper })
+    brain.hear(sender, text, { whisper, eventId: chatRec?.event?.sequence })
   })
 
   /**
@@ -5538,7 +5690,6 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         if (Array.isArray(memory.ephemeral.items)) memory.ephemeral.items = []
       }
     } catch { /* noop */ }
-    try { shared.convo.clear() } catch { /* noop */ }
     try { shared.chatLog.length = 0 } catch { /* noop */ }
     try { timeline.clear(); chatSeenSeq = timeline.seq } catch { /* noop */ }
     // Undelivered IMPORTANT events survive a context reset; already-delivered
@@ -5576,7 +5727,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     // What was running when the link dropped is not finished: resumable, and
     // on disk before the sockets close.
     try { goalReg.suspendAll({ reason: quit ? 'shutdown' : 'connection ended' }); goalReg.save({ force: true }) } catch { /* best effort */ }
-    try { continuity.save() } catch { /* best effort */ }
+    try { continuity.save(); journal.save({ force: true }); pipeline.save() } catch { /* best effort */ }
     try { syncContinuation(quit ? 'quit' : 'dispose'); telemetry.flush() } catch { /* best effort */ }
     for (const t of timers) { clearInterval(t); clearTimeout(t) }
     timers.clear()

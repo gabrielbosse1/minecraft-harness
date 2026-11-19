@@ -1,33 +1,9 @@
-/**
- * history.js — the raw historical record. Complete, append-only, never fed to
- * the model automatically.
- *
- * Curated memories (`memory.js`) are what Zinc chooses to remember; entity
- * documents (`entities.js`) are the long-form dossiers about people, places and
- * itself. This store is the evidence underneath both: every observation, chat
- * line, action, decision and failure, written as NDJSON under
- * `<data>/history/<category>/<YYYY-MM-DD>.jsonl`.
- *
- * Design rules:
- *   - Append only. Nothing here is rewritten, merged or "cleaned up" by
- *     maintenance, so deleting a curated memory can never destroy the record
- *     that produced it.
- *   - Never read as prompt context. The only reader is an explicit
- *     `memory {operation:"history"}` search (or a curator resolving a link), and
- *     that search is bounded: newest files first, a byte cap per file, a hit
- *     cap per call. A year of play never loads into memory at once.
- *   - Repetition is coalesced, not memorised: an identical line repeated inside
- *     the dedupe window is counted on the previous record instead of appending a
- *     new one, and the next occurrence carries `repeats`.
- *   - Every record has a stable reference (`world/2026-11-15.jsonl#12`) that a
- *     curated memory or an entity document can point back to.
- *   - Corrupt or partially written lines are skipped on read, never repaired in
- *     place, and never crash the caller.
- */
+/** Append-only evidence, rebuildable keyword sidecars, and bounded cursor scans. */
 'use strict'
 
 const fs = require('fs')
 const path = require('path')
+const { randomUUID, createHash } = require('crypto')
 const { fold, tokenize, clip, isoDay } = require('./memory_text')
 
 /** How many appends may accumulate before a per-file keyword index is flushed. */
@@ -77,7 +53,6 @@ class HistoryLog {
     this.maxFileBytes = Number.isFinite(opts.maxFileBytes) ? opts.maxFileBytes : 4_000_000
     this.retainDays = Number.isFinite(opts.retainDays) ? opts.retainDays : 0
     this.logger = opts.logger || null
-    this.seq = 0
     this.written = 0
     this.suppressed = 0
     this.corruptLines = 0
@@ -104,7 +79,7 @@ class HistoryLog {
   _countLines (file) {
     if (this._fileLines.has(file)) return this._fileLines.get(file)
     let n = 0
-    try { n = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).length } catch { n = 0 }
+    try { n = fs.readFileSync(file, 'utf8').split('\n').slice(0, -1).length } catch { n = 0 }
     this._fileLines.set(file, n)
     return n
   }
@@ -119,6 +94,7 @@ class HistoryLog {
       const raw = JSON.parse(fs.readFileSync(this._indexPath(file), 'utf8'))
       if (raw && typeof raw === 'object' && raw.tokens) {
         idx = {
+          bytes: raw.bytes ?? null,
           day: raw.day || path.basename(file).replace(/\.jsonl$/, ''),
           records: Number(raw.records) || 0,
           tokens: new Map(Object.entries(raw.tokens || {})),
@@ -135,16 +111,17 @@ class HistoryLog {
     return idx
   }
 
-  _updateFileIndex (file, record) {
+  _updateFileIndex (file, record, priorBytes, bytes) {
     let idx = this._loadFileIndex(file)
     if (!idx) {
-      idx = { day: path.basename(file).replace(/\.jsonl$/, ''), records: 0, tokens: new Map(), entities: [], uuids: [], kinds: {}, firstAt: record.at, lastAt: record.at, dirty: 0 }
+      idx = { bytes: priorBytes === 0 ? 0 : null, day: path.basename(file).replace(/\.jsonl$/, ''), records: 0, tokens: new Map(), entities: [], uuids: [], kinds: {}, firstAt: record.at, lastAt: record.at, dirty: 0 }
       this._indexes.set(file, idx)
     }
+    idx.bytes = idx.bytes === priorBytes ? bytes : null
     idx.records += 1
     idx.firstAt = Math.min(idx.firstAt ?? record.at, record.at)
     idx.lastAt = Math.max(idx.lastAt ?? record.at, record.at)
-    for (const token of new Set(tokenize(record.text))) idx.tokens.set(token, (idx.tokens.get(token) || 0) + 1)
+    for (const token of new Set(tokenize(`${record.text} ${(record.entities || []).join(' ')}`))) idx.tokens.set(token, (idx.tokens.get(token) || 0) + 1)
     for (const entity of record.entities || []) {
       const e = String(entity)
       if (!idx.entities.some((x) => fold(x) === fold(e))) idx.entities.push(clip(e, 40))
@@ -161,6 +138,7 @@ class HistoryLog {
     try {
       fs.mkdirSync(path.dirname(file), { recursive: true })
       const payload = {
+        bytes: idx.bytes,
         day: idx.day,
         records: idx.records,
         tokens: Object.fromEntries(idx.tokens),
@@ -195,21 +173,34 @@ class HistoryLog {
     const entities = Array.isArray(meta.entities) ? meta.entities.map(String).filter(Boolean).slice(0, 12) : []
     const dedupeKey = meta.dedupeKey === null
       ? null
-      : `${cat}|${kind}|${clean}|${meta.uuid || entities.join(',')}`
-    if (dedupeKey) {
-      const prev = this._recent.get(dedupeKey)
-      if (prev && at - prev.at < this.dedupeWindowMs) {
-        prev.repeats = (prev.repeats || 1) + 1
-        prev.at = at
-        this.suppressed++
-        return { ...prev, deduped: true }
-      }
-    }
+      : JSON.stringify([cat, kind, clean, meta.uuid || entities, meta.where || null])
+    const previous = dedupeKey ? this._recent.get(dedupeKey) : null
+    const repeat = previous && at >= previous.at && at - previous.at < this.dedupeWindowMs ? previous : null
     const file = this._file(cat, at)
+    // Preserve an interrupted tail as a corrupt physical line, then resume at
+    // the next line. Existing evidence refs must never move.
+    let priorBytes = 0
+    try {
+      const fd = fs.openSync(file, 'r')
+      try {
+        priorBytes = fs.fstatSync(fd).size
+        if (priorBytes > 0) {
+          const last = Buffer.alloc(1)
+          fs.readSync(fd, last, 0, 1, priorBytes - 1)
+          if (last[0] !== 10) {
+            fs.appendFileSync(file, '\n')
+            priorBytes++
+            this._fileLines.delete(file)
+          }
+        }
+      } finally { fs.closeSync(fd) }
+    } catch (err) { if (err.code !== 'ENOENT') return null }
     const line = this._countLines(file) + 1
-    const id = `h-${at.toString(36)}-${(++this.seq).toString(36)}`
+    const id = `h-${randomUUID()}`
     const record = {
       id,
+      line,
+      offset: priorBytes,
       ref: `${cat}/${path.basename(file)}#${line}`,
       at,
       iso: new Date(at).toISOString(),
@@ -221,15 +212,21 @@ class HistoryLog {
       where: meta.where || null,
       session: meta.session || this.sessionId || null,
       importance: Number.isFinite(meta.importance) ? meta.importance : null,
-      repeats: meta.repeats || null,
+      repeats: repeat ? (repeat.repeats || 1) + 1 : (meta.repeats || null),
+      repeatOf: repeat?.repeatOf || repeat?.ref || null,
       data: meta.data && typeof meta.data === 'object' ? meta.data : null
     }
-    if (dedupeKey) this._recent.set(dedupeKey, { id, at, file, line, repeats: 1 })
     try {
       fs.mkdirSync(path.dirname(file), { recursive: true })
-      fs.appendFileSync(file, `${JSON.stringify(record)}\n`, 'utf8')
+      const encoded = `${JSON.stringify(record)}\n`
+      fs.appendFileSync(file, encoded, 'utf8')
+      if (dedupeKey) {
+        this._recent.delete(dedupeKey)
+        this._recent.set(dedupeKey, { at, ref: record.ref, repeatOf: record.repeatOf, repeats: record.repeats })
+        if (this._recent.size > 4096) this._recent.delete(this._recent.keys().next().value)
+      }
       this._fileLines.set(file, line)
-      this._updateFileIndex(file, record)
+      this._updateFileIndex(file, record, priorBytes, priorBytes + Buffer.byteLength(encoded))
       this.written++
       return record
     } catch (err) {
@@ -279,147 +276,128 @@ class HistoryLog {
     return out
   }
 
-  _readRecords (file) {
-    let raw = ''
+  // Read complete physical lines from a byte cursor. Bound peak memory by the
+  // chunk size plus the longest line, independently of total archive size.
+  *_lines (file, offset = 0, line = 0) {
+    const fd = fs.openSync(file, 'r')
     try {
-      const size = fs.statSync(file).size
-      if (size > this.maxFileBytes) {
-        const fd = fs.openSync(file, 'r')
-        try {
-          const buf = Buffer.alloc(this.maxFileBytes)
-          fs.readSync(fd, buf, 0, this.maxFileBytes, size - this.maxFileBytes)
-          raw = buf.toString('utf8')
-          const nl = raw.indexOf('\n')
-          raw = nl >= 0 ? raw.slice(nl + 1) : raw
-        } finally { fs.closeSync(fd) }
-      } else {
-        raw = fs.readFileSync(file, 'utf8')
+      const buf = Buffer.alloc(64 * 1024)
+      let pending = Buffer.alloc(0)
+      let start = offset
+      for (;;) {
+        const n = fs.readSync(fd, buf, 0, buf.length, offset)
+        if (!n) break
+        offset += n
+        const bytes = Buffer.concat([pending, buf.subarray(0, n)])
+        let i = 0; let j
+        while ((j = bytes.indexOf(10, i)) !== -1) {
+          const text = bytes.toString('utf8', i, j)
+          const at = start
+          start += j - i + 1
+          i = j + 1
+          yield { text, line: ++line, offset: at, next: start }
+        }
+        pending = bytes.subarray(i)
       }
-    } catch { return [] }
-    const lines = raw.split('\n')
-    const out = []
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i].trim()
-      if (!line) continue
-      try {
-        const rec = JSON.parse(line)
-        if (rec && rec.text) out.push(rec)
-      } catch { this.corruptLines++ }
-    }
-    return out
+      if (pending.length) yield { text: pending.toString('utf8'), line: line + 1, offset: start, next: offset, partial: true }
+    } finally { fs.closeSync(fd) }
   }
 
-  /**
-   * Bounded full-text search over raw history. Exact identifiers first, then
-   * keyword overlap, then recency. Returns compact hits plus a `ref` that
-   * `read()` (and a curated memory's `evidence` field) can resolve.
-   */
-  search ({
-    query = '',
-    categories = null,
-    category = null,
-    entity = null,
-    kind = null,
-    since = null,
-    until = null,
-    limit = 8,
-    maxScanFiles = null,
-    maxHits = 60
-  } = {}) {
+  rebuildIndex (file) {
+    this._indexes.delete(file)
+    // Do not load the old sidecar while rebuilding.
+    this._indexes.set(file, { bytes: 0, day: path.basename(file, '.jsonl'), records: 0, tokens: new Map(), entities: [], uuids: [], kinds: {}, firstAt: null, lastAt: null, dirty: 0 })
+    const idx = this._indexes.get(file)
+    let end = 0
+    for (const row of this._lines(file)) {
+      if (row.partial) break
+      let rec
+      try { rec = JSON.parse(row.text) } catch { /* invalid physical line */ }
+      if (rec?.text) this._updateFileIndex(file, rec, end, row.next)
+      else idx.bytes = row.next
+      end = row.next
+    }
+    idx.dirty++
+    this._flushFileIndex(file)
+  }
+
+  search ({ query = '', categories = null, category = null, entity = null,
+    kind = null, goalId = null, since = null, sinceDays = null, until = null, limit = 8, maxScanFiles = null,
+    maxHits = 60, cursor = null, exhaustive = false, near = null, radius = 32,
+    dimension = null, world = null, regionBounds = null, minY = null, maxY = null } = {}) {
     const cats = categories || (category ? [category] : null)
-    // Make records appended since the last flush searchable.
-    this.flushIndexes()
-    const q = String(query || '').trim()
-    const qFold = fold(q)
-    const terms = tokenize(q)
-    const entFold = entity ? fold(entity) : null
-    const maxFiles = Math.min(this.maxScanFiles, Number.isFinite(maxScanFiles) ? maxScanFiles : this.maxScanFiles)
+    const q = String(query || '').trim(); const qFold = fold(q); const terms = tokenize(q)
+    const ent = entity ? fold(entity) : null
+    const signature = createHash('sha256').update(JSON.stringify([q, cats, ent, kind, goalId, since, sinceDays, until, near, radius, dimension, world, regionBounds, minY, maxY])).digest('hex')
+    let resume = null
+    if (cursor) {
+      try { resume = JSON.parse(Buffer.from(cursor, 'base64url').toString()) } catch { /* invalid cursor */ }
+      if (resume?.signature !== signature || typeof resume.key !== 'string' || !Number.isSafeInteger(resume.offset) || resume.offset < 0 || !Number.isSafeInteger(resume.line) || resume.line < 0) {
+        return { hits: [], error: 'invalid cursor for these filters', truncated: true, scannedFiles: 0, scannedRecords: 0, nextCursor: null }
+      }
+    }
+    since ??= Number.isFinite(sinceDays) ? (resume?.since ?? this.now() - sinceDays * 86_400_000) : null
     const files = this._files({ categories: cats, since, until })
-    // Pick candidate files from the small per-file keyword indexes FIRST: an
-    // experience from months ago is found by reading a handful of sidecars and
-    // then two or three daily logs, never the whole history.
-    const candidates = []
-    for (const f of files) {
+    const candidates = files.map((f) => ({ ...f, key: `${f.day}/${f.cat}` })).filter((f) => {
+      if (resume && f.key > resume.key) return false
       const idx = this._loadFileIndex(f.file)
-      let score = 0
-      if (!idx) {
-        // Unindexed file (older install, or an index that failed to write):
-        // still searchable, but only after the indexed candidates.
-        candidates.push({ f, score: 0.05 })
-        continue
-      }
-      if (entFold) {
-        const inEntities = (idx.entities || []).some((e) => fold(e) === entFold)
-        const inUuids = (idx.uuids || []).some((u) => fold(u) === entFold)
-        if (!inEntities && !inUuids) continue
-        score += 1
-      }
-      if (kind) {
-        if (!idx.kinds || !idx.kinds[kind]) continue
-        score += 0.5
-      }
-      if (terms.length) {
-        const overlap = terms.filter((t) => idx.tokens.has(t)).length
-        if (!overlap) continue
-        score += overlap / terms.length
-      }
-      if (!entFold && !kind && !terms.length) continue
-      candidates.push({ f, score })
-    }
-    candidates.sort((a, b) => (b.score - a.score) || (a.f.day < b.f.day ? 1 : a.f.day > b.f.day ? -1 : 0))
+      if (!idx) return true
+      // A stale/missing sidecar can only cost time, never exclude evidence.
+      try { if (idx.bytes !== fs.statSync(f.file).size) return true } catch { return true }
+      if (ent && ![...(idx.entities || []), ...(idx.uuids || [])].some((v) => fold(v) === ent)) return false
+      if (kind && !idx.kinds?.[kind]) return false
+      return !terms.length || terms.some((t) => idx.tokens.has(t))
+    }).sort((a, b) => b.key.localeCompare(a.key))
+    const fileLimit = exhaustive ? Infinity : Math.max(1, Math.min(this.maxScanFiles, maxScanFiles ?? this.maxScanFiles))
+    const byteLimit = exhaustive ? Infinity : Math.max(1, this.maxFileBytes)
+    const hitLimit = Math.max(1, Math.min(100, Number(limit) || 8, maxHits))
     const hits = []
-    let scannedFiles = 0
-    let scannedRecords = 0
-    for (const { f } of candidates) {
-      if (scannedFiles >= maxFiles || hits.length >= maxHits) break
-      const records = this._readRecords(f.file)
+    let scannedFiles = 0; let scannedRecords = 0; let scannedBytes = 0; let unreadable = 0; let next = null
+    outer: for (const f of candidates) {
+      const offset = resume?.key === f.key ? resume.offset : 0
+      let line = resume?.key === f.key ? resume.line : 0
+      if (scannedFiles >= fileLimit || scannedBytes >= byteLimit || hits.length >= hitLimit) { next = { key: f.key, offset, line }; break }
       scannedFiles++
-      scannedRecords += records.length
-      for (let i = 0; i < records.length; i++) {
-        const rec = records[i]
-        if (kind && rec.kind !== kind) continue
-        if (since && rec.at < since) continue
-        if (until && rec.at > until) continue
-        const recFold = fold(`${rec.text} ${(rec.entities || []).join(' ')}`)
-        if (entFold) {
-          const inEntities = (rec.entities || []).some((e) => fold(e) === entFold)
-          if (!inEntities && !(rec.uuid && fold(rec.uuid) === entFold) && !recFold.includes(entFold)) continue
+      try {
+        for (const row of this._lines(f.file, offset, line)) {
+          if (scannedBytes >= byteLimit || hits.length >= hitLimit) { next = { key: f.key, offset: row.offset, line }; break outer }
+          line = row.line
+          scannedBytes += row.next - row.offset
+          let rec
+          try { rec = JSON.parse(row.text) } catch { this.corruptLines++; continue }
+          if (!rec?.text) continue
+          scannedRecords++
+          if ((kind && rec.kind !== kind) || (since !== null && rec.at < since) || (until !== null && rec.at > until)) continue
+          if (goalId && rec.data?.goalId !== goalId) continue
+          if (ent && ![...(rec.entities || []), rec.uuid].some((v) => v && fold(v) === ent)) continue
+          const loc = rec.where
+          if (regionBounds && (!loc || loc.dim !== regionBounds.dim || !['x', 'y', 'z'].every((k) => loc[k] >= regionBounds.min[k] && loc[k] <= regionBounds.max[k]))) continue
+          if (world && loc?.world !== world) continue
+          if (dimension && loc?.dim !== dimension) continue
+          if (minY !== null && !(loc?.y >= minY)) continue
+          if (maxY !== null && !(loc?.y <= maxY)) continue
+          const distance = near && loc ? Math.hypot(loc.x - near.x, loc.y - near.y, loc.z - near.z) : null
+          if (near && (distance === null || distance > radius)) continue
+          const raw = fold(`${rec.text} ${(rec.entities || []).join(' ')}`)
+          const tokenSet = new Set(tokenize(raw))
+          const overlap = terms.filter((t) => tokenSet.has(t)).length
+          const exact = qFold && raw.includes(qFold)
+          if (terms.length ? !overlap : q && !exact) continue
+          const score = (exact ? 1.4 : 0) + (terms.length ? overlap / terms.length : 0)
+          hits.push({ ref: `${f.cat}/${path.basename(f.file)}#${row.line}`, id: rec.id, offset: row.offset, at: rec.at, iso: rec.iso,
+            cat: f.cat, kind: rec.kind, text: clip(rec.text, 320), entities: rec.entities || [], uuid: rec.uuid || null,
+            where: loc || null, distance, repeatOf: rec.repeatOf || null, score })
         }
-        let score = 0
-        if (qFold && recFold.includes(qFold)) score += 1.4
-        if (terms.length) {
-          const overlap = terms.filter((t) => recFold.includes(t)).length
-          if (!overlap && !(qFold && recFold.includes(qFold))) continue
-          score += overlap / terms.length
-        } else if (!entFold && !kind) {
-          continue
-        }
-        if (!score) score = 0.2
-        // Recency nudge (a week-old line matters less than a fresh one).
-        score += Math.max(0, 0.25 - (this.now() - rec.at) / (30 * 24 * 3600_000))
-        hits.push({
-          ref: `${f.cat}/${path.basename(f.file)}#${(rec.line || i + 1)}`,
-          id: rec.id,
-          at: rec.at,
-          iso: rec.iso,
-          cat: rec.cat || f.cat,
-          kind: rec.kind,
-          text: clip(rec.text, 320),
-          entities: rec.entities || [],
-          uuid: rec.uuid || null,
-          score: Math.round(score * 1000) / 1000
-        })
-      }
+        // A bounded page that traversed an entire stale file can safely repair
+        // it without making a partial index authoritative. An explicit rebuild
+        // is also available for files larger than the normal page budget.
+        if (offset === 0 && this._loadFileIndex(f.file)?.bytes !== fs.statSync(f.file).size) this.rebuildIndex(f.file)
+      } catch { unreadable++ }
     }
-    hits.sort((a, b) => (b.score - a.score) || (b.at - a.at))
-    return {
-      hits: hits.slice(0, Math.max(1, limit)),
-      scannedFiles,
-      scannedRecords,
-      candidateFiles: candidates.length,
-      truncated: candidates.length > scannedFiles,
-      corruptLines: this.corruptLines
-    }
+    hits.sort((a, b) => b.score - a.score || b.at - a.at)
+    return { hits, scannedFiles, scannedRecords, scannedBytes, unreadable, candidateFiles: candidates.length,
+      truncated: Boolean(next) || unreadable > 0, nextCursor: next ? Buffer.from(JSON.stringify({ signature, since, ...next })).toString('base64url') : null,
+      corruptLines: this.corruptLines }
   }
 
   /** Resolve one reference and (optionally) its neighbouring lines as context. */
@@ -429,29 +407,21 @@ class HistoryLog {
     const [, cat, file, lineText] = m
     if (!HISTORY_CATEGORIES.includes(cat)) return { ok: false, msg: `unknown history category "${cat}"` }
     const filePath = path.join(this.dir, cat, path.basename(file))
-    let raw = ''
-    try { raw = fs.readFileSync(filePath, 'utf8') } catch { return { ok: false, msg: `history file vanished: ${cat}/${file}` } }
-    const lines = raw.split('\n')
-    const idx = Math.max(1, Number(lineText)) - 1
+    const target = Number(lineText)
     const out = []
-    const lo = Math.max(0, idx - Math.max(0, context))
-    const hi = Math.min(lines.length - 1, idx + Math.max(0, context))
-    for (let i = lo; i <= hi; i++) {
-      const line = (lines[i] || '').trim()
-      let rec = null
-      try { rec = line ? JSON.parse(line) : null } catch { rec = null }
-      if (!rec) continue
-      out.push({
-        ref: `${cat}/${file}#${i + 1}`,
-        at: rec.at,
-        iso: rec.iso,
-        kind: rec.kind,
-        text: rec.text,
-        entities: rec.entities || [],
-        current: i === idx
-      })
-    }
-    if (!out.length) return { ok: false, msg: `no readable record at ${ref}` }
+    let current = false
+    try {
+      for (const row of this._lines(filePath)) {
+        if (row.line < target - context) continue
+        if (row.line > target + context) break
+        let rec
+        try { rec = JSON.parse(row.text) } catch { continue }
+        if (!rec) continue
+        current ||= row.line === target
+        out.push({ ...rec, ref: `${cat}/${file}#${row.line}`, current: row.line === target })
+      }
+    } catch { return { ok: false, msg: `history file unavailable: ${cat}/${file}` } }
+    if (!current) return { ok: false, msg: `no readable record at ${ref}` }
     return { ok: true, ref, cat, file, records: out }
   }
 

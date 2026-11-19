@@ -86,6 +86,36 @@ function roundWhere (pos, dim = 'overworld') {
   }
 }
 
+/** Pure: render one event as a prompt line with UTC time + elapsed age. */
+function formatEventLine (e, nowMs, { badge, batch = false } = {}) {
+  const ageSec = Math.max(0, Math.round((nowMs - e.timestampMs) / 1000))
+  const ageStr = ageSec < 90 ? `${ageSec}s ago` : `${Math.round(ageSec / 60)}m ago`
+  const mcClock = e.worldTime?.clock || formatWorldClock(e.worldTime)
+  const worldPart = mcClock
+    ? `, mc ${mcClock}${e.worldTime?.phase ? ` ${e.worldTime.phase}` : ''}`
+    : (e.worldTime?.phase ? `, ${e.worldTime.phase}` : '')
+  const timeTag = e.timestamp.slice(11, 19)
+  const sevTag = badge ? `[${badge}] ` : ''
+  const locTag = e.where ? ` @${e.where.x},${e.where.y},${e.where.z}` : ''
+  const whoTag = e.entities?.length ? ` [${e.entities.join(',')}]` : ''
+  let countTag = ''
+  if (e.count) {
+    const first = e.first_event_at || new Date(e.first_timestampMs ?? e.timestampMs).toISOString()
+    const last = e.last_event_at || new Date(e.last_timestampMs ?? e.timestampMs).toISOString()
+    countTag = ` (x${e.count}${first ? ` ${first.slice(11, 19)}Z–${last.slice(11, 19)}Z` : ''})`
+  }
+  const recTag = batch
+    ? (e.recovered ? ' [undelivered before restart]' : ' [NEW]')
+    : (e.recovered ? ' [undelivered before restart]' : '')
+  return `  - #${e.sequence} ${sevTag}[${timeTag}Z, ${ageStr}${worldPart}] ${e.type}${locTag}${whoTag}: ${e.description}${countTag}${recTag}`
+}
+
+function sameWhere (a, b) {
+  if (!a && !b) return true
+  if (!a || !b) return false
+  return a.x === b.x && a.y === b.y && a.z === b.z && a.dim === b.dim
+}
+
 function percentile (sorted, p) {
   if (!sorted.length) return null
   const idx = Math.min(sorted.length - 1, Math.max(0, Math.ceil((p / 100) * sorted.length) - 1))
@@ -160,7 +190,9 @@ class EventPipeline {
    *   mono?: () => number,
    *   maxEvents?: number,
    *   dedupeWindowMs?: number,
-   *   coalesceWindowMs?: number
+   *   coalesceWindowMs?: number,
+   *   batchWindowMs?: number,
+   *   maxBatchEvents?: number
    * }} opts
    */
   constructor ({
@@ -169,7 +201,9 @@ class EventPipeline {
     mono = monoNow,
     maxEvents = MAX_BUFFER_EVENTS,
     dedupeWindowMs = 600,
-    coalesceWindowMs = 1500
+    coalesceWindowMs = 1500,
+    batchWindowMs = 3_000,
+    maxBatchEvents = 64
   } = {}) {
     this.file = file
     this.now = now
@@ -177,20 +211,35 @@ class EventPipeline {
     this.maxEvents = maxEvents
     this.dedupeWindowMs = dedupeWindowMs
     this.coalesceWindowMs = coalesceWindowMs
+    // How long events may accumulate before a model decision forces a batch:
+    // a short collection window so bursts are not delivered one event at a time.
+    this.batchWindowMs = Math.max(0, batchWindowMs)
+    this.maxBatchEvents = Math.max(1, Math.trunc(maxBatchEvents))
     this.sequence = 0
     this.lastDeliveredSeq = 0
     this.events = []
     this._dedupeMap = new Map() // dedupeKey -> { timestampMs, seq }
+    this._batchOpenedAt = null // ms when the current undelivered-batch window opened
     this.latency = new LatencyTracker()
     this.stats = {
       emitted: 0,
       deduped: 0,
       coalesced: 0,
       recoveredOnBoot: 0,
-      droppedAmbient: 0
+      droppedAmbient: 0,
+      batchesDelivered: 0,
+      criticalDelivered: 0
     }
     this._dirty = false
     this._load()
+  }
+
+  /** Delivery lane for one event: critical (immediate), batch (next batch), summary (aggregated). */
+  deliveryLane (evt) {
+    const importance = evt.importance || 0
+    if (evt.reactionClass === 'immediate' || importance >= 3) return 'critical'
+    if (evt.reactionClass === 'fast' || importance === 2) return 'batch'
+    return 'summary'
   }
 
   _load () {
@@ -321,9 +370,16 @@ class EventPipeline {
     const importance = Number.isFinite(spec.importance)
       ? spec.importance
       : (defaults?.importance ?? (reactionClass === 'immediate' ? 3 : reactionClass === 'fast' ? 2 : reactionClass === 'ambient' ? 0 : 1))
+    const deliveryLane = reactionClass === 'immediate' || importance >= 3 ? 'critical'
+      : reactionClass === 'fast' || importance === 2 ? 'batch'
+      : 'summary'
 
     const queuedMono = this.mono()
     this.latency.record('receiptToQueueMs', Math.max(0, queuedMono - recvMono))
+
+    // Open a fresh collection window the first time an undelivered event
+    // arrives after the previous batch was delivered (or at startup).
+    if (this._batchOpenedAt === null) this._batchOpenedAt = receivedAt
 
     const evt = {
       sequence: this.sequence,
@@ -351,6 +407,7 @@ class EventPipeline {
       groupKey,
       groupCount: 1,
       samples: null,
+      deliveryLane,
       _queuedMono: queuedMono
     }
 
@@ -414,6 +471,161 @@ class EventPipeline {
 
   undelivered ({ minImportance = 1 } = {}) {
     return this.events.filter((e) => e.processedAt === null && (e.importance || 0) >= minImportance)
+  }
+
+  /** Undelivered critical events that bypass the batch window (death, critical health, attack, imminent threat). */
+  drainCritical ({ nowMs = this.now() } = {}) {
+    const critical = this.events
+      .filter((e) => e.processedAt === null && this.deliveryLane(e) === 'critical')
+      .sort((a, b) => a.sequence - b.sequence)
+    return {
+      events: critical,
+      count: critical.length,
+      firstEventAt: critical.length ? critical[0].timestamp : null,
+      lastEventAt: critical.length ? critical[critical.length - 1].timestamp : null
+    }
+  }
+
+  /**
+   * Build one structured `event_batch` from the events accumulated since the
+   * last model decision. Critical events are excluded — they are delivered
+   * immediately via drainCritical() instead of waiting for the batch window.
+   *
+   * @returns {{ type:string, event_count:number, first_event_at:string|null,
+   *   last_event_at:string|null, windowMs:number, overdue:boolean,
+   *   events:object[], moreRemaining:number }}
+   */
+  formatBatch ({ maxEvents = this.maxBatchEvents, excludeTypes = new Set(), nowMs = this.now() } = {}) {
+    const maxEv = Math.max(1, Math.trunc(maxEvents))
+    const waitedMs = Math.max(0, nowMs - (this._batchOpenedAt || nowMs))
+    // Close the collection window: the next record() opens a fresh window.
+    this._batchOpenedAt = null
+
+    const candidates = this.events.filter((e) => {
+      if (excludeTypes.has(e.eventType) && !e.recoveredFromRestart) return false
+      if (this.deliveryLane(e) === 'critical') return false // bypasses the batch entirely
+      const ageMs = Math.max(0, nowMs - e.receivedAt)
+      return e.processedAt === null
+        ? (ageMs <= 10 * 60_000 || e.recoveredFromRestart)
+        : false // already delivered: never injected into a later batch
+    })
+
+    // Priority at the cap: higher importance first, then most recent — a full
+    // batch never silently drops important events in favor of ambient chatter.
+    const prioritized = candidates.slice().sort((a, b) => {
+      if ((b.importance || 0) !== (a.importance || 0)) return (b.importance || 0) - (a.importance || 0)
+      return b.sequence - a.sequence
+    }).slice(0, maxEv)
+    prioritized.sort((a, b) => a.sequence - b.sequence) // chronological for delivery
+
+    const moreRemaining = Math.max(0, candidates.length - prioritized.length)
+    const entries = prioritized.map((e) => this.batchEventEntry(e, nowMs))
+    const events = this.coalesceBatchEvents(entries, nowMs)
+    const first = events[0]
+    const last = events[events.length - 1]
+
+    this.stats.batchesDelivered += 1
+    return {
+      type: 'event_batch',
+      event_count: events.length,
+      first_event_at: first ? first.timestamp : null,
+      last_event_at: last ? last.timestamp : null,
+      windowMs: waitedMs,
+      overdue: this.batchWindowMs > 0 && waitedMs > this.batchWindowMs,
+      events,
+      moreRemaining
+    }
+  }
+
+  /** One batch entry, with elapsed time so the model knows how old the event is. */
+  batchEventEntry (e, nowMs) {
+    const ageMs = Math.max(0, nowMs - e.timestampMs)
+    const severity = (e.importance || 0) >= 3 ? 'critical'
+      : (e.importance || 0) === 2 ? 'high'
+      : (e.importance || 0) === 1 ? 'medium' : 'low'
+    const entry = {
+      sequence: e.sequence,
+      type: e.eventType,
+      timestamp: e.timestamp,
+      timestampMs: e.timestampMs,
+      elapsedMs: ageMs,
+      ageSec: Math.max(0, Math.round(ageMs / 1000)),
+      severity,
+      description: e.summary,
+      where: e.where,
+      entities: e.entities,
+      cause: e.causalActId || null,
+      recovered: Boolean(e.recoveredFromRestart),
+      observationBasis: e.observationBasis
+    }
+    entry.first_timestampMs = e.timestampMs
+    entry.last_timestampMs = e.timestampMs
+    if (e.groupCount > 1) {
+      entry.count = e.groupCount
+      entry.first_event_at = e.timestamp
+      entry.last_event_at = new Date(e.lastTimestampMs || e.timestampMs).toISOString()
+    }
+    return entry
+  }
+
+  /**
+   * Coalesce repeated identical low-priority events into one entry with a count
+   * and first/last timestamps. Distinct events are never merged.
+   */
+  coalesceBatchEvents (entries, nowMs) {
+    const out = []
+    for (const entry of entries) {
+      const prev = out[out.length - 1]
+      if (prev && prev.severity === 'low' && entry.severity === 'low' &&
+          prev.type === entry.type && prev.description === entry.description &&
+          sameWhere(prev.where, entry.where)) {
+        prev.count = (prev.count || 1) + 1
+        if (!prev.first_event_at) prev.first_event_at = new Date(prev.first_timestampMs).toISOString()
+        prev.last_event_at = entry.timestamp
+        prev.last_timestampMs = entry.timestampMs
+        prev.elapsedMs = Math.max(0, nowMs - entry.timestampMs)
+        prev.ageSec = Math.max(0, Math.round(prev.elapsedMs / 1000))
+        if (entry.cause && !prev.cause) prev.cause = entry.cause
+        for (const ent of entry.entities || []) {
+          if (!prev.entities.includes(ent) && prev.entities.length < 12) prev.entities.push(ent)
+        }
+        continue
+      }
+      out.push(entry)
+    }
+    return out
+  }
+
+  /** Render one batch entry as a prompt line (chronological history, not "happening now"). */
+  formatBatchEventLine (e, nowMs) {
+    return formatEventLine(e, nowMs, { badge: e.severity, batch: true })
+  }
+
+  /** Render one critical event as an immediate (out-of-batch) prompt line. */
+  formatCriticalEventLine (e, nowMs) {
+    return formatEventLine(e, nowMs, { badge: 'CRITICAL', batch: false })
+  }
+
+  /**
+   * Render the accumulated batch as a single structured text block for the
+   * model prompt: a chronological history of recent events with timestamps and
+   * elapsed ages — explicitly not a single event happening now.
+   * @returns {{ text: string, shownSequences: number[], events: object[] }}
+   */
+  formatBatchForPrompt ({ batch, nowMs = this.now() } = {}) {
+    if (!batch || !batch.events.length) return { text: '', shownSequences: [], events: [] }
+    const first = batch.events[0]
+    const last = batch.events[batch.events.length - 1]
+    const oldestAgeSec = Math.max(0, Math.round((nowMs - first.timestampMs) / 1000))
+    const ageStr = oldestAgeSec < 90 ? `${oldestAgeSec}s ago` : `${Math.round(oldestAgeSec / 60)}m ago`
+    const spanSec = Math.max(0, Math.round((last.timestampMs - first.timestampMs) / 1000))
+    const header = `recent events (chronological batch: ${batch.event_count}${spanSec > 0 ? ` over ${spanSec}s` : ''}, oldest ${ageStr})`
+    const lines = [header, ...batch.events.map((e) => this.formatBatchEventLine(e, nowMs))]
+    return {
+      text: lines.join('\n'),
+      shownSequences: batch.events.map((e) => e.sequence),
+      events: batch.events
+    }
   }
 
   /**

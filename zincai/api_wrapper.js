@@ -54,6 +54,11 @@ const sleep = (ms, signal = null) => new Promise((resolve, reject) => {
 })
 const backoffMs = (attempt) => Math.min(8_000, 500 * 2 ** attempt) + Math.floor(Math.random() * 250)
 
+// Transient server/rate-limit faults that may be retried. 501 Not Implemented
+// (unsupported model or endpoint feature) is permanent, as is every 4xx
+// (invalid key, malformed request, unsupported model) — never retried.
+const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504])
+
 // ---------------------------------------------------------------------------
 // Tool schemas — the single source of truth for the System-2 action contract.
 // Keep descriptions terse: every token here is re-sent on every call.
@@ -1208,6 +1213,7 @@ class AmdToolsClient {
 
     let attempt = 0
     let lastError = null
+    let lastRetryAfterMs = null // Retry-After owed from the previous attempt's 429/503
     let effectiveMaxTokens = positiveInt(maxTokens, 16, 500_000)
     const defaultExtra = this._defaultReasoningParams(lane)
     let effectiveExtra = (defaultExtra || (extraParams && typeof extraParams === 'object'))
@@ -1223,9 +1229,11 @@ class AmdToolsClient {
     while (attempt <= maxRetries) {
       if (attempt > 0) {
         this.stats.retries += 1
-        // The backoff is cancellable too: a preempted turn must die AT ONCE,
-        // not after this request's remaining retries have been slept through.
-        await sleep(backoffMs(attempt - 1), signal)
+        // Honor Retry-After in full when the server gave one (rate limits must
+        // not become request storms); otherwise exponential backoff with jitter.
+        // The wait is cancellable: a preempted turn dies AT ONCE.
+        await sleep(lastRetryAfterMs ? 0 : backoffMs(attempt - 1), signal)
+        lastRetryAfterMs = null
       }
       // Checked per attempt: a retry is a fresh request even if the first was
       // allowed to start.
@@ -1259,10 +1267,11 @@ class AmdToolsClient {
         if (signal?.aborted) { const err = new Error('aborted'); err.name = 'AbortError'; throw err }
         const res = await this._fetchWithTimeout(url, { method: 'POST', headers, body: JSON.stringify(payload) }, timeoutMs, signal)
 
-        if (res.status === 429 || res.status >= 500) {
-          const retryAfterMs = res.status === 429 ? parseRetryAfterMs(res.headers?.get?.('retry-after')) : null
+        if (RETRYABLE_STATUS.has(res.status)) {
+          const retryAfterMs = parseRetryAfterMs(res.headers?.get?.('retry-after'))
           if (retryAfterMs) {
             this._cooldownUntil = Math.max(this._cooldownUntil, Date.now() + retryAfterMs)
+            lastRetryAfterMs = retryAfterMs
           }
           const snippet = redactSecrets((await res.text().catch(() => '')).slice(0, 200), this._apiKey)
           lastError = new Error(`HTTP ${res.status}: ${snippet}`)

@@ -558,6 +558,7 @@ class AdvancedCombat {
   resolveTarget (request, { explicitPlayersOnly = false } = {}) {
     const botPos = this.bot.entity?.position
     if (!botPos) return { target: null, why: 'no_target' }
+    const entityId = request && typeof request === 'object' && Number.isInteger(request.entityId) ? request.entityId : null
     const asPlayer = request && typeof request === 'object' ? String(request.player || '').trim() : ''
     const raw = asPlayer || String((request && typeof request === 'object' ? request.name : request) || 'any').trim()
     const wanted = raw.toLowerCase()
@@ -571,6 +572,7 @@ class AdvancedCombat {
     for (const id of Object.keys(this.bot.entities)) {
       const e = this.bot.entities[id]
       if (!e || !e.position || e === this.bot.entity || this._deadEntities.has(e)) continue
+      if (entityId !== null && (e.id !== entityId || isPlayer(e))) continue
       if (e.name === undefined || e.name === null) continue
       const dist = e.position.distanceTo(botPos)
       if (isPlayer(e)) {

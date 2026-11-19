@@ -566,7 +566,7 @@ class System1 {
       const target = decision.target || assessedThreats[0]
       if (this._flee) this._endFlee('engaged', 'auto-engage')
       if (this.combat && !this.combat.isEngaged && target) {
-        const res = await this.combat.engage(target.entity?.name || 'any', { autoDefense: true }).catch(() => ({ ok: false }))
+        const res = await this.combat.engage({ name: target.entity?.name, entityId: target.id }, { autoDefense: true, explicitPlayersOnly: true }).catch(() => ({ ok: false }))
         if (res?.ok) {
           this.chasers = []
           this.acknowledge(assessedThreats.map((t) => t.id), { types: [...new Set(assessedThreats.map((t) => t.name))], label: 'fight', ttlMs: 60_000 })

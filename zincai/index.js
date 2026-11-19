@@ -707,7 +707,30 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     attackerMemoryMs: cfg.threat.attackerMemoryMs ?? 15_000,
     reachable: makeReachabilityCheck(bot, { Movements, goals })
   })
+  const { NavigationIntents } = require('./navigation_intents')
+  let moduleBatchTimer = null
+  const navigationIntents = new NavigationIntents({
+    arbiter, logger: wrapperLog, dimension: () => dim(),
+    available: () => boundary.check('__lane__', { caps: ['move'] }).ok,
+    onResult: (result) => !ended && perceive({ source: result.source, eventType: 'navigation_intent_result', summary: `${result.id}: ${result.state}`, delta: result, importance: 2, remember: false }),
+    requestDecision: ({ source, summary, expedited = false, ...context }) => {
+      const rec = perceive({ ...context, source, summary, eventType: context.eventType || 'module_decision_request',
+        reactionClass: expedited ? 'immediate' : 'deliberate', importance: expedited ? 3 : 2, remember: false })
+      if (expedited) {
+        clearTimeout(moduleBatchTimer)
+        moduleBatchTimer = null
+        brain?.wake('expedited module decision requested', { external: true, urgent: true })
+      } else if (!moduleBatchTimer) {
+        moduleBatchTimer = setTimeout(() => {
+          moduleBatchTimer = null
+          brain?.wake('module decision batch ready', { external: true })
+        }, pipeline.batchWindowMs)
+      }
+      return rec?.event?.sequence ?? null
+    }
+  })
   const wrapper = new PathfinderWrapper(bot, {
+    intents: navigationIntents,
     logger: wrapperLog,
     threat: { ...(cfg.threat || {}), entityFilter: (e) => sense.isThreat(e) },
     isUrgent: () => arbiter.owner() === 'survival' || arbiter.owner() === 'combat',
@@ -2576,32 +2599,9 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     // Timestamped perception window: what happened, when (occurrence vs
     // observation), where, to whom, and whether it was seen or only inferred.
     const nowMs = Date.now()
-    const perceivedMax = level >= 3 ? 0 : level === 2 ? 2 : level === 1 ? 4 : 8
-    // 1. CRITICAL EVENTS FIRST — bypass the batch window and are delivered
-    //    immediately (death, critical health, being attacked, imminent threat).
-    //    They are never mixed into the chronological batch below.
-    const critical = pipeline.drainCritical({ nowMs })
-    const selectedCritical = critical.events.slice(0, level >= 3 ? 4 : level >= 1 ? 8 : 12)
-    const criticalText = selectedCritical.length
-      ? [...selectedCritical.map((e) => pipeline.formatCriticalEventLine(e, nowMs)),
-          ...(critical.count > selectedCritical.length ? [`${critical.count - selectedCritical.length} more critical records queued (not acknowledged)`] : [])].join('\n')
-      : null
-    const criticalSequences = selectedCritical.map((e) => e.sequence)
-
-    // 2. EVENT BATCH — everything else accumulated since the last model
-    //    decision, delivered together as one chronological history (not a
-    //    single event happening now). Repeated low-priority events are
-    //    coalesced with a count + first/last timestamps.
-    let batchText = ''
-    const batchSequences = []
-    if (perceivedMax > 0) {
-      const batch = pipeline.formatBatch({ maxEvents: perceivedMax, excludeTypes: OWN_SECTION, nowMs })
-      if (batch.events.length) {
-        batchText = pipeline.formatBatchForPrompt({ batch, nowMs }).text
-        batchSequences.push(...batch.sequences)
-      }
-    }
-    const shownSequences = [...criticalSequences, ...batchSequences]
+    const decisionBatch = pipeline.formatDecisionBatch({ maxEvents: level >= 3 ? 4 : level >= 1 ? 8 : 16, excludeTypes: OWN_SECTION, nowMs })
+    const batchText = pipeline.formatBatchForPrompt({ batch: decisionBatch, nowMs }).text
+    const shownSequences = decisionBatch.sequences
     const ephItems = level === 0
       ? (memory.ephemeral?.snapshot?.() || [])
         .filter((e) => !OWN_SECTION.has(e.type) && (e.text || e.msg))
@@ -2662,8 +2662,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       recalled || null,
       chat ? `${logHeader('log')}:\n${chat}` : null,
       res ? `results (your last actions):\n${res}` : null,
-      criticalText ? `critical (delivered immediately, bypassing the batch):\n${criticalText}` : null,
-      batchText ? `${batchText}` : null,
+      batchText ? `${batchText}${decisionBatch.moreRemaining ? `\n${decisionBatch.moreRemaining} events remain pending outside this frame.` : ''}` : null,
       level < 3 ? (failGate.advisoryLine(pos) || null) : null,
       level < 4 ? boundaryLine() : null,
       justNow,
@@ -2692,6 +2691,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       reasons,
       shownActionIds,
       shownSequences,
+      eventsRemaining: decisionBatch.moreRemaining,
       shownProposals,
       // Which objective this snapshot was taken for: a delayed answer about
       // one objective must not act on another (see staleActionReason).
@@ -3153,6 +3153,9 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
 
       if (accepted && usableDecision && !ended && life === lifeEpoch && calls.length) {
         pipeline.markProcessed(accepted.shownSequences, { via: 'model' })
+        if (accepted.eventsRemaining && pipeline.undelivered({ minImportance: 2 }).some((event) => !event.chat)) {
+          brain.wake('ordered event backlog remains', { external: false, important: true })
+        }
         continuity.markActionsDelivered(accepted.shownActionIds.filter((id) => accepted.text.includes(`[${id}]`)))
       }
       if (!followUp || wantsEnd || bodyStarted || ended || !alive) break
@@ -3753,6 +3756,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         const requestedAt = performance.now()
         const stopId = ++stopGeneration
         lanes.dropBodyWaiters()
+        if (!action.action_id) navigationIntents.cancelGoals('stopped')
         if (holder) lanes.requestBodyCancellation(holder.holder)
         try { telemetry.record('body_cancellation_requested', { bodyActionId: holder?.holder || null, callId: action._callId || null, goalId: holder?.meta?.goalId || null }) } catch { /* best effort */ }
         const duel = fight?.player ? combat?.target : null
@@ -4849,7 +4853,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       fleeDistance: cfg.system1.fleeDistance ?? 14,
       releaseRadius: cfg.system1.releaseRadius ?? 22,
       calmMs: cfg.system1.calmMs ?? 4000,
-      tether: () => skills?.tether?.() || null,
+      tether: () => skills?.tether?.() || navigationIntents.objectiveTether(),
       tetherTriggerRadius: cfg.system1.tetherTriggerRadius ?? 6,
       tetherReleaseRadius: cfg.system1.tetherReleaseRadius ?? 9,
       tetherCalmMs: cfg.system1.tetherCalmMs ?? 1200,
@@ -4910,6 +4914,13 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     })
     system1.start()
     brain.start()
+    // Trusted in-process module definitions, ordered by declared dependencies.
+    for (const definition of shared.navigationModules || []) {
+      try {
+        const { start, ...contract } = definition
+        navigationIntents.register(contract, start)
+      } catch (err) { recordError('navigation_module_registration', err) }
+    }
     // Process startup is distinct from Minecraft login/spawn. Queue this once
     // the model lane exists so it is delivered as a real decision input.
     brain.wake(shared.lifecycle.startupMessage({
@@ -5645,6 +5656,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     try { executor?.cancel() } catch { /* noop */ }
     try { combat?.stop(); combat?.start() } catch { /* noop */ }
     try { system1?.reset() } catch { /* noop */ }
+    navigationIntents.cancelGoals('life ended')
     try { arbiter.reset('death') } catch { /* noop */ }
     try { wrapper.threat.clear() } catch { /* noop */ }
     // Every job that cannot survive a new life is cancelled here; the goal
@@ -5808,6 +5820,8 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     try { system1?.stop() } catch { /* noop */ }
     try { combat?.stop() } catch { /* noop */ }
     try { wrapper.stop() } catch { /* noop */ }
+    clearTimeout(moduleBatchTimer)
+    navigationIntents.close()
     try { arbiter.stop() } catch { /* noop */ }
     try { hurts.stop() } catch { /* noop */ }
     // Every scoped permission dies with the session, so a reconnect can never
@@ -5941,7 +5955,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       return reconcileGoal(goal)
     },
     internals: () => ({
-      arbiter, sense, wrapper, combat, system1, skills, brain, results, agenda, telemetry, survivalPlanner,
+      arbiter, navigationIntents, sense, wrapper, combat, system1, skills, brain, results, agenda, telemetry, survivalPlanner,
       events: pipeline, latency, redstoneEngineer, redstoneLibrary: shared.redstoneLibrary,
       goals: goalReg, continuity, journal, focusGoal, continuationBlock, resetContext, executeAction, buildActionPrompt, buildChatPrompt,
       compactionState: () => ({ actionCompactionFloor, chatCompactionFloor, consecutiveTruncations, budget: amd.budget.snapshot() }),

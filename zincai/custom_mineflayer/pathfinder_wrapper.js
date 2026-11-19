@@ -655,16 +655,22 @@ class PredictiveThreatMap {
    * upstream has finished its feasibility checks keeps threat a *preference*.
    * @returns {boolean} true when attached
    */
-  attachToMovements (movements) {
+  attachToMovements (movements, intents = null) {
     if (!movements || typeof movements.getNeighbors !== 'function') return false
     if (movements._zincaiThreatCost) return true
     const map = this
     const original = movements.getNeighbors
     movements.getNeighbors = function (node) {
       const neighbors = original.call(this, node)
-      if (map.threats.length === 0) return neighbors
-      for (const n of neighbors) n.cost += map.costAt({ x: n.x + 0.5, y: n.y, z: n.z + 0.5 })
-      return neighbors
+      const field = intents?.field()
+      if (!map.threats.length && !field) return neighbors
+      return neighbors.filter((n) => {
+        const point = { x: n.x + 0.5, y: n.y, z: n.z + 0.5 }
+        const extra = field ? field(point, { x: node.x + 0.5, y: node.y, z: node.z + 0.5 }) : 0
+        if (!Number.isFinite(extra)) return false
+        n.cost += extra + map.costAt(point)
+        return true
+      })
     }
     movements._zincaiThreatCost = true
     return true
@@ -1045,6 +1051,7 @@ class PathfinderWrapper {
    */
   constructor (bot, opts = {}) {
     this.bot = bot
+    this.intents = opts.intents || null
     // Explicit `dig` corridor grants pathfinder permission to break any breakable block along the route.
     this._digWindow = null
     this._digTimer = null
@@ -1131,7 +1138,7 @@ class PathfinderWrapper {
     this._configureHazards(movements)
     movements.allowSprinting = true
     movements.maxDropDown = 4
-    this.threat.attachToMovements(movements)
+    this.threat.attachToMovements(movements, this.intents)
     if (movements === this._movements()) { try { this._escapeMovements() } catch { /* built on demand instead */ } }
     return true
   }
@@ -1174,7 +1181,8 @@ class PathfinderWrapper {
     const out = { worst: 0, sum: 0, critical: false, at: null, nodes: 0 }
     const path = this._path
     const me = this.bot?.entity?.position
-    if (!Array.isArray(path) || !path.length || !me || !this.threat.threats.length) return out
+    const field = this.intents?.field()
+    if (!Array.isArray(path) || !path.length || !me || (!this.threat.threats.length && !field)) return out
     let start = 0
     let best = Infinity
     for (let i = 0; i < path.length; i++) {
@@ -1187,8 +1195,9 @@ class PathfinderWrapper {
     for (let i = start + 1; i < path.length && out.nodes < nodes; i++) {
       const n = path[i]
       const pt = { x: n.x + 0.5, y: n.y, z: n.z + 0.5 }
-      const cost = this.threat.costAt(pt)
-      const crit = this.threat.isCriticalAt(pt)
+      const extra = field ? field(pt) : 0
+      const cost = this.threat.costAt(pt) + (Number.isFinite(extra) ? extra : 60)
+      const crit = !Number.isFinite(extra) || this.threat.isCriticalAt(pt)
       out.nodes++
       out.sum += cost
       if (crit) out.critical = true
@@ -1234,7 +1243,15 @@ class PathfinderWrapper {
   _startThreatMap () {
     clearInterval(this._threatTimer)
     this._threatTimer = setInterval(() => {
-      try { this.threat.sample(this.bot) } catch (err) { this.log('debug', `threat sample failed: ${err.message || err}`) }
+      try {
+        this.threat.sample(this.bot)
+        const pos = this.bot.entity?.position
+        if (this.intents && pos) {
+          this.intents.observe(Object.freeze({ at: this.intents.now(), dim: this.intents.dimension(),
+            position: Object.freeze({ x: pos.x, y: pos.y, z: pos.z }), health: this.bot.health, food: this.bot.food }))
+          this.intents.tick(pos.floored())
+        }
+      } catch (err) { this.log('debug', `threat sample failed: ${err.message || err}`) }
       try { this._watchRoute() } catch (err) { this.log('debug', `route watch failed: ${err.message || err}`) }
     }, this.threat.sampleMs)
     // Sample immediately so the first path is already threat-aware.

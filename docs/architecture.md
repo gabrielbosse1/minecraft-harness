@@ -166,3 +166,5 @@ All physical actuators flow through **`ControlArbiter`** (`zincai/control.js`), 
 - `test/helpers/mc-server.js` boots an ephemeral in-memory 1.21.4 server on a free localhost port with a 1.21.4 protocol bridge for respawn, player entity spawning, and movement relaying, plus helpers for blocks, inventories, health/damage/death, mobs, and real secondary Mineflayer clients (`Alice`).
 - `test/helpers/fake-world.js` builds offline prismarine-chunk scenes for the native-renderer regression suites (`test/10`, `test/11`).
 - `test/helpers/sim-harness.js` wires a local OpenAI-compatible HTTP server (`startScriptedLlmServer`) returning deterministic scripted tool calls, chat replies, and `reasoning_content` directly into `makeShared` + `createHost` + `startSession`.
+
+See [Navigation-centered intents](navigation-intents.md) for the incremental module and ordered event migration in PR #46.

@@ -68,3 +68,23 @@ No RPM bypass was added. `Brain` retains its scheduling limits, backoff and chat
 The new tests use isolated flying-squid 1.21.4 plus a scripted OpenAI-compatible provider. They cover an expiring override restoring a primary goal, A* travel around a restricted region, dependent module removal, and an expedited request containing earlier events. A pure event test covers overflow and acknowledgment of exact IDs. Existing memory delivery, survival and cancellation suites remain the baseline. There is no measured production RPM/latency or live AMD quality result from this migration.
 
 Next, migrate individual direct locomotion paths (combat approach/spacing, then the sensitive emergency and gait paths) behind verified navigation primitives. Add evidence for moving multi-threat fields, exact target engagement/resumption, fusing-to-exploded creeper traces, and hard constraints during jumps before removing their compatibility paths. Do not conflate those follow-ups with the registry being available now.
+
+## Locomotion contributors
+
+A navigation intent chooses **where** to go; a locomotion request chooses **how** to traverse the currently selected route. Publishing or withdrawing a style never sets a destination or claims a body lane. Use the scoped registration handle:
+
+```js
+module.publishLocomotion('interaction', {
+  goal, mode: 'precision', tier: 'objective', reason: 'approach work face',
+  expiresAt: Date.now() + 5000,
+  activeWhen: ({ distance }) => distance <= 5
+})
+// Withdraw after the interaction; unregistering also removes requests.
+module.withdrawLocomotion('interaction')
+```
+
+A hazard-only module can keep publishing fields without publishing any style. An urgent route can request `sprint` with a short expiry; an engagement can bind its approach to the exact follow goal and combat owner. A deterministic procedure can use `requestRouteStyle` without involving the model. A matching mandatory safety request can veto sprint or optional jumps via `allowSprint: false` or `allowOptionalJump: false`. Scope uses goal identity and dimension; target IDs are descriptive metadata, so use the exact target's goal or an activation predicate to enforce target scope. Equal rank uses insertion order with a 350 ms incumbent hold; higher rank preempts immediately. Expiry or withdrawal restores the next eligible style without replanning the destination solely to change gait.
+
+The session wrapper applies style on `physicsTick` after the native pathfinder listener. Native pathfinder still steers and handles required obstacle jumps; it can also apply the sprint permission from the preceding tick. Extra sprint-jumps require an active route, speed, food, cadence, a clear loaded corridor, and a simulated same-level landing. This is conservative screening, not proof of safety on all terrain. Procedure and builder approaches prefer precision near a work target. Short-lived threat and combat approach directives share the registry. Combat stance, reflex escape keys, gap recovery, and standalone/legacy gait adapters still have direct-control paths; this is an incremental migration, not exclusive movement ownership. Session counters report style transitions, safety downgrades, optional jumps, and ticks delegated to compatibility control. No new model tools, arguments, or per-transition notifications are introduced.
+
+Run `node --test scripts/tests/locomotion-arbitration.test.cjs test/20-locomotion-intents.test.js` for deterministic arbitration and controlled Minecraft route checks. The route checks measure transitions, hunger fallback, goal identity, restoration, arrival, and optional jumping on flat ground; they do not establish a production speedup or validate every combat/reflex interaction.

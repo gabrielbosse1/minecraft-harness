@@ -414,6 +414,7 @@ class AdvancedCombat {
     recoveryMs = 220,
     bowChargeThreshold = 1.0,
     hands = null,
+    locomotion = null,
     fleeOnDisengage = true,
     lineOfSight = null,
     watch = null,
@@ -434,6 +435,7 @@ class AdvancedCombat {
     this.recoveryMs = recoveryMs
     this.bowChargeThreshold = bowChargeThreshold
     this.hands = hands || directHands(bot)
+    this.locomotion = locomotion
     this.fleeOnDisengage = fleeOnDisengage !== false
     this.lineOfSight = typeof lineOfSight === 'function' ? lineOfSight : (e) => hasLineOfSight(this.bot, e)
     /**
@@ -683,6 +685,7 @@ class AdvancedCombat {
     this.critArmed = false
     this.autoDefense = false
     this.activeGoal = null
+    this.locomotion?.withdrawLocomotion('approach')
     try { this.hands.release('fight over') } catch { /* bot gone */ }
   }
 
@@ -810,6 +813,8 @@ class AdvancedCombat {
       const followRange = Math.max(1, Math.round(this.profile.min))
       const goal = new GoalFollow(this.target, followRange)
       this.activeGoal = { goal, dynamic: true }
+      this.locomotion?.publishLocomotion('approach', { goal, mode: 'sprint', tier: 'override', reason: 'engagement approach',
+        target: this.target.id, expiresAt: this.now() + 5000, activeWhen: ({ owner }) => owner === 'combat' })
       this.hands.setGoal(goal, true)
     } catch (err) {
       logger.debug(TAG, `follow goal failed: ${err.message || err}`)

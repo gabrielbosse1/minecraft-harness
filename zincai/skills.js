@@ -284,9 +284,10 @@ class Skills {
       bot.pathfinder.thinkTimeout = Math.max(bot.pathfinder.thinkTimeout, 8000)
     }
     const wrapper = this._pathfinder()
-    if (gait && typeof wrapper?.setGait === 'function') {
-      wrapper.setGait(gait)
-    }
+    const precise = goal.constructor?.name === 'GoalGetToBlock'
+    const withdrawStyle = wrapper?.requestRouteStyle?.(goal, gait || (precise ? 'precision' : null), { near: gait ? null : 5 })
+    const legacyGait = gait && !wrapper?.intents
+    if (legacyGait) wrapper?.setGait?.(gait)
     lane.acquire({ reason: token.label })
     this._noPathAt = 0
     lane.setGoal(goal, dynamic)
@@ -359,7 +360,8 @@ class Skills {
       // A dig corridor is for ONE walk: whoever granted it gets it closed here,
       // on success, on noPath and on cancellation alike.
       if (token.digWindow) { try { this._pathfinder()?.endDigging?.(token.cancelled || 'walk done') } catch { /* gone */ } }
-      if (gait) { try { this._pathfinder()?.setGait?.('auto') } catch { /* gone */ } }
+      withdrawStyle?.()
+      if (legacyGait) { try { wrapper?.setGait?.('auto') } catch { /* gone */ } }
       token.walking = false
       token.walkTarget = null
       // A replaced walk must not wipe the goal its replacement just set.
@@ -1323,7 +1325,7 @@ class Skills {
       if (!carried) return fail(`no blocks to shelter with — need ~4 of ${(exec.scaffoldBlocks || ['dirt', 'cobblestone']).join('/')}`)
       token.label = 'sheltering on a pillar'
       const feet = bot.entity.position.floored()
-      const done = await exec.pillarUpTo(feet.y + 3)
+      const done = await exec.pillarUpTo(feet.y + 3, () => Boolean(token.cancelled))
       if (!done) return fail('could not pillar up (blocked above?)')
       try {
         // Stay until cancelled/stopped, re-prioritizing survival implicitly

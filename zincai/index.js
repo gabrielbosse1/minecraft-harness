@@ -4796,6 +4796,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       engageRadius: cfg.behavior.engageRadius ?? 24,
       threatMap: wrapper.threat,
       hands: arbiter.lane('combat', PRIORITY.combat),
+      locomotion: navigationIntents.register({ id: 'combat-approach' }),
       // Running away is the survival layer's job here.
       fleeOnDisengage: false,
       mayTakeShield: () => !armorPrefs.held.has('off-hand'),
@@ -4813,7 +4814,12 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     combat.start()
 
     const taskLane = arbiter.lane('task', PRIORITY.task)
-    executor = new BuilderExecutor(bot, { scaffoldBlocks: cfg.build.scaffoldBlocks, logger: wrapperLog, hands: taskLane, boundary })
+    executor = new BuilderExecutor(bot, { scaffoldBlocks: cfg.build.scaffoldBlocks, logger: wrapperLog, hands: taskLane, boundary, navigation: wrapper })
+    wrapper.pillarExecutor = (height) => {
+      const signal = leaseContext.getStore()?.lease?.signal
+      executor.cancelRequested = false
+      return executor.pillarUpTo(height, () => executor.cancelRequested || signal?.aborted)
+    }
     skills = new Skills(bot, { arbiter, places, logger: wrapperLog, whisper: guard.whisper, executor: () => executor, pathfinder: () => wrapper, boundary, moveTimeoutMs: cfg.navigation?.moveTimeoutMs ?? 180_000, slowWalkMs: cfg.navigation?.slowWalkMs ?? 20_000, onSlowWalk: (warning) => brain?.wake(warning, { external: true }) })
 
     brain = new Brain({
@@ -4838,7 +4844,9 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       maxSelfChain: cfg.inference.maxSelfChain ?? 12
     })
 
+    const threatLocomotion = navigationIntents.register({ id: 'threat-locomotion' })
     system1 = new System1(bot, {
+      locomotion: threatLocomotion,
       registry: new ReflexRegistry(),
       logger,
       arbiter,

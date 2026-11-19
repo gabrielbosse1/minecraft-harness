@@ -3,6 +3,8 @@
 // Priorities are compatible with ControlArbiter's existing lane adapter.
 const NAV_PRIORITY = Object.freeze({ opportunity: 0.5, objective: 1, override: 2, urgent: 2.5, safety: 3 })
 
+const LOCOMOTION_MODES = new Set(['auto', 'walk', 'precision', 'crouch', 'sprint', 'sprint_jump'])
+
 function selectIntent (candidates) {
   let best = null
   for (const candidate of candidates) {
@@ -23,11 +25,12 @@ class NavigationIntents {
     this.log = logger
     this.modules = new Map()
     this.zones = new Map()
+    this.locomotionWinner = null
   }
 
   register ({ id, dependencies = [], modelAssisted = false, observe = null, onResult = null, ...metadata }, start = () => {}) {
     if (typeof id !== 'string' || !id || this.modules.has(id) || dependencies.some((dep) => !this.modules.has(dep))) throw new Error(`invalid or unresolved navigation module: ${id}`)
-    const m = { id, dependencies: dependencies.slice(), modelAssisted, metadata, observe, onResult, lanes: new Set(), goals: new Map(), active: null }
+    const m = { id, dependencies: dependencies.slice(), modelAssisted, metadata, observe, onResult, lanes: new Set(), goals: new Map(), locomotion: new Map(), active: null }
     this.modules.set(id, m)
     const live = () => this.modules.get(id) === m
     const publishGoal = (goalId, spec) => {
@@ -49,6 +52,17 @@ class NavigationIntents {
     }
     const api = Object.freeze({
       publishGoal,
+      publishLocomotion: (key, spec) => {
+        if (!live()) return false
+        const tier = spec?.tier || 'objective'
+        if (!key || !LOCOMOTION_MODES.has(spec?.mode) || !Object.hasOwn(NAV_PRIORITY, tier) || !Number.isFinite(spec.expiresAt)) {
+          throw new TypeError('locomotion requires ID, supported mode, tier and finite expiry')
+        }
+        m.locomotion.set(key, { ...spec, id: key, source: id, priority: NAV_PRIORITY[tier],
+          dim: spec.dim ?? this.dimension(), createdAt: m.locomotion.get(key)?.createdAt ?? this.now() })
+        return true
+      },
+      withdrawLocomotion: (key) => live() && m.locomotion.delete(key),
       publishOverride: (key, spec) => publishGoal(key, { ...spec, tier: spec.tier || 'override' }),
       publishDanger: publishZone,
       // Constraints are currently spatial: hard exclusion or soft clearance cost.
@@ -89,7 +103,11 @@ class NavigationIntents {
   }
 
   cancelGoals (reason = 'cancelled') {
-    for (const m of this.modules.values()) for (const key of m.goals.keys()) this._retire(m, key, reason)
+    for (const m of this.modules.values()) {
+      for (const key of m.goals.keys()) this._retire(m, key, reason)
+      m.locomotion.clear()
+    }
+    this.locomotionWinner = null
   }
 
   close () { for (const id of this.modules.keys()) this.unregister(id) }
@@ -128,6 +146,37 @@ class NavigationIntents {
       lane.acquire({ reason: desired.reason || desired.id })
       m.active = { id: desired.id, intent: desired, lane }
     }
+  }
+
+  /** Resolve style without setting a path or claiming movement. */
+  resolveLocomotion (context = {}) {
+    const now = this.now()
+    const dim = this.dimension()
+    const candidates = []
+    for (const m of this.modules.values()) {
+      for (const [key, request] of m.locomotion) {
+        if (now >= request.expiresAt || request.dim !== dim) { m.locomotion.delete(key); continue }
+        if (request.goal && request.goal !== context.goal) continue
+        try {
+          if (request.cancelWhen?.(context)) { m.locomotion.delete(key); continue }
+          if (request.activeWhen && !request.activeWhen(context)) continue
+        } catch { m.locomotion.delete(key); continue }
+        candidates.push(request)
+      }
+    }
+    // Only safety directives can impose a mandatory style. Restrictions such
+    // as hunger and unsafe landing are enforced separately in the executor.
+    const rank = (r) => r.priority + (r.mandatory && r.priority === NAV_PRIORITY.safety ? 1 : 0)
+    let best = null
+    for (const r of candidates) if (!best || rank(r) > rank(best)) best = r
+    const prev = this.locomotionWinner
+    const current = prev && candidates.find((r) => r.source === prev.request.source && r.id === prev.request.id && r.mode === prev.request.mode)
+    if (current && best && rank(current) === rank(best) && now - prev.at < 350) best = current
+    this.locomotionWinner = best ? { request: best, at: current === best ? prev.at : now } : null
+    if (!best) return null
+    const safety = candidates.filter((r) => r.mandatory && r.priority === NAV_PRIORITY.safety)
+    return { ...best, allowSprint: best.allowSprint !== false && safety.every((r) => r.allowSprint !== false),
+      allowOptionalJump: best.allowOptionalJump !== false && safety.every((r) => r.allowOptionalJump !== false) }
   }
 
   field () {

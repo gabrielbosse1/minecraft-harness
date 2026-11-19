@@ -200,6 +200,7 @@ class System1 {
     // nothing hostile was within 22 blocks, by which time the player was gone.
     // `tether()` returns { label, position } or null; at low health it is
     // ignored and the full escape runs.
+    this.locomotion = opts.locomotion || null
     this.tether = typeof opts.tether === 'function' ? opts.tether : () => null
     this.tetherTriggerRadius = opts.tetherTriggerRadius ?? 6
     this.tetherReleaseRadius = opts.tetherReleaseRadius ?? 9
@@ -535,6 +536,14 @@ class System1 {
       chooseFood
     })
     const nearestThreat = decision.situation?.nearest || assessedThreats[0] || null
+    if (decision.mode === THREAT_MODES.FLEE || (decision.mode === THREAT_MODES.AVOID && tether && nearestThreat?.distance <= 7)) {
+      const emergency = decision.mode === THREAT_MODES.FLEE
+      this.locomotion?.publishLocomotion('threat-response', {
+        mode: emergency ? 'sprint_jump' : 'sprint', tier: emergency ? 'safety' : 'override',
+        expiresAt: now + 550, reason: decision.reason, target: nearestThreat?.id,
+        activeWhen: ({ owner, goal }) => Boolean(goal && (emergency ? owner === 'survival' : owner !== 'survival'))
+      })
+    } else this.locomotion?.withdrawLocomotion('threat-response')
     this.threatMode = decision.mode
     this.lastThreatDecision = decision
     if (decision.changed) {

@@ -673,8 +673,19 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   // Network-level physical barrier: every primitive that could move the body or
   // change the world is refused while the body is paused, disconnected, dead or
   // outside its permissions. Installed BEFORE any subsystem gets the bot.
+  const leaseContext = new AsyncLocalStorage()
   const physicalGuard = require('./boundary').installPhysicalGuard(bot, boundary, {
-    logger: (level, msg) => logger[level]?.(TAG, msg)
+    logger: (level, msg) => logger[level]?.(TAG, msg),
+    ownership: (primitive) => {
+      const lease = leaseContext.getStore()?.lease
+      if (lease?.lane !== LANES.BODY) return null
+      if (lease.released) return 'physical action lease expired or was released'
+      // Active cleanup can still release controls. Never start a new world
+      // mutation for a cancelled continuation. Scaffold cleanup is cooperative.
+      if (lease.signal?.aborted && !['dig', 'equip', 'setControlState'].includes(primitive)) return 'physical action cancellation requested'
+      lease.heartbeat()
+      return null
+    }
   })
 
   // --- who owns what ------------------------------------------------------
@@ -719,6 +730,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   let fight = null // { request, label, kills, player }
   let task = null // { id, label, startedAt } for background work that is not a Skill
   let taskSeq = 0
+  let stopGeneration = 0
   let lastHurt = { at: 0, text: '' }
   let lastSayAt = 0
   const results = [] // what the last actions did: { label, ok, msg, ts }
@@ -1015,8 +1027,6 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     windowMs: cfg.inference?.failWindowMs ?? 120_000,
     maxFails: cfg.inference?.failGateAfter ?? 2
   })
-  /** The action whose turn is executing right now, for failure attribution. */
-  let gateCtx = null
   /**
    * While a turn executes one of its tool calls, every result reported lands
    * here too, so the turn can hand it straight back to the model as that call's
@@ -1027,7 +1037,6 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   let imageTap = null
   /** Screenshots taken since the last turn started (a picture costs a model call to read: bounded per turn). */
   let shotsThisTurn = 0
-  let currentActId = null
   /**
    * Lane-lease handoff.
    *
@@ -1039,7 +1048,6 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
    * invocation's lease separate when independent actions overlap; a claimed
    * lease is released when its background work really ends.
    */
-  const leaseContext = new AsyncLocalStorage()
 
   /** Transfer a BODY lease from this invocation to its background work. */
   function adoptLease (promise, why) {
@@ -1057,6 +1065,9 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
    * (a failure, a finished task, information it asked for), wake it.
    */
   function report (label, result, { wake = null, actId = null } = {}) {
+    const scope = leaseContext.getStore()
+    const gateCtx = scope?.action
+    const currentActId = scope?.actId
     const r = result && typeof result === 'object' ? result : { ok: true, msg: String(result ?? 'done') }
     // What the model asked to be told (a chest's contents, a storage list) is
     // not cut to a headline: at 220 characters a full chest lost its second half.
@@ -1211,7 +1222,11 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     const shouldWake = wake === null ? (!r.ok || (INFORMATIONAL.has(label) && !redundantRead)) : wake
     const wakeText = `${label} ${r.ok ? 'done' : 'failed'}: ${msg}`
     if (redundantRead) logger.debug(TAG, `${label}: answer unchanged after ${streak.n} reads — not waking the model`)
-    if (resultTap) resultTap.push({ label, ok: Boolean(r.ok), msg, wakeText: shouldWake ? wakeText : null })
+    const outcome = { request: r.request || (scope?.lease ? 'accepted' : 'unspecified'), execution: r.execution || (r.complete === false ? 'partial_or_pending' : r.ok ? 'returned' : 'failed_or_rejected'), verification: r.verification || 'not_established' }
+    const latest = results.findLast((item) => item.actId === finalActId && item.ts === resultTs && item.label === label)
+    if (latest) latest.outcome = outcome
+    try { telemetry.record('action_outcome', { tool: label, actionId: finalActId, bodyActionId: r.bodyActionId || leaseContext.getStore()?.lease?.id || null, callId: gateCtx?._callId || null, goalId: execGoalId, ...outcome, msg, evidence: r.evidence || null }) } catch { /* best effort */ }
+    if (resultTap) resultTap.push({ label, ok: Boolean(r.ok), msg, outcome, wakeText: shouldWake ? wakeText : null })
     if (shouldWake) brain?.wake(wakeText, { external: false })
   }
 
@@ -1355,7 +1370,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       try { telemetry.goalEvent({ op: 'suspend', goalId, description: goal.label, status: 'suspended', note: msg }); syncContinuation('goal_suspend') } catch { /* noop */ }
       return
     }
-    if (r && r.ok && r.complete !== false) {
+    if (r && r.ok && r.complete !== false && r.verification !== 'unverified') {
       goalReg.complete(goalId, { note: msg })
       try { telemetry.goalEvent({ op: 'complete', goalId, description: goal.label, status: 'completed', note: msg }); syncContinuation('goal_complete') } catch { /* noop */ }
       // A finished objective is the moment the model has the most to decide
@@ -1435,7 +1450,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         if ((!inheritedBody && !ownLease) || ended || agenda.main !== main || main.paused || ctl?.isCancelled()) {
           return { ok: false, msg: 'cancelled before starting' }
         }
-        return await main.run()
+        return await (ownLease ? leaseContext.run({ lease: ownLease, claimed: true }, main.run) : main.run())
       } finally {
         if (ownLease) ownLease.release(`${main.tool} finished`)
       }
@@ -1474,6 +1489,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     if (prev) shelfMain(prev, `set aside: ${spec.label} was started`)
     agenda.shelved = agenda.shelved.filter((x) => !spec.goalId || x.goalId !== spec.goalId)
     replaceTask()
+    const gateCtx = leaseContext.getStore()?.action
     const main = { ...spec, failAction: gateCtx?.a === spec.tool ? { ...gateCtx } : null, startedAt: Date.now(), paused: null, resumes: 0, seq: 0 }
     let goal = main.goalId ? goalReg.get(main.goalId) : null
     if (goal) {
@@ -1538,7 +1554,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       try {
         if (!inheritedBody) lease = await lanes.acquire(label, { goalId: goal?.id || null })
         if ((!inheritedBody && !lease) || ended) return { ok: false, msg: 'cancelled before starting' }
-        return await run()
+        return await (lease ? leaseContext.run({ lease, claimed: true }, run) : run())
       } finally { if (lease) lease.release(`${label} finished`) }
     })()
     return background(label, adoptLease(work, `${label} finished`), { side: true, goalId: goal ? goal.id : null, actId })
@@ -2273,6 +2289,8 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     const cur = skills?.current()
     const main = agenda.main && !agenda.main.paused ? agenda.main : null
     const asker = main?.askedBy ? `, asked by ${main.askedBy}` : ''
+    const holder = lanes.bodyHolder()
+    if (holder) parts.push(`BODY action ${holder.holder}`)
     if (cur) parts.push(`${cur.label} (${cur.seconds}s${asker})${cur.paused ? ' — paused while the body flees, resumes by itself after' : ''}`)
     else if (task) parts.push(`${task.label} (${Math.round((Date.now() - task.startedAt) / 1000)}s${asker})`)
     if (system1?.fleeing) parts.push('FLEEING by reflex')
@@ -2297,6 +2315,8 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   function activityText () {
     const parts = []
     const cur = skills?.current()
+    const holder = lanes.bodyHolder()
+    if (holder) parts.push(`BODY action ${holder.holder}`)
     if (cur) parts.push(`${cur.label} (${cur.seconds}s)`)
     else if (task) parts.push(`${task.label} (${Math.round((Date.now() - task.startedAt) / 1000)}s)`)
     if (combat?.isEngaged) parts.push(`fighting ${fight?.label || 'target'}`)
@@ -2548,7 +2568,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     const resCap = level >= 4 ? 120 : level === 3 ? 140 : level === 2 ? 180 : 0
     const res = results.slice(-resKeep).map((r) => {
       const msg = resCap && String(r.msg || '').length > resCap ? `${String(r.msg).slice(0, resCap - 1)}…` : r.msg
-      return `  - ${r.label}: ${r.ok ? '' : 'FAILED — '}${msg}`
+      return `  - ${r.label}: ${r.ok ? '' : 'FAILED — '}${msg}${r.outcome ? ` [${r.outcome.request}/${r.outcome.execution}/${r.outcome.verification}]` : ''}`
     }).join('\n')
     // (World events used to be an untimed `events:` list here. They are lines
     // of the IRC log now — `[14:02:07] * hurt: hit by player Steve` — in order
@@ -2667,6 +2687,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       text: lines.filter(Boolean).join('\n'),
       compactionLevel: level,
       threatIds,
+      dimension: dim(),
       askedBy: asked ? asked[1] : null,
       reasons,
       shownActionIds,
@@ -3074,9 +3095,20 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       let wantsEnd = false
       let bodyStarted = null
       let followUp = false
-      for (const action of actions) {
+      // Stop addresses work that existed before this answer, never a new
+      // action in the same answer. Stable ordering within both groups.
+      let stopPending = false
+      const ordered = [...actions.filter((a) => a.a === 'stop'), ...actions.filter((a) => a.a !== 'stop')]
+      for (const action of ordered) {
         if (ended || !alive) break
+        try { telemetry.record('tool_request', { callId: action._callId || null, tool: action._unknownTool || action._badArgs || action.a,
+          originalArguments: action._rawArguments ?? null, normalizedArguments: publicArgs(action), goalId: snap.goalId || null,
+          classification: isBrokenCall(action) ? (action._badArgs || action._unknownTool ? 'invalid_call' : 'no_usable_call') : 'selected' }) } catch { /* best effort */ }
         const callName = action._unknownTool || action._badArgs || action.a
+        if (stopPending && laneOfAction(action) === LANES.BODY) {
+          calls.push({ id: action._callId, name: callName, args: publicArgs(action), result: 'NOT RUN: stop cleanup is pending; retry only after BODY is free.' })
+          continue
+        }
         const plainIdle = action.a === 'idle' && !isBrokenCall(action)
         if (plainIdle) wantsEnd = true
         // The body does one thing at a time. A second physical call in the same
@@ -3099,6 +3131,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         if (action.a === 'goal' || action.a === 'stop') {
           snap.goalId = agenda.main && !agenda.main.paused ? agenda.main.goalId : null
         }
+        if (action.a === 'stop') stopPending ||= tap.some((r) => r.label === 'stop' && r.outcome.execution === 'cancelling')
         executed.push(action)
         const own = tap.filter((r) => r.label === action.a || (action.a === 'idle' && r.label === 'reply'))
         const startedBody = !plainIdle && !own.length && laneOfAction(action) === LANES.BODY && bodyWorking()
@@ -3107,7 +3140,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
           bodyStarted = action.a
           text = `started — ${doingLine().replace(/^doing: /, '')}. It runs by itself; its result starts your next turn. Do not call it again.`
         } else if (tap.length) {
-          text = tap.map((r) => `${r.label === action.a ? '' : `${r.label}: `}${r.ok ? '' : 'FAILED — '}${r.msg}`).join(' | ')
+          text = tap.map((r) => `${r.label === action.a ? '' : `${r.label}: `}${r.ok ? '' : 'FAILED — '}${r.msg} [${r.outcome.request}/${r.outcome.execution}/${r.outcome.verification}]`).join(' | ')
         } else {
           text = plainIdle ? 'ok' : (action.a === 'say' ? 'sent' : 'done')
         }
@@ -3543,6 +3576,10 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   // ----------------------------------------------------------- executor --
   async function executeAction (action, snap) {
     const execStartMono = performance.now()
+    const admittedGeneration = stopGeneration
+    const admittedDimension = dim()
+    const admittedLife = lifeEpoch
+    const admittedDecision = decisionEpoch
     const vanilla = assertVanillaAction(action)
     if (!vanilla.ok) {
       logger.warn(TAG, `refused non-vanilla action (${vanilla.why})`)
@@ -3566,13 +3603,14 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     // the exact same call failed repeatedly seconds ago — refuse
     // it locally instead of running the world mutation again. No wake: the
     // quiet refusal shows up in the next natural prompt's results.
-    if (a !== 'idle') {
+    if (!['idle', 'stop', 'hold'].includes(a)) {
       const blocked = failGate.check(action, here())
       if (blocked) return report(a, { ok: false, msg: blocked }, { wake: false })
     }
     // A decision generated for a situation that no longer exists must not act:
     // the model may have been thinking for a minute and a half.
-    const stale = staleActionReason(action, snap)
+    const stale = snap?.dimension && laneOfAction(action) === LANES.BODY && snap.dimension !== admittedDimension
+      ? 'refused: dimension changed since observation' : staleActionReason(action, snap)
     if (stale) {
       logger.info(TAG, `stale ${a} refused: ${stale.slice(0, 120)}`)
       return report(a, { ok: false, msg: stale }, { wake: false })
@@ -3592,12 +3630,14 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
     // for everything that has to be serialised. The lease is released in the
     // finally block of the executor wrapper below.
     let laneLease = null
+    let interruptedMain = null
     try {
       const lane = laneOfAction(action)
       // A newer physical decision interrupts the current task before waiting
       // for its lease; the old task retains its lock until it really exits.
       if (lane === LANES.BODY && agenda.main && lanes.bodyHolder()) {
-        agenda.main.pendingInterrupt = true
+        interruptedMain = agenda.main
+        interruptedMain.pendingInterrupt = true
         replaceTask()
       }
       const footprint = footprintOf(action)
@@ -3609,19 +3649,29 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       }
     } catch { laneLease = null }
     if (!laneLease) {
-      if (agenda.main?.pendingInterrupt) { shelfMain(agenda.main, 'interrupted while another action waited'); agenda.main = null }
+      if (interruptedMain && agenda.main === interruptedMain && interruptedMain.pendingInterrupt) { shelfMain(agenda.main, 'interrupted while another action waited'); agenda.main = null }
       // A refusal at the lease (paused, disconnected, out of quota) says so in
       // the model's own terms; a genuine resource conflict keeps its old text.
       const again = boundary.check(a, { action })
       const why = again.ok ? 'resource busy' : again.why
       return report(a, { ok: false, msg: `${why} — nothing was started; retry when the body is free` }, { wake: false })
     }
-    return leaseContext.run({ lease: laneLease, claimed: false }, async () => {
-    gateCtx = action
+    if (laneLease.lane === LANES.BODY) {
+      const changed = stopGeneration !== admittedGeneration || lifeEpoch !== admittedLife || decisionEpoch !== admittedDecision || dim() !== admittedDimension
+      const staleAfterWait = changed ? 'refused: execution context changed while waiting for the body' : staleActionReason(action, snap)
+      if (staleAfterWait) {
+        if (interruptedMain && agenda.main === interruptedMain) { shelfMain(interruptedMain, staleAfterWait); agenda.main = null }
+        laneLease.release('stale admission')
+        return report(a, { ok: false, request: 'rejected', execution: 'not_started', msg: staleAfterWait }, { wake: false })
+      }
+    }
+    try { telemetry.record('tool_admission', { callId: action._callId || null, tool: a, bodyActionId: laneLease.lane === LANES.BODY ? laneLease.id : null, resources: laneLease.resources, waitMs: laneLease.waitedMs, goalId: agenda.main?.goalId || null }) } catch { /* best effort */ }
+    return leaseContext.run({ lease: laneLease, claimed: false, action }, async () => {
     const IMMEDIATE_TRACKED = new Set(['say', 'stop', 'hold', 'pace', 'equip', 'redstone_scan', 'redstone_component', 'redstone_engineer', 'recall', 'circuit_project', 'logic_test', 'inspect_region', 'inspect_block', 'screenshot', 'find', 'remember_here', 'note', 'social', 'goal'])
-    currentActId = IMMEDIATE_TRACKED.has(a)
+    const currentActId = IMMEDIATE_TRACKED.has(a)
       ? continuity.beginAction({ tool: a, summary: `${a} ${JSON.stringify(goalArgs(action)).slice(0, 80)}`, sig: `${a}:${JSON.stringify(goalArgs(action))}`, goalId: agenda.main?.goalId || null, args: goalArgs(action) })
       : null
+    leaseContext.getStore().actId = currentActId
     if (currentActId) actStartedMono.set(currentActId, execStartMono)
     if (actStartedMono.size > 32) actStartedMono.delete(actStartedMono.keys().next().value)
     try {
@@ -3696,6 +3746,15 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         return report('pace', { ok: true, msg: bits.join(', ') || `gait=${applied}` }, { wake: false })
       }
       case 'stop': {
+        const holder = lanes.bodyHolder()
+        if (action.action_id && action.action_id !== holder?.holder) {
+          return report('stop', { ok: false, request: 'rejected', msg: `no currently held BODY action ${action.action_id}; nothing cancelled` }, { wake: false })
+        }
+        const requestedAt = performance.now()
+        const stopId = ++stopGeneration
+        lanes.dropBodyWaiters()
+        if (holder) lanes.requestBodyCancellation(holder.holder)
+        try { telemetry.record('body_cancellation_requested', { bodyActionId: holder?.holder || null, callId: action._callId || null, goalId: holder?.meta?.goalId || null }) } catch { /* best effort */ }
         const duel = fight?.player ? combat?.target : null
         const stoppedGoalId = agenda.main?.goalId || null
         agenda.main = null
@@ -3715,7 +3774,17 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         // A duel the model agreed to and then called off: the hits were part
         // of it, so the opponent is not somebody to run from afterwards.
         if (duel) sense.forgive(duel.id)
-        return report('stop', { ok: true, msg: 'stop requested; in-progress actions or survival movement may continue' }, { wake: false })
+        try { bot.stopDigging?.() } catch { /* no active dig */ }
+        if (holder) holder.state = 'cancelling'
+        const drained = !holder || await lanes.waitForBodyRelease(holder.holder)
+        const confirmed = drained && !skills?.current() && !combat?.isEngaged && !lanes.bodyHolder()
+        if (confirmed) latency.record('cancelToCleanupMs', performance.now() - requestedAt)
+        return report('stop', {
+          ok: true, request: 'accepted', bodyActionId: holder?.holder || null,
+          execution: confirmed ? 'cleanup_confirmed' : 'cancelling',
+          evidence: { targetedLeaseReleased: drained, cleanupWaitMs: Math.round(performance.now() - requestedAt) },
+          msg: `stop ${stopId} for ${holder?.holder || 'current task/fight'}: ${confirmed ? 'cleanup confirmed for task/fight' : 'cancellation requested; cleanup not confirmed'}; survival movement may continue`
+        }, { wake: false })
       }
       case 'hold': {
         // "They are harmless or accepted": the body stops running from them. It
@@ -3846,7 +3915,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
           if (!ug.ok) return report('use_block', { ok: false, msg: `refused: ${ug.reason}` })
         }
         decided(snap, { label: 'use_block' })
-        return startSide('use_block', () => skills.useBlock({ what: action.what }), sideOpts('use_block', action, snap))
+        return startSide('use_block', () => skills.useBlock({ what: action.what, target, authorize: (t) => continuity.useBlockGuard(t.pos, t.dimension, { askedBy: snap?.askedBy, what: `the ${t.name}` }) }), sideOpts('use_block', action, snap))
       }
       case 'eat':
         return background('eat', adoptLease(skills.eat({ item: action.item }), 'eat finished'))
@@ -4466,7 +4535,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
           escalate: (event) => brain.wake(`${event.type} ${event.item || event.text || ''}`.trim())
         }
         // A script is not safe to run twice, so a side job ends it instead of pausing it.
-        return startMain({ tool: `run_script ${name}`, label: `script ${name}`, askedBy: snap.askedBy, showAs: `running script ${name}`, resumable: false, run: () => runScript(name, {}, ctx).then((out) => ({ ok: true, msg: typeof out === 'string' ? out : 'done' })) })
+        return startMain({ tool: `run_script ${name}`, label: `script ${name}`, askedBy: snap.askedBy, showAs: `running script ${name}`, resumable: false, run: () => runScript(name, {}, ctx).then((out) => out && typeof out.ok === 'boolean' ? out : ({ ok: false, msg: 'script did not return a domain result' })) })
       }
       case 'goal': {
         return report('goal', await runGoalOp(action, snap))
@@ -4474,14 +4543,14 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
       default:
         return report(String(a), { ok: false, msg: `unknown action "${a}"` })
     }
+    } catch (err) {
+      return report(a, { ok: false, request: 'accepted', execution: 'failed', msg: String(err?.message || err) })
     } finally {
-      gateCtx = null
-      currentActId = null
       // The lease is released here unless a background task adopted it: that
       // task owns the lane until its work is genuinely over. A leaked BODY
       // lock would freeze the avatar, so every path must release exactly once.
       if (!leaseContext.getStore().claimed) { try { laneLease.release('action finished') } catch { /* noop */ } }
-      if (agenda.main?.pendingInterrupt) { shelfMain(agenda.main, `interrupted by ${a}`); agenda.main = null }
+      if (interruptedMain && agenda.main === interruptedMain && interruptedMain.pendingInterrupt) { shelfMain(agenda.main, `interrupted by ${a}`); agenda.main = null }
     }
     })
   }

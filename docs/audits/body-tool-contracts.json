@@ -1,0 +1,2185 @@
+{
+  "action": [
+    {
+      "type": "function",
+      "function": {
+        "name": "say",
+        "description": "Send one short chat line out loud — any language, whatever fits who you are talking to (`to` = private).",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "text": {
+              "type": "string",
+              "description": "The line, max 200 chars. In the language of the conversation."
+            },
+            "to": {
+              "type": "string",
+              "description": "Recipient player (optional)."
+            }
+          },
+          "required": [
+            "text"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "go_to",
+        "description": "Default navigation: walk to a player, saved place, nearby block id (such as chest2), or absolute world coordinates in blocks. Supply x and z alone for horizontal travel on the easiest reachable walking level; supply y only when exact elevation matters. Uses the pathfinder, routes around obstacles/hazards where possible, and may break only its configured soft-terrain blocks when no short detour exists; this is not a tunneling tool. Results report arrival/failure and actual position where available.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "player": {
+              "type": "string",
+              "description": "Player name."
+            },
+            "place": {
+              "type": "string",
+              "description": "Saved place or nearby id."
+            },
+            "x": {
+              "type": "integer",
+              "description": "X."
+            },
+            "y": {
+              "type": "integer",
+              "description": "Y (optional)."
+            },
+            "z": {
+              "type": "integer",
+              "description": "Z."
+            },
+            "gait": {
+              "type": "string",
+              "enum": [
+                "auto",
+                "crouch",
+                "walk",
+                "sprint",
+                "sprint_jump"
+              ],
+              "description": "Movement gait/speed: sprint_jump (fastest for goals), sprint, walk, crouch, or auto."
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "dig",
+        "description": "Intentional obstruction clearing/tunneling: pathfind to a player, saved place/block id, or absolute world x/y/z, temporarily allowing pathfinder block breaking only along that route. Optional materials restrict which block ids may be broken; avoid forbids ids. It does not dig straight up to find the surface. Use only for a verified obstruction or deliberate passage, not ordinary travel; results report observed blocks broken and final position.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "player": {
+              "type": "string",
+              "description": "Target player name."
+            },
+            "place": {
+              "type": "string",
+              "description": "Saved place or nearby id."
+            },
+            "x": {
+              "type": "integer",
+              "description": "X of the destination."
+            },
+            "y": {
+              "type": "integer",
+              "description": "Y of the destination (optional)."
+            },
+            "z": {
+              "type": "integer",
+              "description": "Z of the destination."
+            },
+            "materials": {
+              "type": "array",
+              "description": "Only these block ids may be broken (e.g. [oak_log, dirt]); default: any breakable block in the way.",
+              "items": {
+                "type": "string",
+                "description": "Block id."
+              },
+              "minItems": 1,
+              "maxItems": 16
+            },
+            "avoid": {
+              "type": "array",
+              "description": "Never break these block ids.",
+              "items": {
+                "type": "string",
+                "description": "Block id."
+              },
+              "minItems": 1,
+              "maxItems": 16
+            },
+            "gait": {
+              "type": "string",
+              "enum": [
+                "auto",
+                "crouch",
+                "walk",
+                "sprint",
+                "sprint_jump"
+              ],
+              "description": "Movement gait/speed: sprint_jump (fastest for goals), sprint, walk, crouch, or auto."
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "follow",
+        "description": "Follow a player until you call stop. Keeps going by itself: it dodges mobs and comes back, waits for a path, and walks to where the player was last seen. Call it ONCE — it does not need repeating.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "player": {
+              "type": "string",
+              "description": "Player name."
+            },
+            "gait": {
+              "type": "string",
+              "enum": [
+                "auto",
+                "crouch",
+                "walk",
+                "sprint",
+                "sprint_jump"
+              ],
+              "description": "Movement gait/speed: sprint_jump (fastest for goals), sprint, walk, crouch, or auto."
+            }
+          },
+          "required": [
+            "player"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "pace",
+        "description": "Adjust speed/gait (even mid-walk without cancelling go_to/follow) or do a normal jump. Prefer setting `gait` directly on go_to/follow for goals.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "gait": {
+              "type": "string",
+              "enum": [
+                "auto",
+                "crouch",
+                "walk",
+                "sprint",
+                "sprint_jump"
+              ],
+              "description": "Movement gait/speed: sprint_jump (fastest for goals), sprint, walk, crouch, or auto."
+            },
+            "jump": {
+              "type": "boolean",
+              "description": "True = perform one normal jump."
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "stop",
+        "description": "Request cancellation of the current task or fight without waiting for BODY admission. An optional action_id must match the active BODY lease. Stop runs before new body requests in the same answer. Cleanup may be pending; survival can still move. The durable goal is retained.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action_id": {
+              "type": "string",
+              "description": "Optional active BODY action ID from doing; omit to stop the current task or fight."
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "goal",
+        "description": "Manage persistent objectives (survive death/restart/context reset). Add/update/replan records intent only, not executed progress. Verify world evidence before marking completion. Operations: list|show|add|resume|suspend|cancel|complete|update|replan|combine|verify. Use `replan` the moment a plan step turns out to be impossible or unmeasurable — one call retires the dead steps and writes the real next one.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "operation": {
+              "type": "string",
+              "enum": [
+                "list",
+                "show",
+                "add",
+                "resume",
+                "suspend",
+                "cancel",
+                "complete",
+                "update",
+                "replan",
+                "combine",
+                "verify"
+              ]
+            },
+            "id": {
+              "type": "string",
+              "description": "Goal id (g3), or comma-separated ids for combine (\"g1,g2\")."
+            },
+            "description": {
+              "type": "string",
+              "description": "Goal description (for add/update/combine)."
+            },
+            "reason": {
+              "type": "string",
+              "description": "Why this goal matters (motivation)."
+            },
+            "priority": {
+              "type": "integer",
+              "description": "0–100, higher = more important."
+            },
+            "parent": {
+              "type": "string",
+              "description": "Parent goal id for subgoals (e.g. g1)."
+            },
+            "origin": {
+              "type": "string",
+              "enum": [
+                "self_generated",
+                "player_requested",
+                "shared_project"
+              ]
+            },
+            "player": {
+              "type": "string",
+              "description": "Player name(s) when player_requested or shared_project."
+            },
+            "note": {
+              "type": "string",
+              "description": "Progress or status note."
+            },
+            "percent": {
+              "type": "integer",
+              "description": "For update: 0–100."
+            },
+            "steps": {
+              "type": "array",
+              "description": "add/update/replan: an ordered plan of up to 10 short steps. Shown with done marks across turns, so continue rather than re-planning. Each step should be something the world can confirm (a task you can run, a block you can inspect), not a judgement like \"organize everything\".",
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 10
+            },
+            "done": {
+              "type": "integer",
+              "description": "update: number of the plan step you just finished (1 = first)."
+            },
+            "drop": {
+              "type": "array",
+              "description": "update/replan: plan step numbers to retire (1 = first). Retiring a step that the world keeps refusing is correct, not a failure — the reason is kept with the step. Examples: a barrel that is full, ore that is not in reach.",
+              "items": {
+                "type": "integer"
+              },
+              "minItems": 1,
+              "maxItems": 10
+            },
+            "impossible": {
+              "type": "boolean",
+              "description": "update/replan with drop: mark the retired step(s) as impossible rather than merely dropped (use it when the world refused them, not when you changed your mind)."
+            },
+            "next": {
+              "type": "string",
+              "description": "update/replan: the very next concrete thing to do (survives death/restart). Name the tool call you will make."
+            }
+          },
+          "required": [
+            "operation"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "attack",
+        "description": "Start an explicit melee/ranged attack. Survival reflexes may independently evade or auto-kite a threat while you decide; this tool starts the deliberate attack task. Use `target` for mobs (e.g. \"zombie\", \"any\") when fighting is safer/useful than retreating, or `player` for an exact PvP opponent only when explicitly authorized by the configured policy (never auto-initiate PvP).",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "target": {
+              "type": "string",
+              "description": "Mob type or \"any\" (for mobs, not players)."
+            },
+            "player": {
+              "type": "string",
+              "description": "Exact player name; only use when allowed by the configured PvP policy. The harness never auto-initiates attacks on players."
+            },
+            "count": {
+              "type": "integer",
+              "description": "Optional kill limit (1–24); players always stop at one. If omitted, animals default to 1 and hostiles use the configured chain limit."
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "hold",
+        "description": "Accept current threats and continue the task unless hit/new threat/lit fuse. Pass the [id=…] values from the threats lines to hold specific ones (never guessed numbers); with none, all listed threats are held.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "ids": {
+              "type": "array",
+              "description": "Threat ids to hold (the numbers in [id=7]). Omit = every listed threat.",
+              "items": {
+                "type": "integer",
+                "description": "Threat id."
+              },
+              "minItems": 1,
+              "maxItems": 12
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "look_in",
+        "description": "Open container and list contents (empty = nearest). One look answers the question: if the answer is the same as last time, the container is finished — act on it (take, put elsewhere, move on) instead of looking again. An empty furnace is not a task.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "where": {
+              "type": "string",
+              "description": "Id, label, or empty."
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "take",
+        "description": "Take items from a container or furnace output.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "item": {
+              "type": "string",
+              "description": "Item id."
+            },
+            "count": {
+              "type": "integer",
+              "description": "Amount (default all)."
+            },
+            "where": {
+              "type": "string",
+              "description": "Id, label, or known source."
+            }
+          },
+          "required": [
+            "item"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "put",
+        "description": "Put carried items into a container.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "item": {
+              "type": "string",
+              "description": "Item id."
+            },
+            "count": {
+              "type": "integer",
+              "description": "Amount (default all)."
+            },
+            "where": {
+              "type": "string",
+              "description": "Id or label (default nearest)."
+            }
+          },
+          "required": [
+            "item"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "smelt",
+        "description": "Load furnace with item + carried fuel; collect output with take.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "item": {
+              "type": "string",
+              "description": "Item id to smelt."
+            },
+            "count": {
+              "type": "integer",
+              "description": "Amount (default all)."
+            },
+            "where": {
+              "type": "string",
+              "description": "Furnace id (default nearest)."
+            }
+          },
+          "required": [
+            "item"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "sleep",
+        "description": "Sleep in nearest bed (night/thunderstorm).",
+        "parameters": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "give",
+        "description": "Walk to player and toss item.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "player": {
+              "type": "string",
+              "description": "Player name."
+            },
+            "item": {
+              "type": "string",
+              "description": "Item id."
+            },
+            "count": {
+              "type": "integer",
+              "description": "Amount (default 1)."
+            }
+          },
+          "required": [
+            "player",
+            "item"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "eat",
+        "description": "Eat safe food now (empty = best carried).",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "item": {
+              "type": "string",
+              "description": "Food id (optional)."
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "equip",
+        "description": "Equip a carried item by name (armor goes to its own slot), or unequip one. Better carried armor is equipped automatically, while slots you dress or empty manually stay as you set them.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "item": {
+              "type": "string",
+              "description": "Item id, or \"none\" with where to unequip what is worn there."
+            },
+            "where": {
+              "type": "string",
+              "enum": [
+                "hand",
+                "off-hand",
+                "head",
+                "torso",
+                "legs",
+                "feet"
+              ]
+            }
+          },
+          "required": [
+            "item"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "use_block",
+        "description": "Start a walk to the nearest matching loaded block within 16 blocks, then right-click the guarded target if its state is unchanged. A click acknowledgment does not verify the effect.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "what": {
+              "type": "string",
+              "description": "Block id."
+            }
+          },
+          "required": [
+            "what"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "inspect_block",
+        "description": "Read one loaded block and state; no power inferred.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "x": {
+              "type": "integer",
+              "description": "X."
+            },
+            "y": {
+              "type": "integer",
+              "description": "Y."
+            },
+            "z": {
+              "type": "integer",
+              "description": "Z."
+            }
+          },
+          "required": [
+            "x",
+            "y",
+            "z"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "inspect_region",
+        "description": "Read-only paginated 3D block snapshot around [x,y,z]; no circuit trace.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "x": {
+              "type": "integer",
+              "description": "X."
+            },
+            "y": {
+              "type": "integer",
+              "description": "Y."
+            },
+            "z": {
+              "type": "integer",
+              "description": "Z."
+            },
+            "radius": {
+              "type": "integer",
+              "description": "0–2, default 1."
+            },
+            "page": {
+              "type": "integer",
+              "description": "Page, default 1."
+            }
+          },
+          "required": [
+            "x",
+            "y",
+            "z"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "redstone_scan",
+        "description": "Read-only local redstone snapshot (start with x,y,z; page with snapshot id).",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "x": {
+              "type": "integer",
+              "description": "X."
+            },
+            "y": {
+              "type": "integer",
+              "description": "Y."
+            },
+            "z": {
+              "type": "integer",
+              "description": "Z."
+            },
+            "radius": {
+              "type": "integer",
+              "description": "0–2, default 1."
+            },
+            "snapshot": {
+              "type": "string",
+              "description": "Existing snapshot id."
+            },
+            "page": {
+              "type": "integer",
+              "description": "Page, default 1."
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "redstone_component",
+        "description": "Inspect captured redstone component state and neighbors.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "snapshot": {
+              "type": "string",
+              "description": "Snapshot id."
+            },
+            "x": {
+              "type": "integer",
+              "description": "X."
+            },
+            "y": {
+              "type": "integer",
+              "description": "Y."
+            },
+            "z": {
+              "type": "integer",
+              "description": "Z."
+            },
+            "page": {
+              "type": "integer",
+              "description": "Page, default 1."
+            }
+          },
+          "required": [
+            "snapshot",
+            "x",
+            "y",
+            "z"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "screenshot",
+        "description": "SEE: rendered image of the world around you. Use BEFORE digging/breaking/clearing (to make sure you are not digging in front of a house or inside a cave), BEFORE picking a build site (panorama/map for open surface terrain), and DURING/AFTER building stages to inspect proportions, depth, and flaws. Use inspect_block / inspect_region / find / redstone tools for exact coordinates and block IDs.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "view": {
+              "type": "string",
+              "enum": [
+                "look",
+                "panorama",
+                "map"
+              ],
+              "description": "look = first person (default); panorama = full 360° strip, north in the middle; map = top-down with a labelled x/z grid."
+            },
+            "direction": {
+              "type": "string",
+              "enum": [
+                "north",
+                "northeast",
+                "east",
+                "southeast",
+                "south",
+                "southwest",
+                "west",
+                "northwest",
+                "up",
+                "down"
+              ],
+              "description": "look only: where to face (default: where you face now)."
+            },
+            "at": {
+              "type": "array",
+              "description": "look only: face this block [x,y,z] instead.",
+              "items": {
+                "type": "integer"
+              },
+              "minItems": 3,
+              "maxItems": 3
+            },
+            "perspective": {
+              "type": "string",
+              "enum": [
+                "first",
+                "third"
+              ],
+              "description": "look only: first = from your eyes (default, no own body); third = camera behind you so you see your own body, skin, armour, elytra and both hands."
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "find",
+        "description": "Find block type, item in opened containers, chest label, or \"storage\". It only knows what you have seen: \"nothing known\" means go and look somewhere new (walk, mine, screenshot), not ask again. Page through a storage list once, then decide.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "what": {
+              "type": "string",
+              "description": "Id, label, or \"storage\"."
+            },
+            "page": {
+              "type": "integer",
+              "description": "Storage page (default 1)."
+            }
+          },
+          "required": [
+            "what"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "remember_here",
+        "description": "Save current position under a place name, with optional ownership or verified home tag.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "Place name."
+            },
+            "note": {
+              "type": "string",
+              "description": "Optional note."
+            },
+            "ownership": {
+              "type": "string",
+              "enum": [
+                "own",
+                "shared",
+                "player",
+                "unknown"
+              ]
+            },
+            "owner": {
+              "type": "string",
+              "description": "Owner player name if ownership=\"player\"."
+            },
+            "home": {
+              "type": "boolean",
+              "description": "True ONLY if this is your verified home (built by you or explicitly assigned to you)."
+            }
+          },
+          "required": [
+            "name"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "memory",
+        "description": "Memory: `recall`/`search` (curated memories), `read` one record with its evidence, `remember`/`update` (short facts; pass entity+section or entity+doc to grow that subject's long dossier), `archive`/`delete`/`restore` (raw history is never affected), `merge` duplicates, `duplicates`, `link` a history reference, `profile`/`profiles` (long-form dossiers), `history` (search the raw log), `organize` (idle-time maintenance).",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "operation": {
+              "type": "string",
+              "enum": [
+                "recall",
+                "search",
+                "read",
+                "remember",
+                "update",
+                "archive",
+                "delete",
+                "restore",
+                "merge",
+                "duplicates",
+                "link",
+                "profile",
+                "profiles",
+                "history",
+                "organize",
+                "objects",
+                "alias",
+                "regions",
+                "region",
+                "routes",
+                "rules",
+                "learn",
+                "retire"
+              ]
+            },
+            "query": {
+              "type": "string",
+              "description": "Search text (recall/search/history/profile)."
+            },
+            "text": {
+              "type": "string",
+              "description": "Memory text, or the note to append to a dossier section."
+            },
+            "category": {
+              "type": "string",
+              "enum": [
+                "episodic",
+                "semantic",
+                "procedural",
+                "continuity",
+                "identity",
+                "relationship",
+                "preference",
+                "world",
+                "chat",
+                "actions",
+                "decisions",
+                "relationships",
+                "errors",
+                "maintenance"
+              ],
+              "description": "Curated: episodic|semantic|procedural|continuity. Raw history: world|chat|actions|decisions|relationships|errors|maintenance."
+            },
+            "basis": {
+              "type": "string",
+              "enum": [
+                "observed",
+                "reported",
+                "inferred"
+              ],
+              "description": "Evidence: witnessed by Zinc, told by a player (unverified), or inferred."
+            },
+            "entity": {
+              "type": "string",
+              "description": "Player UUID/name, place or subject this concerns."
+            },
+            "id": {
+              "type": "string",
+              "description": "Memory id (read/update/archive/delete/restore/link)."
+            },
+            "ids": {
+              "type": "array",
+              "description": "Memory ids to merge.",
+              "items": {
+                "type": "string",
+                "description": "Memory id."
+              },
+              "minItems": 2,
+              "maxItems": 12
+            },
+            "into": {
+              "type": "string",
+              "description": "Merge: id of the record to keep (default: first id)."
+            },
+            "evidence": {
+              "type": "string",
+              "description": "A history reference like world/2026-11-15.jsonl#12, or a short evidence note."
+            },
+            "ref": {
+              "type": "string",
+              "description": "History reference to read (operation history)."
+            },
+            "section": {
+              "type": "string",
+              "enum": [
+                "identity",
+                "description",
+                "interactions",
+                "preferences",
+                "behavior",
+                "facts",
+                "uncertainties",
+                "timeline",
+                "notes"
+              ],
+              "description": "Dossier section to append to (with entity)."
+            },
+            "doc": {
+              "type": "string",
+              "description": "Full Markdown body for an entity dossier (with entity); replaces the written notes."
+            },
+            "profile": {
+              "type": "string",
+              "description": "Profile key (alias of entity)."
+            },
+            "status": {
+              "type": "string",
+              "enum": [
+                "active",
+                "archived",
+                "outdated",
+                "contradicted",
+                "all"
+              ],
+              "description": "Which records to consider (recall/profiles)."
+            },
+            "importance": {
+              "type": "integer",
+              "description": "0–5; higher survives compaction and eviction."
+            },
+            "confidence": {
+              "type": "integer",
+              "description": "0–100 (update)."
+            },
+            "threshold": {
+              "type": "number",
+              "description": "Duplicate similarity 0.5–0.99 (default 0.9)."
+            },
+            "hard": {
+              "type": "boolean",
+              "description": "delete: also drop the curated row itself. Raw history is never touched either way."
+            },
+            "reason": {
+              "type": "string",
+              "description": "Why (used for edits, archives and merges)."
+            },
+            "limit": {
+              "type": "integer",
+              "description": "Max results (1–20)."
+            },
+            "goal": {
+              "type": "string",
+              "description": "Goal id filter (recall)."
+            },
+            "x": {
+              "type": "integer",
+              "description": "Nearby X (recall)."
+            },
+            "y": {
+              "type": "integer",
+              "description": "Y."
+            },
+            "z": {
+              "type": "integer",
+              "description": "Z."
+            },
+            "sinceDays": {
+              "type": "integer",
+              "description": "History: only records newer than N days."
+            },
+            "sinceMs": {
+              "type": "integer",
+              "description": "Earliest observation time, Unix milliseconds."
+            },
+            "untilMs": {
+              "type": "integer",
+              "description": "Latest observation time, Unix milliseconds."
+            },
+            "createdSinceMs": {
+              "type": "integer",
+              "description": "Earliest curated creation time, Unix milliseconds."
+            },
+            "createdUntilMs": {
+              "type": "integer",
+              "description": "Latest curated creation time, Unix milliseconds."
+            },
+            "cursor": {
+              "type": "string",
+              "description": "Next page cursor returned by the same search with the same filters."
+            },
+            "mode": {
+              "type": "string",
+              "enum": [
+                "current",
+                "historical",
+                "include_stale"
+              ]
+            },
+            "dimension": {
+              "type": "string",
+              "description": "Exact Minecraft dimension, e.g. overworld or the_nether."
+            },
+            "world": {
+              "type": "string",
+              "description": "Exact world namespace."
+            },
+            "radius": {
+              "type": "integer",
+              "description": "Maximum 3D distance from the supplied coordinates or current position."
+            },
+            "minY": {
+              "type": "integer",
+              "description": "Minimum elevation."
+            },
+            "maxY": {
+              "type": "integer",
+              "description": "Maximum elevation."
+            },
+            "minConfidence": {
+              "type": "integer",
+              "description": "Minimum curated confidence, 0–100."
+            },
+            "maxConfidence": {
+              "type": "integer",
+              "description": "Maximum curated confidence, 0–100."
+            },
+            "subjectKey": {
+              "type": "string",
+              "description": "Exact curated subject key."
+            },
+            "objectId": {
+              "type": "string",
+              "description": "Exact world-object generation ID, short ID or alias for objects."
+            },
+            "eventType": {
+              "type": "string",
+              "description": "Exact raw history event type; use object_inventory or object_removed for object evidence."
+            },
+            "objectKind": {
+              "type": "string",
+              "description": "Object type, e.g. chest, barrel, shulker, bed."
+            },
+            "item": {
+              "type": "string",
+              "description": "Exact item ID for object contents search."
+            },
+            "uncertainty": {
+              "type": "string",
+              "description": "Uncertainty note for a curated update."
+            },
+            "region": {
+              "type": "string",
+              "description": "Exact region ID; filters objects or specifies parent region."
+            },
+            "min": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "description": "Minimum axis coordinate."
+              },
+              "minItems": 3,
+              "maxItems": 3
+            },
+            "max": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "description": "Maximum inclusive axis coordinate."
+              },
+              "minItems": 3,
+              "maxItems": 3
+            },
+            "evidenceRefs": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "description": "Raw observed tool outcome reference."
+              },
+              "maxItems": 12
+            },
+            "expiresAt": {
+              "type": "integer",
+              "description": "Learned rule expiry time, Unix milliseconds."
+            },
+            "revision": {
+              "type": "integer",
+              "description": "Read a saved previous revision (1 = first)."
+            }
+          },
+          "required": [
+            "operation"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "note",
+        "description": "Record a durable discovery, lesson, or ownership observation in long-term memory, or add/drop a personal interest.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "text": {
+              "type": "string",
+              "description": "Short factual note or lesson learned."
+            },
+            "interest": {
+              "type": "string",
+              "description": "Emerging personal interest to add, or \"-topic\" to drop."
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "social",
+        "description": "Inspect or update your independent view/relationship with a player, or record your decision on their request.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "operation": {
+              "type": "string",
+              "enum": [
+                "list",
+                "show",
+                "update",
+                "decide"
+              ]
+            },
+            "player": {
+              "type": "string",
+              "description": "Player name (for show/update/decide)."
+            },
+            "stance": {
+              "type": "string",
+              "description": "Your own category/label (e.g. friend, acquaintance, cautious, distrusted, rival, avoid, collaborator, or custom nuance)."
+            },
+            "trust": {
+              "type": "integer",
+              "description": "Your trust assessment -100..100."
+            },
+            "confidence": {
+              "type": "integer",
+              "description": "Confidence 0–100 (keep modest on thin evidence; raise with consistency)."
+            },
+            "willingness": {
+              "type": "string",
+              "description": "How you want to engage (e.g. cooperate, help when free, verify claims, negotiate, avoid, decline)."
+            },
+            "opinion": {
+              "type": "string",
+              "description": "Nuanced free-form summary of your opinion and why."
+            },
+            "evidence": {
+              "type": "string",
+              "description": "Supporting observation or experience behind this update."
+            },
+            "decision": {
+              "type": "string",
+              "enum": [
+                "accept",
+                "decline",
+                "ignore",
+                "negotiate",
+                "delay"
+              ]
+            }
+          },
+          "required": [
+            "operation"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "craft",
+        "description": "Craft item (walks to a nearby table if needed, or puts down one you carry). A failure names the ingredients and how many you have.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "item": {
+              "type": "string",
+              "description": "Item id."
+            },
+            "count": {
+              "type": "integer",
+              "description": "How many of the item you want in total (the recipe repeats; default one batch). Ask once, not once per batch."
+            }
+          },
+          "required": [
+            "item"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "gather",
+        "description": "Dig named blocks nearby (any diggable vanilla block id or alias such as log/wood/coal/iron/diamond/stone/clay; ores require an appropriate pickaxe). If none is in range the result reports the nearest loaded coordinates.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "item": {
+              "type": "string",
+              "description": "Block id or alias (oak_log, iron, stone, clay, sand…; \"log\" = any wood)."
+            },
+            "count": {
+              "type": "integer",
+              "description": "Count 1–64 (default 1)."
+            },
+            "radius": {
+              "type": "integer",
+              "description": "Radius 1–64 (default 32)."
+            }
+          },
+          "required": [
+            "item"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "mine_resource",
+        "description": "Start mining nearby loaded resources. May bootstrap a wooden or stone pickaxe from carried materials. Count is blocks, not item yield; results distinguish observed blocks broken, remaining blocks and observed inventory gains. Pickup can be partial or unverified.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "item": {
+              "type": "string",
+              "description": "Resource block id or alias (wood, oak_log, stone, coal, iron, diamond, sand…)."
+            },
+            "count": {
+              "type": "integer",
+              "description": "Target blocks to mine 1–64 (default 4)."
+            },
+            "radius": {
+              "type": "integer",
+              "description": "Search radius 4–48 (default 32)."
+            },
+            "ensure_tool": {
+              "type": "boolean",
+              "description": "Auto-craft wooden/stone pickaxe from carried materials if missing (default true)."
+            }
+          },
+          "required": [
+            "item"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "hunt_and_loot",
+        "description": "High-level safe hunting procedure: finds eligible non-protected food animals (cow, pig, sheep, chicken, rabbit) or a named safe mob, kills it, and actively collects and verifies dropped loot. Never targets players, villagers, golems, named or tamed mobs.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "target": {
+              "type": "string",
+              "description": "Animal or mob name, or \"food\" for any nearby food animal (default \"food\")."
+            },
+            "count": {
+              "type": "integer",
+              "description": "How many targets to hunt 1–8 (default 1)."
+            },
+            "radius": {
+              "type": "integer",
+              "description": "Search radius 8–48 (default 32)."
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "prepare_food",
+        "description": "High-level food preparation procedure: crafts bread from carried wheat, cooks raw meat/potatoes in a nearby or crafted furnace with carried fuel, collects cooked food, and optionally eats if hungry.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "item": {
+              "type": "string",
+              "description": "Optional food name to prioritize (e.g. beef, porkchop, bread, potato)."
+            },
+            "count": {
+              "type": "integer",
+              "description": "How many food items to prepare 1–32 (default 4)."
+            },
+            "eat_after": {
+              "type": "boolean",
+              "description": "Eat immediately after preparing if hungry or hurt (default false)."
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "light_up",
+        "description": "Place carried torches on dark walkable floors nearby.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "radius": {
+              "type": "integer",
+              "description": "Radius 2–16 (default 8)."
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "shelter",
+        "description": "Pillar up with carried scaffold blocks (stop cleans up).",
+        "parameters": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "corpse_run",
+        "description": "Walk near \"last death\" and report observed item stacks.",
+        "parameters": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "logic_test",
+        "description": "Test ABSTRACT combinational Boolean graph (not MC redstone; acyclic gates).",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "inputs": {
+              "type": "array",
+              "description": "1–9 input signal ids.",
+              "items": {
+                "type": "string",
+                "description": "Signal id"
+              },
+              "minItems": 1,
+              "maxItems": 9
+            },
+            "gates": {
+              "type": "array",
+              "description": "Up to 128 topological gates.",
+              "maxItems": 128,
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "description": "Signal id"
+                  },
+                  "op": {
+                    "type": "string",
+                    "enum": [
+                      "AND",
+                      "OR",
+                      "XOR",
+                      "NOT",
+                      "BUF",
+                      "NAND",
+                      "NOR",
+                      "FULL_SUM",
+                      "FULL_CARRY"
+                    ]
+                  },
+                  "inputs": {
+                    "type": "array",
+                    "description": "1–3 earlier signal ids.",
+                    "items": {
+                      "type": "string",
+                      "description": "Signal id"
+                    },
+                    "minItems": 1,
+                    "maxItems": 3
+                  }
+                },
+                "required": [
+                  "id",
+                  "op",
+                  "inputs"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "outputs": {
+              "type": "array",
+              "description": "1–9 output signal ids.",
+              "items": {
+                "type": "string",
+                "description": "Signal id"
+              },
+              "minItems": 1,
+              "maxItems": 9
+            },
+            "tests": {
+              "type": "array",
+              "description": "1–512 test vectors (or use adder_width).",
+              "minItems": 1,
+              "maxItems": 512,
+              "items": {
+                "type": "object",
+                "properties": {
+                  "in_bits": {
+                    "type": "string",
+                    "description": "Input bits"
+                  },
+                  "out_bits": {
+                    "type": "string",
+                    "description": "Expected bits"
+                  }
+                },
+                "required": [
+                  "in_bits",
+                  "out_bits"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "adder_width": {
+              "type": "integer",
+              "description": "Exhaustive unsigned adder width 1–4 (A, B, Cin -> S, Cout)."
+            },
+            "project": {
+              "type": "string",
+              "description": "Optional project name to save."
+            }
+          },
+          "required": [
+            "inputs",
+            "gates",
+            "outputs"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "redstone_engineer",
+        "description": "Understand, design, build, test or repair redstone (Java 1.21.4/26.3). operation=analyze|diagnose|simulate|design|place|verify|trace|library|lesson.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "operation": {
+              "type": "string",
+              "enum": [
+                "analyze",
+                "diagnose",
+                "simulate",
+                "design",
+                "place",
+                "verify",
+                "trace",
+                "library",
+                "lesson"
+              ]
+            },
+            "x": {
+              "type": "integer",
+              "description": "Center X (analyze/diagnose/simulate/place)."
+            },
+            "y": {
+              "type": "integer",
+              "description": "Center Y."
+            },
+            "z": {
+              "type": "integer",
+              "description": "Center Z."
+            },
+            "radius": {
+              "type": "integer",
+              "description": "Scan radius 0–6 (default 3) for analyze/diagnose."
+            },
+            "design": {
+              "type": "string",
+              "description": "Design name or behaviour phrase (design/place): and, or, not, xor, latch, clock, pulse, sorter, farm, detector."
+            },
+            "rotate": {
+              "type": "string",
+              "enum": [
+                "north",
+                "south",
+                "east",
+                "west"
+              ],
+              "description": "Rotate the design layout (place)."
+            },
+            "inputs": {
+              "type": "array",
+              "description": "verify: lever/button positions [{x,y,z},…] to toggle.",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "x": {
+                    "type": "integer",
+                    "description": "X"
+                  },
+                  "y": {
+                    "type": "integer",
+                    "description": "Y"
+                  },
+                  "z": {
+                    "type": "integer",
+                    "description": "Z"
+                  }
+                },
+                "required": [
+                  "x",
+                  "y",
+                  "z"
+                ],
+                "additionalProperties": false
+              },
+              "minItems": 1,
+              "maxItems": 4
+            },
+            "outputs": {
+              "type": "array",
+              "description": "verify: output positions [{x,y,z},…] to watch.",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "x": {
+                    "type": "integer",
+                    "description": "X"
+                  },
+                  "y": {
+                    "type": "integer",
+                    "description": "Y"
+                  },
+                  "z": {
+                    "type": "integer",
+                    "description": "Z"
+                  }
+                },
+                "required": [
+                  "x",
+                  "y",
+                  "z"
+                ],
+                "additionalProperties": false
+              },
+              "minItems": 1,
+              "maxItems": 4
+            },
+            "ticks": {
+              "type": "integer",
+              "description": "simulate: ticks to simulate (1–200)."
+            },
+            "node": {
+              "type": "string",
+              "description": "trace: node id \"x,y,z\" to trace signal from."
+            },
+            "name": {
+              "type": "string",
+              "description": "library/lesson: design or lesson name."
+            },
+            "compare": {
+              "type": "array",
+              "description": "design: extra design names to compare.",
+              "items": {
+                "type": "string",
+                "description": "Design name."
+              },
+              "minItems": 1,
+              "maxItems": 4
+            },
+            "note": {
+              "type": "string",
+              "description": "lesson: what you learned (max 240 chars)."
+            }
+          },
+          "required": [
+            "operation"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "recall",
+        "description": "Search long-term memory with relevance ranking: word overlap plus a built-in synonym table (so \"treasure\" finds a memory that says \"diamonds\"), entity, location, goal and category filters, with provenance.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "What to recall (free text)."
+            },
+            "category": {
+              "type": "string",
+              "description": "Filter: episodic | semantic | procedural | continuity."
+            },
+            "entity": {
+              "type": "string",
+              "description": "Player/mob/entity name."
+            },
+            "goal": {
+              "type": "string",
+              "description": "Goal id."
+            },
+            "x": {
+              "type": "integer",
+              "description": "Nearby X (location search)."
+            },
+            "y": {
+              "type": "integer",
+              "description": "Y."
+            },
+            "z": {
+              "type": "integer",
+              "description": "Z."
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "circuit_project",
+        "description": "Bind snapshot, show project/graph, or rerun saved ABSTRACT logic test.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "operation": {
+              "type": "string",
+              "enum": [
+                "bind",
+                "show",
+                "graph",
+                "test",
+                "list"
+              ]
+            },
+            "name": {
+              "type": "string",
+              "description": "Project name (max 32)."
+            },
+            "snapshot": {
+              "type": "string",
+              "description": "For bind: snapshot id."
+            },
+            "page": {
+              "type": "integer",
+              "description": "For graph: page, default 1."
+            },
+            "note": {
+              "type": "string",
+              "description": "For bind: note (max 240 chars)."
+            }
+          },
+          "required": [
+            "operation"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "build",
+        "description": "Place a saved blueprint or an inline 3D grid from carried materials; this mutates the world, checks ownership/materials, and reports placed counts/failures. A one-block inline build is grid [[\"C\"]] + palette {C:\"cobblestone\"}. `at` is the minimum [x,y,z] world-block corner (default: your feet); rows grow +x, layers +y, columns +z. Large named houses/shelters/towers are refused on unloaded, liquid, unsupported, or natural-cave-roof sites.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "blueprint": {
+              "type": "string",
+              "description": "Blueprint name in zincai/blueprints/."
+            },
+            "grid": {
+              "type": "array",
+              "description": "Layers bottom-up; each layer is an array of ROW STRINGS, one char per block (\".\"/\" \" = air). A 3x3 floor is ONE layer: [[\"sss\",\"sss\",\"sss\"]]. A 2-high 3-long wall is two layers: [[\"sss\"],[\"sss\"]].",
+              "items": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "palette": {
+              "type": "object",
+              "description": "Char -> block id map.",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "at": {
+              "type": "array",
+              "description": "Corner [x,y,z] — the minimum x/y/z the thing occupies. Every shape starts here and grows toward +x/+y/+z. Default: feet.",
+              "items": {
+                "type": "integer"
+              },
+              "minItems": 3,
+              "maxItems": 3
+            },
+            "stage": {
+              "type": "string",
+              "description": "Phase: foundation | walls_with_windows | roof | interior_details."
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "build_shape",
+        "description": "Generate and build a geometric shape.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "shape": {
+              "type": "string",
+              "enum": [
+                "cylinder",
+                "dome",
+                "arch",
+                "wall",
+                "box",
+                "floor",
+                "ring"
+              ]
+            },
+            "params": {
+              "type": "object",
+              "description": "All spans start at `at` and grow toward +x/+y/+z (no shape is centred on it). cylinder {r,h} spans 2r+1 wide; ring {r} same; dome {r} same; wall {l,h,axis}; arch {w,h,axis} — h is the top course; box {w,d,h}; floor {w,d}. Optional th, filled; ints 1–128 (dome/ring r>=2, arch w/h>=3)."
+            },
+            "block": {
+              "type": "string",
+              "description": "Block id."
+            },
+            "at": {
+              "type": "array",
+              "description": "Corner [x,y,z] — the minimum x/y/z the thing occupies. Every shape starts here and grows toward +x/+y/+z. Default: feet.",
+              "items": {
+                "type": "integer"
+              },
+              "minItems": 3,
+              "maxItems": 3
+            },
+            "stage": {
+              "type": "string",
+              "description": "Phase: foundation | walls_with_windows | roof | interior_details."
+            }
+          },
+          "required": [
+            "shape",
+            "block"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "run_script",
+        "description": "Start a bundled script (flee or build_tower). Wait for its domain result; starting to flee does not mean safety, and a tower attempt can fail.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "Script name."
+            }
+          },
+          "required": [
+            "name"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "idle",
+        "description": "End your turn when no new action is needed: the body carries on with what it is already doing (or keeps fleeing). Do not call idle to procrastinate when an active goal has a next step you can execute now. Do call idle when the remaining steps are blocked, impossible, or belong to someone else — idling on a dead step is correct; repeating it is not.",
+        "parameters": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    }
+  ],
+  "recovery": [
+    {
+      "type": "function",
+      "function": {
+        "name": "say",
+        "description": "Send one short chat line out loud — any language, whatever fits who you are talking to (`to` = private).",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "text": {
+              "type": "string",
+              "description": "The line, max 200 chars. In the language of the conversation."
+            },
+            "to": {
+              "type": "string",
+              "description": "Recipient player (optional)."
+            }
+          },
+          "required": [
+            "text"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "go_to",
+        "description": "Default navigation: walk to a player, saved place, nearby block id (such as chest2), or absolute world coordinates in blocks. Supply x and z alone for horizontal travel on the easiest reachable walking level; supply y only when exact elevation matters. Uses the pathfinder, routes around obstacles/hazards where possible, and may break only its configured soft-terrain blocks when no short detour exists; this is not a tunneling tool. Results report arrival/failure and actual position where available.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "player": {
+              "type": "string",
+              "description": "Player name."
+            },
+            "place": {
+              "type": "string",
+              "description": "Saved place or nearby id."
+            },
+            "x": {
+              "type": "integer",
+              "description": "X."
+            },
+            "y": {
+              "type": "integer",
+              "description": "Y (optional)."
+            },
+            "z": {
+              "type": "integer",
+              "description": "Z."
+            },
+            "gait": {
+              "type": "string",
+              "enum": [
+                "auto",
+                "crouch",
+                "walk",
+                "sprint",
+                "sprint_jump"
+              ],
+              "description": "Movement gait/speed: sprint_jump (fastest for goals), sprint, walk, crouch, or auto."
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "stop",
+        "description": "Request cancellation of the current task or fight without waiting for BODY admission. An optional action_id must match the active BODY lease. Stop runs before new body requests in the same answer. Cleanup may be pending; survival can still move. The durable goal is retained.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action_id": {
+              "type": "string",
+              "description": "Optional active BODY action ID from doing; omit to stop the current task or fight."
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "goal",
+        "description": "Manage persistent objectives (survive death/restart/context reset). Add/update/replan records intent only, not executed progress. Verify world evidence before marking completion. Operations: list|show|add|resume|suspend|cancel|complete|update|replan|combine|verify. Use `replan` the moment a plan step turns out to be impossible or unmeasurable — one call retires the dead steps and writes the real next one.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "operation": {
+              "type": "string",
+              "enum": [
+                "list",
+                "show",
+                "add",
+                "resume",
+                "suspend",
+                "cancel",
+                "complete",
+                "update",
+                "replan",
+                "combine",
+                "verify"
+              ]
+            },
+            "id": {
+              "type": "string",
+              "description": "Goal id (g3), or comma-separated ids for combine (\"g1,g2\")."
+            },
+            "description": {
+              "type": "string",
+              "description": "Goal description (for add/update/combine)."
+            },
+            "reason": {
+              "type": "string",
+              "description": "Why this goal matters (motivation)."
+            },
+            "priority": {
+              "type": "integer",
+              "description": "0–100, higher = more important."
+            },
+            "parent": {
+              "type": "string",
+              "description": "Parent goal id for subgoals (e.g. g1)."
+            },
+            "origin": {
+              "type": "string",
+              "enum": [
+                "self_generated",
+                "player_requested",
+                "shared_project"
+              ]
+            },
+            "player": {
+              "type": "string",
+              "description": "Player name(s) when player_requested or shared_project."
+            },
+            "note": {
+              "type": "string",
+              "description": "Progress or status note."
+            },
+            "percent": {
+              "type": "integer",
+              "description": "For update: 0–100."
+            },
+            "steps": {
+              "type": "array",
+              "description": "add/update/replan: an ordered plan of up to 10 short steps. Shown with done marks across turns, so continue rather than re-planning. Each step should be something the world can confirm (a task you can run, a block you can inspect), not a judgement like \"organize everything\".",
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 10
+            },
+            "done": {
+              "type": "integer",
+              "description": "update: number of the plan step you just finished (1 = first)."
+            },
+            "drop": {
+              "type": "array",
+              "description": "update/replan: plan step numbers to retire (1 = first). Retiring a step that the world keeps refusing is correct, not a failure — the reason is kept with the step. Examples: a barrel that is full, ore that is not in reach.",
+              "items": {
+                "type": "integer"
+              },
+              "minItems": 1,
+              "maxItems": 10
+            },
+            "impossible": {
+              "type": "boolean",
+              "description": "update/replan with drop: mark the retired step(s) as impossible rather than merely dropped (use it when the world refused them, not when you changed your mind)."
+            },
+            "next": {
+              "type": "string",
+              "description": "update/replan: the very next concrete thing to do (survives death/restart). Name the tool call you will make."
+            }
+          },
+          "required": [
+            "operation"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "attack",
+        "description": "Start an explicit melee/ranged attack. Survival reflexes may independently evade or auto-kite a threat while you decide; this tool starts the deliberate attack task. Use `target` for mobs (e.g. \"zombie\", \"any\") when fighting is safer/useful than retreating, or `player` for an exact PvP opponent only when explicitly authorized by the configured policy (never auto-initiate PvP).",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "target": {
+              "type": "string",
+              "description": "Mob type or \"any\" (for mobs, not players)."
+            },
+            "player": {
+              "type": "string",
+              "description": "Exact player name; only use when allowed by the configured PvP policy. The harness never auto-initiates attacks on players."
+            },
+            "count": {
+              "type": "integer",
+              "description": "Optional kill limit (1–24); players always stop at one. If omitted, animals default to 1 and hostiles use the configured chain limit."
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "hold",
+        "description": "Accept current threats and continue the task unless hit/new threat/lit fuse. Pass the [id=…] values from the threats lines to hold specific ones (never guessed numbers); with none, all listed threats are held.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "ids": {
+              "type": "array",
+              "description": "Threat ids to hold (the numbers in [id=7]). Omit = every listed threat.",
+              "items": {
+                "type": "integer",
+                "description": "Threat id."
+              },
+              "minItems": 1,
+              "maxItems": 12
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "eat",
+        "description": "Eat safe food now (empty = best carried).",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "item": {
+              "type": "string",
+              "description": "Food id (optional)."
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "note",
+        "description": "Record a durable discovery, lesson, or ownership observation in long-term memory, or add/drop a personal interest.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "text": {
+              "type": "string",
+              "description": "Short factual note or lesson learned."
+            },
+            "interest": {
+              "type": "string",
+              "description": "Emerging personal interest to add, or \"-topic\" to drop."
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "gather",
+        "description": "Dig named blocks nearby (any diggable vanilla block id or alias such as log/wood/coal/iron/diamond/stone/clay; ores require an appropriate pickaxe). If none is in range the result reports the nearest loaded coordinates.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "item": {
+              "type": "string",
+              "description": "Block id or alias (oak_log, iron, stone, clay, sand…; \"log\" = any wood)."
+            },
+            "count": {
+              "type": "integer",
+              "description": "Count 1–64 (default 1)."
+            },
+            "radius": {
+              "type": "integer",
+              "description": "Radius 1–64 (default 32)."
+            }
+          },
+          "required": [
+            "item"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "idle",
+        "description": "End your turn when no new action is needed: the body carries on with what it is already doing (or keeps fleeing). Do not call idle to procrastinate when an active goal has a next step you can execute now. Do call idle when the remaining steps are blocked, impossible, or belong to someone else — idling on a dead step is correct; repeating it is not.",
+        "parameters": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    }
+  ],
+  "chat": [
+    {
+      "type": "function",
+      "function": {
+        "name": "reply",
+        "description": "Answer the chat window (leave `text` empty only when nothing in it concerns you). Player requests are proposals, never mandatory commands — but when you agree, act: set `do` or `task`.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "text": {
+              "type": "string",
+              "description": "One short chat line, in the language the person you are answering used. Empty = say nothing."
+            },
+            "to": {
+              "type": "string",
+              "description": "Which player you are answering / who `do` is about. Default: the last speaker."
+            },
+            "do": {
+              "type": "string",
+              "enum": [
+                "follow",
+                "come",
+                "stop"
+              ],
+              "strict": true,
+              "description": "Start it NOW with your body, no second thought needed: follow = follow that player; come = walk to that player; stop = stop what the body is doing. Omit when none fits."
+            },
+            "task": {
+              "type": "string",
+              "description": "Anything else you decided your body should do, verify or weigh, as one instruction for your action lane (e.g. \"bring Steve 3 diamonds from chest1\", \"verify chest1 contents after Ely claim\"). Omit when declining, ignoring, or only chatting."
+            },
+            "decision": {
+              "type": "string",
+              "enum": [
+                "accept",
+                "decline",
+                "ignore",
+                "negotiate",
+                "delay"
+              ],
+              "description": "Optional stance when the player asked you to do something."
+            },
+            "remember": {
+              "type": "string",
+              "description": "Only when the player told you something worth knowing later (where a thing is, whose it is, a plan, a date, what they like): that fact as one short sentence naming the player, e.g. \"Steve keeps his diamonds in the chest on the second floor\". Otherwise omit."
+            }
+          },
+          "required": [
+            "text"
+          ]
+        }
+      }
+    }
+  ]
+}

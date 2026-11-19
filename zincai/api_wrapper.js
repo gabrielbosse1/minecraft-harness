@@ -98,8 +98,8 @@ const ACTION_TOOLS = [
     gait: GAIT,
     jump: { type: 'boolean', description: 'True = perform one normal jump.' }
   }),
-  tool('stop', 'Stop the currently running body task/follow/fight. The durable goal is retained (suspended) rather than cancelled; use goal cancel with its id only when you intentionally abandon that objective. A stopped task may finish its current cancellation cleanup before the body is idle.'),
-  tool('goal', 'Manage persistent objectives (survive death/restart/context reset): list|show|add|resume|suspend|cancel|complete|update|replan|combine|verify. Use `replan` the moment a plan step turns out to be impossible or unmeasurable — one call retires the dead steps and writes the real next one.', {
+  tool('stop', 'Request cancellation of the current task or fight without waiting for BODY admission. An optional action_id must match the active BODY lease. Stop runs before new body requests in the same answer. Cleanup may be pending; survival can still move. The durable goal is retained.', { action_id: STR('Optional active BODY action ID from doing; omit to stop the current task or fight.') }),
+  tool('goal', 'Manage persistent objectives (survive death/restart/context reset). Add/update/replan records intent only, not executed progress. Verify world evidence before marking completion. Operations: list|show|add|resume|suspend|cancel|complete|update|replan|combine|verify. Use `replan` the moment a plan step turns out to be impossible or unmeasurable — one call retires the dead steps and writes the real next one.', {
     operation: { type: 'string', enum: ['list', 'show', 'add', 'resume', 'suspend', 'cancel', 'complete', 'update', 'replan', 'combine', 'verify'] },
     id: STR('Goal id (g3), or comma-separated ids for combine ("g1,g2").'),
     description: STR('Goal description (for add/update/combine).'),
@@ -151,7 +151,7 @@ const ACTION_TOOLS = [
     item: STR('Item id, or "none" with where to unequip what is worn there.'),
     where: { type: 'string', enum: ['hand', 'off-hand', 'head', 'torso', 'legs', 'feet'] }
   }, ['item']),
-  tool('use_block', 'Walk to nearest matching block and right-click it.', { what: STR('Block id.') }, ['what']),
+  tool('use_block', 'Start a walk to the nearest matching loaded block within 16 blocks, then right-click the guarded target if its state is unchanged. A click acknowledgment does not verify the effect.', { what: STR('Block id.') }, ['what']),
   tool('inspect_block', 'Read one loaded block and state; no power inferred.', { x: INT('X.'), y: INT('Y.'), z: INT('Z.') }, ['x', 'y', 'z']),
   tool('inspect_region', 'Read-only paginated 3D block snapshot around [x,y,z]; no circuit trace.', { x: INT('X.'), y: INT('Y.'), z: INT('Z.'), radius: INT('0–2, default 1.'), page: INT('Page, default 1.') }, ['x', 'y', 'z']),
   tool('redstone_scan', 'Read-only local redstone snapshot (start with x,y,z; page with snapshot id).', { x: INT('X.'), y: INT('Y.'), z: INT('Z.'), radius: INT('0–2, default 1.'), snapshot: STR('Existing snapshot id.'), page: INT('Page, default 1.') }),
@@ -247,7 +247,7 @@ const ACTION_TOOLS = [
     count: INT('Count 1–64 (default 1).'),
     radius: INT('Radius 1–64 (default 32).')
   }, ['item']),
-  tool('mine_resource', 'High-level mining procedure: ensures a suitable pickaxe if craftable from carried materials, mines the requested resource, actively walks over and collects dropped items, and verifies inventory gain.', {
+  tool('mine_resource', 'Start mining nearby loaded resources. May bootstrap a wooden or stone pickaxe from carried materials. Count is blocks, not item yield; results distinguish observed blocks broken, remaining blocks and observed inventory gains. Pickup can be partial or unverified.', {
     item: STR('Resource block id or alias (wood, oak_log, stone, coal, iron, diamond, sand…).'),
     count: INT('Target blocks to mine 1–64 (default 4).'),
     radius: INT('Search radius 4–48 (default 32).'),
@@ -322,7 +322,7 @@ const ACTION_TOOLS = [
     at: AT,
     stage: STAGE
   }, ['shape', 'block']),
-  tool('run_script', 'Run saved script in zincai/scripts/.', { name: STR('Script name.') }, ['name']),
+  tool('run_script', 'Start a bundled script (flee or build_tower). Wait for its domain result; starting to flee does not mean safety, and a tower attempt can fail.', { name: STR('Script name.') }, ['name']),
   tool('idle', 'End your turn when no new action is needed: the body carries on with what it is already doing (or keeps fleeing). Do not call idle to procrastinate when an active goal has a next step you can execute now. Do call idle when the remaining steps are blocked, impossible, or belong to someone else — idling on a dead step is correct; repeating it is not.')
 ]
 
@@ -579,6 +579,7 @@ function coerceActions (message, { max = 6 } = {}) {
   const out = []
   for (const call of toolCalls.slice(0, Math.max(1, max))) {
     const one = coerceAction({ tool_calls: [call] })
+    one._rawArguments = call?.function?.arguments ?? null
     if (call?.id) one._callId = String(call.id)
     out.push(one)
   }

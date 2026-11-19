@@ -11,13 +11,13 @@
 
 module.exports = async function flee (ctx) {
   const { bot, system1, log } = ctx
-  if (!bot?.entity) return 'no_entity'
-  if (!system1) return 'no_reflex_layer'
+  if (!bot?.entity) return { ok: false, msg: 'no entity' }
+  if (!system1) return { ok: false, msg: 'no reflex layer' }
   const threats = system1.sense.assess().threats
-  if (!threats.length) { log?.info?.('flee', 'nothing to flee from'); return 'nothing_to_flee' }
+  if (!threats.length) { log?.info?.('flee', 'nothing to flee from'); return { ok: false, msg: 'no live threat to flee from' } }
   // Forget earlier "hold"/"fight" decisions: this is an explicit order to run.
   system1.clearDecision()
   system1.flee({ threats })
   log?.info?.('flee', `running from ${threats[0].name} (${threats[0].distance.toFixed(1)}m)`)
-  return `fleeing_${threats[0].name}`
+  return { ok: Boolean(system1.fleeing), complete: false, verification: 'unverified', msg: `escape requested from ${threats[0].name}; safe arrival not verified` }
 }

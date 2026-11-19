@@ -264,6 +264,10 @@ async function collectNearbyDrops (skills, token, center, {
 }
 
 /** Best carried pickaxe tier (0=wood, 1=stone, 2=iron, 3=diamond, 4=netherite, -1=none). */
+function heldPickaxeTier (item, tiers) {
+  return item?.name?.endsWith('_pickaxe') ? (tiers[item.name.split('_')[0]] ?? -1) : -1
+}
+
 function bestPickaxeTier (bot, TOOL_TIERS) {
   const picks = (bot.inventory?.items?.() || []).filter((i) => /_pickaxe$/.test(i.name))
   return picks.reduce((m, p) => Math.max(m, TOOL_TIERS[p.name.split('_')[0]] ?? 0), -1)
@@ -399,9 +403,18 @@ function mineResource (skills, {
         try { await bot.lookAt(block.position.offset(0.5, 0.5, 0.5), true) } catch { /* cosmetic */ }
         if (token.cancelled || isPreempted(skills)) break
         const current = bot.blockAt(p)
-        if (!current || !targets.names.includes(current.name)) continue
+        if (!current || current.name !== block.name || current.stateId !== block.stateId) continue
+        const allowed = typeof guard === 'function' ? guard(p) : null
+        if (allowed?.ok === false) { skippedKeys.add(`${p.x},${p.y},${p.z}`); continue }
+        const requiredTier = HARVEST_NEED[current.name] ?? -1
+        if (requiredTier >= 0 && heldPickaxeTier(bot.heldItem, TOOL_TIERS) < requiredTier) {
+          misses++
+          continue
+        }
         try {
           await bot.dig(current)
+          const observed = bot.blockAt(p)
+          if (!observed || observed.name === current.name) { misses++; continue }
           dug++
           const pickup = await collectNearbyDrops(skills, token, p, {
             radius: 5.5,
@@ -436,7 +449,10 @@ function mineResource (skills, {
 
     const meta = {
       progress: { done: dug, total: wanted },
-      complete: dug >= wanted && !token.cancelled,
+      complete: dug >= wanted && diff.total > 0 && !token.cancelled,
+      execution: token.cancelled ? 'cancelled' : dug >= wanted && diff.total > 0 ? 'completed' : dug > 0 ? 'partial' : 'failed',
+      verification: diff.total > 0 ? 'inventory_delta_observed' : 'pickup_not_verified',
+      evidence: { requestedBlocks: wanted, observedBlocksBroken: dug, remainingBlocks: Math.max(0, wanted - dug), gained: diff.gained },
       mined: dug,
       collected: diff.total,
       gained: diff.gained,
@@ -445,7 +461,7 @@ function mineResource (skills, {
     }
     if (dug > 0) {
       return ok(
-        `mined ${dug}/${wanted} ${want}${craftedToolNote}; verified collected: ${gainedSummary} (now carrying ${afterTotal} matching items; ${afterTotal - beforeTotal >= 0 ? `+${afterTotal - beforeTotal}` : afterTotal - beforeTotal} net)`,
+        `mined ${dug}/${wanted} ${want}${craftedToolNote}, ${wanted - dug} blocks remaining; observed inventory gains: ${gainedSummary} (now carrying ${afterTotal} matching items; ${afterTotal - beforeTotal >= 0 ? `+${afterTotal - beforeTotal}` : afterTotal - beforeTotal} net)`,
         meta
       )
     }

@@ -7,9 +7,12 @@
 
 module.exports = async function buildTower (ctx) {
   const { bot, pathfinder, log } = ctx
-  if (!bot?.entity || !pathfinder?.pillarToHeight) return 'unavailable'
+  if (!bot?.entity || !pathfinder?.pillarToHeight) return { ok: false, msg: 'pillar procedure unavailable' }
   const target = Math.floor(bot.entity.position.y) + 6
   log?.info?.('build_tower', `pillaring to y=${target}`)
   const ok = await pathfinder.pillarToHeight(target)
-  return ok ? `tower_top_y=${Math.floor(bot.entity.position.y)}` : 'tower_failed'
+  const actualY = Math.floor(bot.entity.position.y)
+  return ok && actualY >= target
+    ? { ok: true, verification: 'unverified', msg: `reached y=${actualY}; full tower structure not verified` }
+    : { ok: false, msg: `tower failed: reached y=${actualY}, target y=${target}` }
 }

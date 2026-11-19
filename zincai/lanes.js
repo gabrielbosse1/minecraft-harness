@@ -27,6 +27,7 @@
 /** Lane names, in the order a human would explain them. */
 const LANES = Object.freeze({
   BODY: 'BODY',
+  CONTROL: 'CONTROL',
   COMPUTATION: 'COMPUTATION',
   INTERACTION: 'INTERACTION',
   WORLD_INFO: 'WORLD_INFO'
@@ -64,8 +65,8 @@ const TOOL_LANES = Object.freeze({
   corpse_run: LANES.BODY,
   sleep: LANES.BODY,
   run_script: LANES.BODY,
-  stop: LANES.BODY,
-  hold: LANES.BODY,
+  stop: LANES.CONTROL,
+  hold: LANES.CONTROL,
   memory: LANES.COMPUTATION,
   redstone_design: LANES.COMPUTATION,
   redstone_review: LANES.COMPUTATION,
@@ -186,7 +187,7 @@ const MAX_REGION_KEYS = 64
  * BODY is deliberately absent: two physical actions never overlap. INTERACTION
  * is absent too — two replies must not interleave their lines.
  */
-const SHARED_LANES = new Set([LANES.WORLD_INFO, LANES.COMPUTATION])
+const SHARED_LANES = new Set([LANES.WORLD_INFO, LANES.COMPUTATION, LANES.CONTROL])
 
 const isShared = (resource) => {
   if (typeof resource !== 'string') return false
@@ -361,6 +362,11 @@ class LaneScheduler {
   }
 
   _grant (resources, info) {
+    info.resources = resources.slice()
+    info.controller = info.meta?.controller || 'tool-execution'
+    info.state = 'running'
+    info.lastProgressAt = info.at
+    info.abort = new AbortController()
     for (const r of resources) {
       if (isShared(r)) {
         if (!this.readers.has(r)) this.readers.set(r, new Map())
@@ -374,6 +380,7 @@ class LaneScheduler {
 
   _lease (resources, holder, tool, grantedAt, waitedMs) {
     let released = false
+    const info = this.held.get('lane:BODY')?.holder === holder ? this.held.get('lane:BODY') : null
     const lease = {
       id: holder,
       tool,
@@ -381,7 +388,9 @@ class LaneScheduler {
       resources,
       grantedAt,
       waitedMs,
-      get released () { return released },
+      signal: info?.abort.signal,
+      heartbeat: () => { if (info && !released) info.lastProgressAt = this.now() },
+      get released () { return released || info?.state === 'released' },
       release: (reason = 'done') => {
         if (released) return false
         released = true
@@ -407,7 +416,7 @@ class LaneScheduler {
         continue
       }
       const info = this.held.get(r)
-      if (info && info.holder === holder) { tool = info.tool; this.held.delete(r) }
+      if (info && info.holder === holder) { info.state = 'released'; tool = info.tool; this.held.delete(r) }
     }
     this.events.push({ at: t, kind: 'release', tool, holder, reason, lane: tool ? laneFromResources(resources) : null })
     this._drain()
@@ -454,6 +463,34 @@ class LaneScheduler {
       try { w.resolve(null) } catch { /* waiter already gone */ }
     }
     return dropped.length
+  }
+
+  requestBodyCancellation (id, reason = 'stop requested') {
+    const info = this.bodyHolder()
+    if (!info || info.holder !== id) return false
+    info.state = 'cancel_requested'
+    this.events.push({ at: this.now(), kind: 'cancel_requested', tool: info.tool, holder: id, reason })
+    info.abort.abort(reason)
+    return true
+  }
+
+  dropBodyWaiters (reason = 'stop requested') {
+    const dropped = this.waiters.filter((w) => w.resources.includes('lane:BODY'))
+    this.waiters = this.waiters.filter((w) => !dropped.includes(w))
+    for (const w of dropped) {
+      this.events.push({ at: this.now(), kind: 'dropped', tool: w.tool, holder: w.holder, reason })
+      w.resolve(null)
+    }
+    return dropped.length
+  }
+
+  /** Observe the exact lease, not whichever action is next in the queue. */
+  async waitForBodyRelease (id, timeoutMs = 2000) {
+    const deadline = Date.now() + timeoutMs
+    while (this.bodyHolder()?.holder === id && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
+    return this.bodyHolder()?.holder !== id
   }
 
   /** Drop waiters and forcibly release leases; only safe after work stops. */

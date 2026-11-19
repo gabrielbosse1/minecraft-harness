@@ -156,9 +156,9 @@ class NavigationIntents {
     for (const m of this.modules.values()) {
       for (const [key, request] of m.locomotion) {
         if (now >= request.expiresAt || request.dim !== dim) { m.locomotion.delete(key); continue }
-        if (request.goal && request.goal !== context.goal) continue
         try {
           if (request.cancelWhen?.(context)) { m.locomotion.delete(key); continue }
+          if (request.goal && request.goal !== context.goal) continue
           if (request.activeWhen && !request.activeWhen(context)) continue
         } catch { m.locomotion.delete(key); continue }
         candidates.push(request)

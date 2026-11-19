@@ -809,13 +809,18 @@ class AdvancedCombat {
       // Hold the existing dynamic follow goal while the pathfinder still has a
       // live path to the target; only re-create/re-set it when the path ran out
       // (e.g. target moved out of reach, goal cleared, pathfinder stalled).
-      if (this.activeGoal?.dynamic && this.bot.pathfinder?.isMoving?.()) return
-      const followRange = Math.max(1, Math.round(this.profile.min))
-      const goal = new GoalFollow(this.target, followRange)
-      this.activeGoal = { goal, dynamic: true }
+      let goal = this.activeGoal?.dynamic && this.bot.pathfinder?.goal === this.activeGoal.goal && this.bot.pathfinder?.isMoving?.() ? this.activeGoal.goal : null
+      if (!goal) {
+        const followRange = Math.max(1, Math.round(this.profile.min))
+        goal = new GoalFollow(this.target, followRange)
+        this.activeGoal = { goal, dynamic: true }
+        this.hands.setGoal(goal, true)
+      }
+      const target = this.target
       this.locomotion?.publishLocomotion('approach', { goal, mode: 'sprint', tier: 'override', reason: 'engagement approach',
-        target: this.target.id, expiresAt: this.now() + 5000, activeWhen: ({ owner }) => owner === 'combat' })
-      this.hands.setGoal(goal, true)
+        target: target.id, expiresAt: this.now() + 5000,
+        cancelWhen: () => this.target !== target || !this._entityAlive(target) || this.activeGoal?.goal !== goal,
+        activeWhen: ({ owner }) => owner === 'combat' })
     } catch (err) {
       logger.debug(TAG, `follow goal failed: ${err.message || err}`)
     }

@@ -88,3 +88,32 @@ A hazard-only module can keep publishing fields without publishing any style. An
 The session wrapper applies style on `physicsTick` after the native pathfinder listener. Native pathfinder still steers and handles required obstacle jumps; it can also apply the sprint permission from the preceding tick. Extra sprint-jumps require an active route, speed, food, cadence, a clear loaded corridor, and a simulated same-level landing. This is conservative screening, not proof of safety on all terrain. Procedure and builder approaches prefer precision near a work target. Short-lived threat and combat approach directives share the registry. Combat stance, reflex escape keys, gap recovery, and standalone/legacy gait adapters still have direct-control paths; this is an incremental migration, not exclusive movement ownership. Session counters report style transitions, safety downgrades, optional jumps, and ticks delegated to compatibility control. No new model tools, arguments, or per-transition notifications are introduced.
 
 Run `node --test scripts/tests/locomotion-arbitration.test.cjs test/20-locomotion-intents.test.js` for deterministic arbitration and controlled Minecraft route checks. The route checks measure transitions, hunger fallback, goal identity, restoration, arrival, and optional jumping on flat ground; they do not establish a production speedup or validate every combat/reflex interaction.
+
+### Automatic movement and jump ownership
+
+`auto` is the original randomized sprint/walk phase generator, not forced walking. It continues running under overrides so normal travel resumes when a directive ends. Moving routes with at least 24 blocks remaining can request optional sprint-jumps automatically; the original 2 blocks/s and 480 ms eligibility thresholds are retained, but a jump now also requires predicted clearance, loaded and level support, route alignment and a safe landing. Sprint permission still respects low food and hazards. A turn, elevation change, missing block data, nearby creeper, danger field, or uncertain landing vetoes the optional jump without stopping native navigation.
+
+An optional jump owns one physics sample of the jump key. A 90 ms watchdog bounds the pulse if physics stops ticking. The wrapper clears its own key and Mineflayer's queued jump edge on goal replacement/cancellation, explicit gait change or shutdown; ordinary per-tick release runs before the native pathfinder writes obstacle controls. Native jumps are not counted as optional. Module styles are resolved on physics ticks and cannot extend a pulse across multiple samples.
+
+Session camera jitter and synthetic heading pauses remain disabled intentionally. The parent periodically wrote yaw and pitch while the pathfinder steered, and on a sharp turn it cleared forward, sprint and jump after the native tick. Removing those writes avoids aim competition and keeps native obstacle jumps intact; standalone compatibility retains the historical behavior. This is not a claim about improved visual perception or model accuracy.
+
+| Remaining direct path | Owner and interaction with route arbitration |
+| --- | --- |
+| Combat stance, critical attack hops, and lateral evasion | Combat body lane. Approach now renews a goal-scoped sprint preference even if the follow goal is unchanged. Close stance deliberately uses direct keys instead of overlaying them on a normal route; higher-priority survival may preempt it. End/disengage withdraw the preference. |
+| Reflex escape, buoyancy, and emergency impact responses | System1 survival/reflex lanes; direct controls remain necessary where a path is unavailable or an immediate evasive impulse is needed. These can interrupt an active route by design. No style overlay is applied to an urgent no-goal owner. |
+| Scaffold positioning | Builder task lane and cancellation checks; standalone fallback still places and jumps directly. Placement already sent to the server cannot be cancelled retroactively. |
+| Gap recovery and explicit gait/jump adapters | Existing wrapper/escape compatibility paths. Direct recovery impulses and manual jump timing are not governed by the optional sprint-jump pulse; residual timing overlap with pathfinder is possible. |
+| Standalone helpers/scripts | Keep their existing control contracts; they are not evidence of exclusive production movement ownership. |
+
+### Controlled comparison against `f216685`
+
+Equivalent flat Minecraft harness scenarios, one run per distance and revision, using the same default `GoalBlock` publication. Walk/sprint columns count forward-key physics samples with sprint off/on; stopped counts samples without forward. Camera is cumulative absolute yaw plus pitch change and includes steering, so it does not isolate cosmetic jitter. All routes arrived; observed food delta was zero (too short to compare exhaustion reliably).
+
+| Route | Revision | Arrival | Sprint / walk / stopped | Ground departures | Path resets | Camera radians |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 18 blocks | Parent | 3.99 s | 20 / 60 / 0 | 0 | 0 | 1.66 |
+| 18 blocks | Corrected | 4.14 s | 13 / 70 / 0 | 0 | 1 | 1.63 |
+| 36 blocks | Parent | 12.87 s | 166 / 80 / 11 | 11 | 0 | 45.62 |
+| 36 blocks | Corrected | 10.85 s | 139 / 78 / 0 | 7 | 0 | 45.53 |
+
+These are individual observations with randomized gait timings, not statistically established throughput or camera improvements. Focused physical regressions exercise automatic jumps, pulse release and consecutive launches, cancellation, explicit gait changes, a low ceiling, and a required native step-up. The combat renewal probe uses deterministic time; it does not substitute for a prolonged live pursuit or a creeper-fuse interruption test.

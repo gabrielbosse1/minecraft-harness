@@ -1795,6 +1795,7 @@ class PathfinderWrapper {
       fast: 'sprint_jump'
     }
     const next = map[raw] || 'auto'
+    if (next !== this._gait) this._releaseOptionalJump()
     this._gait = next
     if (this.intents) {
       this._manualStyleGoal = this.bot.pathfinder?.goal
@@ -1833,14 +1834,33 @@ class PathfinderWrapper {
 
   locomotionStats () { return { ...this._locomotionStats, mode: this._effectiveGait } }
 
+  _releaseOptionalJump () {
+    if (!this._optionalJumpGoal) return
+    this._optionalJumpGoal = null
+    this._jumpPulseUntil = 0
+    clearTimeout(this._optionalJumpTimer)
+    this.bot.setControlState('jump', false)
+    // Mineflayer queues jump edges independently of the held key.
+    this.bot.jumpQueued = false
+  }
+
   _safeOptionalJump () {
     const { entity } = this.bot
     if (!entity?.onGround || !this.bot.controlState?.forward || this._nearHazard() || this._lowCeiling() || !this._path?.length || this._goalDistance() < 5) return false
     const { Vec3 } = require('vec3')
     const pos = entity.position
+    if (Object.values(this.bot.entities || {}).some((e) => e?.name === 'creeper' && e.position?.distanceTo(pos) < 8)) return false
     const dx = -Math.sin(entity.yaw); const dz = -Math.cos(entity.yaw)
     // Conservative flat corridor check. Native pathfinder still handles
     // necessary obstacle jumps with its own physics simulation.
+    // Pathfinder consumes this array as it advances. Reject turns or elevation
+    // changes within the projected flight, not just obstacles along the yaw ray.
+    for (const node of this._path) {
+      const x = node.x - pos.x; const z = node.z - pos.z
+      const forward = x * dx + z * dz
+      if (forward > 4.5) break
+      if (forward < -0.5 || Math.abs(x * dz - z * dx) > 0.85 || Math.abs(node.y - pos.y) > 0.2) return false
+    }
     const field = this.intents.field()
     for (let d = 0; d <= 4.5; d += 0.5) {
       const p = new Vec3(pos.x + dx * d, pos.y, pos.z + dz * d).floored()
@@ -1883,7 +1903,7 @@ class PathfinderWrapper {
     const request = this.intents.resolveLocomotion({ goal, distance: this._goalDistance(), owner: this.intents.arbiter.owner() })
     const manualForRoute = goal && goal === this._manualStyleGoal && request?.priority <= 1 && request.createdAt <= this._manualStyleAt
     let mode = manualForRoute ? this._gait : (request?.mode || this._gait)
-    if (mode === 'auto') mode = this.isUrgent() ? 'sprint' : 'walk'
+    if (mode === 'auto') mode = this.isUrgent() ? 'sprint' : this._goalDistance() >= 24 && bot.pathfinder.isMoving?.() ? 'sprint_jump' : this._sprintWalkPhase
     const fast = mode === 'sprint' || mode === 'sprint_jump'
     const airborne = !bot.entity.onGround && !bot.entity.isInWater && !bot.entity.isInLava
     const maintainMomentum = airborne && (this._effectiveGait === 'sprint' || this._effectiveGait === 'sprint_jump')
@@ -1904,9 +1924,12 @@ class PathfinderWrapper {
     if (sneak || this._styleSneak) bot.setControlState('sneak', sneak)
     this._styleSneak = sneak
     if (!movement.allowSprinting && bot.controlState?.sprint) bot.setControlState('sprint', false)
-    if (mode === 'sprint_jump' && request?.allowOptionalJump !== false && bot.pathfinder.isMoving?.() && this._speedMs >= 3 && now - this._lastSprintJumpAt >= 1200 && this._safeOptionalJump()) {
+    if (mode === 'sprint_jump' && request?.allowOptionalJump !== false && bot.pathfinder.isMoving?.() && !this._optionalJumpGoal && !bot.controlState.jump && this._speedMs >= 2 && now - this._lastSprintJumpAt >= 480 && this._safeOptionalJump()) {
       this._lastSprintJumpAt = now
       this._locomotionStats.optionalJumps++
+      this._optionalJumpGoal = goal
+      this._jumpPulseUntil = now + 90
+      this._optionalJumpTimer = setTimeout(() => this._releaseOptionalJump(), 90)
       bot.setControlState('jump', true)
     }
   }
@@ -1992,7 +2015,6 @@ class PathfinderWrapper {
     // Variable sprint/walk cycles — sprint is a gait, not a default (unless an explicit gait is set).
     // Danger override: never sprint airborne, in liquid, or next to a drop-off.
     const cycle = () => {
-      if (this.intents) return
       this._sprintTimer = setTimeout(cycle, this._sprintWalkPhase === 'sprint' ? 900 + Math.random() * 1600 : 400 + Math.random() * 800)
       const movements = this._movements()
       if (!movements) return
@@ -2001,6 +2023,7 @@ class PathfinderWrapper {
       } else {
         this._sprintWalkPhase = 'sprint'
       }
+      if (this.intents) return
       const hazard = this._nearHazard()
       // Running for its life (or fighting) the bot sprints — careful posture included.
       if (this.isUrgent()) { movements.allowSprinting = true; return }
@@ -2080,6 +2103,14 @@ class PathfinderWrapper {
         }
       }
     }
+    if (this.intents) {
+      // Physics already sampled the previous pulse. Clear it before the native
+      // driver writes this tick's obstacle controls, never after those writes.
+      this._beforeNativeTick = () => this._releaseOptionalJump()
+      this._onOptionalGoalChange = () => this._releaseOptionalJump()
+      bot.prependListener('physicsTick', this._beforeNativeTick)
+      bot.on('goal_updated', this._onOptionalGoalChange)
+    }
     this._onTick(motionTick)
 
     // Idle pause on abrupt heading change while navigating (200–800ms).
@@ -2124,6 +2155,9 @@ class PathfinderWrapper {
 
   /** Remove OUR timers and physicsTick listeners (called on shutdown). */
   stop () {
+    this._releaseOptionalJump()
+    if (this._beforeNativeTick) this.bot.removeListener('physicsTick', this._beforeNativeTick)
+    if (this._onOptionalGoalChange) this.bot.removeListener('goal_updated', this._onOptionalGoalChange)
     clearTimeout(this._digTimer)
     this._digTimer = null
     this._digWindow = null

@@ -93,7 +93,9 @@ Run `node --test scripts/tests/locomotion-arbitration.test.cjs test/20-locomotio
 
 `auto` is the original randomized sprint/walk phase generator, not forced walking. It continues running under overrides so normal travel resumes when a directive ends. Moving routes with at least 24 blocks remaining can request optional sprint-jumps automatically; the original 2 blocks/s and 480 ms eligibility thresholds are retained, but a jump now also requires predicted clearance, loaded and level support, route alignment and a safe landing. Sprint permission still respects low food and hazards. A turn, elevation change, missing block data, nearby creeper, danger field, or uncertain landing vetoes the optional jump without stopping native navigation.
 
-An optional jump owns one physics sample of the jump key. A 90 ms watchdog bounds the pulse if physics stops ticking. The wrapper clears its own key and Mineflayer's queued jump edge on goal replacement/cancellation, explicit gait change or shutdown; ordinary per-tick release runs before the native pathfinder writes obstacle controls. Native jumps are not counted as optional. Module styles are resolved on physics ticks and cannot extend a pulse across multiple samples.
+Automatic sprint-jumps and manual `pace` jumps use one pulse owner per press. A pulse can be sampled by at most one physics tick; the watchdog is 90 ms for automatic jumps and 120 ms for manual jumps if ticks stop. Cancellation releases both the key and Mineflayer’s queued jump edge. The token is checked by the watchdog, so an old callback cannot release a newer pulse. Goal changes, explicit gait changes, stop, and controller shutdown cancel outstanding pulses. Contributor styles still resolve on physics ticks; they do not extend a pulse across multiple samples.
+
+The wrapper releases its pulse before native pathfinder writes obstacle controls. Body-lane handoff and explicit lane jump writes invalidate the old pulse before establishing the incoming owner’s keys. A nearby creeper spawn or movement packet also invalidates a pending pulse; System 1 independently chooses and executes emergency movement. This does not grant the wrapper ownership of a native jump, an emergency hold, or a scaffold jump.
 
 Session camera jitter and synthetic heading pauses remain disabled intentionally. The parent periodically wrote yaw and pitch while the pathfinder steered, and on a sharp turn it cleared forward, sprint and jump after the native tick. Removing those writes avoids aim competition and keeps native obstacle jumps intact; standalone compatibility retains the historical behavior. This is not a claim about improved visual perception or model accuracy.
 
@@ -102,7 +104,7 @@ Session camera jitter and synthetic heading pauses remain disabled intentionally
 | Combat stance, critical attack hops, and lateral evasion | Combat body lane. Approach now renews a goal-scoped sprint preference even if the follow goal is unchanged. Close stance deliberately uses direct keys instead of overlaying them on a normal route; higher-priority survival may preempt it. End/disengage withdraw the preference. |
 | Reflex escape, buoyancy, and emergency impact responses | System1 survival/reflex lanes; direct controls remain necessary where a path is unavailable or an immediate evasive impulse is needed. These can interrupt an active route by design. No style overlay is applied to an urgent no-goal owner. |
 | Scaffold positioning | Builder task lane and cancellation checks; standalone fallback still places and jumps directly. Placement already sent to the server cannot be cancelled retroactively. |
-| Gap recovery and explicit gait/jump adapters | Existing wrapper/escape compatibility paths. Direct recovery impulses and manual jump timing are not governed by the optional sprint-jump pulse; residual timing overlap with pathfinder is possible. |
+| Gap recovery and explicit gait/jump adapters | Existing wrapper/escape compatibility paths. Direct recovery impulses are not discrete wrapper pulses; residual timing overlap with pathfinder is possible. The manual `pace` jump now uses the shared lifecycle. |
 | Standalone helpers/scripts | Keep their existing control contracts; they are not evidence of exclusive production movement ownership. |
 
 ### Controlled comparison against `f216685`
@@ -116,4 +118,12 @@ Equivalent flat Minecraft harness scenarios, one run per distance and revision, 
 | 36 blocks | Parent | 12.87 s | 166 / 80 / 11 | 11 | 0 | 45.62 |
 | 36 blocks | Corrected | 10.85 s | 139 / 78 / 0 | 7 | 0 | 45.53 |
 
-These are individual observations with randomized gait timings, not statistically established throughput or camera improvements. Focused physical regressions exercise automatic jumps, pulse release and consecutive launches, cancellation, explicit gait changes, a low ceiling, and a required native step-up. The combat renewal probe uses deterministic time; it does not substitute for a prolonged live pursuit or a creeper-fuse interruption test.
+These are individual observations with randomized gait timings, not statistically established throughput or camera improvements.
+
+### Physical regression coverage
+
+The controlled 1.21.4 server tests observe keys and queued input, not just action returns. They exercise consecutive physical takeoffs, actual `pace` tool cancellation and gait/goal replacement, overlapping manual/automatic requests, the watchdog with physics suspended, and handoff to a driver holding jump. Separate tests deliver a real creeper spawn packet while an automatic or manual pulse is pending, then observe System 1 priority, increased separation and arrival at the original destination. The fixture briefly suspends physics to isolate the packet-before-next-sample case; egress and route completion use normal physics.
+
+Safety tests cover a right-angle corridor, a low ceiling and a native step-up. At an otherwise eligible launch the server changes blocks to water, lava, a raised block, stairs and a six-block drop. The test checks the client-observed blocks and the launch veto, then probes a hostile in the corridor and unloads only the landing column using a server packet. The runtime also checks the simulated landing footprint, not just the heading ray. These cases are conservative veto probes, not attempts to jump into hazards or a guarantee for every block shape.
+
+A slowed pursuit on soul sand keeps an exact zombie engagement active beyond five seconds. A real creeper preempts it, the target is removed, and the original home goal object resumes and reaches its destination. The deterministic arbitration probe additionally verifies renewal without rewriting the follow goal. Tests use controlled Minecraft and scripted orchestration, not live AMD inference.

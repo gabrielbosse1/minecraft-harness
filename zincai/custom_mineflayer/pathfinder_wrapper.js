@@ -1795,7 +1795,7 @@ class PathfinderWrapper {
       fast: 'sprint_jump'
     }
     const next = map[raw] || 'auto'
-    if (next !== this._gait) this._releaseOptionalJump()
+    if (next !== this._gait) this.cancelJumpPulse()
     this._gait = next
     if (this.intents) {
       this._manualStyleGoal = this.bot.pathfinder?.goal
@@ -1834,14 +1834,33 @@ class PathfinderWrapper {
 
   locomotionStats () { return { ...this._locomotionStats, mode: this._effectiveGait } }
 
-  _releaseOptionalJump () {
-    if (!this._optionalJumpGoal) return
-    this._optionalJumpGoal = null
-    this._jumpPulseUntil = 0
-    clearTimeout(this._optionalJumpTimer)
+  // The token belongs to this particular press, not the route or timer slot.
+  // Native and lane drivers do not use this helper; they take control after
+  // our release, so an old timer cannot release their jump.
+  _beginJumpPulse (kind, duration) {
+    const bot = this.bot
+    if (this._jumpPulse || bot.controlState?.jump || bot.jumpQueued) return false
+    const pulse = { kind, timer: null }
+    this._jumpPulse = pulse
+    this._jumpPulseUntil = Date.now() + duration
+    try { bot.setControlState('jump', true) } catch {
+      this.cancelJumpPulse(pulse)
+      return false
+    }
+    if (bot.controlState?.jump === false) { this.cancelJumpPulse(pulse); return false }
+    pulse.timer = setTimeout(() => this.cancelJumpPulse(pulse), duration)
+    return true
+  }
+
+  cancelJumpPulse (pulse = this._jumpPulse) {
+    if (!pulse || pulse !== this._jumpPulse) return false
+    clearTimeout(pulse.timer)
     this.bot.setControlState('jump', false)
-    // Mineflayer queues jump edges independently of the held key.
+    // Mineflayer queues jump edges separately from held keys.
     this.bot.jumpQueued = false
+    this._jumpPulse = null
+    this._jumpPulseUntil = 0
+    return true
   }
 
   _safeOptionalJump () {
@@ -1862,8 +1881,8 @@ class PathfinderWrapper {
       if (forward < -0.5 || Math.abs(x * dz - z * dx) > 0.85 || Math.abs(node.y - pos.y) > 0.2) return false
     }
     const field = this.intents.field()
-    for (let d = 0; d <= 4.5; d += 0.5) {
-      const p = new Vec3(pos.x + dx * d, pos.y, pos.z + dz * d).floored()
+    const entities = Object.values(this.bot.entities || {})
+    const safeCell = (p) => {
       const floor = this.bot.blockAt(p.offset(0, -1, 0))
       if (floor?.boundingBox !== 'block' || /magma|cactus|campfire|honey|ice|slime/.test(floor.name)) return false
       for (let y = 0; y <= 2; y++) {
@@ -1872,7 +1891,10 @@ class PathfinderWrapper {
       }
       if (field && field(p) >= 8) return false
       if (this.threat.costAt(p) >= 8) return false
-      if (Object.values(this.bot.entities || {}).some((e) => e !== entity && e?.position?.distanceTo(p.offset(0.5, 0, 0.5)) < 1.1)) return false
+      return !entities.some((e) => e !== entity && e?.position?.distanceTo(p.offset(0.5, 0, 0.5)) < 1.1)
+    }
+    for (let d = 0; d <= 4.5; d += 0.5) {
+      if (!safeCell(new Vec3(pos.x + dx * d, pos.y, pos.z + dz * d).floored())) return false
     }
     // Verify the projected landing as well as the loaded corridor, using the
     // same physics simulator bundled with pathfinder. Never force a jump if
@@ -1885,8 +1907,14 @@ class PathfinderWrapper {
         tick = i
         Object.assign(state.control, { forward: true, back: false, left: false, right: false, sneak: false, sprint: true, jump: i === 0 })
       }, 18)
-      return tick > 1 && landing.onGround && !landing.isInLava && !landing.isInWater &&
-        Math.abs(landing.pos.y - pos.y) <= 0.2 && Math.hypot(landing.pos.x - pos.x, landing.pos.z - pos.z) <= 4.5
+      if (tick <= 1 || !landing.onGround || landing.isInLava || landing.isInWater ||
+          Math.abs(landing.pos.y - pos.y) > 0.2 || Math.hypot(landing.pos.x - pos.x, landing.pos.z - pos.z) > 4.5) return false
+      // Movement inertia can shift the simulated landing off the yaw ray.
+      // Check each corner of the player's footprint in the actual landing.
+      for (const x of [-0.3, 0.3]) for (const z of [-0.3, 0.3]) {
+        if (!safeCell(landing.pos.offset(x, 0.05, z).floored())) return false
+      }
+      return true
     } catch { return false }
   }
 
@@ -1924,13 +1952,11 @@ class PathfinderWrapper {
     if (sneak || this._styleSneak) bot.setControlState('sneak', sneak)
     this._styleSneak = sneak
     if (!movement.allowSprinting && bot.controlState?.sprint) bot.setControlState('sprint', false)
-    if (mode === 'sprint_jump' && request?.allowOptionalJump !== false && bot.pathfinder.isMoving?.() && !this._optionalJumpGoal && !bot.controlState.jump && this._speedMs >= 2 && now - this._lastSprintJumpAt >= 480 && this._safeOptionalJump()) {
-      this._lastSprintJumpAt = now
-      this._locomotionStats.optionalJumps++
-      this._optionalJumpGoal = goal
-      this._jumpPulseUntil = now + 90
-      this._optionalJumpTimer = setTimeout(() => this._releaseOptionalJump(), 90)
-      bot.setControlState('jump', true)
+    if (mode === 'sprint_jump' && request?.allowOptionalJump !== false && bot.pathfinder.isMoving?.() && !this._jumpPulse && !bot.controlState.jump && this._speedMs >= 2 && now - this._lastSprintJumpAt >= 480 && this._safeOptionalJump()) {
+      if (this._beginJumpPulse('automatic', 90)) {
+        this._lastSprintJumpAt = now
+        this._locomotionStats.optionalJumps++
+      }
     }
   }
 
@@ -1965,14 +1991,7 @@ class PathfinderWrapper {
     const bot = this.bot
     if (!bot?.entity) return false
     if (this.intents && (this.isUrgent() || !this.intents.available() || !bot.entity.onGround || this._nearHazard() || this._lowCeiling())) return false
-    try {
-      bot.setControlState('jump', true)
-      this._jumpPulseUntil = Date.now() + 120
-      if (!this.intents) setTimeout(() => {
-        try { if (!this.isUrgent()) bot.setControlState('jump', false) } catch { /* gone */ }
-      }, 120)
-      return true
-    } catch { return false }
+    return this._beginJumpPulse('manual', 120)
   }
 
   _goalDistance () {
@@ -2049,13 +2068,6 @@ class PathfinderWrapper {
         }
       }
 
-      if (this._jumpPulseUntil && now >= this._jumpPulseUntil) {
-        this._jumpPulseUntil = 0
-        if (!this.isUrgent() && !bot.entity.isInWater) {
-          try { bot.setControlState('jump', false) } catch { /* mock */ }
-        }
-      }
-
       if (this.intents) { this._applyLocomotion(now); return }
       const movements = this._movements()
       if (this.isUrgent()) {
@@ -2094,22 +2106,29 @@ class PathfinderWrapper {
           now - this._lastSprintJumpAt >= 480 &&
           now >= this._pauseUntil
         ) {
-          this._lastSprintJumpAt = now
-          this._jumpPulseUntil = now + 90
-          try {
+          if (this._beginJumpPulse('automatic', 90)) {
+            this._lastSprintJumpAt = now
             bot.setControlState('sprint', true)
-            bot.setControlState('jump', true)
-          } catch { /* mock */ }
+          }
         }
       }
     }
-    if (this.intents) {
+    {
       // Physics already sampled the previous pulse. Clear it before the native
       // driver writes this tick's obstacle controls, never after those writes.
-      this._beforeNativeTick = () => this._releaseOptionalJump()
-      this._onOptionalGoalChange = () => this._releaseOptionalJump()
-      bot.prependListener('physicsTick', this._beforeNativeTick)
+      this._beforeNativeTick = () => this.cancelJumpPulse()
+      this._onOptionalGoalChange = () => this.cancelJumpPulse()
+      if (bot.prependListener) bot.prependListener('physicsTick', this._beforeNativeTick)
+      else this._onTick(this._beforeNativeTick)
+      this._beforeLaneControls = () => this.cancelJumpPulse()
+      this.intents?.arbiter.on('beforeControls', this._beforeLaneControls)
       bot.on('goal_updated', this._onOptionalGoalChange)
+      this._onPulseThreat = (entity) => {
+        if (this._jumpPulse && entity?.name === 'creeper' && this.bot.entity?.position &&
+            entity.position?.distanceTo(this.bot.entity.position) < 8) this.cancelJumpPulse()
+      }
+      bot.on('entitySpawn', this._onPulseThreat)
+      bot.on('entityMoved', this._onPulseThreat)
     }
     this._onTick(motionTick)
 
@@ -2155,9 +2174,14 @@ class PathfinderWrapper {
 
   /** Remove OUR timers and physicsTick listeners (called on shutdown). */
   stop () {
-    this._releaseOptionalJump()
+    this.cancelJumpPulse()
+    if (this._beforeLaneControls) this.intents?.arbiter.removeListener('beforeControls', this._beforeLaneControls)
     if (this._beforeNativeTick) this.bot.removeListener('physicsTick', this._beforeNativeTick)
     if (this._onOptionalGoalChange) this.bot.removeListener('goal_updated', this._onOptionalGoalChange)
+    if (this._onPulseThreat) {
+      this.bot.removeListener('entitySpawn', this._onPulseThreat)
+      this.bot.removeListener('entityMoved', this._onPulseThreat)
+    }
     clearTimeout(this._digTimer)
     this._digTimer = null
     this._digWindow = null

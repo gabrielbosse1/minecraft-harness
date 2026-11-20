@@ -3753,6 +3753,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         if (action.action_id && action.action_id !== holder?.holder) {
           return report('stop', { ok: false, request: 'rejected', msg: `no currently held BODY action ${action.action_id}; nothing cancelled` }, { wake: false })
         }
+        wrapper?.cancelJumpPulse()
         const requestedAt = performance.now()
         const stopId = ++stopGeneration
         lanes.dropBodyWaiters()

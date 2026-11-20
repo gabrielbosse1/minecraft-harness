@@ -244,6 +244,7 @@ class ControlArbiter extends EventEmitter {
   // ------------------------------------------------------------ internals
 
   _press (key, value) {
+    if (key === 'jump') this.emit('beforeControls')
     try { this.bot.setControlState(key, Boolean(value)) } catch { /* bot gone / mock */ }
   }
 
@@ -288,6 +289,8 @@ class ControlArbiter extends EventEmitter {
       // Same driver (e.g. a lower lane released). Nothing to re-apply.
       return
     }
+    // Invalidate discrete pulses before the new driver can adopt the jump key.
+    this.emit('beforeControls')
     // 1. Let go of what the previous driver pressed.
     if (before) for (const key of Object.keys(before.keys)) if (!after?.keys[key]) this._press(key, false)
     // 2. Pathfinder goal of the new driver (null when it has no opinion).

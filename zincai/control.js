@@ -25,6 +25,8 @@
 
 const { EventEmitter } = require('events')
 
+const { selectIntent } = require('./navigation_intents')
+
 const KEYS = ['forward', 'back', 'left', 'right', 'jump', 'sprint', 'sneak']
 const PRIORITY = Object.freeze({ idle: 0, task: 1, combat: 2, survival: 3 })
 
@@ -176,12 +178,7 @@ class ControlArbiter extends EventEmitter {
 
   /** Highest-priority active lane, or null when nobody claims control. */
   top () {
-    let best = null
-    for (const lane of this.lanes.values()) {
-      if (!lane.active) continue
-      if (!best || lane.priority > best.priority) best = lane
-    }
-    return best
+    return selectIntent([...this.lanes.values()].filter((lane) => lane.active))
   }
 
   owner () { return this.top()?.name || 'idle' }
@@ -247,6 +244,7 @@ class ControlArbiter extends EventEmitter {
   // ------------------------------------------------------------ internals
 
   _press (key, value) {
+    if (key === 'jump') this.emit('beforeControls')
     try { this.bot.setControlState(key, Boolean(value)) } catch { /* bot gone / mock */ }
   }
 
@@ -291,6 +289,8 @@ class ControlArbiter extends EventEmitter {
       // Same driver (e.g. a lower lane released). Nothing to re-apply.
       return
     }
+    // Invalidate discrete pulses before the new driver can adopt the jump key.
+    this.emit('beforeControls')
     // 1. Let go of what the previous driver pressed.
     if (before) for (const key of Object.keys(before.keys)) if (!after?.keys[key]) this._press(key, false)
     // 2. Pathfinder goal of the new driver (null when it has no opinion).

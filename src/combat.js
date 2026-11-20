@@ -414,6 +414,7 @@ class AdvancedCombat {
     recoveryMs = 220,
     bowChargeThreshold = 1.0,
     hands = null,
+    locomotion = null,
     fleeOnDisengage = true,
     lineOfSight = null,
     watch = null,
@@ -434,6 +435,7 @@ class AdvancedCombat {
     this.recoveryMs = recoveryMs
     this.bowChargeThreshold = bowChargeThreshold
     this.hands = hands || directHands(bot)
+    this.locomotion = locomotion
     this.fleeOnDisengage = fleeOnDisengage !== false
     this.lineOfSight = typeof lineOfSight === 'function' ? lineOfSight : (e) => hasLineOfSight(this.bot, e)
     /**
@@ -558,6 +560,7 @@ class AdvancedCombat {
   resolveTarget (request, { explicitPlayersOnly = false } = {}) {
     const botPos = this.bot.entity?.position
     if (!botPos) return { target: null, why: 'no_target' }
+    const entityId = request && typeof request === 'object' && Number.isInteger(request.entityId) ? request.entityId : null
     const asPlayer = request && typeof request === 'object' ? String(request.player || '').trim() : ''
     const raw = asPlayer || String((request && typeof request === 'object' ? request.name : request) || 'any').trim()
     const wanted = raw.toLowerCase()
@@ -571,6 +574,7 @@ class AdvancedCombat {
     for (const id of Object.keys(this.bot.entities)) {
       const e = this.bot.entities[id]
       if (!e || !e.position || e === this.bot.entity || this._deadEntities.has(e)) continue
+      if (entityId !== null && (e.id !== entityId || isPlayer(e))) continue
       if (e.name === undefined || e.name === null) continue
       const dist = e.position.distanceTo(botPos)
       if (isPlayer(e)) {
@@ -681,6 +685,7 @@ class AdvancedCombat {
     this.critArmed = false
     this.autoDefense = false
     this.activeGoal = null
+    this.locomotion?.withdrawLocomotion('approach')
     try { this.hands.release('fight over') } catch { /* bot gone */ }
   }
 
@@ -804,11 +809,18 @@ class AdvancedCombat {
       // Hold the existing dynamic follow goal while the pathfinder still has a
       // live path to the target; only re-create/re-set it when the path ran out
       // (e.g. target moved out of reach, goal cleared, pathfinder stalled).
-      if (this.activeGoal?.dynamic && this.bot.pathfinder?.isMoving?.()) return
-      const followRange = Math.max(1, Math.round(this.profile.min))
-      const goal = new GoalFollow(this.target, followRange)
-      this.activeGoal = { goal, dynamic: true }
-      this.hands.setGoal(goal, true)
+      let goal = this.activeGoal?.dynamic && this.bot.pathfinder?.goal === this.activeGoal.goal && this.bot.pathfinder?.isMoving?.() ? this.activeGoal.goal : null
+      if (!goal) {
+        const followRange = Math.max(1, Math.round(this.profile.min))
+        goal = new GoalFollow(this.target, followRange)
+        this.activeGoal = { goal, dynamic: true }
+        this.hands.setGoal(goal, true)
+      }
+      const target = this.target
+      this.locomotion?.publishLocomotion('approach', { goal, mode: 'sprint', tier: 'override', reason: 'engagement approach',
+        target: target.id, expiresAt: this.now() + 5000,
+        cancelWhen: () => this.target !== target || !this._entityAlive(target) || this.activeGoal?.goal !== goal,
+        activeWhen: ({ owner }) => owner === 'combat' })
     } catch (err) {
       logger.debug(TAG, `follow goal failed: ${err.message || err}`)
     }

@@ -243,7 +243,7 @@ function refuseValue (primitive, reason) {
   return undefined
 }
 
-function installPhysicalGuard (bot, boundary, { logger = () => {} } = {}) {
+function installPhysicalGuard (bot, boundary, { logger = () => {}, ownership = null } = {}) {
   if (!bot || !boundary) return { gated: 0, uninstall: () => {} }
   if (bot.__zincaiPhysicalGuard) return bot.__zincaiPhysicalGuard
   const log = asLogger(logger)
@@ -258,6 +258,11 @@ function installPhysicalGuard (bot, boundary, { logger = () => {} } = {}) {
     originals.set(key, { obj, name, original })
     obj[name] = function guardedPrimitive (...args) {
       if (isRelease && isRelease(...args)) return original.apply(this, args)
+      const refusal = ownership?.(name)
+      if (refusal) {
+        const error = Object.assign(new Error(`refused: ${refusal}`), { refused: true, boundary: true })
+        return PROMISE_PRIMITIVES.has(name) ? Promise.reject(error) : undefined
+      }
       const verdict = boundary.net(name)
       if (!verdict.ok) return refuseValue(name, verdict.reason)
       return original.apply(this, args)

@@ -284,9 +284,10 @@ class Skills {
       bot.pathfinder.thinkTimeout = Math.max(bot.pathfinder.thinkTimeout, 8000)
     }
     const wrapper = this._pathfinder()
-    if (gait && typeof wrapper?.setGait === 'function') {
-      wrapper.setGait(gait)
-    }
+    const precise = goal.constructor?.name === 'GoalGetToBlock'
+    const withdrawStyle = wrapper?.requestRouteStyle?.(goal, gait || (precise ? 'precision' : null), { near: gait ? null : 5 })
+    const legacyGait = gait && !wrapper?.intents
+    if (legacyGait) wrapper?.setGait?.(gait)
     lane.acquire({ reason: token.label })
     this._noPathAt = 0
     lane.setGoal(goal, dynamic)
@@ -359,7 +360,8 @@ class Skills {
       // A dig corridor is for ONE walk: whoever granted it gets it closed here,
       // on success, on noPath and on cancellation alike.
       if (token.digWindow) { try { this._pathfinder()?.endDigging?.(token.cancelled || 'walk done') } catch { /* gone */ } }
-      if (gait) { try { this._pathfinder()?.setGait?.('auto') } catch { /* gone */ } }
+      withdrawStyle?.()
+      if (legacyGait) { try { wrapper?.setGait?.('auto') } catch { /* gone */ } }
       token.walking = false
       token.walkTarget = null
       // A replaced walk must not wipe the goal its replacement just set.
@@ -950,30 +952,30 @@ class Skills {
       if (!positions?.length) return null
       const p = positions[0]
       const block = this.bot.blockAt(p)
-      return block ? { pos: p, name: block.name } : null
+      return block ? { pos: p, name: block.name, stateId: block.stateId, dimension: this._dim() } : null
     } catch { return null }
   }
 
   /** Right-click a nearby block by name: door, gate, lever, button, bell… */
-  useBlock ({ what } = {}) {
+  useBlock ({ what, target = this.previewUseBlockTarget({ what }), authorize = null } = {}) {
     const bot = this.bot
     return this._run('use_block', async (token) => {
-      const q = fold(what).replace(/\s+/g, '_')
-      if (!q) return fail('use_block needs a block name')
-      let positions = []
-      try {
-        const blocks = this._matchUseBlockIds(what)
-        if (!blocks.length) return fail(`unknown block "${what}"`)
-        positions = bot.findBlocks({ matching: blocks.map((b) => b.id), maxDistance: 16, count: 8 })
-      } catch (err) { return fail(`search failed: ${err.message || err}`) }
-      if (!positions.length) return fail(`no ${q} within 16 blocks`)
-      const p = positions[0]
-      token.label = `using ${q}`
+      if (!target) return fail(`no matching loaded block within 16 blocks: ${what || '(empty name)'}`)
+      const p = target.pos
+      token.label = `using ${target.name}`
       const near = await this._approachBlock(token, p)
-      if (!near.ok) return fail(`could not reach the ${q}: ${near.why}`)
+      if (!near.ok) return fail(`could not reach ${target.name}: ${near.why}`)
+      if (token.cancelled || !this.lane.isTop) return fail('interaction cancelled or preempted before activation')
       const block = bot.blockAt(p)
+      if (this._dim() !== target.dimension || !block || block.name !== target.name || block.stateId !== target.stateId) {
+        return fail('stale target: the guarded block or its state changed before activation')
+      }
+      const verdict = authorize?.(target)
+      if (verdict?.ok === false) return fail(`refused: ${verdict.reason}`)
+      const allowed = this.boundary?.check('use_block')
+      if (allowed?.ok === false) return fail(`refused: ${allowed.why}`)
       await bot.activateBlock(block)
-      return ok(`used ${block.name} at ${p.x},${p.y},${p.z}`)
+      return { ...ok(`right-click requested on ${block.name} at ${p.x},${p.y},${p.z}; effect not verified`), verification: 'unverified' }
     })
   }
 
@@ -1323,7 +1325,7 @@ class Skills {
       if (!carried) return fail(`no blocks to shelter with — need ~4 of ${(exec.scaffoldBlocks || ['dirt', 'cobblestone']).join('/')}`)
       token.label = 'sheltering on a pillar'
       const feet = bot.entity.position.floored()
-      const done = await exec.pillarUpTo(feet.y + 3)
+      const done = await exec.pillarUpTo(feet.y + 3, () => Boolean(token.cancelled))
       if (!done) return fail('could not pillar up (blocked above?)')
       try {
         // Stay until cancelled/stopped, re-prioritizing survival implicitly

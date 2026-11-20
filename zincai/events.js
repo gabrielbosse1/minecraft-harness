@@ -540,6 +540,19 @@ class EventPipeline {
     }
   }
 
+  /** One ordered decision frame. Reserve a slot for the newest expedited event
+   * when the backlog exceeds the context budget; omitted IDs stay pending. */
+  formatDecisionBatch ({ maxEvents = this.maxBatchEvents, excludeTypes = new Set(), nowMs = this.now() } = {}) {
+    const candidates = this.events.filter((e) => e.processedAt === null && !e.chat &&
+      (!excludeTypes.has(e.eventType) || this.isDurable(e))).sort((a, b) => a.sequence - b.sequence)
+    const limit = Math.max(2, Math.trunc(maxEvents) || 2)
+    const selected = candidates.slice(0, limit)
+    const urgent = candidates.findLast((e) => this.deliveryLane(e) === 'critical')
+    if (urgent && selected.length === limit && urgent.sequence > selected[limit - 1].sequence) selected[limit - 1] = urgent
+    const events = selected.map((e) => this.batchEventEntry(e, nowMs))
+    return { type: 'event_batch', events, event_count: events.length, sequences: selected.map((e) => e.sequence), moreRemaining: candidates.length - events.length }
+  }
+
   /** One batch entry, with elapsed time so the model knows how old the event is. */
   batchEventEntry (e, nowMs) {
     const ageMs = Math.max(0, nowMs - e.timestampMs)

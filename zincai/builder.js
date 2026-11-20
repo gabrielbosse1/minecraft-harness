@@ -261,6 +261,7 @@ class BuilderExecutor {
     // Optional ControlArbiter lane (zincai/control.js). Without it the builder
     // drives the pathfinder directly, as before.
     this.hands = opts.hands || null
+    this.navigation = opts.navigation || null
     this.cancelRequested = false
     this.placedScaffolds = [] // { pos, name } — only blocks WE placed via pillar towers
     this._trackedKeys = new Set() // dedupe re-placements of the same cell
@@ -309,20 +310,22 @@ class BuilderExecutor {
         else this.bot.pathfinder.setGoal(g, true)
       } catch (err) { this.log('debug', `approach: ${err.message || err}`) }
     }
+    const withdrawStyle = this.navigation?.requestRouteStyle(goal, 'precision', { near: 5 })
     setGoal(goal)
-    let budget = 20_000
-    let last = Date.now()
-    while (!this.cancelRequested) {
-      await new Promise((resolve) => setTimeout(resolve, 150))
-      const now = Date.now()
-      if (this.hands && this.hands.active && !this.hands.isTop) { last = now; continue }
-      budget -= now - last
-      last = now
-      const p = this.bot.entity?.position
-      if (p && Math.hypot(p.x - target.x, p.y - target.y, p.z - target.z) <= distance + 0.6) break
-      if (budget <= 0) { this.log('debug', 'approach: timeout'); break }
-    }
-    setGoal(null)
+    try {
+      let budget = 20_000
+      let last = Date.now()
+      while (!this.cancelRequested) {
+        await new Promise((resolve) => setTimeout(resolve, 150))
+        const now = Date.now()
+        if (this.hands && this.hands.active && !this.hands.isTop) { last = now; continue }
+        budget -= now - last
+        last = now
+        const p = this.bot.entity?.position
+        if (p && Math.hypot(p.x - target.x, p.y - target.y, p.z - target.z) <= distance + 0.6) break
+        if (budget <= 0) { this.log('debug', 'approach: timeout'); break }
+      }
+    } finally { withdrawStyle?.(); setGoal(null) }
   }
 
   /**
@@ -391,13 +394,24 @@ class BuilderExecutor {
    * Pillar-jump upward until the bot stands at/above targetY.
    * Classic jump-place-under-feet tower. Consumes scaffold blocks.
    */
-  async pillarUpTo (targetY) {
+  async pillarUpTo (targetY, cancelled = () => false) {
+    const acquired = this.hands && !this.hands.active
+    if (acquired) this.hands.acquire({ reason: 'scaffold positioning' })
+    try { return await this._pillarUpTo(targetY, cancelled) } finally {
+      this.hands?.setControlState('jump', false)
+      if (acquired) this.hands.release('scaffold positioning ended')
+    }
+  }
+
+  async _pillarUpTo (targetY, cancelled) {
     const bot = this.bot
     const Vec3 = require('vec3').Vec3
     let guard = 0
     let stall = 0
     let lastFeetY = Math.floor(bot.entity.position.y)
-    while (guard++ < 40) {
+    const interrupted = () => cancelled() || (this.hands && !this.hands.isTop)
+    const jump = (value) => this.hands ? this.hands.setControlState('jump', value) : bot.setControlState('jump', value)
+    while (guard++ < 40 && !interrupted()) {
       const feetY = Math.floor(bot.entity.position.y)
       if (feetY >= targetY) return true
       if (feetY > lastFeetY) { stall = 0; lastFeetY = feetY } else if (++stall >= 6) {
@@ -417,12 +431,14 @@ class BuilderExecutor {
       // target — placing at the threshold can race ahead of the move packets,
       // so target ~1.12 and treat the block write as confirmed by a world poll
       // rather than the packet ack alone.
-      bot.setControlState('jump', true)
+      if (interrupted()) return false
+      jump(true)
       const airborneDeadline = Date.now() + 1500
-      while (Date.now() < airborneDeadline) {
+      while (Date.now() < airborneDeadline && !interrupted()) {
         if (bot.entity.position.y - baseY >= 1.12) break
         await new Promise((r) => setTimeout(r, 40))
       }
+      if (interrupted()) { jump(false); return false }
       const dest = basePos
       try {
         const refBlock = bot.blockAt(basePos.offset(0, -1, 0))
@@ -451,7 +467,7 @@ class BuilderExecutor {
       } catch (err) {
         this.log('debug', `tower place failed: ${err.message || err}`)
       }
-      bot.setControlState('jump', false)
+      jump(false)
       // Wait for touchdown (on the placed block on success, back on the ground otherwise)
       const landDeadline = Date.now() + 2500
       while (Date.now() < landDeadline) {
@@ -570,7 +586,7 @@ class BuilderExecutor {
         if (!allowScaffold) { skipped.push(`needs-scaffold@${step.x},${step.y},${step.z}`); continue }
         await this._waitForHands()
         const before = this._count(this.scaffoldBlocks[0])
-        const ok = await this.pillarUpTo(step.y - 3)
+        const ok = await this.pillarUpTo(step.y - 3, () => this.cancelRequested)
         if (ok) towerUsed += Math.max(0, before - this._count(this.scaffoldBlocks[0]))
       }
       await this._approach(target, 3)

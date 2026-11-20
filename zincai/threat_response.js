@@ -21,7 +21,7 @@
 'use strict'
 
 const tactics = require('./tactics')
-const { isAutoFightCandidate, creeperFuseLit, creeperCharged } = require('./threats')
+const { isAutoFightCandidate, creeperFuseLit, creeperCharged, ZOMBIE_BUFFER } = require('./threats')
 
 const MODES = Object.freeze({
   NONE: 'NONE',
@@ -301,12 +301,22 @@ class ThreatResponseEngine {
       }
     }
 
+    // An idle, unarmed bot need not wait for a visible zombie to start
+    // hitting it. On an errand, keep room for detouring and only break away
+    // early if the zombie is already closing at short range.
+    if (!fleeReason && weapon.dmg < 4) {
+      const zombie = active.find(x => x.name === 'zombie' && x.los && !x.caged &&
+        (hasObjective ? x.distance <= 14 && x.closing > 0.35 : x.distance <= ZOMBIE_BUFFER))
+      if (zombie) fleeReason = `opening space from zombie at ${zombie.distance.toFixed(1)}m`
+    }
+
     // --- 2. Flee state retention & clean exit hysteresis -------------------
     if (prevMode === MODES.FLEE) {
-      const effRelease = hasObjective ? this.tetherReleaseRadius : this.releaseRadius
+      const zombieBuffer = !hasObjective && weapon.dmg < 4 && active.some(x => x.name === 'zombie' && x.los)
+      const effRelease = zombieBuffer ? Math.max(ZOMBIE_BUFFER + 2, this.releaseRadius) : hasObjective ? this.tetherReleaseRadius : this.releaseRadius
       const effCalm = hasObjective ? this.tetherCalmMs : this.calmMs
       const safeClearance = !fleeCritical && nearestDist >= effRelease
-      const nonCriticalRecovery = !fleeCritical && !fleeReason && nearestDist >= Math.max(8, effRelease * 0.72) && (sit.closing === null || sit.closing <= 0.1)
+      const nonCriticalRecovery = !zombieBuffer && !fleeCritical && !fleeReason && nearestDist >= Math.max(8, effRelease * 0.72) && (sit.closing === null || sit.closing <= 0.1)
       if (safeClearance || nonCriticalRecovery) {
         if (!this.fleeCalmSince) this.fleeCalmSince = t
         if (t - this.fleeEnteredAt >= this.minFleeMs && t - this.fleeCalmSince >= effCalm) {

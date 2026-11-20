@@ -44,7 +44,7 @@
 const { Vec3 } = require('vec3')
 
 const { ControlArbiter, PRIORITY } = require('./control')
-const { ThreatSense, isHostileMob, isPlayer, isGliding, isUsingItem } = require('./threats')
+const { ThreatSense, isHostileMob, isPlayer, isGliding, isUsingItem, isAutoFightCandidate, ZOMBIE_BUFFER } = require('./threats')
 const { mobSpeed, mobStats, statsOf, reachOf, cornerText, situation } = require('./tactics')
 const { ThreatResponseEngine, MODES: THREAT_MODES, evaluateRecovery } = require('./threat_response')
 const { runnableHeading, clearToRun, surveyGround } = require('./custom_mineflayer/escape')
@@ -520,7 +520,7 @@ class System1 {
     this.sense.assess()
     const live = this._refreshLive()
     const tether = this._tetherNow()
-    const watchLive = (this.sense.last.watch || []).filter((t) => this._isLive(t, now) && t.distance <= this.releaseRadius)
+    const watchLive = (this.sense.last.watch || []).filter((t) => this._isLive(t, now) && t.distance <= (t.name === 'zombie' ? ZOMBIE_BUFFER : this.releaseRadius))
     const chasersNow = this._flee ? this._chasers(now, tether) : []
     const byId = new Map()
     for (const t of [...live, ...chasersNow, ...watchLive]) {
@@ -530,7 +530,7 @@ class System1 {
     const decision = this.threatEngine.evaluate(bot, assessedThreats, {
       hasObjective: Boolean(tether),
       tether,
-      autoFightSuppressed: (entity) => this._isAutoSuppressed([{ id: entity?.id }], now),
+      autoFightSuppressed: (entity) => Boolean(tether && entity?.name === 'zombie' && !assessedThreats.find(t => t.id === entity.id)?.attacker) || this._isAutoSuppressed([{ id: entity?.id }], now),
       combatAvailable: Boolean(this.combat),
       combatCooldown: now < (this.combat?.cooldownUntil || 0),
       chooseFood
@@ -539,7 +539,7 @@ class System1 {
     if (decision.mode === THREAT_MODES.FLEE || (decision.mode === THREAT_MODES.AVOID && tether && nearestThreat?.distance <= 7)) {
       const emergency = decision.mode === THREAT_MODES.FLEE
       this.locomotion?.publishLocomotion('threat-response', {
-        mode: emergency ? 'sprint_jump' : 'sprint', tier: emergency ? 'safety' : 'override',
+        mode: 'sprint', tier: emergency ? 'safety' : 'override',
         expiresAt: now + 550, reason: decision.reason, target: nearestThreat?.id,
         activeWhen: ({ owner, goal }) => Boolean(goal && (emergency ? owner === 'survival' : owner !== 'survival'))
       })
@@ -597,6 +597,21 @@ class System1 {
       }
     } else if (decision.mode === THREAT_MODES.AVOID) {
       // AVOID preserves the active objective while routing around elliptical threat regions.
+      const goal = bot.pathfinder?.goal
+      const candidates = assessedThreats.filter(t => t.name === 'zombie' && t.los && t.distance >= 9 &&
+        t.distance <= (this.combat?.engageRadius ?? 24) && isAutoFightCandidate(t.entity, bot))
+      if (tether && goal && candidates.length && !this.combat?.isEngaged && now >= (this._nextRouteCombatProbe || 0) && now >= (this._routeCombatNoticeUntil || 0)) {
+        this._nextRouteCombatProbe = now + 1800
+        try {
+          const review = this.pathfinder?.routeCombatReview?.(goal, candidates)
+          if (review) {
+            this._routeCombatNoticeUntil = now + 30_000
+            const t = review.blocker
+            this.onEvent({ type: 'route_combat_review', wake: true, urgent: false,
+              text: `Ahead on "${tether.label}": zombie #${t.id} at ${Math.round(t.distance)}m (${t.entity.position.floored()}) intersects the route (${review.reason}). Consider whether to detour, hold, or use attack if combat is worthwhile. The objective remains active; no attack was authorized.` })
+          }
+        } catch { /* incomplete route evidence is not a reason to attack */ }
+      }
       try {
         this.pathfinder?.threat?.sample?.(bot, true)
         this.pathfinder?._watchRoute?.(now)

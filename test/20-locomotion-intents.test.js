@@ -375,3 +375,53 @@ test('real pathfinder turns a right-angle corridor without launching into the be
   await waitFor(() => goal.isEnd(bot.entity.position.floored()), { label: 'native steering completes the corner' })
   assert.ok(bendSamples > 0, 'observed forward movement toward the actual turn')
 })
+
+test('real route prefers a short ground-level detour to jumping onto a dirt ridge', async (t) => {
+  const sim = await startSimulation()
+  t.after(() => sim.stop())
+  const { bot, mc, internals, waitFor } = sim
+  const route = internals.navigationIntents.register({ id: 'ridge-detour' })
+  const from = bot.entity.position.floored()
+  await mc.fillBlocks(from.offset(4, 0, -1), from.offset(7, 0, 1), 'dirt')
+  const goal = new goals.GoalBlock(from.x + 12, from.y, from.z)
+  let detoured = false
+  let climbed = false
+  const observe = () => {
+    const p = bot.entity.position
+    if (p.x < from.x + 4 || p.x >= from.x + 8) return
+    if (p.z < from.z - 1 || p.z >= from.z + 2) detoured = true
+    if (p.y >= from.y + 0.8 && p.z >= from.z - 1 && p.z < from.z + 2) climbed = true
+  }
+  bot.on('physicsTick', observe)
+  t.after(() => bot.removeListener('physicsTick', observe))
+  route.publishGoal('destination', { goal })
+  await waitFor(() => goal.isEnd(bot.entity.position.floored()), { label: 'arrive beyond the dirt ridge' })
+  assert.equal(detoured, true)
+  assert.equal(climbed, false)
+})
+
+test('unarmed idle bot opens distance from a visible zombie before melee range', async (t) => {
+  const sim = await startSimulation()
+  t.after(() => sim.stop())
+  const { bot, mc, internals, waitFor } = sim
+  const origin = bot.entity.position.floored()
+  const danger = origin.offset(21, 0, 0)
+  mc.spawnMob('zombie', danger)
+  await waitFor(() => internals.system1.fleeing && bot.entity.position.distanceTo(danger) > 23, { label: 'early retreat before the zombie closes' })
+})
+
+test('a zombie in a narrow objective corridor prompts a review without starting combat', async (t) => {
+  const sim = await startSimulation()
+  t.after(() => sim.stop())
+  const { bot, mc, internals, waitFor } = sim
+  const from = bot.entity.position.floored()
+  for (const z of [-1, 1]) await mc.fillBlocks(from.offset(-4, 0, z), from.offset(24, 3, z), 'stone')
+  const route = internals.navigationIntents.register({ id: 'blocked-corridor' })
+  const destination = new goals.GoalBlock(from.x + 20, from.y, from.z)
+  route.publishGoal('corridor destination', { goal: destination })
+  const zombie = mc.spawnMob('zombie', from.offset(17, 0, 0))
+  await waitFor(() => bot.entities[zombie.id], { label: 'zombie visible to client' })
+  await waitFor(() => internals.events.events.some(e => e.eventType === 'route_combat_review'), { label: 'early model review of blocked route', timeoutMs: 5000 })
+  assert.equal(internals.combat.isEngaged, false)
+  assert.equal(bot.pathfinder.goal, destination)
+})

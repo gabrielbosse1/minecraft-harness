@@ -704,6 +704,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
   const sense = new ThreatSense(bot, {
     radius: cfg.threat.radius ?? 12,
     rangedRadius: cfg.threat.rangedRadius ?? 18,
+    watchRadius: 40,
     attackerMemoryMs: cfg.threat.attackerMemoryMs ?? 15_000,
     reachable: makeReachabilityCheck(bot, { Movements, goals })
   })
@@ -4877,7 +4878,7 @@ function startSession (shared, onEnded, { host = null, hooks = null } = {}) {
         if (evt.type === 'hazard' && evt.text) {
           lastHazardInfo = { name: String(evt.text).slice(0, 60), at: Date.now() }
         }
-        if (evt.type === 'flee_start' || evt.type === 'flee_end' || evt.type === 'threat_mode_change') {
+        if (evt.type === 'route_combat_review' || evt.type === 'flee_start' || evt.type === 'flee_end' || evt.type === 'threat_mode_change') {
           perceive({
             source: 'system1',
             eventType: evt.type,

@@ -793,7 +793,12 @@ class HurtTracker {
   }
 }
 
+// Vanilla adult zombies typically have a 35-block follow-range attribute.
+// This is a planning estimate, not proof of aggro on a particular server.
+const ZOMBIE_BUFFER = 37
+
 module.exports = {
+  ZOMBIE_BUFFER,
   ThreatSense,
   HurtTracker,
   HOSTILE_NAMES,

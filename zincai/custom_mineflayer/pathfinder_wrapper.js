@@ -76,7 +76,7 @@ const isDoorOrTrapdoorName = (name) => (/_door$/i.test(name) || /_trapdoor$/i.te
  * Hostiles relevant to movement threat. EXACT names (shared with threats.js):
  * the old substring regex also matched skeleton_horse and zombie_horse.
  */
-const { HOSTILE_NAMES, RANGED_NAMES, creeperFuseLit, creeperCharged } = require('../threats')
+const { HOSTILE_NAMES, RANGED_NAMES, creeperFuseLit, creeperCharged, ZOMBIE_BUFFER } = require('../threats')
 const HOSTILE_RE = new RegExp(`^(${[...HOSTILE_NAMES].join('|')})$`, 'i')
 const HEAVY_MELEE_NAMES = new Set(['warden', 'ravager', 'wither', 'ender_dragon', 'elder_guardian', 'piglin_brute', 'vindicator', 'evoker'])
 
@@ -260,7 +260,7 @@ class PredictiveThreatMap {
         if (!this.includePlayers) continue
       } else if (!isHostileName(e.name)) continue
       const d = dist3(e.position, me)
-      if (d > this.maxRadius) continue
+      if (d > (e.name === 'zombie' ? Math.max(this.maxRadius, ZOMBIE_BUFFER + 4) : this.maxRadius)) continue
       out.push({ entity: e, distance: d, isPlayer })
     }
     out.sort((a, b) => a.distance - b.distance)
@@ -523,6 +523,12 @@ class PredictiveThreatMap {
     for (const t of this.threats) {
       if (!t || t.expiresAt <= now) continue
       const py = point.y ?? t.position.y
+      if (t.name === 'zombie' && Math.abs(py - t.position.y) <= 5) {
+        const d = Math.hypot(point.x - t.position.x, point.z - t.position.z)
+        // Soft outer ring: prefer clearance without treating every visible
+        // zombie as a wall that invalidates nearby objectives.
+        if (d < ZOMBIE_BUFFER) score += 0.45 * (1 - d / ZOMBIE_BUFFER) ** 2
+      }
       const df = Math.hypot(point.x - t.future.x, (py - t.future.y) * yWeight, point.z - t.future.z)
       if (df < t.radius) score += (1 - df / t.radius) * t.weight
 
@@ -985,6 +991,25 @@ function configureHazards (bot, movements) {
   }
 }
 
+// Both the detour/escape search and the execution A* should price the same
+// ascent. Charge actual full-height rises, not slab/stair walking steps.
+function preferGroundedRoutes (movements) {
+  if (movements._zincaiGroundedRoutes || typeof movements.getMoveJumpUp !== 'function') return
+  const jumpUp = movements.getMoveJumpUp
+  movements.getMoveJumpUp = function (node, dir, neighbors) {
+    const first = neighbors.length
+    jumpUp.call(this, node, dir, neighbors)
+    if (neighbors.length === first) return
+    const from = this.getBlock(node, 0, -1, 0)
+    const to = this.getBlock(node, dir.x, 0, dir.z)
+    // A scaffold ascent has no existing landing surface.
+    if (!to.physical || to.height - from.height > 0.6) {
+      for (let i = first; i < neighbors.length; i++) neighbors[i].cost += 2
+    }
+  }
+  movements._zincaiGroundedRoutes = true
+}
+
 /** A Movements used only to flood the ground for an escape: geometry, no building, no parkour, no drop that hurts. */
 function escapeMovementsFor (bot, Movements, configureDoors) {
   const m = new Movements(bot)
@@ -998,6 +1023,7 @@ function escapeMovementsFor (bot, Movements, configureDoors) {
   m.maxDropDown = 3
   configureDoors(m)
   configureHazards(bot, m)
+  preferGroundedRoutes(m)
   return m
 }
 
@@ -1140,6 +1166,7 @@ class PathfinderWrapper {
     this._configureDoors(movements)
     this._configureWalkableSurfaces(movements)
     this._configureHazards(movements)
+    preferGroundedRoutes(movements)
     movements.allowSprinting = !this.intents
     movements.maxDropDown = 4
     this.threat.attachToMovements(movements, this.intents)
@@ -1154,13 +1181,13 @@ class PathfinderWrapper {
    * prototype patches are installed once.
    */
   apply () {
+    this._patchStairClearance()
     if (!this.configureMovements()) {
       this.log('warn', 'no Movements instance yet — call setMovements() before apply()')
     }
     if (this._appliedOnce) return this._applied
     this._appliedOnce = true
     this._patchCollisionIndex()
-    this._patchStairClearance()
     this._onPathSeen = (result) => {
       if (!result || !Array.isArray(result.path)) return
       this._path = result.path
@@ -1369,6 +1396,33 @@ class PathfinderWrapper {
     const { goals } = require('mineflayer-pathfinder')
     plan.goal = new goals.GoalBlock(plan.waypoint.x, plan.waypoint.y, plan.waypoint.z)
     return plan
+  }
+
+  /** Geometry-only comparison; never sets a goal or authorizes an attack. */
+  routeCombatReview (goal, threats) {
+    const bot = this.bot
+    const movements = this._escapeMovements()
+    const start = bot.entity?.position
+    if (!start || !movements || !goal) return null
+    const probe = (m) => bot.pathfinder.getPathFromTo(m, start, goal, {
+      optimizePath: false, timeout: 18, tickTimeout: 18, searchRadius: 20
+    }).next().value?.result
+    const direct = probe(movements)
+    if (direct?.status !== 'success') return null
+    const near = (p, e) => Math.abs(p.y - e.position.y) < 4 && Math.hypot(p.x + 0.5 - e.position.x, p.z + 0.5 - e.position.z) < 8
+    const blocker = threats.find(t => !near(start, t.entity) && direct.path.some(p => near(p, t.entity)))
+    if (!blocker) return null
+    if (goal.constructor?.name === 'GoalBlock' && near(goal, blocker.entity)) {
+      return { blocker, reason: 'the exact destination is inside the zombie’s local clearance zone' }
+    }
+    const avoiding = Object.create(movements)
+    avoiding.getNeighbors = node => movements.getNeighbors(node).filter(next => !near(next, blocker.entity))
+    const detour = probe(avoiding)
+    if (detour?.status === 'noPath') return { blocker, reason: 'no route with 8-block clearance found in the local search' }
+    if (detour?.status === 'success' && detour.cost >= direct.cost * 1.5 + 4) {
+      return { blocker, reason: `clearance route cost ${detour.cost.toFixed(0)} vs ${direct.cost.toFixed(0)} directly` }
+    }
+    return null // a timeout/partial search is not evidence that combat is needed
   }
 
   /**
